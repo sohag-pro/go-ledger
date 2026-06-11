@@ -7,5 +7,7 @@ coverage.html
 .env
 .DS_Store
 .vscode/
-docs/blog/
+docs/*
+!docs/adr/
 CLAUDE.md
+.claude/
