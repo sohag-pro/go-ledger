@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — 2026-06-11
+Accepted: 2026-06-11
 
 ## Context
 
@@ -24,7 +24,7 @@ it fails in predictable ways:
   concurrency loses updates unless every code path remembers to lock
   correctly. The schema itself offers no protection.
 
-Double-entry bookkeeping — in use since the 15th century — solves all three
+Double-entry bookkeeping, in use since the 15th century, solves all three
 structurally:
 
 - Every transaction consists of two or more **postings** (ledger entries).
@@ -35,8 +35,8 @@ structurally:
 
 go-ledger models all money movement as double-entry transactions:
 
-- `Transaction` — an atomic, immutable unit of money movement.
-- `Posting` — a single signed entry against one account; a transaction has
+- `Transaction`: an atomic, immutable unit of money movement.
+- `Posting`: a single signed entry against one account; a transaction has
   two or more postings.
 - **Invariant:** Σ(postings) = 0 for every transaction. Enforced in the domain
   types (`Transaction.Validate()`), and later at the database level with a
@@ -48,7 +48,7 @@ go-ledger models all money movement as double-entry transactions:
 
 ### Positive
 
-- Money can never be created or destroyed by a write path bug — an unbalanced
+- Money can never be created or destroyed by a write path bug; an unbalanced
   transaction is rejected before it persists.
 - The ledger is its own audit trail: every balance is explainable as a sum of
   immutable postings.
@@ -59,16 +59,16 @@ go-ledger models all money movement as double-entry transactions:
 ### Negative
 
 - Balance reads are aggregations, not single-row lookups. Acceptable for v1;
-  if it becomes hot, a derived (and rebuildable) balance cache can be added —
+  if it becomes hot, a derived (and rebuildable) balance cache can be added;
   it stays a cache, never the source of truth.
 - Slightly more conceptual overhead for API consumers: posting a payment means
   submitting balanced postings, not "set balance".
 
 ## Alternatives considered
 
-- **Mutable balance table** — rejected: no audit trail, no structural
+- **Mutable balance table**: rejected. No audit trail, no structural
   integrity guarantee (see Context).
-- **Event sourcing with a full event store** — rejected for v1: double-entry
+- **Event sourcing with a full event store**: rejected for v1. Double-entry
   postings already give us the append-only history we need without the
   operational complexity of projections and replay. Revisit only if product
   needs demand it (see scope discipline in the build plan).

@@ -1,7 +1,7 @@
 # go-ledger
 
 A production-grade payment ledger service in Go, built on double-entry
-accounting. Work in progress — see [docs/adr](docs/adr) for design decisions.
+accounting. Work in progress; see [docs/adr](docs/adr) for design decisions.
 
 ## Quickstart
 

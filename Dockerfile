@@ -1,4 +1,4 @@
-# Skeleton — multi-stage build fleshed out in Week 10 (distroless, <20MB target).
+# Skeleton: multi-stage build fleshed out in Week 10 (distroless, <20MB target).
 FROM golang:1.26 AS build
 
 WORKDIR /src
