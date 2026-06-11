@@ -1,0 +1,9 @@
+go_ledger_build_plan.md
+bin/
+tmp/
+*.test
+*.out
+coverage.html
+.env
+.DS_Store
+.vscode/
