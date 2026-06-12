@@ -60,9 +60,9 @@ jobs:
           ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
             set -euo pipefail
             cd /opt/go-ledger
-            if [ -f go-ledger ]; then cp go-ledger go-ledger.prev; fi
+            chmod 755 go-ledger.new
+            if [ -f go-ledger ]; then mv go-ledger go-ledger.prev; fi
             mv go-ledger.new go-ledger
-            chmod 755 go-ledger
             sudo systemctl restart go-ledger
           '
 
