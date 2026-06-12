@@ -1,0 +1,72 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -race -cover ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+  deploy:
+    name: Deploy to VPS
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build linux/amd64 binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o go-ledger ./cmd/server
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Upload binary
+        run: scp -i ~/.ssh/deploy_key go-ledger "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/go-ledger/go-ledger.new"
+
+      - name: Swap binary and restart service
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
+            set -euo pipefail
+            cd /opt/go-ledger
+            if [ -f go-ledger ]; then cp go-ledger go-ledger.prev; fi
+            mv go-ledger.new go-ledger
+            chmod 755 go-ledger
+            sudo systemctl restart go-ledger
+          '
+
+      - name: Health check
+        run: |
+          sleep 3
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz
