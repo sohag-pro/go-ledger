@@ -197,6 +197,21 @@
   pre.code .str { color: var(--amber); }
   pre.code .cm { color: #5E7186; }
 
+  /* code card "try it" footer */
+  .code-cta {
+    display: flex; align-items: center; gap: 10px; text-decoration: none;
+    padding: 13px 20px; border-top: 1px solid var(--line);
+    background: rgba(45,212,191,0.06);
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 500;
+    color: var(--text); transition: background .18s ease;
+  }
+  .code-cta:hover { background: rgba(45,212,191,0.13); }
+  .code-cta .play { display: inline-flex; color: var(--teal); }
+  .code-cta .label { color: var(--muted); }
+  .code-cta:hover .label { color: var(--text); }
+  .code-cta .go { margin-left: auto; color: var(--teal); font-weight: 600; transition: transform .18s ease; }
+  .code-cta:hover .go { transform: translateX(3px); }
+
   /* section heading */
   .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--teal); letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 10px; }
   h2.sec-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(1.8rem, 3.4vw, 2.6rem); line-height: 1.1; letter-spacing: -0.02em; margin: 0; color: var(--paper); }
@@ -351,6 +366,11 @@
     }
     <span class="kw">return</span> <span class="str">nil</span> <span class="cm">// the ledger stays whole</span>
 }</code></pre>
+            <a class="code-cta" href="/playground">
+              <span class="play" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M10 8.5l5 3.5-5 3.5z" fill="currentColor" stroke="none"/></svg></span>
+              <span class="label">Run it against the live API</span>
+              <span class="go" aria-hidden="true">&rarr;</span>
+            </a>
           </div>
         </div>
 
