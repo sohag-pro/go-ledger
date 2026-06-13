@@ -120,7 +120,7 @@
   .section { max-width: 1200px; margin: 0 auto; padding: clamp(40px, 6vw, 80px) clamp(20px, 4vw, 40px); }
   .hero { padding-top: clamp(48px, 8vw, 96px); padding-bottom: clamp(40px, 5vw, 64px); }
   .hero-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
     gap: clamp(36px, 5vw, 64px); align-items: center;
   }
 
@@ -218,7 +218,7 @@
 
   /* feature grid */
   .feat-head { margin-bottom: clamp(28px, 4vw, 44px); max-width: 60ch; }
-  .feat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: clamp(14px, 1.6vw, 20px); }
+  .feat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(290px, 100%), 1fr)); gap: clamp(14px, 1.6vw, 20px); }
   .card {
     background: var(--surface); border: 1px solid rgba(159,176,195,0.1); border-radius: 14px; padding: 24px;
     transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
@@ -243,10 +243,10 @@
   /* built in public */
   .series-card { position: relative; overflow: hidden; border-radius: 20px; border: 1px solid rgba(45,212,191,0.22); background: radial-gradient(120% 140% at 0% 0%, rgba(0,173,216,0.16), rgba(16,23,31,0.4) 55%); padding: clamp(32px, 5vw, 52px); }
   .series-card .lines { position: absolute; inset: 0; background-image: repeating-linear-gradient(180deg, transparent, transparent 27px, rgba(159,176,195,0.05) 27px, rgba(159,176,195,0.05) 28px); pointer-events: none; }
-  .series-grid { position: relative; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: clamp(24px, 4vw, 48px); align-items: center; }
+  .series-grid { position: relative; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: clamp(24px, 4vw, 48px); align-items: center; }
   .series-card h2 { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(1.7rem, 3.4vw, 2.6rem); line-height: 1.08; letter-spacing: -0.02em; margin: 0 0 14px; color: var(--paper); text-wrap: balance; }
   .series-card .body { margin: 0 0 26px; font-size: 16px; color: var(--muted); line-height: 1.6; max-width: 46ch; }
-  .stats { display: flex; gap: clamp(20px, 4vw, 40px); }
+  .stats { display: flex; gap: clamp(20px, 4vw, 40px); flex-wrap: wrap; }
   .stat .num { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(2.6rem, 6vw, 3.6rem); line-height: 1; }
   .stat .num.amber { color: var(--amber); text-shadow: 0 0 28px rgba(232,163,61,0.3); }
   .stat .num.teal { color: var(--teal); text-shadow: 0 0 28px rgba(45,212,191,0.3); }
@@ -281,6 +281,32 @@
     0%, 100% { opacity: 0.35; }
     50% { opacity: 1; }
   }
+  /* phones */
+  @media (max-width: 560px) {
+    /* headline: shrink enough that the longest word ("production-grade") fits
+       its own line, so normal wrapping breaks cleanly at spaces. break-word is
+       only a last-resort guard against clipping on very narrow screens. */
+    h1.headline { font-size: clamp(1.6rem, 6.8vw, 2.3rem); letter-spacing: -0.02em; overflow-wrap: break-word; }
+
+    /* nav: wordmark on its own row, links + button as a centered cluster below */
+    .nav-inner { padding: 12px 16px; gap: 10px; }
+    .nav-links { width: 100%; justify-content: center; gap: 8px 16px; }
+    .navlink { padding: 8px 4px; }
+
+    /* hero: full-width stacked CTAs read cleaner than wrapped inline buttons */
+    .cta-row { flex-direction: column; align-items: stretch; }
+    .btn-primary, .btn-ghost { width: 100%; justify-content: center; }
+
+    /* balance motif: let the caption sit on its own line instead of cramped inline */
+    .balance .note { flex-basis: 100%; margin-left: 0; margin-top: 4px; max-width: 100%; }
+
+    /* code card: smaller type means less horizontal scrolling */
+    pre.code { font-size: 12px; padding: 16px 16px; }
+
+    /* footer: stack the two groups, left-aligned */
+    .foot-inner { flex-direction: column; align-items: flex-start; gap: 14px; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     *, *::before, *::after { animation: none !important; transition: none !important; }
