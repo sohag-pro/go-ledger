@@ -2,7 +2,7 @@ BINARY      := go-ledger
 CMD         := ./cmd/server
 BUILD_DIR   := bin
 
-.PHONY: run build test lint tidy clean dev docker-build help
+.PHONY: run build test lint tidy clean dev docker-build openapi help
 
 run: ## Run the server
 	go run $(CMD)
@@ -18,6 +18,9 @@ lint: ## Run golangci-lint
 
 tidy: ## Tidy go.mod
 	go mod tidy
+
+openapi: ## Regenerate the committed OpenAPI spec (api/openapi.yaml)
+	go run ./cmd/genopenapi
 
 dev: ## Run with hot reload (requires air)
 	air

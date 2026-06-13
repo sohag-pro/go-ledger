@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/web"
 )
 
@@ -31,8 +32,11 @@ func run(logger *slog.Logger) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", handleHealthz)
 	web.Register(mux)
+	// api.New registers /healthz (a typed huma operation), /openapi.json,
+	// /openapi.yaml, and /schemas/. RegisterPlayground serves the Scalar UI.
+	api.New(mux)
+	api.RegisterPlayground(mux)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -61,10 +65,4 @@ func run(logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
-}
-
-func handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
