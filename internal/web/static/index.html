@@ -288,10 +288,15 @@
        only a last-resort guard against clipping on very narrow screens. */
     h1.headline { font-size: clamp(1.6rem, 6.8vw, 2.3rem); letter-spacing: -0.02em; overflow-wrap: break-word; }
 
-    /* nav: wordmark on its own row, links + button as a centered cluster below */
-    .nav-inner { padding: 12px 16px; gap: 10px; }
-    .nav-links { width: 100%; justify-content: center; gap: 8px 16px; }
-    .navlink { padding: 8px 4px; }
+    /* nav: keep everything on the logo row. Blog Series and GitHub are hidden
+       to make room; they stay reachable from the hero and footer. Sizes are
+       tuned so the logo + 3 links fit one row down to 320px. */
+    .nav-inner { padding: 11px 12px; gap: 8px; flex-wrap: nowrap; }
+    .wordmark { font-size: 15px; gap: 6px; }
+    .wordmark .mark { width: 22px; height: 22px; font-size: 11px; }
+    .nav-links { gap: 11px; flex-wrap: nowrap; }
+    .navlink { padding: 6px 0; font-size: 12.5px; }
+    .navlink[href="#series"], .gh-btn { display: none; }
 
     /* hero: full-width stacked CTAs read cleaner than wrapped inline buttons */
     .cta-row { flex-direction: column; align-items: stretch; }
