@@ -10,6 +10,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/sohag-pro/go-ledger/internal/web"
 )
 
 func main() {
@@ -30,7 +32,7 @@ func run(logger *slog.Logger) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /", handleRoot)
+	web.Register(mux)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -65,9 +67,4 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
-}
-
-func handleRoot(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("hello ledger\n"))
 }

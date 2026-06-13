@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>go-ledger: a production-grade payment ledger in Go</title>
+<meta name="description" content="Double-entry accounting with invariants that are impossible to violate: atomic posting, idempotency, immutable audit log, full observability." />
+<meta name="color-scheme" content="dark" />
+<meta property="og:title" content="go-ledger: a production-grade payment ledger in Go" />
+<meta property="og:description" content="Double-entry accounting with invariants that are impossible to violate." />
+<meta property="og:type" content="website" />
+<link rel="preload" href="/static/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="/static/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
+<style>
+  @font-face {
+    font-family: 'Space Grotesk';
+    font-style: normal;
+    font-weight: 400 700;
+    font-display: swap;
+    src: url('/static/fonts/space-grotesk.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 400 600;
+    font-display: swap;
+    src: url('/static/fonts/inter.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 400 600;
+    font-display: swap;
+    src: url('/static/fonts/jetbrains-mono.woff2') format('woff2');
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg: #16202E;
+    --surface: #1E2B3D;
+    --surface-2: #10171F;
+    --cyan: #00ADD8;
+    --teal: #2DD4BF;
+    --amber: #E8A33D;
+    --paper: #F4EFE3;
+    --text: #E8EDF2;
+    --muted: #9FB0C3;
+    --line: rgba(159,176,195,0.12);
+  }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: inherit; }
+  ::selection { background: rgba(0,173,216,0.32); color: var(--paper); }
+
+  /* ambient texture layers */
+  .tex-lines, .tex-glow { position: fixed; pointer-events: none; z-index: 0; }
+  .tex-lines {
+    inset: 0;
+    background-image: repeating-linear-gradient(180deg, transparent, transparent 31px, rgba(159,176,195,0.035) 31px, rgba(159,176,195,0.035) 32px);
+    -webkit-mask-image: linear-gradient(180deg, rgba(0,0,0,0.7), rgba(0,0,0,0.15));
+            mask-image: linear-gradient(180deg, rgba(0,0,0,0.7), rgba(0,0,0,0.15));
+  }
+  .tex-glow {
+    top: -200px; left: 50%; transform: translateX(-50%);
+    width: 1100px; height: 600px;
+    background: radial-gradient(ellipse at center, rgba(0,173,216,0.16), rgba(0,173,216,0) 60%);
+  }
+
+  /* nav */
+  header.nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    background: rgba(22,32,46,0.72);
+    border-bottom: 1px solid var(--line);
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  .nav-inner {
+    padding: 14px clamp(20px, 4vw, 40px);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 20px; flex-wrap: wrap;
+  }
+  .wordmark {
+    display: inline-flex; align-items: center; gap: 9px; text-decoration: none;
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 19px;
+    letter-spacing: -0.01em; color: var(--text);
+  }
+  .wordmark .mark {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(150deg, var(--cyan), var(--teal));
+    color: #0c141f; font-weight: 700; font-size: 13px;
+    box-shadow: 0 4px 16px -4px rgba(0,173,216,0.6);
+  }
+  .nav-links { display: flex; align-items: center; gap: clamp(14px, 2.4vw, 30px); flex-wrap: wrap; }
+  .navlink {
+    text-decoration: none; color: var(--muted); font-size: 15px; font-weight: 500;
+    padding: 6px 2px; border-radius: 6px; transition: color .18s ease;
+  }
+  .navlink:hover { color: var(--text); }
+  .gh-btn {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+    color: var(--text); font-size: 15px; font-weight: 600; padding: 9px 16px;
+    border-radius: 10px; border: 1px solid rgba(45,212,191,0.35);
+    background: rgba(45,212,191,0.08);
+    transition: background .18s ease, border-color .18s ease, transform .18s ease;
+  }
+  .gh-btn:hover { background: rgba(45,212,191,0.16); border-color: rgba(45,212,191,0.6); transform: translateY(-1px); }
+
+  /* layout */
+  main { position: relative; z-index: 1; }
+  .section { max-width: 1200px; margin: 0 auto; padding: clamp(40px, 6vw, 80px) clamp(20px, 4vw, 40px); }
+  .hero { padding-top: clamp(48px, 8vw, 96px); padding-bottom: clamp(40px, 5vw, 64px); }
+  .hero-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: clamp(36px, 5vw, 64px); align-items: center;
+  }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 6px 13px; border-radius: 999px;
+    background: rgba(45,212,191,0.09); border: 1px solid rgba(45,212,191,0.25);
+    font-family: 'JetBrains Mono', monospace; font-size: 12.5px; font-weight: 500;
+    color: var(--teal); letter-spacing: 0.02em; margin-bottom: 24px;
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 8px var(--teal); }
+
+  h1.headline {
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+    font-size: clamp(2.3rem, 5.2vw, 4rem); line-height: 1.04; letter-spacing: -0.025em;
+    margin: 0 0 22px; color: var(--paper); text-wrap: balance;
+  }
+  .subhead {
+    font-size: clamp(1.05rem, 1.5vw, 1.28rem); line-height: 1.55; color: var(--muted);
+    margin: 0 0 32px; max-width: 36ch; text-wrap: pretty;
+  }
+  .subhead em { font-style: normal; color: var(--text); }
+
+  .cta-row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 9px; text-decoration: none;
+    font-weight: 600; font-size: 16px; color: #0c141f; padding: 14px 24px; border-radius: 12px;
+    background: linear-gradient(150deg, var(--cyan), var(--teal));
+    box-shadow: 0 14px 38px -14px rgba(0,173,216,0.85);
+    transition: transform .18s ease, box-shadow .18s ease;
+  }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 20px 48px -14px rgba(0,173,216,0.95); }
+  .btn-ghost {
+    display: inline-flex; align-items: center; gap: 9px; text-decoration: none;
+    font-weight: 600; font-size: 16px; color: var(--text); padding: 14px 22px; border-radius: 12px;
+    border: 1px solid rgba(159,176,195,0.28); background: rgba(30,43,61,0.6);
+    transition: border-color .18s ease, background .18s ease, transform .18s ease;
+  }
+  .btn-ghost:hover { border-color: rgba(45,212,191,0.5); background: rgba(30,43,61,0.95); transform: translateY(-2px); }
+  .btn-ghost .arrow { color: var(--teal); }
+
+  /* balance motif */
+  .balance {
+    display: flex; align-items: center; gap: clamp(10px, 2vw, 18px);
+    margin-top: clamp(34px, 5vw, 48px); font-family: 'JetBrains Mono', monospace; flex-wrap: wrap;
+  }
+  .balance .debit { font-size: clamp(1.3rem, 3vw, 1.9rem); font-weight: 600; color: #F4756B; text-shadow: 0 0 18px rgba(247,117,107,0.25); }
+  .balance .credit { font-size: clamp(1.3rem, 3vw, 1.9rem); font-weight: 600; color: var(--teal); text-shadow: 0 0 18px rgba(45,212,191,0.3); }
+  .balance .zero {
+    display: inline-flex; align-items: center; justify-content: center; min-width: 54px; height: 54px;
+    padding: 0 14px; border-radius: 14px; background: rgba(232,163,61,0.12); border: 1px solid rgba(232,163,61,0.5);
+    color: var(--amber); font-size: clamp(1.4rem, 3.4vw, 2.1rem); font-weight: 700;
+    box-shadow: 0 0 28px -6px rgba(232,163,61,0.45);
+  }
+  .balance .note { font-size: 13px; color: var(--muted); margin-left: 6px; font-family: 'Inter', sans-serif; max-width: 18ch; }
+  .flow-dash { animation: flowPulse 2.6s ease-in-out infinite; }
+  .flow-dash.delay { animation-delay: .4s; }
+
+  /* code card */
+  .code-card-shell { animation: ledgerGlow 5.5s ease-in-out infinite; border-radius: 16px; }
+  .code-card { background: var(--surface-2); border: 1px solid rgba(159,176,195,0.16); border-radius: 16px; overflow: hidden; }
+  .code-bar {
+    display: flex; align-items: center; gap: 8px; padding: 13px 16px;
+    border-bottom: 1px solid var(--line); background: rgba(30,43,61,0.5);
+  }
+  .code-bar .d { width: 11px; height: 11px; border-radius: 50%; }
+  .code-bar .file { margin-left: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--muted); }
+  pre.code {
+    margin: 0; padding: 20px 22px; overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace; font-size: 13.5px; line-height: 1.72; color: var(--text);
+  }
+  pre.code .kw { color: var(--teal); }
+  pre.code .ty { color: var(--cyan); }
+  pre.code .fn { color: #7FD8EE; }
+  pre.code .str { color: var(--amber); }
+  pre.code .cm { color: #5E7186; }
+
+  /* section heading */
+  .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--teal); letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 10px; }
+  h2.sec-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(1.8rem, 3.4vw, 2.6rem); line-height: 1.1; letter-spacing: -0.02em; margin: 0; color: var(--paper); }
+
+  /* feature grid */
+  .feat-head { margin-bottom: clamp(28px, 4vw, 44px); max-width: 60ch; }
+  .feat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: clamp(14px, 1.6vw, 20px); }
+  .card {
+    background: var(--surface); border: 1px solid rgba(159,176,195,0.1); border-radius: 14px; padding: 24px;
+    transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
+  }
+  .card:hover { transform: translateY(-4px); border-color: rgba(45,212,191,0.4); box-shadow: 0 22px 50px -28px rgba(0,173,216,0.6); }
+  .card .icon { width: 40px; height: 40px; border-radius: 11px; display: flex; align-items: center; justify-content: center; background: rgba(0,173,216,0.12); color: var(--teal); margin-bottom: 16px; }
+  .card h3 { font-family: 'Space Grotesk', sans-serif; font-size: 1.16rem; font-weight: 600; margin: 0 0 8px; color: var(--paper); }
+  .card p { margin: 0; font-size: 15px; color: var(--muted); line-height: 1.55; }
+
+  /* stack */
+  .stack-panel {
+    background: linear-gradient(165deg, rgba(30,43,61,0.85), rgba(22,32,46,0.6));
+    border: 1px solid var(--line); border-radius: 18px; padding: clamp(28px, 4vw, 44px);
+  }
+  .stack-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+  .stack-head h2 { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(1.5rem, 3vw, 2.1rem); letter-spacing: -0.02em; margin: 0; color: var(--paper); }
+  .stack-head .sub { margin: 0; font-size: 14px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 500; color: #C9D6E3; padding: 9px 15px; border-radius: 9px; background: rgba(159,176,195,0.06); border: 1px solid rgba(159,176,195,0.18); }
+  .chip.lead { color: var(--text); background: rgba(0,173,216,0.1); border-color: rgba(0,173,216,0.32); }
+
+  /* built in public */
+  .series-card { position: relative; overflow: hidden; border-radius: 20px; border: 1px solid rgba(45,212,191,0.22); background: radial-gradient(120% 140% at 0% 0%, rgba(0,173,216,0.16), rgba(16,23,31,0.4) 55%); padding: clamp(32px, 5vw, 52px); }
+  .series-card .lines { position: absolute; inset: 0; background-image: repeating-linear-gradient(180deg, transparent, transparent 27px, rgba(159,176,195,0.05) 27px, rgba(159,176,195,0.05) 28px); pointer-events: none; }
+  .series-grid { position: relative; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: clamp(24px, 4vw, 48px); align-items: center; }
+  .series-card h2 { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(1.7rem, 3.4vw, 2.6rem); line-height: 1.08; letter-spacing: -0.02em; margin: 0 0 14px; color: var(--paper); text-wrap: balance; }
+  .series-card .body { margin: 0 0 26px; font-size: 16px; color: var(--muted); line-height: 1.6; max-width: 46ch; }
+  .stats { display: flex; gap: clamp(20px, 4vw, 40px); }
+  .stat .num { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(2.6rem, 6vw, 3.6rem); line-height: 1; }
+  .stat .num.amber { color: var(--amber); text-shadow: 0 0 28px rgba(232,163,61,0.3); }
+  .stat .num.teal { color: var(--teal); text-shadow: 0 0 28px rgba(45,212,191,0.3); }
+  .stat .lbl { font-size: 14px; color: var(--muted); margin-top: 6px; }
+
+  /* footer */
+  footer { position: relative; z-index: 1; border-top: 1px solid var(--line); background: rgba(16,23,31,0.6); }
+  .foot-inner { max-width: 1200px; margin: 0 auto; padding: 36px clamp(20px, 4vw, 40px); display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .foot-left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .foot-left .name { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 17px; color: var(--text); }
+  .foot-left .meta { font-size: 14px; color: var(--muted); }
+  .foot-links { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+  .footlink { text-decoration: none; color: var(--muted); font-size: 14px; font-weight: 500; transition: color .18s ease; }
+  .footlink:hover { color: var(--teal); }
+
+  .accent-go { color: var(--teal); }
+  .accent-dash { color: var(--muted); }
+  .go-cyan { color: var(--cyan); }
+
+  /* focus visibility */
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; border-radius: 8px; }
+
+  /* scroll reveal */
+  .reveal { opacity: 0; transform: translateY(18px); transition: opacity .6s cubic-bezier(.2,.7,.3,1), transform .6s cubic-bezier(.2,.7,.3,1); }
+  .reveal.in { opacity: 1; transform: translateY(0); }
+
+  @keyframes ledgerGlow {
+    0%, 100% { box-shadow: 0 0 0 1px rgba(45,212,191,0.18), 0 18px 60px -24px rgba(0,173,216,0.55); }
+    50% { box-shadow: 0 0 0 1px rgba(45,212,191,0.34), 0 22px 70px -22px rgba(0,173,216,0.75); }
+  }
+  @keyframes flowPulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .reveal { opacity: 1; transform: none; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="tex-lines" aria-hidden="true"></div>
+  <div class="tex-glow" aria-hidden="true"></div>
+
+  <!-- ============ NAV ============ -->
+  <header class="nav">
+    <nav class="wrap nav-inner" aria-label="Primary">
+      <a class="wordmark" href="#top">
+        <span class="mark" aria-hidden="true">&equiv;</span>
+        <span><span class="accent-go">go</span><span class="accent-dash">-</span>ledger</span>
+      </a>
+      <div class="nav-links">
+        <a class="navlink" href="#features">Features</a>
+        <a class="navlink" href="#stack">Stack</a>
+        <a class="navlink" href="#series">Blog Series</a>
+        <a class="gh-btn" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="top">
+
+    <!-- ============ HERO ============ -->
+    <section class="section hero">
+      <div class="hero-grid">
+
+        <div>
+          <div class="pill"><span class="dot"></span>open source &middot; MIT &middot; Go 1.26</div>
+          <h1 class="headline">A production-grade payment ledger in&nbsp;<span class="go-cyan">Go</span>.</h1>
+          <p class="subhead">Double-entry accounting with invariants that are <em>impossible to violate</em>: atomic posting, idempotency, immutable audit log, and full observability.</p>
+          <div class="cta-row">
+            <a class="btn-primary" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener">
+              <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+              View on GitHub
+            </a>
+            <a class="btn-ghost" href="https://notes.sohag.pro/series/go-ledger" target="_blank" rel="noopener">
+              Read the build series <span class="arrow" aria-hidden="true">&rarr;</span>
+            </a>
+          </div>
+
+          <div class="balance" aria-label="The balance invariant: a debit of -600 plus a credit of +600 sums to zero">
+            <span class="debit">-600</span>
+            <svg class="flow-svg" width="40" height="12" viewBox="0 0 40 12" fill="none" aria-hidden="true"><path class="flow-dash" d="M0 6h34" stroke="#9FB0C3" stroke-width="1.4" stroke-dasharray="3 3"/><path d="M30 1l6 5-6 5" stroke="#9FB0C3" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="zero">0</span>
+            <svg class="flow-svg" width="40" height="12" viewBox="0 0 40 12" fill="none" aria-hidden="true"><path class="flow-dash delay" d="M0 6h34" stroke="#9FB0C3" stroke-width="1.4" stroke-dasharray="3 3"/><path d="M30 1l6 5-6 5" stroke="#9FB0C3" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="credit">+600</span>
+            <span class="note">every debit has an equal credit</span>
+          </div>
+        </div>
+
+        <div class="code-card-shell">
+          <div class="code-card">
+            <div class="code-bar">
+              <span class="d" style="background:#F4756B;"></span>
+              <span class="d" style="background:#E8A33D;"></span>
+              <span class="d" style="background:#2DD4BF;"></span>
+              <span class="file">ledger/transaction.go</span>
+            </div>
+            <pre class="code"><code><span class="cm">// debits must equal credits, always.</span>
+<span class="kw">func</span> (t <span class="ty">Transaction</span>) <span class="fn">Validate</span>() <span class="kw">error</span> {
+    <span class="kw">var</span> debits, credits <span class="ty">int64</span>
+    <span class="kw">for</span> _, e := <span class="kw">range</span> t.Entries {
+        debits  += e.Debit
+        credits += e.Credit
+    }
+    <span class="kw">if</span> debits != credits {
+        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(
+            <span class="str">"unbalanced: &Sigma;dr=%d &ne; &Sigma;cr=%d"</span>,
+            debits, credits,
+        )
+    }
+    <span class="kw">return</span> <span class="str">nil</span> <span class="cm">// the ledger stays whole</span>
+}</code></pre>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ============ FEATURES ============ -->
+    <section id="features" class="section">
+      <div class="feat-head reveal">
+        <p class="eyebrow">// what's inside</p>
+        <h2 class="sec-title">Correctness, encoded.</h2>
+      </div>
+      <div class="feat-grid">
+
+        <article class="card reveal">
+          <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M12 4v16"/></svg></div>
+          <h3>Double-entry domain model</h3>
+          <p>Invariants encoded directly in Go types: an unbalanced transaction won't compile a path to disk.</p>
+        </article>
+
+        <article class="card reveal">
+          <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></div>
+          <h3>Atomic, concurrency-safe posting</h3>
+          <p>SERIALIZABLE isolation plus row locks, stress-tested under concurrent contention.</p>
+        </article>
+
+        <article class="card reveal">
+          <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v5h-5"/></svg></div>
+          <h3>Idempotency keys</h3>
+          <p>Safe retries with exactly-once posting: the same key never moves money twice.</p>
+        </article>
+
+        <article class="card reveal">
+          <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16l-7-3-7 3z"/><path d="M9 8h6M9 12h6"/></svg></div>
+          <h3>Immutable audit log</h3>
+          <p>Append-only and written inside the same DB transaction as the posting it records.</p>
+        </article>
+
+        <article class="card reveal">
+          <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8l-4 4 4 4M17 8l4 4-4 4M14 4l-4 16"/></svg></div>
+          <h3>REST + gRPC</h3>
+          <p>Thin transport handlers sitting over one shared, well-tested domain core.</p>
+        </article>
+
+        <article class="card reveal">
+          <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2 6 4-14 2 8h6"/></svg></div>
+          <h3>Full observability</h3>
+          <p>OpenTelemetry traces, structured slog, and RED metrics on every path.</p>
+        </article>
+
+      </div>
+    </section>
+
+    <!-- ============ TECH STACK ============ -->
+    <section id="stack" class="section">
+      <div class="stack-panel reveal">
+        <div class="stack-head">
+          <h2>The stack</h2>
+          <p class="sub">boring tech, deployed properly</p>
+        </div>
+        <div class="chips">
+          <span class="chip lead">Go</span>
+          <span class="chip">chi</span>
+          <span class="chip">pgx + sqlc</span>
+          <span class="chip">goose</span>
+          <span class="chip">Postgres</span>
+          <span class="chip">gRPC / buf</span>
+          <span class="chip">OpenTelemetry</span>
+          <span class="chip">Docker (distroless)</span>
+          <span class="chip">VPS</span>
+          <span class="chip">GitHub Actions</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ BUILT IN PUBLIC ============ -->
+    <section id="series" class="section" style="padding-bottom:clamp(56px,7vw,88px);">
+      <div class="series-card reveal">
+        <div class="lines" aria-hidden="true"></div>
+        <div class="series-grid">
+          <div>
+            <p class="eyebrow">// built in public</p>
+            <h2>A 12-week build, documented post by post.</h2>
+            <p class="body">Twelve weeks, twelve posts: every design decision, trade-off, and failed experiment behind the ledger, written down as it shipped.</p>
+            <a class="btn-primary" href="https://notes.sohag.pro/series/go-ledger" target="_blank" rel="noopener">Read the series <span aria-hidden="true">&rarr;</span></a>
+          </div>
+          <div class="stats">
+            <div class="stat">
+              <div class="num amber">12</div>
+              <div class="lbl">weeks of build</div>
+            </div>
+            <div class="stat">
+              <div class="num teal">12</div>
+              <div class="lbl">posts in the series</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ============ FOOTER ============ -->
+  <footer>
+    <div class="foot-inner">
+      <div class="foot-left">
+        <span class="name"><span class="accent-go">go</span><span class="accent-dash">-</span>ledger</span>
+        <span class="meta">MIT licensed &middot; built by Sohag Hasan</span>
+      </div>
+      <nav class="foot-links" aria-label="Footer">
+        <a class="footlink" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener">GitHub repo</a>
+        <a class="footlink" href="https://notes.sohag.pro" target="_blank" rel="noopener">notes.sohag.pro</a>
+        <a class="footlink" href="https://notes.sohag.pro/series/go-ledger" target="_blank" rel="noopener">Build series</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var els = Array.prototype.slice.call(document.querySelectorAll('.reveal'));
+      var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce || !('IntersectionObserver' in window)) {
+        els.forEach(function (el) { el.classList.add('in'); });
+        return;
+      }
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+        });
+      }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
+      els.forEach(function (el) { io.observe(el); });
+      // safety net
+      setTimeout(function () { els.forEach(function (el) { el.classList.add('in'); }); }, 2500);
+    })();
+  </script>
+
+</body>
+</html>
