@@ -140,6 +140,7 @@ func TestMoneyString(t *testing.T) {
 		{-5, "-0.05 USD"},
 		{0, "0.00 USD"},
 		{100, "1.00 USD"},
+		{math.MinInt64, "-92233720368547758.08 USD"},
 	}
 	for _, tt := range tests {
 		m, _ := NewMoney(tt.amount, "USD")

@@ -92,10 +92,10 @@ func (m Money) Neg() (Money, error) {
 // multi-currency lands (out of scope, see ADR-002).
 func (m Money) String() string {
 	sign := ""
-	a := m.amount
-	if a < 0 {
+	a := uint64(m.amount) //nolint:gosec // intentional signed-to-unsigned reinterpretation for abs value
+	if m.amount < 0 {
 		sign = "-"
-		a = -a // safe: MinInt64 cannot reach here in v1 amounts; guarded callers use Neg
+		a = -a // unsigned negation yields the correct magnitude, even for MinInt64
 	}
 	return fmt.Sprintf("%s%d.%02d %s", sign, a/100, a%100, m.currency)
 }
