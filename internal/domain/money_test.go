@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -67,5 +68,63 @@ func TestMoneyIsZero(t *testing.T) {
 	nz, _ := NewMoney(1, "USD")
 	if nz.IsZero() {
 		t.Error("IsZero() = true for non-zero amount")
+	}
+}
+
+func TestMoneyAdd(t *testing.T) {
+	tests := []struct {
+		name    string
+		a, b    int64
+		ca, cb  Currency
+		want    int64
+		wantErr error
+	}{
+		{"simple", 100, 50, "USD", "USD", 150, nil},
+		{"with negative", 100, -150, "USD", "USD", -50, nil},
+		{"currency mismatch", 100, 50, "USD", "EUR", 0, ErrCurrencyMismatch},
+		{"overflow positive", math.MaxInt64, 1, "USD", "USD", 0, ErrOverflow},
+		{"overflow negative", math.MinInt64, -1, "USD", "USD", 0, ErrOverflow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, _ := NewMoney(tt.a, tt.ca)
+			b, _ := NewMoney(tt.b, tt.cb)
+			got, err := a.Add(b)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Add() err = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr == nil && got.Amount() != tt.want {
+				t.Errorf("Add() = %d, want %d", got.Amount(), tt.want)
+			}
+		})
+	}
+}
+
+func TestMoneySub(t *testing.T) {
+	a, _ := NewMoney(100, "USD")
+	b, _ := NewMoney(30, "USD")
+	got, err := a.Sub(b)
+	if err != nil || got.Amount() != 70 {
+		t.Fatalf("Sub() = %d, %v; want 70, nil", got.Amount(), err)
+	}
+	eur, _ := NewMoney(1, "EUR")
+	if _, err := a.Sub(eur); !errors.Is(err, ErrCurrencyMismatch) {
+		t.Errorf("Sub() cross-currency err = %v, want ErrCurrencyMismatch", err)
+	}
+	mn, _ := NewMoney(math.MinInt64, "USD")
+	one, _ := NewMoney(1, "USD")
+	if _, err := mn.Sub(one); !errors.Is(err, ErrOverflow) {
+		t.Errorf("Sub() underflow err = %v, want ErrOverflow", err)
+	}
+}
+
+func TestMoneyNeg(t *testing.T) {
+	a, _ := NewMoney(100, "USD")
+	if n, _ := a.Neg(); n.Amount() != -100 {
+		t.Errorf("Neg() = %d, want -100", n.Amount())
+	}
+	mn, _ := NewMoney(math.MinInt64, "USD")
+	if _, err := mn.Neg(); !errors.Is(err, ErrOverflow) {
+		t.Errorf("Neg() of MinInt64 err = %v, want ErrOverflow", err)
 	}
 }
