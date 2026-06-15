@@ -1,6 +1,9 @@
 package domain
 
-import "math"
+import (
+	"fmt"
+	"math"
+)
 
 // Currency is an ISO 4217 alphabetic code, for example "USD". v1 is
 // single-currency, but Money carries its Currency so cross-currency arithmetic
@@ -82,4 +85,17 @@ func (m Money) Neg() (Money, error) {
 		return Money{}, ErrOverflow
 	}
 	return Money{amount: -m.amount, currency: m.currency}, nil
+}
+
+// String renders the amount with two decimal places and the currency code, for
+// example "10.50 USD". v1 assumes a two-decimal currency; revisit when
+// multi-currency lands (out of scope, see ADR-002).
+func (m Money) String() string {
+	sign := ""
+	a := m.amount
+	if a < 0 {
+		sign = "-"
+		a = -a // safe: MinInt64 cannot reach here in v1 amounts; guarded callers use Neg
+	}
+	return fmt.Sprintf("%s%d.%02d %s", sign, a/100, a%100, m.currency)
 }

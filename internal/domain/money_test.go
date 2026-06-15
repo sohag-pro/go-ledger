@@ -128,3 +128,23 @@ func TestMoneyNeg(t *testing.T) {
 		t.Errorf("Neg() of MinInt64 err = %v, want ErrOverflow", err)
 	}
 }
+
+func TestMoneyString(t *testing.T) {
+	tests := []struct {
+		amount int64
+		want   string
+	}{
+		{1050, "10.50 USD"},
+		{-1050, "-10.50 USD"},
+		{5, "0.05 USD"},
+		{-5, "-0.05 USD"},
+		{0, "0.00 USD"},
+		{100, "1.00 USD"},
+	}
+	for _, tt := range tests {
+		m, _ := NewMoney(tt.amount, "USD")
+		if got := m.String(); got != tt.want {
+			t.Errorf("String() for %d = %q, want %q", tt.amount, got, tt.want)
+		}
+	}
+}
