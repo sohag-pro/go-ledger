@@ -22,4 +22,6 @@ var (
 	ErrInvalidAccountType = errors.New("domain: invalid account type")
 	// ErrInvalidAccount is returned when an Account is missing required fields.
 	ErrInvalidAccount = errors.New("domain: invalid account")
+	// ErrInvalidPosting is returned when a posting is missing an account id.
+	ErrInvalidPosting = errors.New("domain: invalid posting")
 )
