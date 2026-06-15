@@ -45,3 +45,28 @@ func TestAccountTypeString(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		id      string
+		accName string
+		typ     AccountType
+		cur     Currency
+		wantErr error
+	}{
+		{"valid", "acc_1", "Cash", Asset, "USD", nil},
+		{"empty id", "", "Cash", Asset, "USD", ErrInvalidAccount},
+		{"empty name", "acc_1", "", Asset, "USD", ErrInvalidAccount},
+		{"bad type", "acc_1", "Cash", AccountType(0), "USD", ErrInvalidAccountType},
+		{"bad currency", "acc_1", "Cash", Asset, "usd", ErrInvalidCurrency},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := Account{ID: tt.id, Name: tt.accName, Type: tt.typ, Currency: tt.cur}
+			if err := a.Validate(); !errors.Is(err, tt.wantErr) {
+				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}

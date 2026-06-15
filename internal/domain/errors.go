@@ -20,4 +20,6 @@ var (
 	ErrTooFewPostings = errors.New("domain: transaction needs at least two postings")
 	// ErrInvalidAccountType is returned when an AccountType is out of range.
 	ErrInvalidAccountType = errors.New("domain: invalid account type")
+	// ErrInvalidAccount is returned when an Account is missing required fields.
+	ErrInvalidAccount = errors.New("domain: invalid account")
 )

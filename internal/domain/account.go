@@ -53,3 +53,25 @@ func (t AccountType) String() string {
 		return "unknown"
 	}
 }
+
+// Account is a named ledger account of a given type and currency. It is
+// identity plus classification only; the balance is never stored here, it is
+// derived by summing postings (see ADR-001).
+type Account struct {
+	ID       string
+	Name     string
+	Type     AccountType
+	Currency Currency
+}
+
+// Validate checks that the account has an id and name, a defined type, and a
+// well-formed currency.
+func (a Account) Validate() error {
+	if a.ID == "" || a.Name == "" {
+		return ErrInvalidAccount
+	}
+	if err := a.Type.Validate(); err != nil {
+		return err
+	}
+	return a.Currency.Validate()
+}
