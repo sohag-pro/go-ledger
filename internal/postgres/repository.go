@@ -1,0 +1,219 @@
+// Package postgres is the Postgres storage adapter for the ledger. It implements
+// the domain.Repository port on top of pgx and sqlc-generated queries. It holds
+// no business rules: the double-entry invariant is enforced by the domain
+// (Transaction.Validate) and, from Week 4, by a database CHECK constraint.
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
+)
+
+// Repository is a domain.Repository backed by a pgx connection pool.
+type Repository struct {
+	pool *pgxpool.Pool
+	q    *sqlc.Queries
+}
+
+// NewRepository returns a Repository that uses pool for all queries.
+func NewRepository(pool *pgxpool.Pool) *Repository {
+	return &Repository{pool: pool, q: sqlc.New(pool)}
+}
+
+// compile-time check that Repository satisfies the domain port.
+var _ domain.Repository = (*Repository)(nil)
+
+// CreateAccount assigns an identity if a.ID is empty, validates the account, and
+// inserts it.
+func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *domain.Account) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if a.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate account id: %w", err)
+		}
+		a.ID = id.String()
+	}
+	if err := a.Validate(); err != nil {
+		return err
+	}
+	aid, err := uuid.Parse(a.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	return r.q.CreateAccount(ctx, sqlc.CreateAccountParams{
+		ID:       aid,
+		TenantID: tid,
+		Name:     a.Name,
+		Type:     a.Type.String(),
+		Currency: string(a.Currency),
+	})
+}
+
+// GetAccount returns the account, or domain.ErrAccountNotFound if absent.
+func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domain.Account, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(id)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	row, err := r.q.GetAccount(ctx, sqlc.GetAccountParams{TenantID: tid, ID: aid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Account{}, domain.ErrAccountNotFound
+	}
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
+	}
+	return accountFromRow(row)
+}
+
+// CreateTransaction validates t, assigns identities where empty, and writes the
+// transaction and all its postings in one database transaction.
+func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *domain.Transaction) error {
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if t.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate transaction id: %w", err)
+		}
+		t.ID = id.String()
+	}
+	txID, err := uuid.Parse(t.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse transaction id: %w", err)
+	}
+	// Validate guarantees at least one posting and a single shared currency.
+	currency := string(t.Postings[0].Amount.Currency())
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after a successful commit is a no-op
+
+	q := r.q.WithTx(tx)
+	if err := q.CreateTransaction(ctx, sqlc.CreateTransactionParams{
+		ID:       txID,
+		TenantID: tid,
+		Currency: currency,
+	}); err != nil {
+		return fmt.Errorf("postgres: insert transaction: %w", err)
+	}
+	for i := range t.Postings {
+		p := &t.Postings[i]
+		aid, err := uuid.Parse(p.AccountID)
+		if err != nil {
+			return fmt.Errorf("postgres: parse posting account id: %w", err)
+		}
+		pid, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate posting id: %w", err)
+		}
+		if err := q.CreatePosting(ctx, sqlc.CreatePostingParams{
+			ID:            pid,
+			TenantID:      tid,
+			TransactionID: txID,
+			AccountID:     aid,
+			Amount:        p.Amount.Amount(),
+		}); err != nil {
+			return fmt.Errorf("postgres: insert posting: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit: %w", err)
+	}
+	return nil
+}
+
+// GetTransaction returns the transaction and its postings, or
+// domain.ErrTransactionNotFound if absent.
+func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	txID, err := uuid.Parse(id)
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: parse transaction id: %w", err)
+	}
+	row, err := r.q.GetTransaction(ctx, sqlc.GetTransactionParams{TenantID: tid, ID: txID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Transaction{}, domain.ErrTransactionNotFound
+	}
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: get transaction: %w", err)
+	}
+	postings, err := r.q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
+		TenantID:      tid,
+		TransactionID: txID,
+	})
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: list postings: %w", err)
+	}
+	currency := domain.Currency(row.Currency)
+	out := domain.Transaction{ID: row.ID.String(), Postings: make([]domain.Posting, 0, len(postings))}
+	for _, p := range postings {
+		money, err := domain.NewMoney(p.Amount, currency)
+		if err != nil {
+			return domain.Transaction{}, fmt.Errorf("postgres: build posting money: %w", err)
+		}
+		out.Postings = append(out.Postings, domain.Posting{AccountID: p.AccountID.String(), Amount: money})
+	}
+	return out, nil
+}
+
+// Balance returns the derived balance of an account in the account's currency.
+func (r *Repository) Balance(ctx context.Context, tenantID, accountID string) (domain.Money, error) {
+	// Read the account first: it is the source of the currency and lets us
+	// distinguish "no postings yet" (balance zero) from "no such account".
+	acct, err := r.GetAccount(ctx, tenantID, accountID)
+	if err != nil {
+		return domain.Money{}, err
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Money{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return domain.Money{}, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	sum, err := r.q.AccountBalance(ctx, sqlc.AccountBalanceParams{TenantID: tid, AccountID: aid})
+	if err != nil {
+		return domain.Money{}, fmt.Errorf("postgres: account balance: %w", err)
+	}
+	return domain.NewMoney(sum, acct.Currency)
+}
+
+func accountFromRow(row sqlc.Account) (domain.Account, error) {
+	at, err := domain.ParseAccountType(row.Type)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
+	}
+	return domain.Account{
+		ID:       row.ID.String(),
+		Name:     row.Name,
+		Type:     at,
+		Currency: domain.Currency(row.Currency),
+	}, nil
+}
