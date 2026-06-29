@@ -106,6 +106,30 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	return accountFromRow(row)
 }
 
+// ListAccounts returns up to limit of the tenant's accounts, ordered by name.
+func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit int) ([]domain.Account, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.ListAccounts(ctx, sqlc.ListAccountsParams{
+		TenantID: tid,
+		Limit:    int32(limit), //nolint:gosec // limit is bounded by the API layer
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list accounts: %w", err)
+	}
+	out := make([]domain.Account, 0, len(rows))
+	for _, row := range rows {
+		acct, err := accountFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, acct)
+	}
+	return out, nil
+}
+
 // CreateTransaction validates t and writes the transaction and all its postings
 // atomically. It is a convenience wrapper around RunInTx for the common case of
 // posting a single transaction; it inherits the SERIALIZABLE isolation and retry

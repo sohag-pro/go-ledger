@@ -40,6 +40,18 @@ type accountIDInput struct {
 	ID string `path:"id" format:"uuid" doc:"Account id"`
 }
 
+// ListAccountsInput is the list-accounts request: a capped limit, no cursor.
+type ListAccountsInput struct {
+	Limit int `query:"limit" default:"100" minimum:"1" maximum:"500" doc:"Max accounts to return"`
+}
+
+// AccountsOutput is the list-accounts response.
+type AccountsOutput struct {
+	Body struct {
+		Accounts []AccountBody `json:"accounts"`
+	}
+}
+
 // BalanceOutput is the account balance response.
 type BalanceOutput struct {
 	Body struct {
@@ -95,6 +107,25 @@ func registerAccounts(api huma.API, deps Deps) {
 			return nil, toHumaErr(err)
 		}
 		return &AccountOutput{Body: toAccountBody(*acct)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-accounts",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts",
+		Summary:     "List accounts",
+		Tags:        []string{"accounts"},
+	}, func(ctx context.Context, in *ListAccountsInput) (*AccountsOutput, error) {
+		accts, err := deps.Accounts.List(ctx, deps.DefaultTenant, in.Limit)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		out := &AccountsOutput{}
+		out.Body.Accounts = make([]AccountBody, 0, len(accts))
+		for _, a := range accts {
+			out.Body.Accounts = append(out.Body.Accounts, toAccountBody(a))
+		}
+		return out, nil
 	})
 
 	huma.Register(api, huma.Operation{

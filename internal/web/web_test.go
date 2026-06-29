@@ -51,6 +51,13 @@ func TestRoutes(t *testing.T) {
 			wantBody:   "/static/fonts/space-grotesk.woff2",
 		},
 		{
+			name:       "console served",
+			method:     http.MethodGet,
+			path:       "/console",
+			wantStatus: http.StatusOK,
+			wantBody:   "API console",
+		},
+		{
 			name:       "healthz still works alongside web routes",
 			method:     http.MethodGet,
 			path:       "/healthz",

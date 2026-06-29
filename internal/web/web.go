@@ -16,38 +16,57 @@ var staticFS embed.FS
 // files carry no modtime, so http.ServeContent cannot derive a validator on its
 // own; a content hash gives us a stable, correct ETag for revalidation.
 var (
-	indexHTML []byte
-	indexETag string
+	indexHTML   []byte
+	indexETag   string
+	consoleHTML []byte
+	consoleETag string
 )
 
 func init() {
-	data, err := staticFS.ReadFile("static/index.html")
-	if err != nil {
-		panic("web: missing embedded static/index.html: " + err.Error())
-	}
-	indexHTML = data
-	sum := sha256.Sum256(data)
-	indexETag = `"` + hex.EncodeToString(sum[:]) + `"`
+	indexHTML, indexETag = loadPage("static/index.html")
+	consoleHTML, consoleETag = loadPage("static/console.html")
 }
 
-// Register wires the landing page and its assets onto a stdlib mux. Kept for the
-// package's own tests; the server mounts Index and Assets on chi directly.
+// loadPage reads an embedded HTML page and computes its content-hash ETag.
+// Embedded files carry no modtime, so a content hash gives a stable validator.
+func loadPage(name string) ([]byte, string) {
+	data, err := staticFS.ReadFile(name)
+	if err != nil {
+		panic("web: missing embedded " + name + ": " + err.Error())
+	}
+	sum := sha256.Sum256(data)
+	return data, `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+// Register wires the landing page, console, and assets onto a stdlib mux. Kept
+// for the package's own tests; the server mounts the handlers on chi directly.
 func Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{$}", Index)
+	mux.HandleFunc("GET /console", Console)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", Assets()))
 }
 
 // Index serves the landing page with content-hash ETag revalidation.
 func Index(w http.ResponseWriter, r *http.Request) {
-	if match := r.Header.Get("If-None-Match"); match == indexETag {
+	servePage(w, r, indexHTML, indexETag)
+}
+
+// Console serves the developer console (a deliberate dev-tool exception to the
+// "no web UI" scope rule; see CLAUDE.md). It calls the same public /v1 API.
+func Console(w http.ResponseWriter, r *http.Request) {
+	servePage(w, r, consoleHTML, consoleETag)
+}
+
+func servePage(w http.ResponseWriter, r *http.Request, body []byte, etag string) {
+	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
-	w.Header().Set("ETag", indexETag)
+	w.Header().Set("ETag", etag)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = w.Write(indexHTML)
+	_, _ = w.Write(body)
 }
 
 // Assets serves files under static/ (fonts) with a long immutable cache. Asset

@@ -59,3 +59,43 @@ func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (Account
 	)
 	return i, err
 }
+
+const listAccounts = `-- name: ListAccounts :many
+SELECT id, tenant_id, name, type, currency, created_at
+FROM accounts
+WHERE tenant_id = $1
+ORDER BY name, id
+LIMIT $2
+`
+
+type ListAccountsParams struct {
+	TenantID uuid.UUID
+	Limit    int32
+}
+
+func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error) {
+	rows, err := q.db.Query(ctx, listAccounts, arg.TenantID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Account
+	for rows.Next() {
+		var i Account
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Name,
+			&i.Type,
+			&i.Currency,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

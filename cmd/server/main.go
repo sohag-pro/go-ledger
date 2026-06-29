@@ -97,6 +97,7 @@ func run(logger *slog.Logger) error {
 	// spoofable. Revisit with a trusted-proxy allowlist when one is in front.
 	router.Use(middleware.RequestID, middleware.Recoverer, slogLogger(logger))
 	router.Get("/", web.Index)
+	router.Get("/console", web.Console)
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
 	api.RegisterPlayground(router)
 	api.New(router, deps) // mounts /v1/*, /healthz, /openapi.*, /schemas/

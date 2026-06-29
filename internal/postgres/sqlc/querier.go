@@ -21,6 +21,7 @@ type Querier interface {
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
 	GetAccount(ctx context.Context, arg GetAccountParams) (Account, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
+	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 }
 
