@@ -46,7 +46,12 @@ func New(router chi.Router, deps Deps) huma.API {
 	config.DocsPath = ""
 
 	config.Info.Description = "A production-grade payment ledger built on double-entry accounting. " +
-		"Every endpoint here is generated from the live Go handlers, so this spec always matches the running service."
+		"Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.\n\n" +
+		"Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. " +
+		"A transaction's postings must sum to zero.\n\n" +
+		"- Source: [github.com/sohag-pro/go-ledger](https://github.com/sohag-pro/go-ledger)\n" +
+		"- Landing page: [go.sohag.pro](https://go.sohag.pro)\n" +
+		"- Try-it console: [go.sohag.pro/console](https://go.sohag.pro/console)"
 	config.Info.Contact = &huma.Contact{Name: "Sohag Hasan", URL: "https://sohag.pro"}
 	config.Info.License = &huma.License{
 		Name: "MIT",

@@ -305,11 +305,14 @@
       .catch(function (e) { show($("rd-out"), e.message, true); });
   });
 
-  var stmtCursor = null, stmtAccount = null;
+  var stmtCursor = null, stmtAccount = null, stmtLabel = "", stmtCount = 0;
   $("rd-statement").addEventListener("click", function () {
-    stmtAccount = $("rd-account").value; stmtCursor = null;
+    var sel = $("rd-account");
+    stmtAccount = sel.value; stmtCursor = null; stmtCount = 0;
     if (!stmtAccount) { show($("rd-out"), "create an account first", true); return; }
-    $("rd-out").textContent = ""; $("rd-table").innerHTML = "";
+    stmtLabel = sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : stmtAccount;
+    show($("rd-out"), "Statement for " + stmtLabel + " (newest first, loading...)");
+    $("rd-table").innerHTML = "";
     loadStatement();
   });
   function loadStatement() {
@@ -335,13 +338,17 @@
         "<td class='num'>" + fromMinor(e.running_balance) + "</td>";
       tb.appendChild(tr);
     });
+    stmtCount += (s.entries || []).length;
     host.querySelectorAll(".more").forEach(function (n) { n.remove(); });
+    if (stmtCount === 0) {
+      show($("rd-out"), "Statement for " + stmtLabel + ": no postings yet");
+      return;
+    }
+    show($("rd-out"), "Statement for " + stmtLabel + " (" + stmtCount + " entr" + (stmtCount === 1 ? "y" : "ies") + ", newest first)");
     if (s.next_cursor) {
       var more = document.createElement("button"); more.className = "btn ghost sm more"; more.style.marginTop = "10px";
       more.textContent = "Load more"; more.addEventListener("click", loadStatement);
       host.appendChild(more);
-    } else if (!(s.entries || []).length && !tb.children.length) {
-      show($("rd-out"), "no postings yet");
     }
   }
 

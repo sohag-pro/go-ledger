@@ -265,7 +265,14 @@ info:
   contact:
     name: Sohag Hasan
     url: https://sohag.pro
-  description: A production-grade payment ledger built on double-entry accounting. Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.
+  description: |-
+    A production-grade payment ledger built on double-entry accounting. Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.
+
+    Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. A transaction's postings must sum to zero.
+
+    - Source: [github.com/sohag-pro/go-ledger](https://github.com/sohag-pro/go-ledger)
+    - Landing page: [go.sohag.pro](https://go.sohag.pro)
+    - Try-it console: [go.sohag.pro/console](https://go.sohag.pro/console)
   license:
     name: MIT
     url: https://github.com/sohag-pro/go-ledger/blob/main/LICENSE
