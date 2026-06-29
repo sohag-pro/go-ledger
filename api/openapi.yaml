@@ -20,6 +20,18 @@ components:
         - type
         - currency
       type: object
+    AccountsOutputBody:
+      additionalProperties: false
+      properties:
+        accounts:
+          items:
+            $ref: "#/components/schemas/AccountBody"
+          type:
+            - array
+            - "null"
+      required:
+        - accounts
+      type: object
     BalanceOutputBody:
       additionalProperties: false
       properties:
@@ -282,6 +294,36 @@ paths:
       tags:
         - meta
   /v1/accounts:
+    get:
+      operationId: list-accounts
+      parameters:
+        - description: Max accounts to return
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 100
+            description: Max accounts to return
+            format: int64
+            maximum: 500
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: List accounts
+      tags:
+        - accounts
     post:
       operationId: create-account
       requestBody:

@@ -59,6 +59,18 @@ func (f *fakeRepo) GetAccount(_ context.Context, _, id string) (domain.Account, 
 	return a, nil
 }
 
+func (f *fakeRepo) ListAccounts(_ context.Context, _ string, limit int) ([]domain.Account, error) {
+	out := make([]domain.Account, 0, len(f.accounts))
+	for _, a := range f.accounts {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (f *fakeRepo) CreateTransaction(_ context.Context, _ string, t *domain.Transaction) error {
 	if t.ID == "" {
 		t.ID = uuid.NewString()
@@ -227,6 +239,30 @@ func TestGetAccountNotFound(t *testing.T) {
 	rec := do(t, r, http.MethodGet, "/v1/accounts/"+uuid.NewString(), nil)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status %d, want 404", rec.Code)
+	}
+}
+
+func TestListAccounts(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	createAccount(t, r, "Cash", "asset")
+	createAccount(t, r, "Revenue", "income")
+
+	rec := do(t, r, http.MethodGet, "/v1/accounts", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Accounts []AccountBody `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Accounts) != 2 {
+		t.Fatalf("got %d accounts, want 2", len(out.Accounts))
+	}
+	// Ordered by name: Cash before Revenue.
+	if out.Accounts[0].Name != "Cash" || out.Accounts[1].Name != "Revenue" {
+		t.Errorf("unexpected order: %s, %s", out.Accounts[0].Name, out.Accounts[1].Name)
 	}
 }
 

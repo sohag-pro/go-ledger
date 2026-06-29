@@ -224,6 +224,33 @@ func TestCurrencyMismatchRejectedByTrigger(t *testing.T) {
 	}
 }
 
+func TestListAccounts(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+
+	for _, name := range []string{"Revenue", "Cash"} {
+		a := &domain.Account{Name: name, Type: domain.Asset, Currency: "USD"}
+		if err := repo.CreateAccount(ctx, tenant, a); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+
+	got, err := repo.ListAccounts(ctx, tenant, 100)
+	if err != nil {
+		t.Fatalf("list accounts: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d accounts, want 2", len(got))
+	}
+	// Ordered by name: Cash before Revenue.
+	if got[0].Name != "Cash" || got[1].Name != "Revenue" {
+		t.Errorf("order = %s, %s; want Cash, Revenue", got[0].Name, got[1].Name)
+	}
+}
+
 // TestAccountStatement exercises the window-function + keyset statement query
 // against real Postgres: ordering (newest first), running balance, descriptions,
 // and cursor pagination across pages.

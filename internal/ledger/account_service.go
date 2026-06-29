@@ -29,6 +29,11 @@ func (s *AccountService) Get(ctx context.Context, tenantID, id string) (domain.A
 	return s.repo.GetAccount(ctx, tenantID, id)
 }
 
+// List returns up to limit of the tenant's accounts, ordered by name.
+func (s *AccountService) List(ctx context.Context, tenantID string, limit int) ([]domain.Account, error) {
+	return s.repo.ListAccounts(ctx, tenantID, limit)
+}
+
 // Balance returns an account's derived balance, or domain.ErrAccountNotFound.
 func (s *AccountService) Balance(ctx context.Context, tenantID, id string) (domain.Money, error) {
 	return s.repo.Balance(ctx, tenantID, id)

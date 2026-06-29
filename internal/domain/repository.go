@@ -56,6 +56,11 @@ type Repository interface {
 	// ErrAccountNotFound if none exists.
 	GetAccount(ctx context.Context, tenantID, id string) (Account, error)
 
+	// ListAccounts returns up to limit of the tenant's accounts, ordered by name.
+	// Accounts are a small bounded set, so this is a simple capped list rather
+	// than a paginated cursor.
+	ListAccounts(ctx context.Context, tenantID string, limit int) ([]Account, error)
+
 	// CreateTransaction validates t (the double-entry invariant) and persists the
 	// transaction together with all its postings in a single atomic database
 	// transaction. If t.ID is empty the adapter assigns one and writes it back to
