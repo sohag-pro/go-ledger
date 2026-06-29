@@ -28,4 +28,11 @@ var (
 	ErrAccountNotFound = errors.New("domain: account not found")
 	// ErrTransactionNotFound is returned when no transaction matches the given id.
 	ErrTransactionNotFound = errors.New("domain: transaction not found")
+	// ErrConflict is returned when a write could not be serialized after the
+	// adapter exhausted its retries. It is transient: the caller may retry, and a
+	// transport layer should map it to 503 (or 409), not 500.
+	ErrConflict = errors.New("domain: write conflict, retries exhausted")
+	// ErrDuplicateTransaction is returned when a transaction is created with an id
+	// that already exists. A transport layer should map it to 409 Conflict.
+	ErrDuplicateTransaction = errors.New("domain: transaction already exists")
 )

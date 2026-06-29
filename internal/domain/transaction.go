@@ -31,6 +31,13 @@ type Transaction struct {
 // signed amounts summing to exactly zero. It returns the first error found:
 // ErrTooFewPostings, ErrInvalidPosting, ErrCurrencyMismatch, ErrOverflow, or
 // ErrUnbalanced.
+//
+// Two things are deliberately allowed. A zero-amount posting is valid: a
+// balanced set can legitimately include a zero leg (for example a zero fee), and
+// the invariant is about the sum, not each leg. Repeated accounts are also
+// allowed: a transaction may touch the same account in more than one posting (a
+// reclassification can debit and credit the same account alongside other legs).
+// Neither can break the balance invariant, so neither is rejected here.
 func (t Transaction) Validate() error {
 	if len(t.Postings) < 2 {
 		return ErrTooFewPostings

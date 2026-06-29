@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sohag-pro/go-ledger/internal/api"
+	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/web"
 )
 
@@ -44,10 +45,32 @@ func run(logger *slog.Logger) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// Metrics run on a separate server bound to loopback, so the Prometheus
+	// endpoint (which leaks volumes, latencies, and retry rates) is never exposed
+	// on the public interface. A scraper reaches it over the host's private
+	// network or an SSH tunnel.
+	metricsAddr := os.Getenv("METRICS_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = "127.0.0.1:9090"
+	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", metrics.Handler())
+	metricsSrv := &http.Server{
+		Addr:              metricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting server", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+	go func() {
+		logger.Info("starting metrics server", "addr", metricsSrv.Addr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -61,8 +84,11 @@ func run(logger *slog.Logger) error {
 	case <-ctx.Done():
 	}
 
-	logger.Info("shutting down server")
+	logger.Info("shutting down servers")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("metrics server shutdown", "error", err)
+	}
 	return srv.Shutdown(shutdownCtx)
 }

@@ -8,14 +8,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver for goose
 	"github.com/pressly/goose/v3"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
@@ -66,7 +69,7 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("close sql db: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, 10)
 	if err != nil {
 		t.Fatalf("new pool: %v", err)
 	}
@@ -180,5 +183,104 @@ func TestTenantIsolation(t *testing.T) {
 	_, err := repo.GetAccount(ctx, other, acct.ID)
 	if !errors.Is(err, domain.ErrAccountNotFound) {
 		t.Errorf("cross-tenant read: got %v, want ErrAccountNotFound", err)
+	}
+}
+
+// TestCurrencyMismatchRejectedByTrigger proves the DB-level guarantee from
+// ADR-005: a posting into an account whose currency differs from its
+// transaction's currency is rejected, even when inserted as raw rows.
+func TestCurrencyMismatchRejectedByTrigger(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tenant := uuid.New()
+	acct := uuid.New()
+	txn := uuid.New()
+	posting := uuid.New()
+
+	// Account holds EUR; the transaction is in USD.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO accounts (id, tenant_id, name, type, currency) VALUES ($1,$2,'a','asset','EUR')`,
+		acct, tenant); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO transactions (id, tenant_id, currency) VALUES ($1,$2,'USD')`,
+		txn, tenant); err != nil {
+		t.Fatalf("insert transaction: %v", err)
+	}
+	// The immediate trigger fires on this insert and must reject it.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4,$5)`,
+		posting, tenant, txn, acct, int64(100)); err == nil {
+		t.Fatal("expected posting into a EUR account from a USD transaction to be rejected, got nil")
+	}
+}
+
+// serErr returns a synthetic Postgres serialization failure, letting RunInTx's
+// retry path be exercised deterministically without manufacturing a real
+// read/write conflict.
+func serErr() error {
+	return &pgconn.PgError{Code: "40001", Message: "synthetic serialization failure"}
+}
+
+// TestRunInTxRetriesThenCommits feeds RunInTx one serialization failure followed
+// by success, and checks it retried exactly once (counter +1) and committed.
+// Not parallel: it asserts on the global retries counter.
+func TestRunInTxRetriesThenCommits(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	before := testutil.ToFloat64(metrics.SerializationRetries)
+	calls := 0
+	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+		calls++
+		if calls == 1 {
+			return serErr()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected success after one retry, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 attempts, got %d", calls)
+	}
+	if delta := testutil.ToFloat64(metrics.SerializationRetries) - before; delta != 1 {
+		t.Errorf("expected 1 retry recorded, got %v", delta)
+	}
+}
+
+// TestRunInTxExhaustionReturnsConflict checks that a persistent serialization
+// failure ends as a typed, transient domain.ErrConflict, not a raw pg error.
+func TestRunInTxExhaustionReturnsConflict(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+		return serErr()
+	})
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expected ErrConflict after exhaustion, got %v", err)
+	}
+}
+
+// TestRunInTxNonRetryablePropagates checks that an ordinary error is returned
+// immediately, without retrying.
+func TestRunInTxNonRetryablePropagates(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	sentinel := errors.New("boom")
+	calls := 0
+	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected no retry for non-serialization error, got %d attempts", calls)
 	}
 }

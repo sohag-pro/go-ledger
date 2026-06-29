@@ -8,14 +8,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
 )
+
+const (
+	// maxPostAttempts bounds how many times RunInTx replays fn after a
+	// serialization conflict before giving up.
+	maxPostAttempts = 25
+	// backoffBase and backoffCap bound the exponential backoff between retries.
+	backoffBase = time.Millisecond
+	backoffCap  = 100 * time.Millisecond
+)
+
+// retryBackoff returns how long to wait before the given retry attempt (1-based).
+// It is exponential, capped, with full jitter: the random spread is what stops a
+// crowd of conflicting transactions from retrying in lockstep and colliding
+// again. See "Exponential Backoff And Jitter" (AWS Architecture Blog).
+func retryBackoff(attempt int) time.Duration {
+	exp := backoffBase << uint(attempt-1)
+	if exp <= 0 || exp > backoffCap { // overflow or past the cap
+		exp = backoffCap
+	}
+	return time.Duration(rand.Int64N(int64(exp) + 1)) //nolint:gosec // jitter, not crypto
+}
 
 // Repository is a domain.Repository backed by a pgx connection pool.
 type Repository struct {
@@ -81,12 +106,106 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	return accountFromRow(row)
 }
 
-// CreateTransaction validates t, assigns identities where empty, and writes the
-// transaction and all its postings in one database transaction.
+// CreateTransaction validates t and writes the transaction and all its postings
+// atomically. It is a convenience wrapper around RunInTx for the common case of
+// posting a single transaction; it inherits the SERIALIZABLE isolation and retry
+// behavior. Validation happens once here, before the transaction starts, rather
+// than inside the retried unit of work.
 func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *domain.Transaction) error {
 	if err := t.Validate(); err != nil {
 		return err
 	}
+	return r.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		return tx.CreateTransaction(ctx, tenantID, t)
+	})
+}
+
+// RunInTx executes fn inside a SERIALIZABLE transaction, committing on success
+// and rolling back on error. SERIALIZABLE can abort a transaction with a
+// serialization conflict (SQLSTATE 40001), and the conflict often surfaces only
+// at COMMIT, so both fn and the commit are watched and the whole unit of work is
+// replayed up to maxPostAttempts times. fn must therefore be safe to run more
+// than once.
+func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domain.Tx) error) error {
+	var lastErr error
+	for attempt := 0; attempt < maxPostAttempts; attempt++ {
+		if attempt > 0 {
+			metrics.SerializationRetries.Inc()
+			// Exponential backoff with jitter lets the competing transaction
+			// finish and spreads retriers out. Respect cancellation while waiting.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(retryBackoff(attempt)):
+			}
+		}
+
+		tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+		if err != nil {
+			return fmt.Errorf("postgres: begin: %w", err)
+		}
+
+		if err := fn(ctx, txRepo{q: r.q.WithTx(tx)}); err != nil {
+			// Roll back with a detached context so cleanup still runs even if the
+			// caller's context was cancelled (timeout, client gone).
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			if isSerializationFailure(err) {
+				lastErr = err
+				continue
+			}
+			return err
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			if isSerializationFailure(err) {
+				lastErr = err
+				continue
+			}
+			return fmt.Errorf("postgres: commit: %w", err)
+		}
+		return nil
+	}
+	// Exhausted: surface a typed, transient error so transport can map it to 503
+	// rather than 500. The underlying SQLSTATE is included for logs.
+	return fmt.Errorf("postgres: serialization retries exhausted after %d attempts (%v): %w",
+		maxPostAttempts, lastErr, domain.ErrConflict)
+}
+
+// isSerializationFailure reports whether err is a Postgres serialization failure
+// (40001) or deadlock (40P01), the two conditions worth retrying.
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "40001" || pgErr.Code == "40P01"
+	}
+	return false
+}
+
+// isUniqueViolation reports whether err is a Postgres unique-violation (23505),
+// for example inserting a transaction with an id that already exists.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
+
+// txRepo is a domain.Tx bound to one transaction's sqlc queries. All writes it
+// performs are part of the surrounding pgx transaction opened by RunInTx.
+type txRepo struct {
+	q *sqlc.Queries
+}
+
+var _ domain.Tx = txRepo{}
+
+// CreateTransaction assigns identities where empty and inserts the transaction
+// and its postings using the bound transaction's queries. It trusts that t is
+// already valid: the public entry points (Repository.CreateTransaction and the
+// service layer) validate once before the transaction starts, so validation is
+// not repeated here on every retry.
+func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *domain.Transaction) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -102,21 +221,17 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 	if err != nil {
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	// Validate guarantees at least one posting and a single shared currency.
+	// A valid transaction has at least one posting in a single shared currency.
 	currency := string(t.Postings[0].Amount.Currency())
 
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("postgres: begin: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // rollback after a successful commit is a no-op
-
-	q := r.q.WithTx(tx)
-	if err := q.CreateTransaction(ctx, sqlc.CreateTransactionParams{
+	if err := tr.q.CreateTransaction(ctx, sqlc.CreateTransactionParams{
 		ID:       txID,
 		TenantID: tid,
 		Currency: currency,
 	}); err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateTransaction
+		}
 		return fmt.Errorf("postgres: insert transaction: %w", err)
 	}
 	for i := range t.Postings {
@@ -129,7 +244,7 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 		if err != nil {
 			return fmt.Errorf("postgres: generate posting id: %w", err)
 		}
-		if err := q.CreatePosting(ctx, sqlc.CreatePostingParams{
+		if err := tr.q.CreatePosting(ctx, sqlc.CreatePostingParams{
 			ID:            pid,
 			TenantID:      tid,
 			TransactionID: txID,
@@ -138,9 +253,6 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 		}); err != nil {
 			return fmt.Errorf("postgres: insert posting: %w", err)
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("postgres: commit: %w", err)
 	}
 	return nil
 }
