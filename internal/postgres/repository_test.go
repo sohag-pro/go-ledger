@@ -331,6 +331,38 @@ func TestAccountStatement(t *testing.T) {
 	}
 }
 
+// TestPostCrossCurrencyReturnsMismatch checks that posting a transaction that
+// touches an account of a different currency comes back as a typed
+// domain.ErrCurrencyMismatch (which the API maps to 422), not a generic error.
+func TestPostCrossCurrencyReturnsMismatch(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+
+	usd := &domain.Account{Name: "USD acct", Type: domain.Asset, Currency: "USD"}
+	eur := &domain.Account{Name: "EUR acct", Type: domain.Asset, Currency: "EUR"}
+	if err := repo.CreateAccount(ctx, tenant, usd); err != nil {
+		t.Fatalf("create usd: %v", err)
+	}
+	if err := repo.CreateAccount(ctx, tenant, eur); err != nil {
+		t.Fatalf("create eur: %v", err)
+	}
+
+	// Balanced USD transaction, but one leg posts into the EUR account.
+	debit, _ := domain.NewMoney(100, "USD")
+	credit, _ := domain.NewMoney(-100, "USD")
+	txn := &domain.Transaction{Postings: []domain.Posting{
+		{AccountID: usd.ID, Amount: debit},
+		{AccountID: eur.ID, Amount: credit},
+	}}
+	err := repo.CreateTransaction(ctx, tenant, txn)
+	if !errors.Is(err, domain.ErrCurrencyMismatch) {
+		t.Fatalf("got %v, want ErrCurrencyMismatch", err)
+	}
+}
+
 // serErr returns a synthetic Postgres serialization failure, letting RunInTx's
 // retry path be exercised deterministically without manufacturing a real
 // read/write conflict.

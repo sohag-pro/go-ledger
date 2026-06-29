@@ -25,16 +25,24 @@ func toHumaErr(err error) error {
 		return huma.Error409Conflict("transaction already exists")
 	case errors.Is(err, domain.ErrConflict):
 		return huma.Error503ServiceUnavailable("write conflict, please retry")
-	case errors.Is(err, domain.ErrUnbalanced),
-		errors.Is(err, domain.ErrCurrencyMismatch),
-		errors.Is(err, domain.ErrTooFewPostings),
-		errors.Is(err, domain.ErrInvalidPosting),
-		errors.Is(err, domain.ErrInvalidAccount),
-		errors.Is(err, domain.ErrInvalidAccountType),
-		errors.Is(err, domain.ErrInvalidCurrency),
-		errors.Is(err, domain.ErrDescriptionTooLong),
-		errors.Is(err, domain.ErrOverflow):
-		return huma.Error422UnprocessableEntity(err.Error())
+	case errors.Is(err, domain.ErrUnbalanced):
+		return huma.Error422UnprocessableEntity("transaction postings must sum to zero")
+	case errors.Is(err, domain.ErrCurrencyMismatch):
+		return huma.Error422UnprocessableEntity("every posting must be in the transaction's currency, and that currency must match the account's currency")
+	case errors.Is(err, domain.ErrTooFewPostings):
+		return huma.Error422UnprocessableEntity("a transaction needs at least two postings")
+	case errors.Is(err, domain.ErrInvalidPosting):
+		return huma.Error422UnprocessableEntity("a posting is missing its account id")
+	case errors.Is(err, domain.ErrInvalidAccount):
+		return huma.Error422UnprocessableEntity("account is missing a required field")
+	case errors.Is(err, domain.ErrInvalidAccountType):
+		return huma.Error422UnprocessableEntity("invalid account type")
+	case errors.Is(err, domain.ErrInvalidCurrency):
+		return huma.Error422UnprocessableEntity("invalid currency code (expected three uppercase letters)")
+	case errors.Is(err, domain.ErrDescriptionTooLong):
+		return huma.Error422UnprocessableEntity("posting description is too long")
+	case errors.Is(err, domain.ErrOverflow):
+		return huma.Error422UnprocessableEntity("amount is out of range")
 	default:
 		return huma.Error500InternalServerError("internal error")
 	}

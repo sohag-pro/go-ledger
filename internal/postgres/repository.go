@@ -186,6 +186,11 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domai
 				lastErr = err
 				continue
 			}
+			// The deferred balance trigger fires at COMMIT for an unbalanced
+			// transaction (normally caught by Validate first, but map it anyway).
+			if pgConstraint(err) == "postings_balanced" {
+				return domain.ErrUnbalanced
+			}
 			return fmt.Errorf("postgres: commit: %w", err)
 		}
 		return nil
@@ -214,6 +219,17 @@ func isUniqueViolation(err error) bool {
 		return pgErr.Code == "23505"
 	}
 	return false
+}
+
+// pgConstraint returns the constraint name on a Postgres error, or "". The
+// invariant triggers tag their exceptions with a constraint name (migration
+// 0005), so the adapter can translate them to typed domain errors.
+func pgConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return ""
 }
 
 // txRepo is a domain.Tx bound to one transaction's sqlc queries. All writes it
@@ -276,6 +292,11 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 			Amount:        p.Amount.Amount(),
 			Description:   p.Description,
 		}); err != nil {
+			// The currency-integrity trigger rejects a posting into an account
+			// whose currency differs from the transaction's.
+			if pgConstraint(err) == "postings_currency_matches" {
+				return domain.ErrCurrencyMismatch
+			}
 			return fmt.Errorf("postgres: insert posting: %w", err)
 		}
 	}
