@@ -6,6 +6,7 @@
 <title>go-ledger: a production-grade payment ledger in Go</title>
 <meta name="description" content="Double-entry accounting with invariants that are impossible to violate: atomic posting, idempotency, immutable audit log, full observability." />
 <meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#16202E" />
 <meta property="og:title" content="go-ledger: a production-grade payment ledger in Go" />
 <meta property="og:description" content="Double-entry accounting with invariants that are impossible to violate." />
 <meta property="og:type" content="website" />
@@ -188,7 +189,7 @@
   .code-bar .d { width: 11px; height: 11px; border-radius: 50%; }
   .code-bar .file { margin-left: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--muted); }
   pre.code {
-    margin: 0; padding: 20px 22px; overflow-x: auto;
+    margin: 0; padding: 20px 22px; overflow-x: auto; -webkit-overflow-scrolling: touch;
     font-family: 'JetBrains Mono', monospace; font-size: 13.5px; line-height: 1.72; color: var(--text);
   }
   pre.code .kw { color: var(--teal); }
@@ -220,10 +221,18 @@
   .feat-head { margin-bottom: clamp(28px, 4vw, 44px); max-width: 60ch; }
   .feat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(290px, 100%), 1fr)); gap: clamp(14px, 1.6vw, 20px); }
   .card {
+    position: relative;
     background: var(--surface); border: 1px solid rgba(159,176,195,0.1); border-radius: 14px; padding: 24px;
     transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
   }
   .card:hover { transform: translateY(-4px); border-color: rgba(45,212,191,0.4); box-shadow: 0 22px 50px -28px rgba(0,173,216,0.6); }
+  .tag {
+    position: absolute; top: 16px; right: 16px;
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 600;
+    letter-spacing: 0.05em; text-transform: uppercase; padding: 4px 9px; border-radius: 999px;
+  }
+  .tag.shipped { color: var(--teal); background: rgba(45,212,191,0.1); border: 1px solid rgba(45,212,191,0.32); }
+  .tag.planned { color: var(--muted); background: rgba(159,176,195,0.06); border: 1px solid rgba(159,176,195,0.2); }
   .card .icon { width: 40px; height: 40px; border-radius: 11px; display: flex; align-items: center; justify-content: center; background: rgba(0,173,216,0.12); color: var(--teal); margin-bottom: 16px; }
   .card h3 { font-family: 'Space Grotesk', sans-serif; font-size: 1.16rem; font-weight: 600; margin: 0 0 8px; color: var(--paper); }
   .card p { margin: 0; font-size: 15px; color: var(--muted); line-height: 1.55; }
@@ -295,7 +304,8 @@
     .wordmark { font-size: 15px; gap: 6px; }
     .wordmark .mark { width: 22px; height: 22px; font-size: 11px; }
     .nav-links { gap: 11px; flex-wrap: nowrap; }
-    .navlink { padding: 6px 0; font-size: 12.5px; }
+    /* bigger tap targets: ~40px tall is comfortable for thumbs */
+    .navlink { padding: 9px 1px; font-size: 12.5px; min-height: 40px; display: inline-flex; align-items: center; }
     .navlink[href="#series"], .gh-btn { display: none; }
 
     /* hero: full-width stacked CTAs read cleaner than wrapped inline buttons */
@@ -310,6 +320,13 @@
 
     /* footer: stack the two groups, left-aligned */
     .foot-inner { flex-direction: column; align-items: flex-start; gap: 14px; }
+  }
+
+  /* very narrow phones: drop the decorative flow arrows so the balance motif
+     reads as a clean "-600  0  +600" instead of wrapping awkwardly */
+  @media (max-width: 400px) {
+    .balance { gap: 12px; }
+    .balance .flow-svg { display: none; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -353,7 +370,7 @@
         <div>
           <div class="pill"><span class="dot"></span>open source &middot; MIT &middot; Go 1.26</div>
           <h1 class="headline">A production-grade payment ledger in&nbsp;<span class="go-cyan">Go</span>.</h1>
-          <p class="subhead">Double-entry accounting with invariants that are <em>impossible to violate</em>: atomic posting, idempotency, immutable audit log, and full observability.</p>
+          <p class="subhead">Double-entry accounting with invariants that are <em>impossible to violate</em>. Built in the open over 12 weeks: atomic posting, idempotency, an immutable audit log, and full observability.</p>
           <div class="cta-row">
             <a class="btn-primary" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener">
               <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -380,22 +397,22 @@
               <span class="d" style="background:#F4756B;"></span>
               <span class="d" style="background:#E8A33D;"></span>
               <span class="d" style="background:#2DD4BF;"></span>
-              <span class="file">ledger/transaction.go</span>
+              <span class="file">internal/domain/transaction.go</span>
             </div>
-            <pre class="code"><code><span class="cm">// debits must equal credits, always.</span>
+            <pre class="code"><code><span class="cm">// postings are signed; they must sum to zero.</span>
 <span class="kw">func</span> (t <span class="ty">Transaction</span>) <span class="fn">Validate</span>() <span class="kw">error</span> {
-    <span class="kw">var</span> debits, credits <span class="ty">int64</span>
-    <span class="kw">for</span> _, e := <span class="kw">range</span> t.Entries {
-        debits  += e.Debit
-        credits += e.Credit
+    sum := t.Postings[<span class="str">0</span>].Amount
+    <span class="kw">for</span> _, p := <span class="kw">range</span> t.Postings[<span class="str">1</span>:] {
+        next, err := sum.<span class="fn">Add</span>(p.Amount) <span class="cm">// +debit / -credit</span>
+        <span class="kw">if</span> err != <span class="kw">nil</span> {
+            <span class="kw">return</span> err
+        }
+        sum = next
     }
-    <span class="kw">if</span> debits != credits {
-        <span class="kw">return</span> fmt.<span class="fn">Errorf</span>(
-            <span class="str">"unbalanced: &Sigma;dr=%d &ne; &Sigma;cr=%d"</span>,
-            debits, credits,
-        )
+    <span class="kw">if</span> !sum.<span class="fn">IsZero</span>() {
+        <span class="kw">return</span> <span class="ty">ErrUnbalanced</span> <span class="cm">// money can't appear or vanish</span>
     }
-    <span class="kw">return</span> <span class="str">nil</span> <span class="cm">// the ledger stays whole</span>
+    <span class="kw">return</span> <span class="kw">nil</span>
 }</code></pre>
             <a class="code-cta" href="/playground">
               <span class="play" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M10 8.5l5 3.5-5 3.5z" fill="currentColor" stroke="none"/></svg></span>
@@ -418,36 +435,42 @@
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M12 4v16"/></svg></div>
+          <span class="tag shipped">shipped</span>
           <h3>Double-entry domain model</h3>
           <p>Invariants encoded directly in Go types: an unbalanced transaction won't compile a path to disk.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg></div>
+          <span class="tag planned">planned</span>
           <h3>Atomic, concurrency-safe posting</h3>
           <p>SERIALIZABLE isolation plus row locks, stress-tested under concurrent contention.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v5h-5"/></svg></div>
+          <span class="tag planned">planned</span>
           <h3>Idempotency keys</h3>
           <p>Safe retries with exactly-once posting: the same key never moves money twice.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16l-7-3-7 3z"/><path d="M9 8h6M9 12h6"/></svg></div>
+          <span class="tag planned">planned</span>
           <h3>Immutable audit log</h3>
           <p>Append-only and written inside the same DB transaction as the posting it records.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8l-4 4 4 4M17 8l4 4-4 4M14 4l-4 16"/></svg></div>
+          <span class="tag planned">planned</span>
           <h3>REST + gRPC</h3>
           <p>Thin transport handlers sitting over one shared, well-tested domain core.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2 6 4-14 2 8h6"/></svg></div>
+          <span class="tag planned">planned</span>
           <h3>Full observability</h3>
           <p>OpenTelemetry traces, structured slog, and RED metrics on every path.</p>
         </article>
@@ -490,12 +513,12 @@
           </div>
           <div class="stats">
             <div class="stat">
-              <div class="num amber">12</div>
-              <div class="lbl">weeks of build</div>
+              <div class="num amber">3<span style="color:var(--muted);font-size:0.5em;font-weight:600;"> / 12</span></div>
+              <div class="lbl">weeks shipped</div>
             </div>
             <div class="stat">
-              <div class="num teal">12</div>
-              <div class="lbl">posts in the series</div>
+              <div class="num teal">3</div>
+              <div class="lbl">posts published</div>
             </div>
           </div>
         </div>
