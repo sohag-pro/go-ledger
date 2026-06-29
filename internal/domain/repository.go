@@ -1,6 +1,31 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+// StatementEntry is one line of an account statement: a posting that affected the
+// account, with the account's running balance as of that posting. Amount and
+// RunningBalance are in the account's currency.
+type StatementEntry struct {
+	// ID is the posting's own id. It is the keyset tiebreaker for paging and what
+	// a statement cursor points at.
+	ID             string
+	TransactionID  string
+	Amount         Money
+	RunningBalance Money
+	Description    string
+	CreatedAt      time.Time
+}
+
+// StatementCursor is an opaque keyset position for paging a statement. It points
+// at the last entry of the previous page; the next page returns entries strictly
+// older than it, by (CreatedAt, ID) descending.
+type StatementCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
 
 // Tx is a unit of work bound to a single database transaction. The service
 // layer composes one or more writes inside RunInTx; everything done through a Tx
@@ -51,6 +76,14 @@ type Repository interface {
 	// eventually-summed balance; a caller that needs a point-in-time consistent
 	// read should perform it inside RunInTx.
 	Balance(ctx context.Context, tenantID, accountID string) (Money, error)
+
+	// Statement returns up to limit postings affecting the account, newest first,
+	// each carrying the account's running balance as of that posting. after is the
+	// keyset position to page from; nil starts at the newest entry. currency is the
+	// account's currency, used to build the Money values. The caller is expected to
+	// have resolved the account (for its currency and existence) first; an unknown
+	// account simply yields no entries.
+	Statement(ctx context.Context, tenantID, accountID string, currency Currency, after *StatementCursor, limit int) ([]StatementEntry, error)
 
 	// RunInTx executes fn inside a SERIALIZABLE database transaction. It commits
 	// if fn returns nil and rolls back otherwise. Because SERIALIZABLE can abort a

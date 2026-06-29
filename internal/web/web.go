@@ -30,15 +30,15 @@ func init() {
 	indexETag = `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
-// Register wires the landing page and its assets onto mux. It owns the exact
-// root route and the /static/ asset tree; callers keep their own routes
-// (healthz, future API) on the same mux.
+// Register wires the landing page and its assets onto a stdlib mux. Kept for the
+// package's own tests; the server mounts Index and Assets on chi directly.
 func Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /{$}", handleIndex)
-	mux.Handle("GET /static/", http.StripPrefix("/static/", assetServer()))
+	mux.HandleFunc("GET /{$}", Index)
+	mux.Handle("GET /static/", http.StripPrefix("/static/", Assets()))
 }
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
+// Index serves the landing page with content-hash ETag revalidation.
+func Index(w http.ResponseWriter, r *http.Request) {
 	if match := r.Header.Get("If-None-Match"); match == indexETag {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -50,9 +50,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(indexHTML)
 }
 
-// assetServer serves files under static/ (fonts) with a long immutable cache.
-// Asset filenames are content-stable, so a year-long cache is safe.
-func assetServer() http.Handler {
+// Assets serves files under static/ (fonts) with a long immutable cache. Asset
+// filenames are content-stable, so a year-long cache is safe.
+func Assets() http.Handler {
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		panic("web: cannot sub static FS: " + err.Error())

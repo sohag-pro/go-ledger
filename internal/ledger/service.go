@@ -59,3 +59,8 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		"tenant_id", tenantID, "transaction_id", t.ID, "postings", len(t.Postings))
 	return nil
 }
+
+// Get returns a transaction and its postings, or domain.ErrTransactionNotFound.
+func (s *TransactionService) Get(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
+	return s.repo.GetTransaction(ctx, tenantID, id)
+}

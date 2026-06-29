@@ -1,0 +1,19 @@
+meta {
+  name: 06 Get Statement
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/v1/accounts/{{cashId}}/statement?limit=50
+  auth: none
+}
+
+params:query {
+  limit: 50
+}
+
+assert {
+  res.status: eq 200
+  res.body.account_id: eq {{cashId}}
+}

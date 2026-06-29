@@ -3,6 +3,8 @@ package api
 import (
 	_ "embed"
 	"net/http"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // scalarJS is the self-hosted Scalar API reference bundle. Pinned to
@@ -34,15 +36,15 @@ const playgroundHTML = `<!doctype html>
 // RegisterPlayground serves the interactive Scalar playground at /playground
 // and its embedded JS asset. The spec it renders comes from huma at
 // /openapi.json, so the playground always reflects the live API.
-func RegisterPlayground(mux *http.ServeMux) {
-	mux.HandleFunc("GET /playground", func(w http.ResponseWriter, _ *http.Request) {
+func RegisterPlayground(router chi.Router) {
+	router.Get("/playground", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		_, _ = w.Write([]byte(playgroundHTML))
 	})
 
-	mux.HandleFunc("GET /playground/scalar.js", func(w http.ResponseWriter, _ *http.Request) {
+	router.Get("/playground/scalar.js", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("X-Content-Type-Options", "nosniff")

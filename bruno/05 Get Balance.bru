@@ -1,0 +1,16 @@
+meta {
+  name: 05 Get Balance
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/v1/accounts/{{cashId}}/balance
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.amount: eq 10000
+  res.body.currency: eq USD
+}

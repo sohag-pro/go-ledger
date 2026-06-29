@@ -1,18 +1,27 @@
 package domain
 
+// MaxPostingDescriptionLen bounds a posting's free-text narration.
+const MaxPostingDescriptionLen = 256
+
 // Posting is one signed entry against a single account. The sign carries
 // direction: a positive Amount is a debit, a negative Amount is a credit. This
 // is the convention referenced throughout the domain (see ADR-002). A
-// transaction's postings must sum to zero.
+// transaction's postings must sum to zero. Description is an optional free-text
+// narration for the line (for example "dinner repayment").
 type Posting struct {
-	AccountID string
-	Amount    Money
+	AccountID   string
+	Amount      Money
+	Description string
 }
 
-// Validate checks that the posting names an account.
+// Validate checks that the posting names an account and that its description is
+// within the length limit.
 func (p Posting) Validate() error {
 	if p.AccountID == "" {
 		return ErrInvalidPosting
+	}
+	if len(p.Description) > MaxPostingDescriptionLen {
+		return ErrDescriptionTooLong
 	}
 	return nil
 }

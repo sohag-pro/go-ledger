@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -29,9 +30,84 @@ func (q *Queries) AccountBalance(ctx context.Context, arg AccountBalanceParams) 
 	return balance, err
 }
 
+const accountStatement = `-- name: AccountStatement :many
+WITH entries AS (
+    SELECT
+        id,
+        transaction_id,
+        amount,
+        description,
+        created_at,
+        (SUM(amount) OVER (ORDER BY created_at, id))::bigint AS running_balance
+    FROM postings
+    WHERE tenant_id = $1 AND account_id = $2
+)
+SELECT id, transaction_id, amount, running_balance, description, created_at
+FROM entries
+WHERE created_at < $3
+   OR (created_at = $3 AND id < $4)
+ORDER BY created_at DESC, id DESC
+LIMIT $5
+`
+
+type AccountStatementParams struct {
+	TenantID       uuid.UUID
+	AccountID      uuid.UUID
+	AfterCreatedAt time.Time
+	AfterID        uuid.UUID
+	PageLimit      int32
+}
+
+type AccountStatementRow struct {
+	ID             uuid.UUID
+	TransactionID  uuid.UUID
+	Amount         int64
+	RunningBalance int64
+	Description    string
+	CreatedAt      time.Time
+}
+
+// Postings affecting an account, newest first, each with the running balance as
+// of that posting. The running balance is a window SUM over the account's full
+// posting history (the CTE); the keyset filter and limit then return one page.
+// after_created_at / after_id are the keyset position: pass a far-future
+// timestamp and the max uuid for the first page.
+func (q *Queries) AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error) {
+	rows, err := q.db.Query(ctx, accountStatement,
+		arg.TenantID,
+		arg.AccountID,
+		arg.AfterCreatedAt,
+		arg.AfterID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AccountStatementRow
+	for rows.Next() {
+		var i AccountStatementRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TransactionID,
+			&i.Amount,
+			&i.RunningBalance,
+			&i.Description,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createPosting = `-- name: CreatePosting :exec
-INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, description)
+VALUES ($1, $2, $3, $4, $5, $6)
 `
 
 type CreatePostingParams struct {
@@ -40,6 +116,7 @@ type CreatePostingParams struct {
 	TransactionID uuid.UUID
 	AccountID     uuid.UUID
 	Amount        int64
+	Description   string
 }
 
 func (q *Queries) CreatePosting(ctx context.Context, arg CreatePostingParams) error {
@@ -49,12 +126,13 @@ func (q *Queries) CreatePosting(ctx context.Context, arg CreatePostingParams) er
 		arg.TransactionID,
 		arg.AccountID,
 		arg.Amount,
+		arg.Description,
 	)
 	return err
 }
 
 const listPostingsByTransaction = `-- name: ListPostingsByTransaction :many
-SELECT id, tenant_id, transaction_id, account_id, amount, created_at
+SELECT id, tenant_id, transaction_id, account_id, amount, description, created_at
 FROM postings
 WHERE tenant_id = $1 AND transaction_id = $2
 ORDER BY created_at, id
@@ -65,21 +143,32 @@ type ListPostingsByTransactionParams struct {
 	TransactionID uuid.UUID
 }
 
-func (q *Queries) ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]Posting, error) {
+type ListPostingsByTransactionRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	TransactionID uuid.UUID
+	AccountID     uuid.UUID
+	Amount        int64
+	Description   string
+	CreatedAt     time.Time
+}
+
+func (q *Queries) ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error) {
 	rows, err := q.db.Query(ctx, listPostingsByTransaction, arg.TenantID, arg.TransactionID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Posting
+	var items []ListPostingsByTransactionRow
 	for rows.Next() {
-		var i Posting
+		var i ListPostingsByTransactionRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
 			&i.TransactionID,
 			&i.AccountID,
 			&i.Amount,
+			&i.Description,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err

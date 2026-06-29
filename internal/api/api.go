@@ -1,28 +1,38 @@
 // Package api defines the go-ledger HTTP API using huma, which generates the
 // OpenAPI 3.1 spec directly from the typed operation handlers. The spec is a
 // byproduct of the same handlers that serve traffic, so the published docs and
-// the API cannot drift. huma runs on the stdlib mux today via the humago
-// adapter; when chi lands (Week 5) this swaps to the humachi adapter without
-// touching the operations.
+// the API cannot drift. huma runs on a chi router via the humachi adapter, so
+// chi owns routing and middleware while huma owns operations, validation, and
+// problem+json errors.
 package api
 
 import (
-	"net/http"
-
 	"github.com/danielgtaylor/huma/v2"
-	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/danielgtaylor/huma/v2/adapters/humachi"
+	"github.com/go-chi/chi/v5"
+
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 // APIVersion is the OpenAPI info.version. It is a deliberately stable semantic
 // version, never a build SHA or timestamp, so the committed api/openapi.yaml
 // snapshot stays reproducible across machines and CI.
-const APIVersion = "0.1.0"
+const APIVersion = "0.2.0"
 
-// New builds the huma API, registers every operation onto mux, and returns the
-// API. huma also serves /openapi.json, /openapi.yaml, and /schemas/ from the
-// same mux. The interactive playground is registered separately by
-// RegisterPlayground.
-func New(mux *http.ServeMux) huma.API {
+// Deps are the services the operations call, plus the tenant every request acts
+// as until an auth layer resolves a real one. Spec generation passes a zero Deps
+// because the handler bodies are never invoked while serializing the schema.
+type Deps struct {
+	Accounts      *ledger.AccountService
+	Transactions  *ledger.TransactionService
+	DefaultTenant string
+}
+
+// New builds the huma API on the given chi router, registers every operation,
+// and returns the API. huma also serves /openapi.json, /openapi.yaml, and
+// /schemas/ from the same router. The interactive playground is registered
+// separately by RegisterPlayground.
+func New(router chi.Router, deps Deps) huma.API {
 	config := huma.DefaultConfig("go-ledger API", APIVersion)
 
 	// Drop the default create hooks. The only one DefaultConfig adds is the
@@ -46,22 +56,24 @@ func New(mux *http.ServeMux) huma.API {
 		{URL: "https://go.sohag.pro", Description: "production"},
 	}
 
-	api := humago.New(mux, config)
-	registerOperations(api)
+	api := humachi.New(router, config)
+	registerOperations(api, deps)
 	return api
 }
 
-// registerOperations wires every API operation. New endpoints get added here
-// and show up in the spec and playground automatically.
-func registerOperations(api huma.API) {
+// registerOperations wires every API operation. New endpoints get added here and
+// show up in the spec and playground automatically.
+func registerOperations(api huma.API, deps Deps) {
 	registerHealth(api)
+	registerAccounts(api, deps)
+	registerTransactions(api, deps)
 }
 
-// SpecYAML builds the API on a throwaway mux and serializes its OpenAPI spec to
-// YAML. It is the single source for both the generator (cmd/genopenapi) and the
-// drift test, so the committed snapshot and the runtime spec come from the same
-// code path.
+// SpecYAML builds the API on a throwaway router and serializes its OpenAPI spec
+// to YAML. It is the single source for both the generator (cmd/genopenapi) and
+// the drift test, so the committed snapshot and the runtime spec come from the
+// same code path.
 func SpecYAML() ([]byte, error) {
-	api := New(http.NewServeMux())
+	api := New(chi.NewRouter(), Deps{})
 	return api.OpenAPI().YAML()
 }

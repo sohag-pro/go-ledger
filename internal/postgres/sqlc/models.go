@@ -26,6 +26,7 @@ type Posting struct {
 	AccountID     uuid.UUID
 	Amount        int64
 	CreatedAt     time.Time
+	Description   string
 }
 
 type Transaction struct {

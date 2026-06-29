@@ -1,5 +1,86 @@
 components:
   schemas:
+    AccountBody:
+      additionalProperties: false
+      properties:
+        currency:
+          description: ISO 4217 code, e.g. USD
+          type: string
+        id:
+          description: Account id (UUID)
+          type: string
+        name:
+          type: string
+        type:
+          description: "One of: asset, liability, equity, income, expense"
+          type: string
+      required:
+        - id
+        - name
+        - type
+        - currency
+      type: object
+    BalanceOutputBody:
+      additionalProperties: false
+      properties:
+        account_id:
+          type: string
+        amount:
+          description: Signed balance in minor units (e.g. cents)
+          format: int64
+          type: integer
+        currency:
+          type: string
+      required:
+        - account_id
+        - amount
+        - currency
+      type: object
+    CreateAccountInputBody:
+      additionalProperties: false
+      properties:
+        currency:
+          description: ISO 4217 alphabetic code
+          pattern: ^[A-Z]{3}$
+          type: string
+        name:
+          description: Human-readable account name
+          maxLength: 200
+          minLength: 1
+          type: string
+        type:
+          description: Fundamental account class
+          enum:
+            - asset
+            - liability
+            - equity
+            - income
+            - expense
+          type: string
+      required:
+        - name
+        - type
+        - currency
+      type: object
+    CreateTransactionInputBody:
+      additionalProperties: false
+      properties:
+        currency:
+          description: ISO 4217 code shared by every posting
+          pattern: ^[A-Z]{3}$
+          type: string
+        postings:
+          description: Two or more legs that must sum to zero
+          items:
+            $ref: "#/components/schemas/PostingInput"
+          minItems: 2
+          type:
+            - array
+            - "null"
+      required:
+        - currency
+        - postings
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -63,6 +144,111 @@ components:
       required:
         - status
       type: object
+    PostingBody:
+      additionalProperties: false
+      properties:
+        account_id:
+          type: string
+        amount:
+          format: int64
+          type: integer
+        description:
+          type: string
+      required:
+        - account_id
+        - amount
+        - description
+      type: object
+    PostingInput:
+      additionalProperties: false
+      properties:
+        account_id:
+          description: Account this leg posts to
+          format: uuid
+          type: string
+        amount:
+          description: "Signed amount in minor units: positive debit, negative credit"
+          format: int64
+          type: integer
+        description:
+          description: Optional narration for this line
+          maxLength: 256
+          type: string
+      required:
+        - account_id
+        - amount
+      type: object
+    StatementEntryBody:
+      additionalProperties: false
+      properties:
+        amount:
+          description: Signed posting amount in minor units
+          format: int64
+          type: integer
+        created_at:
+          format: date-time
+          type: string
+        description:
+          type: string
+        id:
+          description: Posting id
+          type: string
+        running_balance:
+          description: Account balance as of this posting, in minor units
+          format: int64
+          type: integer
+        transaction_id:
+          type: string
+      required:
+        - id
+        - transaction_id
+        - amount
+        - running_balance
+        - description
+        - created_at
+      type: object
+    StatementOutputBody:
+      additionalProperties: false
+      properties:
+        account_id:
+          type: string
+        currency:
+          type: string
+        entries:
+          items:
+            $ref: "#/components/schemas/StatementEntryBody"
+          type:
+            - array
+            - "null"
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+      required:
+        - account_id
+        - currency
+        - entries
+        - next_cursor
+      type: object
+    TransactionBody:
+      additionalProperties: false
+      properties:
+        currency:
+          type: string
+        id:
+          type: string
+        postings:
+          items:
+            $ref: "#/components/schemas/PostingBody"
+          type:
+            - array
+            - "null"
+      required:
+        - id
+        - currency
+        - postings
+      type: object
 info:
   contact:
     name: Sohag Hasan
@@ -72,7 +258,7 @@ info:
     name: MIT
     url: https://github.com/sohag-pro/go-ledger/blob/main/LICENSE
   title: go-ledger API
-  version: 0.1.0
+  version: 0.2.0
 openapi: 3.1.0
 paths:
   /healthz:
@@ -95,6 +281,187 @@ paths:
       summary: Liveness check
       tags:
         - meta
+  /v1/accounts:
+    post:
+      operationId: create-account
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Create an account
+      tags:
+        - accounts
+  /v1/accounts/{id}:
+    get:
+      operationId: get-account
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Get an account
+      tags:
+        - accounts
+  /v1/accounts/{id}/balance:
+    get:
+      operationId: get-account-balance
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Get an account's balance
+      tags:
+        - accounts
+  /v1/accounts/{id}/statement:
+    get:
+      operationId: get-account-statement
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+        - description: Max entries per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max entries per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatementOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: List an account's postings with running balance
+      tags:
+        - accounts
+  /v1/transactions:
+    post:
+      description: Posts a balanced transaction. The postings must sum to zero in the given currency.
+      operationId: create-transaction
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTransactionInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Post a transaction
+      tags:
+        - transactions
+  /v1/transactions/{id}:
+    get:
+      operationId: get-transaction
+      parameters:
+        - description: Transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Transaction id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Get a transaction
+      tags:
+        - transactions
 servers:
   - description: production
     url: https://go.sohag.pro
