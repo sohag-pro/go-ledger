@@ -32,6 +32,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Constraint triggers must be FOR EACH ROW, so for an N-leg transaction this
+-- fires N times at COMMIT and runs the same per-transaction SUM check each time.
+-- N is tiny (a transaction is usually two legs), so the repeated work is
+-- negligible; this is intentional, not an oversight to "optimize" into a
+-- per-statement trigger (which cannot be DEFERRABLE).
 CREATE CONSTRAINT TRIGGER postings_balanced
     AFTER INSERT ON postings
     DEFERRABLE INITIALLY DEFERRED

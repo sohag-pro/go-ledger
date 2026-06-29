@@ -109,8 +109,12 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 // CreateTransaction validates t and writes the transaction and all its postings
 // atomically. It is a convenience wrapper around RunInTx for the common case of
 // posting a single transaction; it inherits the SERIALIZABLE isolation and retry
-// behavior.
+// behavior. Validation happens once here, before the transaction starts, rather
+// than inside the retried unit of work.
 func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *domain.Transaction) error {
+	if err := t.Validate(); err != nil {
+		return err
+	}
 	return r.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
 		return tx.CreateTransaction(ctx, tenantID, t)
 	})
@@ -142,7 +146,9 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domai
 		}
 
 		if err := fn(ctx, txRepo{q: r.q.WithTx(tx)}); err != nil {
-			_ = tx.Rollback(ctx)
+			// Roll back with a detached context so cleanup still runs even if the
+			// caller's context was cancelled (timeout, client gone).
+			_ = tx.Rollback(context.WithoutCancel(ctx))
 			if isSerializationFailure(err) {
 				lastErr = err
 				continue
@@ -151,7 +157,7 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domai
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			_ = tx.Rollback(ctx)
+			_ = tx.Rollback(context.WithoutCancel(ctx))
 			if isSerializationFailure(err) {
 				lastErr = err
 				continue
@@ -160,7 +166,10 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domai
 		}
 		return nil
 	}
-	return fmt.Errorf("postgres: serialization retries exhausted after %d attempts: %w", maxPostAttempts, lastErr)
+	// Exhausted: surface a typed, transient error so transport can map it to 503
+	// rather than 500. The underlying SQLSTATE is included for logs.
+	return fmt.Errorf("postgres: serialization retries exhausted after %d attempts (%v): %w",
+		maxPostAttempts, lastErr, domain.ErrConflict)
 }
 
 // isSerializationFailure reports whether err is a Postgres serialization failure
@@ -173,6 +182,16 @@ func isSerializationFailure(err error) bool {
 	return false
 }
 
+// isUniqueViolation reports whether err is a Postgres unique-violation (23505),
+// for example inserting a transaction with an id that already exists.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
+
 // txRepo is a domain.Tx bound to one transaction's sqlc queries. All writes it
 // performs are part of the surrounding pgx transaction opened by RunInTx.
 type txRepo struct {
@@ -181,12 +200,12 @@ type txRepo struct {
 
 var _ domain.Tx = txRepo{}
 
-// CreateTransaction validates t, assigns identities where empty, and inserts the
-// transaction and its postings using the bound transaction's queries.
+// CreateTransaction assigns identities where empty and inserts the transaction
+// and its postings using the bound transaction's queries. It trusts that t is
+// already valid: the public entry points (Repository.CreateTransaction and the
+// service layer) validate once before the transaction starts, so validation is
+// not repeated here on every retry.
 func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *domain.Transaction) error {
-	if err := t.Validate(); err != nil {
-		return err
-	}
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -202,7 +221,7 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 	if err != nil {
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	// Validate guarantees at least one posting and a single shared currency.
+	// A valid transaction has at least one posting in a single shared currency.
 	currency := string(t.Postings[0].Amount.Currency())
 
 	if err := tr.q.CreateTransaction(ctx, sqlc.CreateTransactionParams{
@@ -210,6 +229,9 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 		TenantID: tid,
 		Currency: currency,
 	}); err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateTransaction
+		}
 		return fmt.Errorf("postgres: insert transaction: %w", err)
 	}
 	for i := range t.Postings {
