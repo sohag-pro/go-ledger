@@ -49,6 +49,7 @@ func New(router chi.Router, deps Deps) huma.API {
 		"Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.\n\n" +
 		"Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. " +
 		"A transaction's postings must sum to zero.\n\n" +
+		"This is a public demo: the data resets every 4 hours to a fresh, realistic ledger.\n\n" +
 		"- Source: [github.com/sohag-pro/go-ledger](https://github.com/sohag-pro/go-ledger)\n" +
 		"- Landing page: [go.sohag.pro](https://go.sohag.pro)\n" +
 		"- Try-it console: [go.sohag.pro/console](https://go.sohag.pro/console)"

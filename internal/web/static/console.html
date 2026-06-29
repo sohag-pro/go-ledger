@@ -34,7 +34,9 @@
   .unit { display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
 
   h1 { font-family:'Space Grotesk',sans-serif; font-size:clamp(1.5rem,3vw,2rem); letter-spacing:-0.02em; color:var(--paper); margin:8px 0 4px; }
-  .lede { color:var(--muted); margin:0 0 24px; max-width:60ch; }
+  .lede { color:var(--muted); margin:0 0 12px; max-width:60ch; }
+  .banner { margin:0 0 24px; max-width:70ch; font-size:13.5px; color:var(--amber);
+    background:rgba(232,163,61,0.08); border:1px solid rgba(232,163,61,0.32); border-radius:10px; padding:10px 14px; }
 
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr)); gap:18px; }
   .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px; }
@@ -98,6 +100,7 @@
   <main class="wrap">
     <h1>API console</h1>
     <p class="lede">A small console for the live API. Create accounts, post a balanced transaction by picking accounts from a dropdown, and read balances and statements. Everything here calls the same public API at <span class="mono">/v1</span>.</p>
+    <p class="banner">Public demo: the ledger resets every 4 hours to fresh, realistic sample data. Anything you create is cleared on the next reset.</p>
 
     <div class="grid">
       <!-- Create account -->

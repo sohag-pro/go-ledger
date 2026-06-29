@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver for goose
 	"github.com/pressly/goose/v3"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
+	"github.com/sohag-pro/go-ledger/internal/seed"
 	"github.com/sohag-pro/go-ledger/internal/web"
 )
 
@@ -44,6 +47,8 @@ type config struct {
 	metricsAddr   string
 	databaseURL   string
 	defaultTenant string
+	seedEnabled   bool
+	seedInterval  time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -52,6 +57,8 @@ func loadConfig() (config, error) {
 		metricsAddr:   getenv("METRICS_ADDR", "127.0.0.1:9090"),
 		databaseURL:   os.Getenv("DATABASE_URL"),
 		defaultTenant: getenv("DEFAULT_TENANT_ID", defaultTenantID),
+		seedEnabled:   getenvBool("SEED_ENABLED", true),
+		seedInterval:  getenvDuration("SEED_INTERVAL", 4*time.Hour),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -62,6 +69,26 @@ func loadConfig() (config, error) {
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getenvBool(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
+		}
+	}
+	return fallback
+}
+
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
 	}
 	return fallback
 }
@@ -90,6 +117,15 @@ func run(logger *slog.Logger) error {
 		Accounts:      ledger.NewAccountService(repo),
 		Transactions:  ledger.NewTransactionService(repo, logger),
 		DefaultTenant: cfg.defaultTenant,
+	}
+
+	// Demo seeder: reset and repopulate the demo ledger on startup and on an
+	// interval, so the public demo always has fresh, realistic data. Stops on
+	// shutdown.
+	if cfg.seedEnabled {
+		seedCtx, cancelSeed := context.WithCancel(context.Background())
+		defer cancelSeed()
+		go runSeeder(seedCtx, logger, pool, cfg.defaultTenant, cfg.seedInterval)
 	}
 
 	router := chi.NewRouter()
@@ -169,6 +205,31 @@ func runMigrations(dsn string, logger *slog.Logger) error {
 	}
 	logger.Info("migrations applied")
 	return nil
+}
+
+// runSeeder seeds the demo ledger once immediately, then every interval, until
+// ctx is cancelled. A failed seed is logged and the loop continues.
+func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant string, interval time.Duration) {
+	doSeed := func() {
+		start := time.Now()
+		if err := seed.Seed(ctx, pool, tenant, time.Now()); err != nil {
+			logger.Error("demo seed failed", "error", err)
+			return
+		}
+		logger.Info("demo data seeded", "elapsed", time.Since(start))
+	}
+
+	doSeed()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			doSeed()
+		}
+	}
 }
 
 // slogLogger logs one structured line per request: method, path, status, size,

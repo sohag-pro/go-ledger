@@ -270,6 +270,8 @@ info:
 
     Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. A transaction's postings must sum to zero.
 
+    This is a public demo: the data resets every 4 hours to a fresh, realistic ledger.
+
     - Source: [github.com/sohag-pro/go-ledger](https://github.com/sohag-pro/go-ledger)
     - Landing page: [go.sohag.pro](https://go.sohag.pro)
     - Try-it console: [go.sohag.pro/console](https://go.sohag.pro/console)
