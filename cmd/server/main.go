@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sohag-pro/go-ledger/internal/api"
+	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/web"
 )
 
@@ -37,6 +38,9 @@ func run(logger *slog.Logger) error {
 	// /openapi.yaml, and /schemas/. RegisterPlayground serves the Scalar UI.
 	api.New(mux)
 	api.RegisterPlayground(mux)
+	// Prometheus scrape endpoint. The DB-backed collectors stay at zero until the
+	// service posts transactions (Week 5 wires the service into the server).
+	mux.Handle("GET /metrics", metrics.Handler())
 
 	srv := &http.Server{
 		Addr:              ":" + port,
