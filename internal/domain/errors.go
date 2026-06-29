@@ -24,4 +24,8 @@ var (
 	ErrInvalidAccount = errors.New("domain: invalid account")
 	// ErrInvalidPosting is returned when a posting is missing an account id.
 	ErrInvalidPosting = errors.New("domain: invalid posting")
+	// ErrAccountNotFound is returned when no account matches the given id.
+	ErrAccountNotFound = errors.New("domain: account not found")
+	// ErrTransactionNotFound is returned when no transaction matches the given id.
+	ErrTransactionNotFound = errors.New("domain: transaction not found")
 )

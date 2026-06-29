@@ -54,6 +54,26 @@ func (t AccountType) String() string {
 	}
 }
 
+// ParseAccountType maps the lowercase name produced by String back to its
+// AccountType. It returns ErrInvalidAccountType for any unrecognized name. This
+// is the inverse of String and is used when reading a stored account type.
+func ParseAccountType(s string) (AccountType, error) {
+	switch s {
+	case "asset":
+		return Asset, nil
+	case "liability":
+		return Liability, nil
+	case "equity":
+		return Equity, nil
+	case "income":
+		return Income, nil
+	case "expense":
+		return Expense, nil
+	default:
+		return 0, ErrInvalidAccountType
+	}
+}
+
 // Account is a named ledger account of a given type and currency. It is
 // identity plus classification only; the balance is never stored here, it is
 // derived by summing postings (see ADR-001).
