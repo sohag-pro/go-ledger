@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -34,6 +35,12 @@ var (
 
 func init() {
 	registry.MustRegister(PostDuration, SerializationRetries)
+	// Standard runtime and process metrics (go_*, process_*) for baseline
+	// observability: goroutines, memory, GC, open FDs, CPU.
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
 }
 
 // Handler serves the ledger's metrics in the Prometheus text format.
