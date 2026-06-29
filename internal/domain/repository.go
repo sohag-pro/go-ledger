@@ -44,6 +44,12 @@ type Repository interface {
 
 	// Balance returns the derived balance of an account: the sum of its postings'
 	// signed amounts. It returns ErrAccountNotFound if the account does not exist.
+	//
+	// Balance is a non-snapshot read: the existence check and the sum are not
+	// guaranteed to observe the same instant, so a balance read concurrent with a
+	// posting may reflect either side of that write. This is fine for an
+	// eventually-summed balance; a caller that needs a point-in-time consistent
+	// read should perform it inside RunInTx.
 	Balance(ctx context.Context, tenantID, accountID string) (Money, error)
 
 	// RunInTx executes fn inside a SERIALIZABLE database transaction. It commits
