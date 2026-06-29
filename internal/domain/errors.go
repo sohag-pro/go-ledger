@@ -24,6 +24,9 @@ var (
 	ErrInvalidAccount = errors.New("domain: invalid account")
 	// ErrInvalidPosting is returned when a posting is missing an account id.
 	ErrInvalidPosting = errors.New("domain: invalid posting")
+	// ErrDescriptionTooLong is returned when a posting description exceeds
+	// MaxPostingDescriptionLen.
+	ErrDescriptionTooLong = errors.New("domain: posting description too long")
 	// ErrAccountNotFound is returned when no account matches the given id.
 	ErrAccountNotFound = errors.New("domain: account not found")
 	// ErrTransactionNotFound is returned when no transaction matches the given id.

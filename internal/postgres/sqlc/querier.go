@@ -10,12 +10,18 @@ import (
 
 type Querier interface {
 	AccountBalance(ctx context.Context, arg AccountBalanceParams) (int64, error)
+	// Postings affecting an account, newest first, each with the running balance as
+	// of that posting. The running balance is a window SUM over the account's full
+	// posting history (the CTE); the keyset filter and limit then return one page.
+	// after_created_at / after_id are the keyset position: pass a far-future
+	// timestamp and the max uuid for the first page.
+	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
 	GetAccount(ctx context.Context, arg GetAccountParams) (Account, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
-	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]Posting, error)
+	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

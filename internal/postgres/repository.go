@@ -250,6 +250,7 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 			TransactionID: txID,
 			AccountID:     aid,
 			Amount:        p.Amount.Amount(),
+			Description:   p.Description,
 		}); err != nil {
 			return fmt.Errorf("postgres: insert posting: %w", err)
 		}
@@ -289,7 +290,11 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 		if err != nil {
 			return domain.Transaction{}, fmt.Errorf("postgres: build posting money: %w", err)
 		}
-		out.Postings = append(out.Postings, domain.Posting{AccountID: p.AccountID.String(), Amount: money})
+		out.Postings = append(out.Postings, domain.Posting{
+			AccountID:   p.AccountID.String(),
+			Amount:      money,
+			Description: p.Description,
+		})
 	}
 	return out, nil
 }
@@ -315,6 +320,65 @@ func (r *Repository) Balance(ctx context.Context, tenantID, accountID string) (d
 		return domain.Money{}, fmt.Errorf("postgres: account balance: %w", err)
 	}
 	return domain.NewMoney(sum, acct.Currency)
+}
+
+// statementFirstPageTime is the far-future keyset sentinel used to fetch the
+// newest page (every real created_at is strictly before it).
+var statementFirstPageTime = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+
+// Statement returns one keyset page of the account's postings, newest first,
+// each with its running balance, in the given currency.
+func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, currency domain.Currency, after *domain.StatementCursor, limit int) ([]domain.StatementEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+
+	// First page: a sentinel that is strictly greater than any real (created_at,
+	// id). Subsequent pages: the cursor handed back from the previous page.
+	afterTime, afterID := statementFirstPageTime, uuid.Max
+	if after != nil {
+		afterTime = after.CreatedAt
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+
+	rows, err := r.q.AccountStatement(ctx, sqlc.AccountStatementParams{
+		TenantID:       tid,
+		AccountID:      aid,
+		AfterCreatedAt: afterTime,
+		AfterID:        afterID,
+		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: account statement: %w", err)
+	}
+
+	entries := make([]domain.StatementEntry, 0, len(rows))
+	for _, row := range rows {
+		amount, err := domain.NewMoney(row.Amount, currency)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: statement amount: %w", err)
+		}
+		running, err := domain.NewMoney(row.RunningBalance, currency)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: statement running balance: %w", err)
+		}
+		entries = append(entries, domain.StatementEntry{
+			ID:             row.ID.String(),
+			TransactionID:  row.TransactionID.String(),
+			Amount:         amount,
+			RunningBalance: running,
+			Description:    row.Description,
+			CreatedAt:      row.CreatedAt,
+		})
+	}
+	return entries, nil
 }
 
 func accountFromRow(row sqlc.Account) (domain.Account, error) {

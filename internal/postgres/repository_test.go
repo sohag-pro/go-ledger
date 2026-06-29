@@ -224,6 +224,68 @@ func TestCurrencyMismatchRejectedByTrigger(t *testing.T) {
 	}
 }
 
+// TestAccountStatement exercises the window-function + keyset statement query
+// against real Postgres: ordering (newest first), running balance, descriptions,
+// and cursor pagination across pages.
+func TestAccountStatement(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+
+	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
+	other := &domain.Account{Name: "Other", Type: domain.Asset, Currency: "USD"}
+	for _, a := range []*domain.Account{cash, other} {
+		if err := repo.CreateAccount(ctx, tenant, a); err != nil {
+			t.Fatalf("create account: %v", err)
+		}
+	}
+
+	// Three deposits of 100 into cash. Running balances will be 100, 200, 300.
+	for i := 0; i < 3; i++ {
+		debit, _ := domain.NewMoney(100, "USD")
+		credit, _ := domain.NewMoney(-100, "USD")
+		txn := &domain.Transaction{Postings: []domain.Posting{
+			{AccountID: cash.ID, Amount: debit, Description: "deposit"},
+			{AccountID: other.ID, Amount: credit},
+		}}
+		if err := repo.CreateTransaction(ctx, tenant, txn); err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+
+	// First page of 2, newest first: running balances 300 then 200.
+	page1, err := repo.Statement(ctx, tenant, cash.ID, "USD", nil, 2)
+	if err != nil {
+		t.Fatalf("statement page1: %v", err)
+	}
+	if len(page1) != 2 {
+		t.Fatalf("page1 has %d entries, want 2", len(page1))
+	}
+	if page1[0].RunningBalance.Amount() != 300 || page1[1].RunningBalance.Amount() != 200 {
+		t.Errorf("page1 running balances = %d,%d want 300,200",
+			page1[0].RunningBalance.Amount(), page1[1].RunningBalance.Amount())
+	}
+	if page1[0].Description != "deposit" {
+		t.Errorf("description = %q, want deposit", page1[0].Description)
+	}
+
+	// Second page via keyset cursor at the last entry: the remaining one, running 100.
+	last := page1[len(page1)-1]
+	cursor := &domain.StatementCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	page2, err := repo.Statement(ctx, tenant, cash.ID, "USD", cursor, 2)
+	if err != nil {
+		t.Fatalf("statement page2: %v", err)
+	}
+	if len(page2) != 1 {
+		t.Fatalf("page2 has %d entries, want 1", len(page2))
+	}
+	if page2[0].RunningBalance.Amount() != 100 {
+		t.Errorf("page2 running balance = %d, want 100", page2[0].RunningBalance.Amount())
+	}
+}
+
 // serErr returns a synthetic Postgres serialization failure, letting RunInTx's
 // retry path be exercised deterministically without manufacturing a real
 // read/write conflict.
