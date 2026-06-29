@@ -2,7 +2,9 @@ BINARY      := go-ledger
 CMD         := ./cmd/server
 BUILD_DIR   := bin
 
-.PHONY: run build test lint tidy clean dev docker-build openapi help
+MIGRATIONS  := internal/postgres/migrations
+
+.PHONY: run build test lint tidy clean dev docker-build openapi sqlc migrate-up migrate-down help
 
 run: ## Run the server
 	go run $(CMD)
@@ -21,6 +23,15 @@ tidy: ## Tidy go.mod
 
 openapi: ## Regenerate the committed OpenAPI spec (api/openapi.yaml)
 	go run ./cmd/genopenapi
+
+sqlc: ## Regenerate sqlc query code from internal/postgres/queries
+	sqlc generate
+
+migrate-up: ## Apply all migrations (needs DATABASE_URL)
+	goose -dir $(MIGRATIONS) postgres "$(DATABASE_URL)" up
+
+migrate-down: ## Roll back the last migration (needs DATABASE_URL)
+	goose -dir $(MIGRATIONS) postgres "$(DATABASE_URL)" down
 
 dev: ## Run with hot reload (requires air)
 	air
