@@ -297,16 +297,17 @@
        only a last-resort guard against clipping on very narrow screens. */
     h1.headline { font-size: clamp(1.6rem, 6.8vw, 2.3rem); letter-spacing: -0.02em; overflow-wrap: break-word; }
 
-    /* nav: keep everything on the logo row. Blog Series and GitHub are hidden
-       to make room; they stay reachable from the hero and footer. Sizes are
-       tuned so the logo + 3 links fit one row down to 320px. */
+    /* nav: keep everything on the logo row. Stack, Blog Series, and GitHub are
+       hidden to make room (Stack stays reachable by scrolling, Series and GitHub
+       from the hero and footer); Features, Playground, and Console stay. Sizes
+       are tuned so the logo + 3 links fit one row down to 320px. */
     .nav-inner { padding: 11px 12px; gap: 8px; flex-wrap: nowrap; }
     .wordmark { font-size: 15px; gap: 6px; }
     .wordmark .mark { width: 22px; height: 22px; font-size: 11px; }
     .nav-links { gap: 11px; flex-wrap: nowrap; }
     /* bigger tap targets: ~40px tall is comfortable for thumbs */
     .navlink { padding: 9px 1px; font-size: 12.5px; min-height: 40px; display: inline-flex; align-items: center; }
-    .navlink[href="#series"], .gh-btn { display: none; }
+    .navlink[href="#series"], .navlink[href="#stack"], .gh-btn { display: none; }
 
     /* hero: full-width stacked CTAs read cleaner than wrapped inline buttons */
     .cta-row { flex-direction: column; align-items: stretch; }

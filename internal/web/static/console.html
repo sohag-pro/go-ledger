@@ -59,11 +59,14 @@
 
   .posting-row { display:grid; grid-template-columns:2fr 1fr 2fr auto; gap:8px; align-items:end; margin-bottom:8px; }
   @media (max-width:560px){ .posting-row{ grid-template-columns:1fr 1fr; } }
+  @media (max-width:420px){ .posting-row{ grid-template-columns:1fr; } }
   .sumline { font-family:'JetBrains Mono',monospace; font-size:13px; margin-top:10px; color:var(--muted); }
   .sumline.ok { color:var(--teal); } .sumline.bad { color:var(--amber); }
 
+  #rd-table { overflow-x:auto; -webkit-overflow-scrolling:touch; }
   table { width:100%; border-collapse:collapse; font-size:13.5px; margin-top:8px; }
-  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  @media (max-width:560px){ th,td{ padding:6px 7px; font-size:12.5px; } }
   th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.04em; }
   td.num,th.num { text-align:right; font-family:'JetBrains Mono',monospace; }
   .pos { color:var(--teal); } .neg { color:var(--red); }
