@@ -65,6 +65,20 @@ The pieces:
 suspenders here would mean taking explicit locks and running SERIALIZABLE and
 retrying, which is more moving parts and redundant guarantees for no gain.
 
+## Observability
+
+Posting is instrumented with two Prometheus collectors: a histogram
+`transaction_post_duration_seconds`, labeled by outcome, for latency, and a
+counter `transaction_post_serialization_retries_total` so a climbing retry rate
+makes write contention visible. These sit alongside the standard Go runtime and
+process collectors.
+
+The scrape endpoint is served on a separate server bound to loopback
+(`127.0.0.1:9090` by default), not on the public API port. A metrics endpoint
+leaks transaction volumes, latencies, and retry rates, so it is reached over the
+host's private network or an SSH tunnel, never the public interface. The public
+liveness check stays `GET /healthz`.
+
 ## Measured baselines
 
 Stress test: 100 goroutines posting 10,000 balanced transactions against a shared
