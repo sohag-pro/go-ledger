@@ -3,9 +3,11 @@ package ledger_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -29,67 +31,79 @@ import (
 // transactions hit Postgres concurrently, regardless of goroutine count.
 const dbMaxConns = 25
 
-// newTestPool starts a throwaway Postgres, runs all migrations (including the
-// balance trigger from 0002), and returns a pool. It skips, not fails, when no
-// Docker daemon is reachable so the suite stays green without Docker; CI runs it.
-func newTestPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx := context.Background()
+// One Postgres container is shared across the package, started once in TestMain.
+// Tests scope data by unique tenant ids, so a single container suffices and CI is
+// not overwhelmed by one container per test.
+var (
+	sharedPool *pgxpool.Pool
+	poolErr    error
+)
 
+func TestMain(m *testing.M) {
+	os.Exit(runWithContainer(m))
+}
+
+func runWithContainer(m *testing.M) int {
+	ctx := context.Background()
 	container, err := tcpostgres.Run(ctx,
 		"postgres:16-alpine",
 		tcpostgres.WithDatabase("ledger"),
 		tcpostgres.WithUsername("ledger"),
 		tcpostgres.WithPassword("ledger"),
-		// Wait on the readiness log, not just the open port: Postgres opens 5432
-		// during initdb and then restarts it, so a port-only wait races the real
-		// readiness and causes connection resets under parallel container startup
-		// (notably in CI). The startup log appears twice (initdb, then the real
-		// server), hence WithOccurrence(2).
+		// Wait on the readiness log: Postgres opens 5432 during initdb then restarts
+		// it, so a port-only wait races real readiness. The log appears twice, hence
+		// WithOccurrence(2).
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
-				WithStartupTimeout(90*time.Second),
+				WithStartupTimeout(120*time.Second),
 		),
 	)
 	if err != nil {
-		t.Skipf("skipping integration test: cannot start postgres container (is Docker running?): %v", err)
+		poolErr = fmt.Errorf("cannot start postgres container (is Docker running?): %w", err)
+		return m.Run()
 	}
-	t.Cleanup(func() {
-		if err := container.Terminate(context.Background()); err != nil {
-			t.Logf("terminate container: %v", err)
-		}
-	})
+	defer func() { _ = container.Terminate(context.Background()) }()
 
 	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
-		t.Fatalf("connection string: %v", err)
+		poolErr = err
+		return m.Run()
 	}
-
-	sqlDB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open sql db: %v", err)
+	if err := migrate(dsn); err != nil {
+		poolErr = err
+		return m.Run()
 	}
-	goose.SetBaseFS(postgres.Migrations)
-	if err := goose.SetDialect("postgres"); err != nil {
-		t.Fatalf("set dialect: %v", err)
-	}
-	if err := goose.Up(sqlDB, "migrations"); err != nil {
-		t.Fatalf("goose up: %v", err)
-	}
-	if err := sqlDB.Close(); err != nil {
-		t.Fatalf("close sql db: %v", err)
-	}
-
-	// Tuned pool (bounded conns, statement/lock timeouts). MaxConns, not the
-	// goroutine count, sets how many posting transactions actually run at the
-	// database at once.
 	pool, err := postgres.NewPool(ctx, dsn, dbMaxConns)
 	if err != nil {
-		t.Fatalf("new pool: %v", err)
+		poolErr = err
+		return m.Run()
 	}
-	t.Cleanup(pool.Close)
-	return pool
+	defer pool.Close()
+	sharedPool = pool
+	return m.Run()
+}
+
+func migrate(dsn string) error {
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sqlDB.Close() }()
+	goose.SetBaseFS(postgres.Migrations)
+	if err := goose.SetDialect("postgres"); err != nil {
+		return err
+	}
+	return goose.Up(sqlDB, "migrations")
+}
+
+// newTestPool returns the shared pool, skipping when no container was available.
+func newTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	if poolErr != nil {
+		t.Skipf("skipping integration test: %v", poolErr)
+	}
+	return sharedPool
 }
 
 func discardLogger() *slog.Logger {
