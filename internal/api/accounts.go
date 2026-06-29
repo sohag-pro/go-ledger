@@ -1,0 +1,170 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/danielgtaylor/huma/v2"
+
+	"github.com/sohag-pro/go-ledger/internal/domain"
+)
+
+// AccountBody is the JSON shape of an account in responses.
+type AccountBody struct {
+	ID       string `json:"id" doc:"Account id (UUID)"`
+	Name     string `json:"name"`
+	Type     string `json:"type" doc:"One of: asset, liability, equity, income, expense"`
+	Currency string `json:"currency" doc:"ISO 4217 code, e.g. USD"`
+}
+
+func toAccountBody(a domain.Account) AccountBody {
+	return AccountBody{ID: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency)}
+}
+
+// CreateAccountInput is the create-account request body.
+type CreateAccountInput struct {
+	Body struct {
+		Name     string `json:"name" minLength:"1" maxLength:"200" doc:"Human-readable account name"`
+		Type     string `json:"type" enum:"asset,liability,equity,income,expense" doc:"Fundamental account class"`
+		Currency string `json:"currency" pattern:"^[A-Z]{3}$" doc:"ISO 4217 alphabetic code"`
+	}
+}
+
+// AccountOutput wraps an account in a response.
+type AccountOutput struct {
+	Body AccountBody
+}
+
+type accountIDInput struct {
+	ID string `path:"id" format:"uuid" doc:"Account id"`
+}
+
+// BalanceOutput is the account balance response.
+type BalanceOutput struct {
+	Body struct {
+		AccountID string `json:"account_id"`
+		Amount    int64  `json:"amount" doc:"Signed balance in minor units (e.g. cents)"`
+		Currency  string `json:"currency"`
+	}
+}
+
+// StatementInput is the account statement request: a path id plus keyset paging.
+type StatementInput struct {
+	ID     string `path:"id" format:"uuid" doc:"Account id"`
+	Limit  int    `query:"limit" default:"50" minimum:"1" maximum:"200" doc:"Max entries per page"`
+	Cursor string `query:"cursor" doc:"Opaque cursor from a previous page's next_cursor"`
+}
+
+// StatementEntryBody is one line of a statement: a posting affecting the account,
+// with the running balance as of that posting.
+type StatementEntryBody struct {
+	ID             string    `json:"id" doc:"Posting id"`
+	TransactionID  string    `json:"transaction_id"`
+	Amount         int64     `json:"amount" doc:"Signed posting amount in minor units"`
+	RunningBalance int64     `json:"running_balance" doc:"Account balance as of this posting, in minor units"`
+	Description    string    `json:"description"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// StatementOutput is one page of an account statement.
+type StatementOutput struct {
+	Body struct {
+		AccountID  string               `json:"account_id"`
+		Currency   string               `json:"currency"`
+		Entries    []StatementEntryBody `json:"entries"`
+		NextCursor *string              `json:"next_cursor" doc:"Cursor for the next page, or null if this is the last page"`
+	}
+}
+
+func registerAccounts(api huma.API, deps Deps) {
+	huma.Register(api, huma.Operation{
+		OperationID:   "create-account",
+		Method:        http.MethodPost,
+		Path:          "/v1/accounts",
+		Summary:       "Create an account",
+		Tags:          []string{"accounts"},
+		DefaultStatus: http.StatusCreated,
+	}, func(ctx context.Context, in *CreateAccountInput) (*AccountOutput, error) {
+		at, err := domain.ParseAccountType(in.Body.Type)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		acct := &domain.Account{Name: in.Body.Name, Type: at, Currency: domain.Currency(in.Body.Currency)}
+		if err := deps.Accounts.Create(ctx, deps.DefaultTenant, acct); err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &AccountOutput{Body: toAccountBody(*acct)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "get-account",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts/{id}",
+		Summary:     "Get an account",
+		Tags:        []string{"accounts"},
+	}, func(ctx context.Context, in *accountIDInput) (*AccountOutput, error) {
+		acct, err := deps.Accounts.Get(ctx, deps.DefaultTenant, in.ID)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &AccountOutput{Body: toAccountBody(acct)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "get-account-balance",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts/{id}/balance",
+		Summary:     "Get an account's balance",
+		Tags:        []string{"accounts"},
+	}, func(ctx context.Context, in *accountIDInput) (*BalanceOutput, error) {
+		bal, err := deps.Accounts.Balance(ctx, deps.DefaultTenant, in.ID)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		out := &BalanceOutput{}
+		out.Body.AccountID = in.ID
+		out.Body.Amount = bal.Amount()
+		out.Body.Currency = string(bal.Currency())
+		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "get-account-statement",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts/{id}/statement",
+		Summary:     "List an account's postings with running balance",
+		Tags:        []string{"accounts"},
+	}, func(ctx context.Context, in *StatementInput) (*StatementOutput, error) {
+		after, err := decodeCursor(in.Cursor)
+		if err != nil {
+			return nil, huma.Error422UnprocessableEntity(err.Error())
+		}
+		acct, entries, err := deps.Accounts.Statement(ctx, deps.DefaultTenant, in.ID, after, in.Limit)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		out := &StatementOutput{}
+		out.Body.AccountID = acct.ID
+		out.Body.Currency = string(acct.Currency)
+		out.Body.Entries = make([]StatementEntryBody, 0, len(entries))
+		for _, e := range entries {
+			out.Body.Entries = append(out.Body.Entries, StatementEntryBody{
+				ID:             e.ID,
+				TransactionID:  e.TransactionID,
+				Amount:         e.Amount.Amount(),
+				RunningBalance: e.RunningBalance.Amount(),
+				Description:    e.Description,
+				CreatedAt:      e.CreatedAt,
+			})
+		}
+		// A full page implies there may be more; hand back a cursor at the last
+		// entry. A short page is the end, so next_cursor stays null.
+		if in.Limit > 0 && len(entries) == in.Limit {
+			last := entries[len(entries)-1]
+			c := encodeCursor(last.CreatedAt, last.ID)
+			out.Body.NextCursor = &c
+		}
+		return out, nil
+	})
+}

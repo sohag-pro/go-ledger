@@ -6,23 +6,26 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 )
 
-// newMux wires the API and playground exactly as cmd/server does, so tests
-// exercise real route registration and precedence.
-func newMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	New(mux)
-	RegisterPlayground(mux)
-	return mux
+// newRouter wires the API and playground onto a chi router the way cmd/server
+// does, so tests exercise real route registration and precedence. Services are
+// zero because these tests hit only meta routes (health, spec, playground).
+func newRouter() chi.Router {
+	r := chi.NewRouter()
+	RegisterPlayground(r)
+	New(r, Deps{})
+	return r
 }
 
 func TestHealthOperation(t *testing.T) {
-	mux := newMux()
+	router := newRouter()
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
+	router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -46,18 +49,18 @@ func TestHealthOperation(t *testing.T) {
 }
 
 func TestOpenAPIServed(t *testing.T) {
-	mux := newMux()
+	router := newRouter()
 
 	for _, path := range []string{"/openapi.json", "/openapi.yaml"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
+		router.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s status = %d, want 200", path, rec.Code)
 		}
 		got := rec.Body.String()
-		for _, want := range []string{"/healthz", "go-ledger API", APIVersion} {
+		for _, want := range []string{"/healthz", "/v1/accounts", "go-ledger API", APIVersion} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s missing %q", path, want)
 			}
@@ -66,12 +69,12 @@ func TestOpenAPIServed(t *testing.T) {
 }
 
 func TestPlayground(t *testing.T) {
-	mux := newMux()
+	router := newRouter()
 
 	t.Run("page references spec and asset", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playground", nil)
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
+		router.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rec.Code)
@@ -87,7 +90,7 @@ func TestPlayground(t *testing.T) {
 	t.Run("scalar asset served with immutable cache", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/playground/scalar.js", nil)
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
+		router.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rec.Code)
