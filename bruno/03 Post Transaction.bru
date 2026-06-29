@@ -1,0 +1,30 @@
+meta {
+  name: 03 Post Transaction
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/v1/transactions
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "currency": "USD",
+    "postings": [
+      { "account_id": "{{cashId}}", "amount": 10000, "description": "first sale" },
+      { "account_id": "{{revenueId}}", "amount": -10000, "description": "revenue earned" }
+    ]
+  }
+}
+
+script:post-response {
+  bru.setVar("transactionId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+  res.body.postings: length 2
+}

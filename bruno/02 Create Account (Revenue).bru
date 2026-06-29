@@ -1,0 +1,27 @@
+meta {
+  name: 02 Create Account (Revenue)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/v1/accounts
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "name": "Revenue",
+    "type": "income",
+    "currency": "USD"
+  }
+}
+
+script:post-response {
+  bru.setVar("revenueId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+}

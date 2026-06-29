@@ -1,0 +1,16 @@
+meta {
+  name: 07 Get Transaction
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/v1/transactions/{{transactionId}}
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+  res.body.id: eq {{transactionId}}
+  res.body.postings: length 2
+}
