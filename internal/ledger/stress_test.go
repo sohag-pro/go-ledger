@@ -25,6 +25,10 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
+// dbMaxConns caps the test pool. This is the real ceiling on how many posting
+// transactions hit Postgres concurrently, regardless of goroutine count.
+const dbMaxConns = 25
+
 // newTestPool starts a throwaway Postgres, runs all migrations (including the
 // balance trigger from 0002), and returns a pool. It skips, not fails, when no
 // Docker daemon is reachable so the suite stays green without Docker; CI runs it.
@@ -70,7 +74,10 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("close sql db: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
+	// Tuned pool (bounded conns, statement/lock timeouts). MaxConns, not the
+	// goroutine count, sets how many posting transactions actually run at the
+	// database at once.
+	pool, err := postgres.NewPool(ctx, dsn, dbMaxConns)
 	if err != nil {
 		t.Fatalf("new pool: %v", err)
 	}
@@ -169,7 +176,8 @@ func TestPostConcurrentStress(t *testing.T) {
 	}
 
 	p50, p99 := percentile(lats, 0.50), percentile(lats, 0.99)
-	t.Logf("posted %d transactions across %d accounts via %d goroutines", len(lats), accounts, goroutines)
+	t.Logf("posted %d transactions across %d accounts via %d goroutines (DB concurrency capped at MaxConns=%d)",
+		len(lats), accounts, goroutines, dbMaxConns)
 	t.Logf("latency baselines: p50=%s p99=%s", p50, p99)
 }
 

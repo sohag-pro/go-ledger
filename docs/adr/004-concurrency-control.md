@@ -71,6 +71,14 @@ Stress test: 100 goroutines posting 10,000 balanced transactions against a share
 pool of 100 accounts. Result: all 10,000 commit, zero failures, and the sum of
 every account balance is exactly zero.
 
+One honest caveat about the concurrency level: the real ceiling on how many
+posting transactions run at the database at once is the connection pool's
+`MaxConns`, not the goroutine count. The test sets `MaxConns` to 25 explicitly and
+logs it, so "100 goroutines" means up to 25 transactions truly concurrent at
+Postgres with the rest queued on pool acquisition. That is still meaningful
+contention on 100 shared accounts, and it is the number worth quoting rather than
+the goroutine count.
+
 Latency on the local test machine (Postgres 16 in a colima VM): p50 about 35 ms,
 p99 about 68 ms. These are above the original p50 < 10 ms / p99 < 50 ms target.
 The dominant cost is WAL fsync on the VM's virtualized disk: every commit waits
