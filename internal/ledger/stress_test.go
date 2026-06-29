@@ -41,8 +41,15 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 		tcpostgres.WithDatabase("ledger"),
 		tcpostgres.WithUsername("ledger"),
 		tcpostgres.WithPassword("ledger"),
+		// Wait on the readiness log, not just the open port: Postgres opens 5432
+		// during initdb and then restarts it, so a port-only wait races the real
+		// readiness and causes connection resets under parallel container startup
+		// (notably in CI). The startup log appears twice (initdb, then the real
+		// server), hence WithOccurrence(2).
 		testcontainers.WithWaitStrategy(
-			wait.ForListeningPort("5432/tcp").WithStartupTimeout(60*time.Second),
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(90*time.Second),
 		),
 	)
 	if err != nil {
