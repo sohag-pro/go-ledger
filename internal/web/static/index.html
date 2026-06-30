@@ -190,8 +190,10 @@
   .code-bar .file { margin-left: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--muted); }
   pre.code {
     margin: 0; padding: 20px 22px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none; /* hide the horizontal scrollbar chrome, keep scrollability */
     font-family: 'JetBrains Mono', monospace; font-size: 13.5px; line-height: 1.72; color: var(--text);
   }
+  pre.code::-webkit-scrollbar { display: none; }
   pre.code .kw { color: var(--teal); }
   pre.code .ty { color: var(--cyan); }
   pre.code .fn { color: #7FD8EE; }
