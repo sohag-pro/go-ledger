@@ -8,6 +8,15 @@ This is the same pattern at the core of every fintech company, built small enoug
 
 📖 **Follow the build:** every week ships with a blog post explaining the why behind the code, at [notes.sohag.pro/series/go-ledger](https://notes.sohag.pro/series/go-ledger).
 
+## The Ledger Book
+
+The whole build is also collected into a book: every weekly essay, the senior-level interview questions that stress-test each design, and the architecture decision records, in one volume. Free to read, in whatever format you like.
+
+- **PDF:** [the-ledger-book.pdf](https://github.com/sohag-pro/go-ledger/raw/main/the-ledger-book.pdf)
+- **EPUB:** [the-ledger-book.epub](https://github.com/sohag-pro/go-ledger/raw/main/the-ledger-book.epub)
+
+Both live at the repo root and rebuild from the blog and Q&A sources.
+
 ## Quickstart
 
 Requires Go 1.26+.

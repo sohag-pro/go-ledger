@@ -27,6 +27,7 @@ const playgroundHTML = `<!doctype html>
   <title>go-ledger API playground</title>
 </head>
 <body>
+  <a href="/#book" style="position:fixed; right:16px; bottom:16px; z-index:9999; font-family:system-ui,-apple-system,sans-serif; font-size:13px; color:#E8EDF2; background:#16202E; border:1px solid rgba(0,173,216,0.45); border-radius:999px; padding:8px 15px; text-decoration:none; box-shadow:0 8px 24px rgba(0,0,0,0.45);">Get The Ledger Book &rarr;</a>
   <script id="api-reference" data-url="/openapi.json"></script>
   <script src="/playground/scalar.js"></script>
 </body>
