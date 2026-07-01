@@ -32,6 +32,42 @@ components:
       required:
         - accounts
       type: object
+    AuditEntryBody:
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+        actor:
+          type: string
+        after: {}
+        before: {}
+        created_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        transaction_id:
+          type: string
+      required:
+        - id
+        - action
+        - transaction_id
+        - actor
+        - after
+        - created_at
+      type: object
+    AuditListOutputBody:
+      additionalProperties: false
+      properties:
+        entries:
+          items:
+            $ref: "#/components/schemas/AuditEntryBody"
+          type:
+            - array
+            - "null"
+      required:
+        - entries
+      type: object
     BalanceOutputBody:
       additionalProperties: false
       properties:
@@ -385,6 +421,34 @@ paths:
       summary: Get an account
       tags:
         - accounts
+  /v1/accounts/{id}/audit:
+    get:
+      operationId: get-account-audit
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditListOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: List an account's audit log
+      tags:
+        - accounts
   /v1/accounts/{id}/balance:
     get:
       operationId: get-account-balance
@@ -461,8 +525,16 @@ paths:
         - accounts
   /v1/transactions:
     post:
-      description: Posts a balanced transaction. The postings must sum to zero in the given currency.
+      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Supply an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
       operationId: create-transaction
+      parameters:
+        - description: Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+          in: header
+          name: Idempotency-Key
+          schema:
+            description: Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+            maxLength: 255
+            type: string
       requestBody:
         content:
           application/json:
@@ -476,6 +548,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/TransactionBody"
           description: Created
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
         default:
           content:
             application/problem+json:
@@ -511,6 +587,34 @@ paths:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
       summary: Get a transaction
+      tags:
+        - transactions
+  /v1/transactions/{id}/audit:
+    get:
+      operationId: get-transaction-audit
+      parameters:
+        - description: Transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Transaction id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditListOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: List a transaction's audit log
       tags:
         - transactions
 servers:
