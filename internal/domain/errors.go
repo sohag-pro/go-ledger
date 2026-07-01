@@ -38,4 +38,13 @@ var (
 	// ErrDuplicateTransaction is returned when a transaction is created with an id
 	// that already exists. A transport layer should map it to 409 Conflict.
 	ErrDuplicateTransaction = errors.New("domain: transaction already exists")
+	// ErrIdempotencyConflict is returned when an Idempotency-Key is reused with a
+	// different request body. A transport layer should map it to 409 Conflict.
+	ErrIdempotencyConflict = errors.New("domain: idempotency key reused with a different request")
+	// ErrDuplicateIdempotencyKey signals that an idempotency key already exists.
+	// It is an internal control-flow signal: the service turns it into a replay,
+	// so it is never surfaced to transport directly.
+	ErrDuplicateIdempotencyKey = errors.New("domain: idempotency key already exists")
+	// ErrIdempotencyKeyNotFound is returned when a lookup finds no row for a key.
+	ErrIdempotencyKeyNotFound = errors.New("domain: idempotency key not found")
 )

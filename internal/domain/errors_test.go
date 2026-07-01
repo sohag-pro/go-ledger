@@ -22,3 +22,14 @@ func TestSentinelErrorsAreDistinct(t *testing.T) {
 		}
 	}
 }
+
+func TestIdempotencySentinelsAreDistinct(t *testing.T) {
+	all := []error{ErrIdempotencyConflict, ErrDuplicateIdempotencyKey, ErrIdempotencyKeyNotFound}
+	for i := range all {
+		for j := range all {
+			if i != j && errors.Is(all[i], all[j]) {
+				t.Errorf("sentinel %d and %d are not distinct", i, j)
+			}
+		}
+	}
+}

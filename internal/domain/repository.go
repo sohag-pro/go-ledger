@@ -29,13 +29,20 @@ type StatementCursor struct {
 
 // Tx is a unit of work bound to a single database transaction. The service
 // layer composes one or more writes inside RunInTx; everything done through a Tx
-// commits together or not at all. Week 6 will add the audit-log write here so it
-// shares the posting's transaction.
+// commits together or not at all.
 type Tx interface {
 	// CreateTransaction validates t and persists the transaction and all its
 	// postings within the surrounding transaction. If t.ID is empty an id is
 	// assigned and written back to t.
 	CreateTransaction(ctx context.Context, tenantID string, t *Transaction) error
+
+	// InsertIdempotencyKey records key with the request fingerprint and the
+	// transaction it produced, within the surrounding transaction. It returns
+	// ErrDuplicateIdempotencyKey if (tenantID, key) already exists.
+	InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, transactionID string) error
+
+	// AppendAudit writes one audit row within the surrounding transaction.
+	AppendAudit(ctx context.Context, tenantID string, e AuditEntry) error
 }
 
 // Repository is the persistence port for the ledger. The domain owns this
@@ -71,6 +78,19 @@ type Repository interface {
 	// GetTransaction returns the transaction with the given id within the tenant,
 	// including all its postings, or ErrTransactionNotFound if none exists.
 	GetTransaction(ctx context.Context, tenantID, id string) (Transaction, error)
+
+	// GetIdempotencyKey returns the stored record for (tenantID, key), or
+	// ErrIdempotencyKeyNotFound if none exists.
+	GetIdempotencyKey(ctx context.Context, tenantID, key string) (IdempotencyRecord, error)
+
+	// ListAuditByTransaction returns the audit rows for a transaction, oldest
+	// first. An unknown transaction yields no rows.
+	ListAuditByTransaction(ctx context.Context, tenantID, transactionID string) ([]AuditEntry, error)
+
+	// ListAuditByAccount returns the audit rows for every transaction that has a
+	// posting touching the account, oldest first. An unknown account yields no
+	// rows.
+	ListAuditByAccount(ctx context.Context, tenantID, accountID string) ([]AuditEntry, error)
 
 	// Balance returns the derived balance of an account: the sum of its postings'
 	// signed amounts. It returns ErrAccountNotFound if the account does not exist.
