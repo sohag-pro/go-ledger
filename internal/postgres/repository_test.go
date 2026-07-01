@@ -102,7 +102,7 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 	return sharedPool
 }
 
-func money(t *testing.T, amount int64, currency string) domain.Money {
+func money(t *testing.T, amount int64, currency string) domain.Money { //nolint:unparam // currency is a real, reusable parameter even though every current caller passes "USD"
 	t.Helper()
 	m, err := domain.NewMoney(amount, domain.Currency(currency))
 	if err != nil {

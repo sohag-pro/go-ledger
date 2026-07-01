@@ -303,6 +303,61 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 	return nil
 }
 
+// InsertIdempotencyKey records the key inside the surrounding transaction. A
+// primary-key collision means the key already exists: it is mapped to
+// ErrDuplicateIdempotencyKey so the service can replay the original response.
+func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, transactionID string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	txID, err := uuid.Parse(transactionID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse transaction id: %w", err)
+	}
+	if err := tr.q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
+		TenantID:       tid,
+		IdempotencyKey: key,
+		Fingerprint:    fingerprint,
+		TransactionID:  txID,
+	}); err != nil {
+		if pgConstraint(err) == "idempotency_keys_pkey" {
+			return domain.ErrDuplicateIdempotencyKey
+		}
+		return fmt.Errorf("postgres: insert idempotency key: %w", err)
+	}
+	return nil
+}
+
+// AppendAudit writes one audit row inside the surrounding transaction. The id is
+// a fresh UUIDv7 so rows sort by creation time.
+func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.AuditEntry) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	txID, err := uuid.Parse(e.TransactionID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse audit transaction id: %w", err)
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("postgres: generate audit id: %w", err)
+	}
+	if err := tr.q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
+		ID:            id,
+		TenantID:      tid,
+		Action:        e.Action,
+		TransactionID: txID,
+		Actor:         e.Actor,
+		Before:        e.Before,
+		After:         e.After,
+	}); err != nil {
+		return fmt.Errorf("postgres: insert audit log: %w", err)
+	}
+	return nil
+}
+
 // GetTransaction returns the transaction and its postings, or
 // domain.ErrTransactionNotFound if absent.
 func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
@@ -342,6 +397,80 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 		})
 	}
 	return out, nil
+}
+
+// GetIdempotencyKey returns the stored record for (tenantID, key), or
+// domain.ErrIdempotencyKeyNotFound if none exists.
+func (r *Repository) GetIdempotencyKey(ctx context.Context, tenantID, key string) (domain.IdempotencyRecord, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.IdempotencyRecord{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	row, err := r.q.GetIdempotencyKey(ctx, sqlc.GetIdempotencyKeyParams{TenantID: tid, IdempotencyKey: key})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.IdempotencyRecord{}, domain.ErrIdempotencyKeyNotFound
+	}
+	if err != nil {
+		return domain.IdempotencyRecord{}, fmt.Errorf("postgres: get idempotency key: %w", err)
+	}
+	return domain.IdempotencyRecord{
+		Key:           row.IdempotencyKey,
+		Fingerprint:   row.Fingerprint,
+		TransactionID: row.TransactionID.String(),
+	}, nil
+}
+
+// ListAuditByTransaction returns the audit rows for a transaction, oldest first.
+func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, transactionID string) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	txID, err := uuid.Parse(transactionID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse transaction id: %w", err)
+	}
+	rows, err := r.q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{TenantID: tid, TransactionID: txID})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit by transaction: %w", err)
+	}
+	return auditEntriesFromRows(rows), nil
+}
+
+// ListAuditByAccount returns the audit rows for every transaction with a posting
+// touching the account, oldest first.
+func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID string) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	rows, err := r.q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{TenantID: tid, AccountID: aid})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
+	}
+	return auditEntriesFromRows(rows), nil
+}
+
+// auditEntriesFromRows converts sqlc audit rows to domain entries. Before/After
+// are jsonb columns surfaced as []byte; they convert to json.RawMessage.
+func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+		})
+	}
+	return out
 }
 
 // Balance returns the derived balance of an account in the account's currency.

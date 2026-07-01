@@ -20,8 +20,13 @@ type Querier interface {
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
 	GetAccount(ctx context.Context, arg GetAccountParams) (Account, error)
+	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
+	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
+	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error)
+	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error)
+	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 }
 

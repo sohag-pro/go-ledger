@@ -19,6 +19,25 @@ type Account struct {
 	CreatedAt time.Time
 }
 
+type AuditLog struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+}
+
+type IdempotencyKey struct {
+	TenantID       uuid.UUID
+	IdempotencyKey string
+	Fingerprint    string
+	TransactionID  uuid.UUID
+	CreatedAt      time.Time
+}
+
 type Posting struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
