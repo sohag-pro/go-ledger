@@ -164,7 +164,7 @@ func TestPostConcurrentStress(t *testing.T) {
 					{AccountID: ids[to], Amount: credit},
 				}}
 				start := time.Now()
-				if err := svc.Post(ctx, tenant, txn); err != nil {
+				if _, err := svc.Post(ctx, tenant, txn, nil); err != nil {
 					failures.Add(1)
 					t.Errorf("post failed: %v", err)
 					continue
@@ -267,7 +267,7 @@ func TestPostRejectsUnbalanced(t *testing.T) {
 		{AccountID: uuid.NewString(), Amount: debit},
 		{AccountID: uuid.NewString(), Amount: credit},
 	}}
-	if err := svc.Post(context.Background(), uuid.NewString(), txn); err == nil {
+	if _, err := svc.Post(context.Background(), uuid.NewString(), txn, nil); err == nil {
 		t.Fatal("expected unbalanced transaction to be rejected, got nil")
 	}
 }

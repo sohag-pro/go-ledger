@@ -31,10 +31,24 @@ var (
 		Name: "transaction_post_serialization_retries_total",
 		Help: "Number of posting transactions retried after a serialization conflict.",
 	})
+
+	// IdempotencyReplays counts posts short-circuited by a matching
+	// Idempotency-Key: the original transaction was returned, no new one written.
+	IdempotencyReplays = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "transaction_idempotency_replays_total",
+		Help: "Number of transaction posts served as an idempotent replay.",
+	})
+
+	// IdempotencyConflicts counts posts rejected because an Idempotency-Key was
+	// reused with a different request body.
+	IdempotencyConflicts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "transaction_idempotency_conflicts_total",
+		Help: "Number of transaction posts rejected for an idempotency-key/body mismatch.",
+	})
 )
 
 func init() {
-	registry.MustRegister(PostDuration, SerializationRetries)
+	registry.MustRegister(PostDuration, SerializationRetries, IdempotencyReplays, IdempotencyConflicts)
 	// Standard runtime and process metrics (go_*, process_*) for baseline
 	// observability: goroutines, memory, GC, open FDs, CPU.
 	registry.MustRegister(

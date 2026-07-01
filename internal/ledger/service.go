@@ -6,6 +6,8 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -30,34 +32,100 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger) *Transactio
 }
 
 // Post validates t and persists it atomically inside a SERIALIZABLE transaction,
-// retrying transparently on serialization conflicts. It records posting latency
-// and outcome, and returns the domain validation error unchanged when t does not
-// balance, so callers can map it to a 4xx rather than a 5xx.
-func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction) error {
-	// Validate up front so an unbalanced or malformed transaction fails fast,
-	// without touching the database.
+// retrying transparently on serialization conflicts. When idem is non-nil it also
+// records the idempotency key and, if the same key was already used, replays the
+// original transaction instead of writing a new one (returning replayed=true). A
+// key reused with a different request body returns domain.ErrIdempotencyConflict.
+// Every real post also writes one append-only audit row in the same transaction.
+func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction, idem *domain.Idempotency) (replayed bool, err error) {
 	if err := t.Validate(); err != nil {
 		metrics.PostDuration.WithLabelValues("invalid").Observe(0)
-		return err
+		return false, err
 	}
 
+	fingerprint := t.Fingerprint()
 	start := time.Now()
-	err := s.repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
-		return tx.CreateTransaction(ctx, tenantID, t)
+	runErr := s.repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {
+			return err
+		}
+		if idem != nil {
+			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, t.ID); err != nil {
+				return err
+			}
+		}
+		after, err := json.Marshal(auditSnapshot(t))
+		if err != nil {
+			return err
+		}
+		return tx.AppendAudit(ctx, tenantID, domain.AuditEntry{
+			Action:        domain.ActionTransactionCreated,
+			TransactionID: t.ID,
+			Actor:         tenantID,
+			After:         after,
+		})
 	})
 	elapsed := time.Since(start).Seconds()
 
-	if err != nil {
+	if runErr != nil {
+		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
+			return s.replay(ctx, tenantID, idem.Key, fingerprint, t)
+		}
 		metrics.PostDuration.WithLabelValues("failed").Observe(elapsed)
 		s.log.ErrorContext(ctx, "post transaction failed",
-			"tenant_id", tenantID, "transaction_id", t.ID, "error", err)
-		return err
+			"tenant_id", tenantID, "transaction_id", t.ID, "error", runErr)
+		return false, runErr
 	}
 
 	metrics.PostDuration.WithLabelValues("committed").Observe(elapsed)
 	s.log.InfoContext(ctx, "transaction posted",
 		"tenant_id", tenantID, "transaction_id", t.ID, "postings", len(t.Postings))
-	return nil
+	return false, nil
+}
+
+// replay resolves a duplicate idempotency key: if the stored fingerprint matches,
+// it loads the original transaction into t and reports a replay; if not, the key
+// was reused with a different body and it returns ErrIdempotencyConflict.
+func (s *TransactionService) replay(ctx context.Context, tenantID, key, fingerprint string, t *domain.Transaction) (bool, error) {
+	rec, err := s.repo.GetIdempotencyKey(ctx, tenantID, key)
+	if err != nil {
+		return false, err
+	}
+	if rec.Fingerprint != fingerprint {
+		metrics.IdempotencyConflicts.Inc()
+		return false, domain.ErrIdempotencyConflict
+	}
+	existing, err := s.repo.GetTransaction(ctx, tenantID, rec.TransactionID)
+	if err != nil {
+		return false, err
+	}
+	*t = existing
+	metrics.IdempotencyReplays.Inc()
+	s.log.InfoContext(ctx, "transaction replayed",
+		"tenant_id", tenantID, "transaction_id", existing.ID, "idempotency_key", key)
+	return true, nil
+}
+
+// auditSnapshot is the JSON-serializable view of a transaction stored in the
+// audit log's after column. Using a map gives deterministic, sorted keys.
+func auditSnapshot(t *domain.Transaction) map[string]any {
+	currency := ""
+	if len(t.Postings) > 0 {
+		currency = string(t.Postings[0].Amount.Currency())
+	}
+	postings := make([]map[string]any, 0, len(t.Postings))
+	for _, p := range t.Postings {
+		postings = append(postings, map[string]any{
+			"account_id":  p.AccountID,
+			"amount":      p.Amount.Amount(),
+			"description": p.Description,
+		})
+	}
+	return map[string]any{
+		"id":       t.ID,
+		"currency": currency,
+		"postings": postings,
+	}
 }
 
 // Get returns a transaction and its postings, or domain.ErrTransactionNotFound.
