@@ -116,6 +116,7 @@ func run(logger *slog.Logger) error {
 	deps := api.Deps{
 		Accounts:      ledger.NewAccountService(repo),
 		Transactions:  ledger.NewTransactionService(repo, logger),
+		Audit:         ledger.NewAuditService(repo),
 		DefaultTenant: cfg.defaultTenant,
 	}
 

@@ -23,6 +23,8 @@ func toHumaErr(err error) error {
 		return huma.Error404NotFound("transaction not found")
 	case errors.Is(err, domain.ErrDuplicateTransaction):
 		return huma.Error409Conflict("transaction already exists")
+	case errors.Is(err, domain.ErrIdempotencyConflict):
+		return huma.Error409Conflict("idempotency key was reused with a different request body")
 	case errors.Is(err, domain.ErrConflict):
 		return huma.Error503ServiceUnavailable("write conflict, please retry")
 	case errors.Is(err, domain.ErrUnbalanced):

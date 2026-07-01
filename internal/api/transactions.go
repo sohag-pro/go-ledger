@@ -32,7 +32,8 @@ type TransactionBody struct {
 
 // CreateTransactionInput is the post-transaction request body.
 type CreateTransactionInput struct {
-	Body struct {
+	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409."`
+	Body           struct {
 		Currency string         `json:"currency" pattern:"^[A-Z]{3}$" doc:"ISO 4217 code shared by every posting"`
 		Postings []PostingInput `json:"postings" minItems:"2" doc:"Two or more legs that must sum to zero"`
 	}
@@ -41,6 +42,14 @@ type CreateTransactionInput struct {
 // TransactionOutput wraps a transaction in a response.
 type TransactionOutput struct {
 	Body TransactionBody
+}
+
+// CreateTransactionOutput is the post-transaction response. Replayed is surfaced
+// as the Idempotent-Replayed header: true when an Idempotency-Key matched an
+// earlier request and the original transaction was returned unchanged.
+type CreateTransactionOutput struct {
+	Replayed bool `header:"Idempotent-Replayed"`
+	Body     TransactionBody
 }
 
 type transactionIDInput struct {
@@ -75,10 +84,10 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/transactions",
 		Summary:       "Post a transaction",
-		Description:   "Posts a balanced transaction. The postings must sum to zero in the given currency.",
+		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Supply an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict.",
 		Tags:          []string{"transactions"},
 		DefaultStatus: http.StatusCreated,
-	}, func(ctx context.Context, in *CreateTransactionInput) (*TransactionOutput, error) {
+	}, func(ctx context.Context, in *CreateTransactionInput) (*CreateTransactionOutput, error) {
 		currency := domain.Currency(in.Body.Currency)
 		postings := make([]domain.Posting, 0, len(in.Body.Postings))
 		for _, p := range in.Body.Postings {
@@ -93,10 +102,15 @@ func registerTransactions(api huma.API, deps Deps) {
 			})
 		}
 		txn := &domain.Transaction{Postings: postings}
-		if err := deps.Transactions.Post(ctx, deps.DefaultTenant, txn); err != nil {
+		var idem *domain.Idempotency
+		if in.IdempotencyKey != "" {
+			idem = &domain.Idempotency{Key: in.IdempotencyKey}
+		}
+		replayed, err := deps.Transactions.Post(ctx, deps.DefaultTenant, txn, idem)
+		if err != nil {
 			return nil, toHumaErr(err)
 		}
-		return &TransactionOutput{Body: toTransactionBody(*txn)}, nil
+		return &CreateTransactionOutput{Replayed: replayed, Body: toTransactionBody(*txn)}, nil
 	})
 
 	huma.Register(api, huma.Operation{

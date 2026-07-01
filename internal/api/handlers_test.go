@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,8 @@ type fakeRepo struct {
 	txns     map[string]domain.Transaction
 	postings []postingRec
 	clock    int64
+	idem     map[string]domain.IdempotencyRecord // key -> record
+	audit    []domain.AuditEntry
 }
 
 type postingRec struct {
@@ -37,7 +40,11 @@ type postingRec struct {
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{accounts: map[string]domain.Account{}, txns: map[string]domain.Transaction{}}
+	return &fakeRepo{
+		accounts: map[string]domain.Account{},
+		txns:     map[string]domain.Transaction{},
+		idem:     map[string]domain.IdempotencyRecord{},
+	}
 }
 
 func (f *fakeRepo) CreateAccount(_ context.Context, _ string, a *domain.Account) error {
@@ -96,6 +103,58 @@ func (f *fakeRepo) GetTransaction(_ context.Context, _, id string) (domain.Trans
 		return domain.Transaction{}, domain.ErrTransactionNotFound
 	}
 	return t, nil
+}
+
+func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, transactionID string) error {
+	if _, ok := f.idem[key]; ok {
+		return domain.ErrDuplicateIdempotencyKey
+	}
+	f.idem[key] = domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, TransactionID: transactionID}
+	return nil
+}
+
+func (f *fakeRepo) AppendAudit(_ context.Context, _ string, e domain.AuditEntry) error {
+	if e.ID == "" {
+		e.ID = uuid.NewString()
+	}
+	f.clock++
+	e.CreatedAt = time.Unix(f.clock, 0).UTC()
+	f.audit = append(f.audit, e)
+	return nil
+}
+
+func (f *fakeRepo) GetIdempotencyKey(_ context.Context, _, key string) (domain.IdempotencyRecord, error) {
+	rec, ok := f.idem[key]
+	if !ok {
+		return domain.IdempotencyRecord{}, domain.ErrIdempotencyKeyNotFound
+	}
+	return rec, nil
+}
+
+func (f *fakeRepo) ListAuditByTransaction(_ context.Context, _, transactionID string) ([]domain.AuditEntry, error) {
+	out := make([]domain.AuditEntry, 0)
+	for _, e := range f.audit {
+		if e.TransactionID == transactionID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) ListAuditByAccount(_ context.Context, _, accountID string) ([]domain.AuditEntry, error) {
+	txns := map[string]bool{}
+	for _, p := range f.postings {
+		if p.accountID == accountID {
+			txns[p.txnID] = true
+		}
+	}
+	out := make([]domain.AuditEntry, 0)
+	for _, e := range f.audit {
+		if txns[e.TransactionID] {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeRepo) Balance(_ context.Context, _, accountID string) (domain.Money, error) {
@@ -164,6 +223,7 @@ func newAPIRouter(repo domain.Repository) chi.Router {
 	New(r, Deps{
 		Accounts:      ledger.NewAccountService(repo),
 		Transactions:  ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil))),
+		Audit:         ledger.NewAuditService(repo),
 		DefaultTenant: testTenant,
 	})
 	return r
@@ -183,6 +243,30 @@ func do(t *testing.T, r chi.Router, method, path string, body any) *httptest.Res
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+// postJSON POSTs a raw JSON body with optional extra headers, e.g. Idempotency-Key.
+//
+//nolint:unparam // path is a general test-helper parameter; only one literal is in use today.
+func postJSON(t *testing.T, r chi.Router, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+// getJSON GETs path with no body.
+func getJSON(t *testing.T, r chi.Router, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -388,5 +472,79 @@ func TestStatementPagination(t *testing.T) {
 	}
 	if page2.NextCursor != nil {
 		t.Errorf("expected no next_cursor on the last page, got %q", *page2.NextCursor)
+	}
+}
+
+func TestCreateTransactionIdempotentReplayHeader(t *testing.T) {
+	repo := newFakeRepo()
+	a := &domain.Account{Name: "A", Type: domain.Asset, Currency: "USD"}
+	b := &domain.Account{Name: "B", Type: domain.Income, Currency: "USD"}
+	_ = repo.CreateAccount(context.Background(), "t", a)
+	_ = repo.CreateAccount(context.Background(), "t", b)
+	router := newAPIRouter(repo)
+
+	body := `{"currency":"USD","postings":[` +
+		`{"account_id":"` + a.ID + `","amount":100},` +
+		`{"account_id":"` + b.ID + `","amount":-100}]}`
+
+	// First call: 201, no replay header (or "false").
+	rec1 := postJSON(t, router, "/v1/transactions", body, map[string]string{"Idempotency-Key": "abc"})
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201", rec1.Code)
+	}
+
+	// Retry same key + body: replay header true, same id.
+	rec2 := postJSON(t, router, "/v1/transactions", body, map[string]string{"Idempotency-Key": "abc"})
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("replay status = %d, want 201", rec2.Code)
+	}
+	if rec2.Header().Get("Idempotent-Replayed") != "true" {
+		t.Errorf("replay header = %q, want true", rec2.Header().Get("Idempotent-Replayed"))
+	}
+
+	// Same key, different body: 409.
+	other := `{"currency":"USD","postings":[` +
+		`{"account_id":"` + a.ID + `","amount":200},` +
+		`{"account_id":"` + b.ID + `","amount":-200}]}`
+	rec3 := postJSON(t, router, "/v1/transactions", other, map[string]string{"Idempotency-Key": "abc"})
+	if rec3.Code != http.StatusConflict {
+		t.Errorf("conflict status = %d, want 409", rec3.Code)
+	}
+}
+
+func TestAuditEndpoints(t *testing.T) {
+	repo := newFakeRepo()
+	a := &domain.Account{Name: "A", Type: domain.Asset, Currency: "USD"}
+	b := &domain.Account{Name: "B", Type: domain.Income, Currency: "USD"}
+	_ = repo.CreateAccount(context.Background(), "t", a)
+	_ = repo.CreateAccount(context.Background(), "t", b)
+	router := newAPIRouter(repo)
+
+	body := `{"currency":"USD","postings":[` +
+		`{"account_id":"` + a.ID + `","amount":100},` +
+		`{"account_id":"` + b.ID + `","amount":-100}]}`
+	rec := postJSON(t, router, "/v1/transactions", body, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("post status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+
+	byTxn := getJSON(t, router, "/v1/transactions/"+created.ID+"/audit")
+	if byTxn.Code != http.StatusOK {
+		t.Fatalf("audit by txn status = %d", byTxn.Code)
+	}
+	if !strings.Contains(byTxn.Body.String(), "transaction.created") {
+		t.Errorf("audit by txn body missing action: %s", byTxn.Body.String())
+	}
+
+	byAcct := getJSON(t, router, "/v1/accounts/"+a.ID+"/audit")
+	if byAcct.Code != http.StatusOK {
+		t.Fatalf("audit by account status = %d", byAcct.Code)
+	}
+	if !strings.Contains(byAcct.Body.String(), "transaction.created") {
+		t.Errorf("audit by account body missing action: %s", byAcct.Body.String())
 	}
 }

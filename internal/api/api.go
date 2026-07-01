@@ -25,6 +25,7 @@ const APIVersion = "0.2.0"
 type Deps struct {
 	Accounts      *ledger.AccountService
 	Transactions  *ledger.TransactionService
+	Audit         *ledger.AuditService
 	DefaultTenant string
 }
 
@@ -73,6 +74,7 @@ func registerOperations(api huma.API, deps Deps) {
 	registerHealth(api)
 	registerAccounts(api, deps)
 	registerTransactions(api, deps)
+	registerAudit(api, deps)
 }
 
 // SpecYAML builds the API on a throwaway router and serializes its OpenAPI spec
