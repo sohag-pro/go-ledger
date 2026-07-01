@@ -2,7 +2,9 @@ package domain
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"hash"
 	"strconv"
 )
 
@@ -14,20 +16,28 @@ import (
 // deliberately excluded so a client that retries without echoing an id still
 // matches. It is used to detect a reused idempotency key carrying a different
 // body.
+//
+// Each field is length-prefixed before being hashed, so field content can never
+// be mistaken for a field boundary: two distinct transactions cannot collide
+// even if a field carries bytes (for example an embedded NUL) that a plain
+// separator scheme would let straddle a boundary.
 func (t Transaction) Fingerprint() string {
 	h := sha256.New()
 	if len(t.Postings) > 0 {
-		h.Write([]byte(t.Postings[0].Amount.Currency()))
+		writeField(h, []byte(t.Postings[0].Amount.Currency()))
 	}
 	for _, p := range t.Postings {
-		// A NUL separator between fields so distinct field boundaries cannot
-		// collide (for example account "ab" + "" vs "a" + "b").
-		h.Write([]byte{0})
-		h.Write([]byte(p.AccountID))
-		h.Write([]byte{0})
-		h.Write([]byte(strconv.FormatInt(p.Amount.Amount(), 10)))
-		h.Write([]byte{0})
-		h.Write([]byte(p.Description))
+		writeField(h, []byte(p.AccountID))
+		writeField(h, []byte(strconv.FormatInt(p.Amount.Amount(), 10)))
+		writeField(h, []byte(p.Description))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// writeField hashes b framed by its length, making the stream self-delimiting.
+func writeField(h hash.Hash, b []byte) {
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(b))) //nolint:gosec // length is non-negative
+	h.Write(n[:])
+	h.Write(b)
 }

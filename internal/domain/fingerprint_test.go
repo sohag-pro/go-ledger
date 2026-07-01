@@ -48,3 +48,42 @@ func TestFingerprintStableAndDistinct(t *testing.T) {
 		}
 	}
 }
+
+// TestFingerprintNoBoundaryCollision proves the length-prefixed framing keeps
+// adversarial pairs distinct even though a plain separator scheme would let
+// bytes straddle a field boundary and collide.
+func TestFingerprintNoBoundaryCollision(t *testing.T) {
+	cases := []struct {
+		name string
+		a    Transaction
+		b    Transaction
+	}{
+		{
+			name: "byte moved across account/description boundary",
+			a: Transaction{Postings: []Posting{
+				{AccountID: "a", Amount: mustMoney(t, 100, "USD"), Description: "b"},
+				{AccountID: "x", Amount: mustMoney(t, -100, "USD")},
+			}},
+			b: Transaction{Postings: []Posting{
+				{AccountID: "ab", Amount: mustMoney(t, 100, "USD"), Description: ""},
+				{AccountID: "x", Amount: mustMoney(t, -100, "USD")},
+			}},
+		},
+		{
+			name: "embedded NUL in description vs none",
+			a: Transaction{Postings: []Posting{
+				{AccountID: "a", Amount: mustMoney(t, 100, "USD"), Description: "a\x00b"},
+				{AccountID: "x", Amount: mustMoney(t, -100, "USD")},
+			}},
+			b: Transaction{Postings: []Posting{
+				{AccountID: "a", Amount: mustMoney(t, 100, "USD"), Description: "ab"},
+				{AccountID: "x", Amount: mustMoney(t, -100, "USD")},
+			}},
+		},
+	}
+	for _, tc := range cases {
+		if tc.a.Fingerprint() == tc.b.Fingerprint() {
+			t.Errorf("%s: adversarial pair collided", tc.name)
+		}
+	}
+}
