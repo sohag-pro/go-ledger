@@ -492,6 +492,12 @@ func TestCreateTransactionIdempotentReplayHeader(t *testing.T) {
 	if rec1.Code != http.StatusCreated {
 		t.Fatalf("first status = %d, want 201", rec1.Code)
 	}
+	var txn1 struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec1.Body.Bytes(), &txn1); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
 
 	// Retry same key + body: replay header true, same id.
 	rec2 := postJSON(t, router, "/v1/transactions", body, map[string]string{"Idempotency-Key": "abc"})
@@ -500,6 +506,15 @@ func TestCreateTransactionIdempotentReplayHeader(t *testing.T) {
 	}
 	if rec2.Header().Get("Idempotent-Replayed") != "true" {
 		t.Errorf("replay header = %q, want true", rec2.Header().Get("Idempotent-Replayed"))
+	}
+	var txn2 struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &txn2); err != nil {
+		t.Fatalf("decode replay response: %v", err)
+	}
+	if txn1.ID != txn2.ID {
+		t.Errorf("replay returned different id: first=%s, replay=%s", txn1.ID, txn2.ID)
 	}
 
 	// Same key, different body: 409.
@@ -539,6 +554,12 @@ func TestAuditEndpoints(t *testing.T) {
 	if !strings.Contains(byTxn.Body.String(), "transaction.created") {
 		t.Errorf("audit by txn body missing action: %s", byTxn.Body.String())
 	}
+	if !strings.Contains(byTxn.Body.String(), a.ID) {
+		t.Errorf("audit by txn body missing account id in after: %s", byTxn.Body.String())
+	}
+	if !strings.Contains(byTxn.Body.String(), `"currency":"USD"`) {
+		t.Errorf("audit by txn body missing currency in after: %s", byTxn.Body.String())
+	}
 
 	byAcct := getJSON(t, router, "/v1/accounts/"+a.ID+"/audit")
 	if byAcct.Code != http.StatusOK {
@@ -546,5 +567,11 @@ func TestAuditEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(byAcct.Body.String(), "transaction.created") {
 		t.Errorf("audit by account body missing action: %s", byAcct.Body.String())
+	}
+	if !strings.Contains(byAcct.Body.String(), a.ID) {
+		t.Errorf("audit by account body missing account id in after: %s", byAcct.Body.String())
+	}
+	if !strings.Contains(byAcct.Body.String(), `"currency":"USD"`) {
+		t.Errorf("audit by account body missing currency in after: %s", byAcct.Body.String())
 	}
 }
