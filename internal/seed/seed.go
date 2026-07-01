@@ -133,8 +133,17 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
 
-	// Reset: postings reference transactions and accounts, so delete them first.
-	for _, table := range []string{"postings", "transactions", "accounts"} {
+	// audit_log is append-only, guarded by a trigger that rejects UPDATE/DELETE.
+	// The demo seeder is the one sanctioned exception: this transaction-local GUC
+	// lets the reset clear audit rows. Only the seeder sets it; the service path
+	// never does, so the log stays immutable in normal operation.
+	if _, err := tx.Exec(ctx, "SET LOCAL audit.allow_purge = 'on'"); err != nil {
+		return fmt.Errorf("seed: enable audit purge: %w", err)
+	}
+
+	// Reset: idempotency_keys and audit_log reference transactions, so clear them
+	// first, then postings and transactions before accounts.
+	for _, table := range []string{"idempotency_keys", "audit_log", "postings", "transactions", "accounts"} {
 		if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE tenant_id = $1", tid); err != nil {
 			return fmt.Errorf("seed: clear %s: %w", table, err)
 		}

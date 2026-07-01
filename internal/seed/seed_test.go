@@ -151,3 +151,62 @@ func TestSeed(t *testing.T) {
 		t.Errorf("re-seed changed transaction count: %d then %d (expected reset, not append)", before, after)
 	}
 }
+
+// TestSeedResetsAuditAndIdempotency proves the reset clears idempotency_keys
+// and audit_log for the tenant, and that it does so despite audit_log's
+// append-only immutability trigger (via the seeder's gated SET LOCAL). The
+// seeder itself writes raw rows and never populates these two tables, so this
+// test stands in for the application path: it attaches a fabricated
+// idempotency key and audit row to one of the seeded transactions, then
+// re-seeds and checks both are gone.
+func TestSeedResetsAuditAndIdempotency(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tenant := uuid.New()
+	now := time.Now()
+
+	if err := seed.Seed(ctx, pool, tenant.String(), now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var txnID uuid.UUID
+	if err := pool.QueryRow(ctx,
+		"SELECT id FROM transactions WHERE tenant_id = $1 LIMIT 1", tenant).Scan(&txnID); err != nil {
+		t.Fatalf("find seeded transaction: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, transaction_id)
+		 VALUES ($1, 'test-key', 'test-fingerprint', $2)`, tenant, txnID); err != nil {
+		t.Fatalf("insert idempotency key: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, after)
+		 VALUES ($1, $2, 'transaction.created', $3, $4, '{}'::jsonb)`,
+		uuid.New(), tenant, txnID, tenant.String()); err != nil {
+		t.Fatalf("insert audit row: %v", err)
+	}
+
+	// Re-seeding must clear both, even though audit_log rejects DELETE outside
+	// the seeder's gated transaction.
+	if err := seed.Seed(ctx, pool, tenant.String(), now); err != nil {
+		t.Fatalf("re-seed over idempotency and audit rows: %v", err)
+	}
+
+	var idemCount, auditCount int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM idempotency_keys WHERE tenant_id = $1", tenant).Scan(&idemCount); err != nil {
+		t.Fatalf("count idempotency_keys: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM audit_log WHERE tenant_id = $1", tenant).Scan(&auditCount); err != nil {
+		t.Fatalf("count audit_log: %v", err)
+	}
+	if idemCount != 0 {
+		t.Errorf("idempotency_keys not cleared on reset: %d rows remain", idemCount)
+	}
+	if auditCount != 0 {
+		t.Errorf("audit_log not cleared on reset: %d rows remain", auditCount)
+	}
+}
