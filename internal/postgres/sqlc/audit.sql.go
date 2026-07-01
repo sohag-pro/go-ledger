@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -49,16 +50,31 @@ WHERE audit_log.tenant_id = $1
     FROM postings
     WHERE postings.tenant_id = $1 AND postings.account_id = $2
   )
-ORDER BY audit_log.created_at, audit_log.id
+  AND (audit_log.created_at < $3
+       OR (audit_log.created_at = $3 AND audit_log.id < $4))
+ORDER BY audit_log.created_at DESC, audit_log.id DESC
+LIMIT $5
 `
 
 type ListAuditByAccountParams struct {
-	TenantID  uuid.UUID
-	AccountID uuid.UUID
+	TenantID       uuid.UUID
+	AccountID      uuid.UUID
+	AfterCreatedAt time.Time
+	AfterID        uuid.UUID
+	PageLimit      int32
 }
 
+// Keyset page of audit rows for every transaction with a posting touching the
+// account, newest first. after_created_at / after_id are the keyset position:
+// pass a far-future timestamp and the max uuid for the first page.
 func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error) {
-	rows, err := q.db.Query(ctx, listAuditByAccount, arg.TenantID, arg.AccountID)
+	rows, err := q.db.Query(ctx, listAuditByAccount,
+		arg.TenantID,
+		arg.AccountID,
+		arg.AfterCreatedAt,
+		arg.AfterID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

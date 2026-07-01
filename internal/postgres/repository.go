@@ -437,9 +437,9 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 	return auditEntriesFromRows(rows), nil
 }
 
-// ListAuditByAccount returns the audit rows for every transaction with a posting
-// touching the account, oldest first.
-func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID string) ([]domain.AuditEntry, error) {
+// ListAuditByAccount returns one keyset page of audit rows for every
+// transaction with a posting touching the account, newest first.
+func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -448,7 +448,24 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	rows, err := r.q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{TenantID: tid, AccountID: aid})
+
+	// First page: a sentinel that is strictly greater than any real (created_at,
+	// id). Subsequent pages: the cursor handed back from the previous page.
+	afterTime, afterID := statementFirstPageTime, uuid.Max
+	if after != nil {
+		afterTime = after.CreatedAt
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+
+	rows, err := r.q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{
+		TenantID:       tid,
+		AccountID:      aid,
+		AfterCreatedAt: afterTime,
+		AfterID:        afterID,
+		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
 	}

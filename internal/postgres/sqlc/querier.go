@@ -25,6 +25,9 @@ type Querier interface {
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error)
+	// Keyset page of audit rows for every transaction with a posting touching the
+	// account, newest first. after_created_at / after_id are the keyset position:
+	// pass a far-future timestamp and the max uuid for the first page.
 	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error)
 	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)

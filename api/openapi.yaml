@@ -1,5 +1,23 @@
 components:
   schemas:
+    AccountAuditOutputBody:
+      additionalProperties: false
+      properties:
+        entries:
+          items:
+            $ref: "#/components/schemas/AuditEntryBody"
+          type:
+            - array
+            - "null"
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+      required:
+        - entries
+        - next_cursor
+      type: object
     AccountBody:
       additionalProperties: false
       properties:
@@ -433,12 +451,30 @@ paths:
             description: Account id
             format: uuid
             type: string
+        - description: Max entries per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max entries per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AuditListOutputBody"
+                $ref: "#/components/schemas/AccountAuditOutputBody"
           description: OK
         default:
           content:

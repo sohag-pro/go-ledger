@@ -104,7 +104,7 @@ func TestAuditAppendAndQuery(t *testing.T) {
 		t.Error("audit row missing generated id or created_at")
 	}
 
-	byAcct, err := repo.ListAuditByAccount(ctx, tenant, debit)
+	byAcct, err := repo.ListAuditByAccount(ctx, tenant, debit, nil, 50)
 	if err != nil {
 		t.Fatalf("list by account: %v", err)
 	}

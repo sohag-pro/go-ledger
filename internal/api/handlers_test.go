@@ -141,17 +141,37 @@ func (f *fakeRepo) ListAuditByTransaction(_ context.Context, _, transactionID st
 	return out, nil
 }
 
-func (f *fakeRepo) ListAuditByAccount(_ context.Context, _, accountID string) ([]domain.AuditEntry, error) {
+func (f *fakeRepo) ListAuditByAccount(_ context.Context, _, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
 	txns := map[string]bool{}
 	for _, p := range f.postings {
 		if p.accountID == accountID {
 			txns[p.txnID] = true
 		}
 	}
-	out := make([]domain.AuditEntry, 0)
+	matched := make([]domain.AuditEntry, 0)
 	for _, e := range f.audit {
 		if txns[e.TransactionID] {
-			out = append(out, e)
+			matched = append(matched, e)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.Before(matched[j].CreatedAt)
+		}
+		return matched[i].ID < matched[j].ID
+	})
+	// newest first
+	out := make([]domain.AuditEntry, 0, len(matched))
+	for i := len(matched) - 1; i >= 0; i-- {
+		e := matched[i]
+		if after != nil {
+			if e.CreatedAt.After(after.CreatedAt) || (e.CreatedAt.Equal(after.CreatedAt) && e.ID >= after.ID) {
+				continue
+			}
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
 		}
 	}
 	return out, nil
@@ -573,5 +593,24 @@ func TestAuditEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(byAcct.Body.String(), `"currency":"USD"`) {
 		t.Errorf("audit by account body missing currency in after: %s", byAcct.Body.String())
+	}
+
+	// A full page (limit=1 against a single audit row) hands back a next_cursor.
+	pagedAcct := getJSON(t, router, "/v1/accounts/"+a.ID+"/audit?limit=1")
+	if pagedAcct.Code != http.StatusOK {
+		t.Fatalf("audit by account paged status = %d", pagedAcct.Code)
+	}
+	var page struct {
+		Entries    []AuditEntryBody `json:"entries"`
+		NextCursor *string          `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(pagedAcct.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode paged audit: %v", err)
+	}
+	if len(page.Entries) != 1 {
+		t.Fatalf("paged audit has %d entries, want 1", len(page.Entries))
+	}
+	if page.NextCursor == nil {
+		t.Fatal("expected next_cursor on a full page")
 	}
 }

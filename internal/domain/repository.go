@@ -87,10 +87,11 @@ type Repository interface {
 	// first. An unknown transaction yields no rows.
 	ListAuditByTransaction(ctx context.Context, tenantID, transactionID string) ([]AuditEntry, error)
 
-	// ListAuditByAccount returns the audit rows for every transaction that has a
-	// posting touching the account, oldest first. An unknown account yields no
-	// rows.
-	ListAuditByAccount(ctx context.Context, tenantID, accountID string) ([]AuditEntry, error)
+	// ListAuditByAccount returns up to limit audit rows for every transaction
+	// that has a posting touching the account, newest first (keyset paged). after
+	// is the keyset position to page from; nil starts at the newest entry. An
+	// unknown account yields no rows.
+	ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *StatementCursor, limit int) ([]AuditEntry, error)
 
 	// Balance returns the derived balance of an account: the sum of its postings'
 	// signed amounts. It returns ErrAccountNotFound if the account does not exist.

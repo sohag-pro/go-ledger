@@ -23,8 +23,8 @@ func (s *AuditService) ByTransaction(ctx context.Context, tenantID, transactionI
 	return s.repo.ListAuditByTransaction(ctx, tenantID, transactionID)
 }
 
-// ByAccount returns the audit rows for every transaction touching the account,
-// oldest first.
-func (s *AuditService) ByAccount(ctx context.Context, tenantID, accountID string) ([]domain.AuditEntry, error) {
-	return s.repo.ListAuditByAccount(ctx, tenantID, accountID)
+// ByAccount returns one keyset page of audit rows for every transaction
+// touching the account, newest first.
+func (s *AuditService) ByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
+	return s.repo.ListAuditByAccount(ctx, tenantID, accountID, after, limit)
 }
