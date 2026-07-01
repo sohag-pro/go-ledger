@@ -10,6 +10,11 @@
 <meta property="og:title" content="go-ledger: a production-grade payment ledger in Go" />
 <meta property="og:description" content="Double-entry accounting with invariants that are impossible to violate." />
 <meta property="og:type" content="website" />
+<meta property="og:image" content="/static/logo.png" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:image" content="/static/logo.png" />
+<link rel="icon" type="image/png" href="/static/logo.png" />
+<link rel="apple-touch-icon" href="/static/logo.png" />
 <link rel="preload" href="/static/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin />
 <link rel="preload" href="/static/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
 <style>
@@ -96,9 +101,8 @@
   }
   .wordmark .mark {
     display: inline-flex; align-items: center; justify-content: center;
-    width: 28px; height: 28px; border-radius: 8px;
-    background: linear-gradient(150deg, var(--cyan), var(--teal));
-    color: #0c141f; font-weight: 700; font-size: 13px;
+    width: 28px; height: 28px; border-radius: 8px; overflow: hidden;
+    object-fit: cover;
     box-shadow: 0 4px 16px -4px rgba(0,173,216,0.6);
   }
   .nav-links { display: flex; align-items: center; gap: clamp(14px, 2.4vw, 30px); flex-wrap: wrap; }
@@ -267,6 +271,10 @@
   footer { position: relative; z-index: 1; border-top: 1px solid var(--line); background: rgba(16,23,31,0.6); }
   .foot-inner { max-width: 1200px; margin: 0 auto; padding: 36px clamp(20px, 4vw, 40px); display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
   .foot-left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .foot-logo { width: 32px; height: 32px; border-radius: 8px; }
+  .foot-badge { flex-basis: 100%; display: flex; justify-content: center; padding-top: 26px; }
+  .foot-badge a { display: inline-block; opacity: 0.9; transition: opacity .18s ease; }
+  .foot-badge a:hover { opacity: 1; }
   .foot-left .name { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 17px; color: var(--text); }
   .foot-left .meta { font-size: 14px; color: var(--muted); }
   .foot-links { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
@@ -348,7 +356,7 @@
   <header class="nav">
     <nav class="wrap nav-inner" aria-label="Primary">
       <a class="wordmark" href="#top">
-        <span class="mark" aria-hidden="true">&equiv;</span>
+        <img class="mark" src="/static/logo.png" alt="go-ledger logo" width="28" height="28" />
         <span><span class="accent-go">go</span><span class="accent-dash">-</span>ledger</span>
       </a>
       <div class="nav-links">
@@ -564,6 +572,7 @@
   <footer>
     <div class="foot-inner">
       <div class="foot-left">
+        <img class="foot-logo" src="/static/logo.png" alt="go-ledger logo" width="32" height="32" />
         <span class="name"><span class="accent-go">go</span><span class="accent-dash">-</span>ledger</span>
         <span class="meta">MIT licensed &middot; built by Sohag Hasan</span>
       </div>
@@ -572,6 +581,12 @@
         <a class="footlink" href="https://notes.sohag.pro" target="_blank" rel="noopener">notes.sohag.pro</a>
         <a class="footlink" href="https://notes.sohag.pro/series/go-ledger" target="_blank" rel="noopener">Build series</a>
       </nav>
+      <div class="foot-badge">
+        <!-- Launchpadly - go-ledger (listed-on) -->
+        <a href="https://launchpadly.co/startup/go-ledger" target="_blank" rel="noopener noreferrer" data-launchpadly-badge="go-ledger" data-launchpadly-badge-variant="listed-on">
+          <img src="https://launchpadly.co/embed/badges/startup/go-ledger.svg?variant=listed-on" alt="Launchpadly Startup Directory" width="260" height="48" style="display:block;border:0;" />
+        </a>
+      </div>
     </div>
   </footer>
 

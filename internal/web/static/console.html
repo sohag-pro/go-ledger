@@ -7,6 +7,8 @@
 <meta name="theme-color" content="#16202E" />
 <title>go-ledger console</title>
 <meta name="description" content="A small developer console for the go-ledger API: create accounts, post transactions, and read balances and statements." />
+<link rel="icon" type="image/png" href="/static/logo.png" />
+<link rel="apple-touch-icon" href="/static/logo.png" />
 <link rel="preload" href="/static/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin />
 <link rel="preload" href="/static/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
 <style>
@@ -26,7 +28,7 @@
   header.bar { position:sticky; top:0; z-index:10; backdrop-filter:blur(12px); background:rgba(22,32,46,0.8); border-bottom:1px solid var(--line); }
   .bar-inner { max-width:1000px; margin:0 auto; padding:12px clamp(16px,4vw,32px); display:flex; align-items:center; gap:16px; flex-wrap:wrap; justify-content:space-between; }
   .brand { display:inline-flex; align-items:center; gap:9px; font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:18px; text-decoration:none; color:var(--text); }
-  .brand .mark { width:26px; height:26px; border-radius:7px; display:inline-flex; align-items:center; justify-content:center; background:linear-gradient(150deg,var(--cyan),var(--teal)); color:#0c141f; font-weight:700; font-size:12px; }
+  .brand .mark { width:26px; height:26px; border-radius:7px; overflow:hidden; object-fit:cover; display:inline-flex; align-items:center; justify-content:center; }
   .brand .accent-go{color:var(--teal);} .brand .accent-dash{color:var(--muted);}
   .bar-right { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
   .bar-right a { color:var(--muted); text-decoration:none; font-size:14px; font-weight:500; }
@@ -101,7 +103,7 @@
 <body>
   <header class="bar">
     <div class="bar-inner">
-      <a class="brand" href="/"><span class="mark">&equiv;</span><span><span class="accent-go">go</span><span class="accent-dash">-</span>ledger</span></a>
+      <a class="brand" href="/"><img class="mark" src="/static/logo.png" alt="go-ledger logo" width="26" height="26" /><span><span class="accent-go">go</span><span class="accent-dash">-</span>ledger</span></a>
       <div class="bar-right">
         <span class="unit">
           <select id="unit" style="width:auto;" title="Amount unit">
