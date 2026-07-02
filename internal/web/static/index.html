@@ -242,6 +242,11 @@
   .card .icon { width: 40px; height: 40px; border-radius: 11px; display: flex; align-items: center; justify-content: center; background: rgba(0,173,216,0.12); color: var(--teal); margin-bottom: 16px; }
   .card h3 { font-family: 'Space Grotesk', sans-serif; font-size: 1.16rem; font-weight: 600; margin: 0 0 8px; color: var(--paper); }
   .card p { margin: 0; font-size: 15px; color: var(--muted); line-height: 1.55; }
+  .card p code {
+    font-family: 'JetBrains Mono', monospace; font-size: 12.5px;
+    color: var(--teal); background: rgba(45,212,191,0.08);
+    padding: 1px 6px; border-radius: 6px; white-space: nowrap;
+  }
 
   /* stack */
   .stack-panel {
@@ -462,23 +467,23 @@
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v5h-5"/></svg></div>
-          <span class="tag planned">planned</span>
+          <span class="tag shipped">shipped</span>
           <h3>Idempotency keys</h3>
-          <p>Safe retries with exactly-once posting: the same key never moves money twice.</p>
+          <p>An <code>Idempotency-Key</code> makes a retry safe: the same key returns the original transaction and never moves money twice.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16l-7-3-7 3z"/><path d="M9 8h6M9 12h6"/></svg></div>
-          <span class="tag planned">planned</span>
+          <span class="tag shipped">shipped</span>
           <h3>Immutable audit log</h3>
-          <p>Append-only and written inside the same DB transaction as the posting it records.</p>
+          <p>Append-only, written in the same transaction as the posting, and enforced immutable by a Postgres trigger.</p>
         </article>
 
         <article class="card reveal">
           <div class="icon" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8l-4 4 4 4M17 8l4 4-4 4M14 4l-4 16"/></svg></div>
-          <span class="tag planned">planned</span>
+          <span class="tag shipped">shipped</span>
           <h3>REST + gRPC</h3>
-          <p>Thin transport handlers sitting over one shared, well-tested domain core.</p>
+          <p>Two front doors over one shared domain core, so the protocols cannot drift. Same rules, same errors, same guarantees.</p>
         </article>
 
         <article class="card reveal">
@@ -526,11 +531,11 @@
           </div>
           <div class="stats">
             <div class="stat">
-              <div class="num amber">5<span style="color:var(--muted);font-size:0.5em;font-weight:600;"> / 12</span></div>
+              <div class="num amber">7<span style="color:var(--muted);font-size:0.5em;font-weight:600;"> / 12</span></div>
               <div class="lbl">weeks shipped</div>
             </div>
             <div class="stat">
-              <div class="num teal">5</div>
+              <div class="num teal">7</div>
               <div class="lbl">posts published</div>
             </div>
           </div>
