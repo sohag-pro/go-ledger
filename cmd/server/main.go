@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/pressly/goose/v3"
 
 	"github.com/sohag-pro/go-ledger/internal/api"
+	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
@@ -45,6 +47,7 @@ func main() {
 type config struct {
 	port          string
 	metricsAddr   string
+	grpcAddr      string
 	databaseURL   string
 	defaultTenant string
 	seedEnabled   bool
@@ -55,6 +58,7 @@ func loadConfig() (config, error) {
 	cfg := config{
 		port:          getenv("PORT", "8080"),
 		metricsAddr:   getenv("METRICS_ADDR", "127.0.0.1:9090"),
+		grpcAddr:      getenv("GRPC_ADDR", ":9091"),
 		databaseURL:   os.Getenv("DATABASE_URL"),
 		defaultTenant: getenv("DEFAULT_TENANT_ID", defaultTenantID),
 		seedEnabled:   getenvBool("SEED_ENABLED", true),
@@ -169,6 +173,23 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
+	grpcSrv := grpcserver.NewGRPCServer(grpcserver.Deps{
+		Accounts:      deps.Accounts,
+		Transactions:  deps.Transactions,
+		Audit:         deps.Audit,
+		DefaultTenant: cfg.defaultTenant,
+	}, logger)
+	grpcListener, err := net.Listen("tcp", cfg.grpcAddr)
+	if err != nil {
+		return fmt.Errorf("grpc listen on %s: %w", cfg.grpcAddr, err)
+	}
+	go func() {
+		logger.Info("starting grpc server", "addr", cfg.grpcAddr)
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			errCh <- err
+		}
+	}()
+
 	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -184,6 +205,7 @@ func run(logger *slog.Logger) error {
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("metrics server shutdown", "error", err)
 	}
+	grpcSrv.GracefulStop()
 	return srv.Shutdown(shutdownCtx)
 }
 
