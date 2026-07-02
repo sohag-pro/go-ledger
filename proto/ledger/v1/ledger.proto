@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+// Posting is one signed leg of a transaction. A positive amount is a debit, a
+// negative amount is a credit. Amounts are minor units (for example cents).
+message Posting {
+  string account_id = 1;
+  int64 amount = 2;
+  string description = 3;
+}
+
+message Transaction {
+  string id = 1;
+  string currency = 2;
+  repeated Posting postings = 3;
+}
+
+message Account {
+  string id = 1;
+  string name = 2;
+  string type = 3; // asset, liability, equity, income, or expense
+  string currency = 4;
+}
+
+message CreateAccountRequest {
+  string name = 1;
+  string type = 2;
+  string currency = 3;
+}
+message CreateAccountResponse {
+  Account account = 1;
+}
+
+message GetAccountRequest {
+  string id = 1;
+}
+message GetAccountResponse {
+  Account account = 1;
+}
+
+message ListAccountsRequest {
+  int32 limit = 1;
+}
+message ListAccountsResponse {
+  repeated Account accounts = 1;
+}
+
+message GetBalanceRequest {
+  string account_id = 1;
+}
+message GetBalanceResponse {
+  string account_id = 1;
+  int64 amount = 2;
+  string currency = 3;
+}
+
+message StatementEntry {
+  string id = 1;
+  string transaction_id = 2;
+  int64 amount = 3;
+  int64 running_balance = 4;
+  string description = 5;
+  string created_at = 6; // RFC3339 timestamp
+}
+message GetStatementRequest {
+  string account_id = 1;
+  int32 limit = 2;
+  string cursor = 3;
+}
+message GetStatementResponse {
+  string account_id = 1;
+  string currency = 2;
+  repeated StatementEntry entries = 3;
+  string next_cursor = 4;
+}
+
+// PostTransactionRequest carries the balanced transaction. The idempotency key,
+// when supplied, travels in the gRPC metadata key "idempotency-key", mirroring
+// the REST Idempotency-Key header, not in this message.
+message PostTransactionRequest {
+  string currency = 1;
+  repeated Posting postings = 2;
+}
+message PostTransactionResponse {
+  Transaction transaction = 1;
+  bool replayed = 2;
+}
+
+message GetTransactionRequest {
+  string id = 1;
+}
+message GetTransactionResponse {
+  Transaction transaction = 1;
+}
+
+message AuditEntry {
+  string id = 1;
+  string action = 2;
+  string transaction_id = 3;
+  string actor = 4;
+  string before = 5; // raw JSON, may be empty for a create
+  string after = 6; // raw JSON snapshot
+  string created_at = 7; // RFC3339 timestamp
+}
+message GetTransactionAuditRequest {
+  string transaction_id = 1;
+}
+message GetTransactionAuditResponse {
+  repeated AuditEntry entries = 1;
+}
+message GetAccountAuditRequest {
+  string account_id = 1;
+  int32 limit = 2;
+  string cursor = 3;
+}
+message GetAccountAuditResponse {
+  repeated AuditEntry entries = 1;
+  string next_cursor = 2;
+}
+
+service LedgerService {
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc GetStatement(GetStatementRequest) returns (GetStatementResponse);
+  rpc PostTransaction(PostTransactionRequest) returns (PostTransactionResponse);
+  rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+  rpc GetTransactionAudit(GetTransactionAuditRequest) returns (GetTransactionAuditResponse);
+  rpc GetAccountAudit(GetAccountAuditRequest) returns (GetAccountAuditResponse);
+}
