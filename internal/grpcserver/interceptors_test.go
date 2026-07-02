@@ -1,10 +1,12 @@
 package grpcserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -26,13 +28,19 @@ func TestTenantInterceptorInjectsTenant(t *testing.T) {
 }
 
 func TestRecoveryInterceptorTurnsPanicIntoInternal(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
 	handler := func(_ context.Context, _ any) (any, error) {
 		panic("boom")
 	}
-	interceptor := recoveryUnaryInterceptor()
+	interceptor := recoveryUnaryInterceptor(log)
 	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/x/Y"}, handler)
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("code = %v, want Internal", status.Code(err))
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "/x/Y") || !strings.Contains(logged, "panic") {
+		t.Fatalf("expected panic log to mention method and panic, got: %s", logged)
 	}
 }
 

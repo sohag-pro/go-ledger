@@ -159,7 +159,7 @@ func run(logger *slog.Logger) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 3)
 	go func() {
 		logger.Info("starting server", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -205,7 +205,16 @@ func run(logger *slog.Logger) error {
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("metrics server shutdown", "error", err)
 	}
-	grpcSrv.GracefulStop()
+	// Wait for in-flight RPCs to finish, but do not let a stuck one outlast the
+	// shutdown deadline: force-stop if the graceful stop is still running when
+	// shutdownCtx expires.
+	stopped := make(chan struct{})
+	go func() { grpcSrv.GracefulStop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-shutdownCtx.Done():
+		grpcSrv.Stop()
+	}
 	return srv.Shutdown(shutdownCtx)
 }
 

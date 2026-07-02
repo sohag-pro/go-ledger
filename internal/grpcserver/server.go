@@ -19,6 +19,31 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/paging"
 )
 
+// Page limit defaults and maxima for the gRPC handlers. These mirror the REST
+// huma tags (`minimum`/`maximum` struct tags in internal/api/accounts.go and
+// internal/api/audit.go), which are string literals and cannot be shared as Go
+// constants, so keep the two in sync by hand.
+const (
+	defaultAccountsLimit = 100
+	maxAccountsLimit     = 500
+	defaultPageLimit     = 50
+	maxPageLimit         = 200
+)
+
+// clampLimit returns def when requested is <= 0, maxVal when requested
+// exceeds maxVal, and requested otherwise. It guards the gRPC handlers
+// against a caller requesting an unbounded scan, mirroring the REST layer's
+// huma maximum tags.
+func clampLimit(requested, def, maxVal int) int {
+	if requested <= 0 {
+		return def
+	}
+	if requested > maxVal {
+		return maxVal
+	}
+	return requested
+}
+
 // Deps are the shared services the gRPC handlers call, the same ones the REST
 // layer uses, plus the default tenant injected by the tenant interceptor.
 type Deps struct {
@@ -50,7 +75,7 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 		log = slog.Default()
 	}
 	s := grpc.NewServer(grpc.ChainUnaryInterceptor(
-		recoveryUnaryInterceptor(),
+		recoveryUnaryInterceptor(log),
 		loggingUnaryInterceptor(log),
 		tenantUnaryInterceptor(d.DefaultTenant),
 	))
@@ -124,10 +149,7 @@ func (s *Server) GetAccount(ctx context.Context, req *ledgerv1.GetAccountRequest
 
 // ListAccounts lists accounts for the calling tenant, most recent first.
 func (s *Server) ListAccounts(ctx context.Context, req *ledgerv1.ListAccountsRequest) (*ledgerv1.ListAccountsResponse, error) {
-	limit := int(req.Limit)
-	if limit <= 0 {
-		limit = 100
-	}
+	limit := clampLimit(int(req.Limit), defaultAccountsLimit, maxAccountsLimit)
 	accts, err := s.accounts.List(ctx, tenantFrom(ctx), limit)
 	if err != nil {
 		return nil, toStatus(err)
@@ -155,10 +177,7 @@ func (s *Server) GetStatement(ctx context.Context, req *ledgerv1.GetStatementReq
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	limit := int(req.Limit)
-	if limit <= 0 {
-		limit = 50
-	}
+	limit := clampLimit(int(req.Limit), defaultPageLimit, maxPageLimit)
 	acct, entries, err := s.accounts.Statement(ctx, tenantFrom(ctx), req.AccountId, after, limit)
 	if err != nil {
 		return nil, toStatus(err)
@@ -237,10 +256,7 @@ func (s *Server) GetAccountAudit(ctx context.Context, req *ledgerv1.GetAccountAu
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	limit := int(req.Limit)
-	if limit <= 0 {
-		limit = 50
-	}
+	limit := clampLimit(int(req.Limit), defaultPageLimit, maxPageLimit)
 	entries, err := s.audit.ByAccount(ctx, tenantFrom(ctx), req.AccountId, after, limit)
 	if err != nil {
 		return nil, toStatus(err)

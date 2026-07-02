@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"google.golang.org/grpc"
@@ -33,11 +34,18 @@ func tenantUnaryInterceptor(defaultTenant string) grpc.UnaryServerInterceptor {
 }
 
 // recoveryUnaryInterceptor turns a panic in a handler into a codes.Internal
-// error instead of tearing down the connection.
-func recoveryUnaryInterceptor() grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+// error instead of tearing down the connection. It sits outermost in the
+// chain, so it logs the panic itself instead of relying on the logging
+// interceptor, which never runs once a panic unwinds past it.
+func recoveryUnaryInterceptor(log *slog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 		defer func() {
 			if r := recover(); r != nil {
+				log.LogAttrs(ctx, slog.LevelError, "grpc handler panic",
+					slog.String("method", info.FullMethod),
+					slog.Any("panic", r),
+					slog.String("stack", string(debug.Stack())),
+				)
 				err = status.Error(codes.Internal, "internal error")
 			}
 		}()
