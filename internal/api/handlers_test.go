@@ -614,3 +614,30 @@ func TestAuditEndpoints(t *testing.T) {
 		t.Fatal("expected next_cursor on a full page")
 	}
 }
+
+// TestMalformedCursorRejected checks that a cursor that does not decode to a
+// valid keyset position (decodeCursor's error path in cursor.go) comes back as
+// 422 on every endpoint that accepts one, rather than a 500 or a silently
+// ignored cursor.
+func TestMalformedCursorRejected(t *testing.T) {
+	repo := newFakeRepo()
+	a := &domain.Account{Name: "A", Type: domain.Asset, Currency: "USD"}
+	if err := repo.CreateAccount(context.Background(), "t", a); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	router := newAPIRouter(repo)
+
+	t.Run("statement", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/accounts/"+a.ID+"/statement?cursor=not-a-valid-cursor", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("audit", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/accounts/"+a.ID+"/audit?cursor=garbage", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+}
