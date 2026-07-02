@@ -25,7 +25,7 @@ func main() {
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("dial %s: %v", addr, err) //nolint:gosec
+		log.Fatalf("dial %s: %v", addr, err) //nolint:gosec // G706: addr is constrained to host:port; no format directive injection risk
 	}
 	defer func() { _ = conn.Close() }()
 	client := ledgerv1.NewLedgerServiceClient(conn)
