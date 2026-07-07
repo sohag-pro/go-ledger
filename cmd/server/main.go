@@ -133,6 +133,22 @@ func run(logger *slog.Logger) error {
 	}
 	otel.SetMeterProvider(meterProvider)
 
+	// Flush telemetry last, on every exit path. Deferring it means the batch
+	// exporter drains after the HTTP and gRPC servers have already stopped
+	// accepting work (their shutdown runs earlier in run's body), so in-flight
+	// requests still get their spans, and an unreachable OTLP endpoint cannot eat
+	// the servers' drain budget: this flush has its own bounded one.
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := obs.Shutdown(flushCtx); err != nil {
+			logger.Error("observability shutdown", "error", err)
+		}
+		if err := meterProvider.Shutdown(flushCtx); err != nil {
+			logger.Error("meter provider shutdown", "error", err)
+		}
+	}()
+
 	// Apply migrations before serving. On a single instance this is the simplest
 	// correct option: the binary that needs a column also creates it.
 	if err := runMigrations(cfg.databaseURL, logger); err != nil {
@@ -239,14 +255,6 @@ func run(logger *slog.Logger) error {
 	defer cancel()
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("metrics server shutdown", "error", err)
-	}
-	// Flush buffered spans and metrics within the same shutdown budget so a stuck
-	// exporter cannot outlast termination.
-	if err := obs.Shutdown(shutdownCtx); err != nil {
-		logger.Error("observability shutdown", "error", err)
-	}
-	if err := meterProvider.Shutdown(shutdownCtx); err != nil {
-		logger.Error("meter provider shutdown", "error", err)
 	}
 	// Wait for in-flight RPCs to finish, but do not let a stuck one outlast the
 	// shutdown deadline: force-stop if the graceful stop is still running when
