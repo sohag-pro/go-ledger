@@ -256,60 +256,152 @@ func TestChaosMidTransactionCutRollsBack(t *testing.T) {
 	}
 }
 
+// ackDropToxicName is the toxic this test registers on the proxy's downstream
+// (server to client) direction to model a lost acknowledgement. It is removed
+// once the injection has done its job, so later pools opened against the same
+// proxy are not affected by it.
+const ackDropToxicName = "ambiguous-commit-ack-drop"
+
 // TestChaosAmbiguousCommitReplayIsIdempotent is Case B from ADR-011: the
-// ambiguous-commit scenario a client sees when it sends a post, the server
-// commits, but the acknowledgement never reaches the client (a dropped
-// connection, a timeout on the client side). The client cannot tell whether
+// connection is lost after COMMIT is sent and Postgres durably applies it, but
+// the acknowledgement never reaches the client. The client cannot tell whether
 // the post succeeded, so the natural, and correct, reaction is to retry with
 // the same idempotency key. This must not double-post, and the
 // idempotency-key row and the transaction commit must be consistent with each
 // other (both exist, never one without the other), which is what makes the
 // replay safe to trust.
+//
+// The distinguishing property versus Case A is durability: Case A's cut never
+// lets COMMIT reach Postgres, so zero rows persist. Here COMMIT does reach
+// Postgres and does get applied; only the reply back to the client is lost.
+// That is injected with a toxiproxy `reset_peer` toxic on the downstream
+// stream only (server to client), added from the same commit-tracer hook Case
+// A uses. Because the toxic is one-directional, the "commit" statement still
+// travels upstream to Postgres untouched and gets applied; the toxic only
+// fires once Postgres's reply starts flowing back, at which point it drops
+// that reply and resets the connection instead of forwarding it. The client
+// never learns the outcome, but the database already committed.
 func TestChaosAmbiguousCommitReplayIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	env := startChaosEnv(t)
 
-	pool, err := postgres.NewPool(ctx, env.proxyDSN, 5)
+	seedPool, err := postgres.NewPool(ctx, env.proxyDSN, 5)
 	if err != nil {
-		t.Fatalf("chaos test: open pool: %v", err)
+		t.Fatalf("chaos test: open seed pool: %v", err)
 	}
-	defer pool.Close()
-
-	repo := postgres.NewRepository(pool)
-	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	seedRepo := postgres.NewRepository(seedPool)
 	tenant := uuid.NewString()
 
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
-	if err := repo.CreateAccount(ctx, tenant, debit); err != nil {
+	if err := seedRepo.CreateAccount(ctx, tenant, debit); err != nil {
 		t.Fatalf("chaos test: create debit account: %v", err)
 	}
-	if err := repo.CreateAccount(ctx, tenant, credit); err != nil {
+	if err := seedRepo.CreateAccount(ctx, tenant, credit); err != nil {
 		t.Fatalf("chaos test: create credit account: %v", err)
 	}
+	// Close before wiring up the traced pool: the accounts are seeded over a
+	// plain, healthy connection with nothing watching for "commit".
+	seedPool.Close()
 
+	tracer := &commitInterceptTracer{onCommit: func() {
+		// timeout: 0 means the toxic resets the connection (SetLinger(0), a
+		// TCP RST) as soon as it observes the first byte flowing downstream,
+		// rather than forwarding it. That first byte is Postgres's reply to
+		// "commit", sent only after the commit is already durable, so this
+		// drops exactly the acknowledgement and nothing upstream of it.
+		if _, err := env.proxy.AddToxic(
+			ackDropToxicName, "reset_peer", "downstream", 1.0,
+			toxiproxyclient.Attributes{"timeout": 0},
+		); err != nil {
+			t.Errorf("chaos test: add downstream ack-drop toxic at commit: %v", err)
+		}
+	}}
+	cutPool, err := buildTracedPool(ctx, env.proxyDSN, tracer)
+	if err != nil {
+		t.Fatalf("chaos test: open traced pool: %v", err)
+	}
+	defer cutPool.Close()
+
+	cutRepo := postgres.NewRepository(cutPool)
+	svc := ledger.NewTransactionService(cutRepo, discardLogger(), nil)
 	idem := &domain.Idempotency{Key: "ambiguous-commit-key"}
 	txn := mkTxn(t, debit.ID, credit.ID)
 
-	// The real post: it commits on a healthy connection. What is ambiguous in
-	// the scenario this models is not whether the server committed, it did,
-	// but whether the client's acknowledgement of that fact survived. That
-	// ambiguity lives entirely on the client side, so the test proves the
-	// server-side contract that makes a client-side retry safe: replaying the
-	// same key must not create a second transaction.
-	replayed, err := svc.Post(ctx, tenant, txn, idem)
-	if err != nil {
-		t.Fatalf("chaos test: first post: %v", err)
+	// The real post: the commit statement reaches Postgres and is applied,
+	// but the client never sees the acknowledgement. From the client's side
+	// this looks exactly like a failed post, which is what makes the retry
+	// below the realistic and dangerous case: the client cannot distinguish
+	// "never committed" from "committed, ack lost" and must retry safely
+	// either way.
+	replayed, postErr := svc.Post(ctx, tenant, txn, idem)
+	if postErr == nil {
+		t.Fatal("expected the first post to fail: the client must not learn the outcome")
 	}
 	if replayed {
-		t.Fatal("first post should not be reported as a replay")
+		t.Fatal("a failed first post cannot be a replay")
 	}
+	if !tracer.fired.Load() {
+		t.Fatal("commit interceptor never fired; the test did not actually inject the failure at commit")
+	}
+	t.Logf("post errored as expected after the downstream ack was dropped: %v", postErr)
+
+	// Clear the toxic before opening any further connections through this
+	// proxy: reset_peer applies to every connection that passes through it,
+	// so leaving it in place would break the verification and replay pools
+	// below too, not just the one the commit went out on.
+	if err := env.proxy.RemoveToxic(ackDropToxicName); err != nil {
+		t.Fatalf("chaos test: remove ack-drop toxic: %v", err)
+	}
+
+	verifyPool, err := postgres.NewPool(ctx, env.proxyDSN, 5)
+	if err != nil {
+		t.Fatalf("chaos test: open verify pool: %v", err)
+	}
+	defer verifyPool.Close()
+	verifyRepo := postgres.NewRepository(verifyPool)
+
+	// The key assertion: even though the client saw an error, Postgres
+	// already committed. Exactly one transaction row exists for the id the
+	// client attempted, and its postings still sum to zero.
+	txnID, err := uuid.Parse(txn.ID)
+	if err != nil {
+		t.Fatalf("chaos test: parse transaction id: %v", err)
+	}
+	var txnCount int
+	if err := verifyPool.QueryRow(ctx,
+		`select count(*) from transactions where id = $1`, txnID,
+	).Scan(&txnCount); err != nil {
+		t.Fatalf("chaos test: count transactions: %v", err)
+	}
+	if txnCount != 1 {
+		t.Fatalf("durable-commit check: transaction rows for %s = %d, want 1 (commit should have "+
+			"reached Postgres even though the client never saw the acknowledgement)", txn.ID, txnCount)
+	}
+
+	var postingCount int
+	var postingSum int64
+	if err := verifyPool.QueryRow(ctx,
+		`select count(*), coalesce(sum(amount), 0) from postings where transaction_id = $1`, txnID,
+	).Scan(&postingCount, &postingSum); err != nil {
+		t.Fatalf("chaos test: sum postings: %v", err)
+	}
+	if postingCount != 2 {
+		t.Fatalf("durable-commit check: postings for %s = %d, want 2", txn.ID, postingCount)
+	}
+	if postingSum != 0 {
+		t.Fatalf("durable-commit check: postings for %s sum to %d, want 0", txn.ID, postingSum)
+	}
+	t.Logf("durable-commit check passed: transaction %s persisted (count=%d) with %d postings summing to %d, "+
+		"even though the client saw an error", txn.ID, txnCount, postingCount, postingSum)
 
 	// The client that never learned the outcome retries with the same key and
 	// the same request body (so the fingerprint matches), on a healthy
-	// connection, exactly as a real client would after a timeout.
+	// connection, exactly as a real client would after a timeout. This must
+	// not create a second transaction.
 	retryTxn := mkTxn(t, debit.ID, credit.ID)
-	replayedRetry, err := svc.Post(ctx, tenant, retryTxn, idem)
+	svcRetry := ledger.NewTransactionService(verifyRepo, discardLogger(), nil)
+	replayedRetry, err := svcRetry.Post(ctx, tenant, retryTxn, idem)
 	if err != nil {
 		t.Fatalf("chaos test: replayed post: %v", err)
 	}
@@ -320,19 +412,16 @@ func TestChaosAmbiguousCommitReplayIsIdempotent(t *testing.T) {
 		t.Fatalf("replay returned a different transaction id: got %s, want %s", retryTxn.ID, txn.ID)
 	}
 
-	// Exactly one transaction exists for this key: no double-post.
-	txnID, err := uuid.Parse(txn.ID)
-	if err != nil {
-		t.Fatalf("chaos test: parse transaction id: %v", err)
-	}
-	var txnCount int
-	if err := pool.QueryRow(ctx,
+	// Still exactly one transaction for this key after the replay: no
+	// double-post.
+	var txnCountAfterReplay int
+	if err := verifyPool.QueryRow(ctx,
 		`select count(*) from transactions where id = $1`, txnID,
-	).Scan(&txnCount); err != nil {
-		t.Fatalf("chaos test: count transactions: %v", err)
+	).Scan(&txnCountAfterReplay); err != nil {
+		t.Fatalf("chaos test: count transactions after replay: %v", err)
 	}
-	if txnCount != 1 {
-		t.Fatalf("transaction rows for %s = %d, want 1", txn.ID, txnCount)
+	if txnCountAfterReplay != 1 {
+		t.Fatalf("transaction rows for %s after replay = %d, want 1", txn.ID, txnCountAfterReplay)
 	}
 
 	// The atomicity guard: TransactionService.Post writes the transaction, the
@@ -340,14 +429,14 @@ func TestChaosAmbiguousCommitReplayIsIdempotent(t *testing.T) {
 	// commit together or not at all (see internal/postgres/repository.go,
 	// Repository.RunInTx and TransactionService.Post). Confirm both sides are
 	// present and agree, not just that a replay happened to work.
-	rec, err := repo.GetIdempotencyKey(ctx, tenant, idem.Key)
+	rec, err := verifyRepo.GetIdempotencyKey(ctx, tenant, idem.Key)
 	if err != nil {
 		t.Fatalf("chaos test: get idempotency key: %v", err)
 	}
 	if rec.TransactionID != txn.ID {
 		t.Fatalf("idempotency key points at transaction %s, want %s", rec.TransactionID, txn.ID)
 	}
-	if _, err := repo.GetTransaction(ctx, tenant, rec.TransactionID); err != nil {
+	if _, err := verifyRepo.GetTransaction(ctx, tenant, rec.TransactionID); err != nil {
 		t.Fatalf("chaos test: transaction referenced by the idempotency key does not exist: %v", err)
 	}
 }
