@@ -11,3 +11,42 @@ services:
       - "16686:16686" # UI
       - "4318:4318"   # OTLP/HTTP
       - "4317:4317"   # OTLP/gRPC (unused by default, exposed for convenience)
+
+  # load-test profile: a full, self-contained stack (postgres + app, jaeger
+  # included) for k6/etc. load runs against a real server. Not started by a
+  # plain `docker compose up`; bring it up with:
+  #   docker compose --profile load-test up -d --build
+  postgres:
+    image: postgres:16
+    container_name: go-ledger-postgres
+    profiles: ["load-test"]
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # The app self-migrates on boot (embedded goose migrations in main.go), so
+  # no separate migration or init step is needed here. SEED_ENABLED is off
+  # and DEFAULT_TENANT_ID points at a dedicated load tenant so the demo
+  # seeder never collides with load traffic.
+  app:
+    build: .
+    container_name: go-ledger-app
+    profiles: ["load-test"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      SEED_ENABLED: "false"
+      DEFAULT_TENANT_ID: "load-test"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
