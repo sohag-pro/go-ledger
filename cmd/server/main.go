@@ -20,22 +20,29 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver for goose
 	"github.com/pressly/goose/v3"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/sohag-pro/go-ledger/internal/api"
 	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
+	"github.com/sohag-pro/go-ledger/internal/observability"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 	"github.com/sohag-pro/go-ledger/internal/seed"
 	"github.com/sohag-pro/go-ledger/internal/web"
 )
+
+const ledgerTracerName = "github.com/sohag-pro/go-ledger/internal/ledger"
 
 // defaultTenantID is the tenant every request acts as until an auth layer
 // resolves a real one. Override with DEFAULT_TENANT_ID.
 const defaultTenantID = "00000000-0000-0000-0000-000000000001"
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(observability.NewTraceHandler(slog.NewJSONHandler(os.Stdout, nil)))
 	slog.SetDefault(logger)
 
 	if err := run(logger); err != nil {
@@ -50,6 +57,8 @@ type config struct {
 	grpcAddr      string
 	databaseURL   string
 	defaultTenant string
+	env           string
+	serviceName   string
 	seedEnabled   bool
 	seedInterval  time.Duration
 }
@@ -61,6 +70,8 @@ func loadConfig() (config, error) {
 		grpcAddr:      getenv("GRPC_ADDR", ":9091"),
 		databaseURL:   os.Getenv("DATABASE_URL"),
 		defaultTenant: getenv("DEFAULT_TENANT_ID", defaultTenantID),
+		env:           getenv("APP_ENV", "development"),
+		serviceName:   getenv("OTEL_SERVICE_NAME", "go-ledger"),
 		seedEnabled:   getenvBool("SEED_ENABLED", true),
 		seedInterval:  getenvDuration("SEED_INTERVAL", 4*time.Hour),
 	}
@@ -104,6 +115,24 @@ func run(logger *slog.Logger) error {
 	}
 	ctx := context.Background()
 
+	// Tracing and metrics providers first, so every later component records into
+	// them. Setup chooses its exporter from the environment (see ADR-010) and is a
+	// no-op when no OTLP endpoint is configured.
+	obs, err := observability.Setup(ctx, observability.Config{
+		ServiceName: cfg.serviceName,
+		Environment: cfg.env,
+		Logger:      logger,
+	})
+	if err != nil {
+		return fmt.Errorf("observability setup: %w", err)
+	}
+
+	meterProvider, err := metrics.MeterProvider()
+	if err != nil {
+		return fmt.Errorf("metrics meter provider: %w", err)
+	}
+	otel.SetMeterProvider(meterProvider)
+
 	// Apply migrations before serving. On a single instance this is the simplest
 	// correct option: the binary that needs a column also creates it.
 	if err := runMigrations(cfg.databaseURL, logger); err != nil {
@@ -119,7 +148,7 @@ func run(logger *slog.Logger) error {
 	repo := postgres.NewRepository(pool)
 	deps := api.Deps{
 		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, logger, nil),
+		Transactions:  ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
 		Audit:         ledger.NewAuditService(repo),
 		DefaultTenant: cfg.defaultTenant,
 	}
@@ -136,16 +165,22 @@ func run(logger *slog.Logger) error {
 	router := chi.NewRouter()
 	// No RealIP middleware: it trusts client-set forwarding headers and is
 	// spoofable. Revisit with a trusted-proxy allowlist when one is in front.
-	router.Use(middleware.RequestID, middleware.Recoverer, slogLogger(logger))
+	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger))
 	router.Get("/", web.Index)
 	router.Get("/console", web.Console)
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
 	api.RegisterPlayground(router)
 	api.New(router, deps) // mounts /v1/*, /healthz, /openapi.*, /schemas/
 
+	// Wrap the router in one OTel server span per request. Health checks are
+	// filtered out so traces are real request work, not liveness noise; the
+	// metrics server (below) is never wrapped (ADR-004, ADR-010).
+	tracedHandler := otelhttp.NewHandler(router, "http.server",
+		otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/healthz" }),
+	)
 	srv := &http.Server{
 		Addr:              ":" + cfg.port,
-		Handler:           router,
+		Handler:           tracedHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -205,6 +240,14 @@ func run(logger *slog.Logger) error {
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("metrics server shutdown", "error", err)
 	}
+	// Flush buffered spans and metrics within the same shutdown budget so a stuck
+	// exporter cannot outlast termination.
+	if err := obs.Shutdown(shutdownCtx); err != nil {
+		logger.Error("observability shutdown", "error", err)
+	}
+	if err := meterProvider.Shutdown(shutdownCtx); err != nil {
+		logger.Error("meter provider shutdown", "error", err)
+	}
 	// Wait for in-flight RPCs to finish, but do not let a stuck one outlast the
 	// shutdown deadline: force-stop if the graceful stop is still running when
 	// shutdownCtx expires.
@@ -262,6 +305,22 @@ func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, ten
 			doSeed()
 		}
 	}
+}
+
+// otelRouteName upgrades the otelhttp server span name from the raw path to the
+// matched chi route pattern once routing has resolved, so high-cardinality URLs
+// (account and transaction ids) cannot explode the trace backend.
+func otelRouteName(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		if rc := chi.RouteContext(r.Context()); rc != nil {
+			if pattern := rc.RoutePattern(); pattern != "" {
+				span := oteltrace.SpanFromContext(r.Context())
+				span.SetName(r.Method + " " + pattern)
+				span.SetAttributes(semconv.HTTPRoute(pattern))
+			}
+		}
+	})
 }
 
 // slogLogger logs one structured line per request: method, path, status, size,
