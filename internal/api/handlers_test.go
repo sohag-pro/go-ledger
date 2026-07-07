@@ -242,7 +242,7 @@ func newAPIRouter(repo domain.Repository) chi.Router {
 	r := chi.NewRouter()
 	New(r, Deps{
 		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil))),
+		Transactions:  ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
 		Audit:         ledger.NewAuditService(repo),
 		DefaultTenant: testTenant,
 	})

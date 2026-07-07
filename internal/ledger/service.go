@@ -11,6 +11,11 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 )
@@ -18,17 +23,21 @@ import (
 // TransactionService posts transactions to the ledger. It is the single entry
 // point both the REST and gRPC layers will call to move money.
 type TransactionService struct {
-	repo domain.Repository
-	log  *slog.Logger
+	repo   domain.Repository
+	log    *slog.Logger
+	tracer oteltrace.Tracer
 }
 
 // NewTransactionService returns a TransactionService backed by repo. If log is
-// nil the default slog logger is used.
-func NewTransactionService(repo domain.Repository, log *slog.Logger) *TransactionService {
+// nil the default slog logger is used; if tracer is nil the global tracer is used.
+func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer oteltrace.Tracer) *TransactionService {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &TransactionService{repo: repo, log: log}
+	if tracer == nil {
+		tracer = otel.Tracer("github.com/sohag-pro/go-ledger/internal/ledger")
+	}
+	return &TransactionService{repo: repo, log: log, tracer: tracer}
 }
 
 // Post validates t and persists it atomically inside a SERIALIZABLE transaction,
@@ -38,7 +47,18 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger) *Transactio
 // key reused with a different request body returns domain.ErrIdempotencyConflict.
 // Every real post also writes one append-only audit row in the same transaction.
 func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction, idem *domain.Idempotency) (replayed bool, err error) {
+	ctx, span := s.tracer.Start(ctx, "ledger.PostTransaction",
+		oteltrace.WithAttributes(
+			attribute.String("tenant_id", tenantID),
+			attribute.Int("transaction.posting_count", len(t.Postings)),
+			attribute.Bool("idempotency.present", idem != nil),
+		),
+	)
+	defer span.End()
+
 	if err := t.Validate(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "validation failed")
 		metrics.PostDuration.WithLabelValues("invalid").Observe(0)
 		return false, err
 	}
@@ -71,6 +91,8 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
 			return s.replay(ctx, tenantID, idem.Key, fingerprint, t)
 		}
+		span.RecordError(runErr)
+		span.SetStatus(codes.Error, "post failed")
 		metrics.PostDuration.WithLabelValues("failed").Observe(elapsed)
 		s.log.ErrorContext(ctx, "post transaction failed",
 			"tenant_id", tenantID, "transaction_id", t.ID, "error", runErr)

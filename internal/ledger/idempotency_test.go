@@ -27,7 +27,7 @@ func TestPostIdempotentHammer(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
-	svc := ledger.NewTransactionService(repo, nil)
+	svc := ledger.NewTransactionService(repo, nil, nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
 
@@ -91,7 +91,7 @@ func TestPostIdempotentConflict(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
-	svc := ledger.NewTransactionService(repo, nil)
+	svc := ledger.NewTransactionService(repo, nil, nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
 

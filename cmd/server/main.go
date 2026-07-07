@@ -119,7 +119,7 @@ func run(logger *slog.Logger) error {
 	repo := postgres.NewRepository(pool)
 	deps := api.Deps{
 		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, logger),
+		Transactions:  ledger.NewTransactionService(repo, logger, nil),
 		Audit:         ledger.NewAuditService(repo),
 		DefaultTenant: cfg.defaultTenant,
 	}

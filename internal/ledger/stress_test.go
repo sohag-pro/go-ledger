@@ -123,7 +123,7 @@ func TestPostConcurrentStress(t *testing.T) {
 
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
-	svc := ledger.NewTransactionService(repo, discardLogger())
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
 
@@ -260,7 +260,7 @@ func TestUnbalancedRejectedByTrigger(t *testing.T) {
 // fast, before any database round-trip. A nil repository is safe because Validate
 // returns before the repo is touched.
 func TestPostRejectsUnbalanced(t *testing.T) {
-	svc := ledger.NewTransactionService(nil, discardLogger())
+	svc := ledger.NewTransactionService(nil, discardLogger(), nil)
 	debit, _ := domain.NewMoney(100, "USD")
 	credit, _ := domain.NewMoney(-50, "USD") // does not offset the debit
 	txn := &domain.Transaction{Postings: []domain.Posting{

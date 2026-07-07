@@ -98,7 +98,7 @@ func dialClient(t *testing.T) ledgerv1.LedgerServiceClient {
 	repo := postgres.NewRepository(sharedPool)
 	deps := grpcserver.Deps{
 		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, nil),
+		Transactions:  ledger.NewTransactionService(repo, nil, nil),
 		Audit:         ledger.NewAuditService(repo),
 		DefaultTenant: testTenant,
 	}

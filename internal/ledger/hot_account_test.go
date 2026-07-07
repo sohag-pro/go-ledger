@@ -35,7 +35,7 @@ func TestPostConcurrentSameAccount(t *testing.T) {
 
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
-	svc := ledger.NewTransactionService(repo, discardLogger())
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
 
