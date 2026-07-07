@@ -10,6 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 var registry = prometheus.NewRegistry()
@@ -60,4 +62,22 @@ func init() {
 // Handler serves the ledger's metrics in the Prometheus text format.
 func Handler() http.Handler {
 	return promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+}
+
+// MeterProvider builds an OpenTelemetry MeterProvider whose Prometheus exporter
+// writes into this package's registry, so the RED metrics emitted by otelhttp and
+// otelgrpc are scraped from the same /metrics endpoint as the native collectors.
+// Scope and target info are dropped to keep the output uncluttered; runtime
+// instrumentation is deliberately not enabled here to avoid duplicating the native
+// go_* and process_* collectors.
+func MeterProvider() (*sdkmetric.MeterProvider, error) {
+	exporter, err := otelprom.New(
+		otelprom.WithRegisterer(registry),
+		otelprom.WithoutScopeInfo(),
+		otelprom.WithoutTargetInfo(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter)), nil
 }
