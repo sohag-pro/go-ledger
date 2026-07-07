@@ -44,13 +44,6 @@ func TestRoutes(t *testing.T) {
 			},
 		},
 		{
-			name:       "index has local font, not google",
-			method:     http.MethodGet,
-			path:       "/",
-			wantStatus: http.StatusOK,
-			wantBody:   "/static/fonts/space-grotesk.woff2",
-		},
-		{
 			name:       "console served",
 			method:     http.MethodGet,
 			path:       "/console",
@@ -107,6 +100,18 @@ func TestIndexNoEmDashes(t *testing.T) {
 	for _, r := range string(indexHTML) {
 		if r == enDash || r == emDash {
 			t.Fatalf("index.html contains a banned dash %U", r)
+		}
+	}
+}
+
+func TestIndexNoExternalFonts(t *testing.T) {
+	// The landing page ships self-contained: system font stack, no web fonts, and
+	// no third-party CDN so it leaks nothing to Google and needs no network at
+	// render time. Guard against a regression that reintroduces an external font.
+	body := string(indexHTML)
+	for _, host := range []string{"fonts.googleapis.com", "fonts.gstatic.com", "//use.typekit", "//fonts."} {
+		if strings.Contains(body, host) {
+			t.Errorf("index.html references an external font host %q; it must stay self-contained", host)
 		}
 	}
 }
