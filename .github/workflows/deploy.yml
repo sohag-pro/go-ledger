@@ -79,6 +79,59 @@ jobs:
         if: always()
         run: docker compose --profile load-test down
 
+  coverage-badge:
+    name: Publish coverage badge
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+
+      - name: Build shields endpoint JSON
+        run: |
+          # Match scripts/coverage.sh: strip generated packages (0% coverage,
+          # no tests of their own) before computing the total, so the badge
+          # reports the same number the coverage gate enforces, not a number
+          # dragged down by generated code.
+          EXCLUDE='internal/genproto/|internal/postgres/sqlc/'
+          FILTERED="$(mktemp)"
+          head -n 1 cover.out > "$FILTERED"
+          grep -vE "$EXCLUDE" cover.out | tail -n +2 >> "$FILTERED" || true
+          PCT=$(go tool cover -func="$FILTERED" | grep '^total:' | awk '{print $3}' | tr -d '%')
+          rm -f "$FILTERED"
+          COLOR=red
+          awk "BEGIN{exit !($PCT>=70 && $PCT<80)}" && COLOR=yellow
+          awk "BEGIN{exit !($PCT>=80)}" && COLOR=brightgreen
+          mkdir -p out
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > out/coverage.json
+
+      - name: Publish to badges branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cp out/coverage.json /tmp/coverage.json
+          git fetch origin badges || true
+          if git checkout badges 2>/dev/null; then
+            find . -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +
+          else
+            git checkout --orphan badges
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          cp /tmp/coverage.json coverage.json
+          git add coverage.json
+          git commit -m "chore: update coverage badge" || echo "no change"
+          git push origin badges
+
   deploy:
     name: Deploy to VPS
     needs: [lint, test]
