@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -35,6 +36,11 @@ func NewPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, er
 	cfg.ConnConfig.RuntimeParams["statement_timeout"] = statementTimeout
 	cfg.ConnConfig.RuntimeParams["lock_timeout"] = lockTimeout
 	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = idleInTxTimeout
+
+	// One span per SQL statement. otelpgx omits query arguments by default, so
+	// account ids, amounts, and idempotency keys never leave the process as span
+	// attributes (see ADR-010); we do not opt into WithIncludeQueryParameters.
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName())
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

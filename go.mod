@@ -5,6 +5,7 @@ go 1.26.4
 require github.com/danielgtaylor/huma/v2 v2.38.0
 
 require (
+	github.com/exaring/otelpgx v0.11.1
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
