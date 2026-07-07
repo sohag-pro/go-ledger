@@ -46,6 +46,35 @@ func TestAccountTypeString(t *testing.T) {
 	}
 }
 
+func TestParseAccountType(t *testing.T) {
+	tests := []struct {
+		name    string
+		s       string
+		want    AccountType
+		wantErr error
+	}{
+		{"asset", "asset", Asset, nil},
+		{"liability", "liability", Liability, nil},
+		{"equity", "equity", Equity, nil},
+		{"income", "income", Income, nil},
+		{"expense", "expense", Expense, nil},
+		{"unknown name", "bogus", 0, ErrInvalidAccountType},
+		{"empty string", "", 0, ErrInvalidAccountType},
+		{"wrong case", "Asset", 0, ErrInvalidAccountType},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseAccountType(tt.s)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ParseAccountType(%q) err = %v, want %v", tt.s, err, tt.wantErr)
+			}
+			if tt.wantErr == nil && got != tt.want {
+				t.Errorf("ParseAccountType(%q) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAccountValidate(t *testing.T) {
 	tests := []struct {
 		name    string

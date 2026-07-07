@@ -14,6 +14,50 @@ func mustMoney(t *testing.T, amount int64, cur Currency) Money {
 	return m
 }
 
+func TestPostingValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		posting Posting
+		wantErr error
+	}{
+		{
+			name:    "valid",
+			posting: Posting{AccountID: "a", Amount: mustMoney(t, 100, "USD"), Description: "dinner repayment"},
+			wantErr: nil,
+		},
+		{
+			name:    "empty account id",
+			posting: Posting{AccountID: "", Amount: mustMoney(t, 100, "USD")},
+			wantErr: ErrInvalidPosting,
+		},
+		{
+			name: "description at limit",
+			posting: Posting{
+				AccountID:   "a",
+				Amount:      mustMoney(t, 100, "USD"),
+				Description: string(make([]byte, MaxPostingDescriptionLen)),
+			},
+			wantErr: nil,
+		},
+		{
+			name: "description too long",
+			posting: Posting{
+				AccountID:   "a",
+				Amount:      mustMoney(t, 100, "USD"),
+				Description: string(make([]byte, MaxPostingDescriptionLen+1)),
+			},
+			wantErr: ErrDescriptionTooLong,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.posting.Validate(); !errors.Is(err, tt.wantErr) {
+				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestTransactionValidate(t *testing.T) {
 	tests := []struct {
 		name     string
