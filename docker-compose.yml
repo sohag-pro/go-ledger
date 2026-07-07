@@ -46,7 +46,7 @@ services:
     environment:
       DATABASE_URL: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
       SEED_ENABLED: "false"
-      DEFAULT_TENANT_ID: "load-test"
+      DEFAULT_TENANT_ID: "00000000-0000-0000-0000-000000000002"
       PORT: "8080"
     ports:
       - "8080:8080"
