@@ -4,7 +4,7 @@ BUILD_DIR   := bin
 
 MIGRATIONS  := internal/postgres/migrations
 
-.PHONY: run build test lint tidy clean dev docker-build openapi sqlc proto migrate-up migrate-down help
+.PHONY: run build test lint tidy clean dev docker-build openapi sqlc proto migrate-up migrate-down jaeger help
 
 run: ## Run the server
 	go run $(CMD)
@@ -39,6 +39,9 @@ migrate-down: ## Roll back the last migration (needs DATABASE_URL)
 
 dev: ## Run with hot reload (requires air)
 	air
+
+jaeger: ## Start Jaeger all-in-one for local tracing (UI on :16686)
+	docker compose up -d jaeger
 
 docker-build: ## Build the Docker image
 	docker build -t $(BINARY):latest .

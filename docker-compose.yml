@@ -1,0 +1,13 @@
+# Local observability backend. Jaeger all-in-one receives OTLP/HTTP on 4318 and
+# serves its UI on 16686. Point the app at it with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: go-ledger-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP/HTTP
+      - "4317:4317"   # OTLP/gRPC (unused by default, exposed for convenience)
