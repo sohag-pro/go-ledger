@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -74,11 +75,14 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := grpc.NewServer(grpc.ChainUnaryInterceptor(
-		recoveryUnaryInterceptor(log),
-		loggingUnaryInterceptor(log),
-		tenantUnaryInterceptor(d.DefaultTenant),
-	))
+	s := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.ChainUnaryInterceptor(
+			recoveryUnaryInterceptor(log),
+			loggingUnaryInterceptor(log),
+			tenantUnaryInterceptor(d.DefaultTenant),
+		),
+	)
 	ledgerv1.RegisterLedgerServiceServer(s, NewServer(d))
 
 	hs := health.NewServer()
