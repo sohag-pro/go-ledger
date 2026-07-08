@@ -97,6 +97,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		Summary:       "Create an account",
 		Tags:          []string{"accounts"},
 		DefaultStatus: http.StatusCreated,
+		MaxBodyBytes:  MaxRequestBodyBytes,
 	}, func(ctx context.Context, in *CreateAccountInput) (*AccountOutput, error) {
 		at, err := domain.ParseAccountType(in.Body.Type)
 		if err != nil {

@@ -474,6 +474,37 @@ func TestPostTransactionAndBalance(t *testing.T) {
 		}
 	})
 
+	// ADR-012 "Input hardening": the postings array has a maxItems of 100, so
+	// one request can no longer become an arbitrarily large transaction. This
+	// is huma schema validation (maxItems), so it rejects before the handler
+	// (and the balance check) ever runs; the 101 postings here deliberately
+	// do not sum to zero.
+	t.Run("too many postings 422", func(t *testing.T) {
+		postings := make([]map[string]any, 101)
+		for i := range postings {
+			postings[i] = map[string]any{"account_id": cash, "amount": 1}
+		}
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": postings,
+		}, map[string]string{"Idempotency-Key": "post-and-balance-too-many"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	// ADR-012 "Input hardening": create-transaction sets MaxBodyBytes to
+	// MaxRequestBodyBytes (64 KiB), so huma's own body read stops at the limit
+	// and returns 413, independent of the router-level body-size middleware in
+	// cmd/server (which is not present on this test router).
+	t.Run("oversized body 413", func(t *testing.T) {
+		body := strings.Repeat("a", int(MaxRequestBodyBytes)+1)
+		rec := postJSON(t, r, "/v1/transactions", body, map[string]string{"Idempotency-Key": "oversized-body"})
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("status %d, want 413 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("missing idempotency key 400", func(t *testing.T) {
 		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
 			"currency": "USD",

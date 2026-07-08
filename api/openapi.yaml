@@ -139,6 +139,7 @@ components:
           description: Two or more legs that must sum to zero
           items:
             $ref: "#/components/schemas/PostingInput"
+          maxItems: 100
           minItems: 2
           type:
             - array

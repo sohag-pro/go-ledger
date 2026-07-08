@@ -190,7 +190,10 @@ func run(logger *slog.Logger) error {
 	router := chi.NewRouter()
 	// No RealIP middleware: it trusts client-set forwarding headers and is
 	// spoofable. Revisit with a trusted-proxy allowlist when one is in front.
-	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger))
+	// maxBodyBytes is last (innermost, closest to the handlers) so RequestID,
+	// Recoverer, the trace span, and the request log all still wrap and
+	// observe a request it rejects.
+	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger), maxBodyBytes(api.MaxRequestBodyBytes))
 	router.Get("/", web.Index)
 	router.Get("/console", web.Console)
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
@@ -207,16 +210,24 @@ func run(logger *slog.Logger) error {
 		Addr:              ":" + cfg.port,
 		Handler:           tracedHandler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Metrics on a separate loopback server so the Prometheus endpoint is never
-	// exposed on the public interface (see ADR-004).
+	// exposed on the public interface (see ADR-004). Same timeouts as the main
+	// server: it is loopback-only, but a slow scrape should not hold a
+	// connection open indefinitely either.
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", metrics.Handler())
 	metricsSrv := &http.Server{
 		Addr:              cfg.metricsAddr,
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	errCh := make(chan error, 3)
@@ -338,6 +349,31 @@ func otelRouteName(next http.Handler) http.Handler {
 			}
 		}
 	})
+}
+
+// maxBodyBytes caps every request body at limit bytes (see ADR-012, "Input
+// hardening"), so one request can no longer become an arbitrarily large
+// transaction or exhaust memory before validation runs. A request that
+// declares a Content-Length over the limit is rejected with 413 before any
+// handler reads a byte of it. The body reader is also wrapped with
+// http.MaxBytesReader so a request with no declared length (or one that
+// understates it, for example chunked transfer-encoding) is still capped once
+// a handler starts reading; huma's write operations set the same limit as
+// their own MaxBodyBytes, so that path also ends in a clean 413 rather than a
+// generic read error. GET requests such as the console, static assets, and
+// the playground are unaffected: they carry no body, so the check and the
+// wrapper are both no-ops for them.
+func maxBodyBytes(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ContentLength > limit {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // slogLogger logs one structured line per request: method, path, status, size,
