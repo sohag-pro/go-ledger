@@ -120,7 +120,7 @@
   <main class="wrap">
     <h1>API console</h1>
     <p class="lede">A small console for the live API. Create accounts, post a balanced transaction by picking accounts from a dropdown, and read balances and statements. Everything here calls the same public API at <span class="mono">/v1</span>.</p>
-    <p class="banner">Public demo: the ledger resets every 4 hours to fresh, realistic sample data. Anything you create is cleared on the next reset.</p>
+    <p class="banner">Public demo: the ledger resets every 4 hours to fresh, realistic sample data. Anything you create is cleared on the next reset. Requests here authenticate with a public demo API key scoped to this demo tenant, so there is nothing private to protect.</p>
 
     <div class="grid">
       <!-- Create account -->
@@ -192,6 +192,7 @@
   "use strict";
   var UNIT_KEY = "goledger.amountUnit";
   var DECIMALS = 2; // v1 is single-currency, 2-decimal
+  var DEMO_API_KEY = "glk_demo_public_key_reset_every_4h";
   var accounts = [];
 
   var $ = function (id) { return document.getElementById(id); };
@@ -227,12 +228,18 @@
   }
   function api(method, path, body) {
     var opts = { method: method, headers: {} };
+    opts.headers["Authorization"] = "Bearer " + DEMO_API_KEY;
+    if (method === "POST" && path.indexOf("/v1/transactions") === 0) {
+      opts.headers["Idempotency-Key"] = crypto.randomUUID();
+    }
     if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     return fetch(path, opts).then(function (res) {
       return res.text().then(function (t) {
         var json = null; try { json = t ? JSON.parse(t) : null; } catch (e) {}
         if (!res.ok) {
           var msg = json && (json.detail || json.title) ? (json.title || "") + (json.detail ? ": " + json.detail : "") : (t || res.status);
+          if (res.status === 401) msg = "Unauthorized (401): the console's demo API key was rejected. " + msg;
+          if (res.status === 429) msg = "Rate limited (429): the demo key hit its request limit, try again shortly. " + msg;
           throw new Error(msg);
         }
         return json;
