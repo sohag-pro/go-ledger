@@ -59,14 +59,14 @@ func TestAuditHashChainBuildsAcrossTransactions(t *testing.T) {
 	if row1.PrevHash != domain.AuditGenesisHash {
 		t.Errorf("row1 prev_hash = %q, want genesis %q", row1.PrevHash, domain.AuditGenesisHash)
 	}
-	if want := domain.ComputeAuditRowHash(row1, domain.AuditGenesisHash); row1.RowHash != want {
+	if want := domain.ComputeAuditRowHash(tenant, row1, domain.AuditGenesisHash); row1.RowHash != want {
 		t.Errorf("row1 row_hash = %q, want recomputed %q", row1.RowHash, want)
 	}
 
 	if row2.PrevHash != row1.RowHash {
 		t.Errorf("row2 prev_hash = %q, want row1's row_hash %q", row2.PrevHash, row1.RowHash)
 	}
-	if want := domain.ComputeAuditRowHash(row2, row1.RowHash); row2.RowHash != want {
+	if want := domain.ComputeAuditRowHash(tenant, row2, row1.RowHash); row2.RowHash != want {
 		t.Errorf("row2 row_hash = %q, want recomputed %q", row2.RowHash, want)
 	}
 }
@@ -102,7 +102,7 @@ func TestAuditHashChainVerifiesWholeWalk(t *testing.T) {
 		if row.PrevHash != prev {
 			t.Fatalf("row %d: prev_hash = %q, want %q", i, row.PrevHash, prev)
 		}
-		recomputed := domain.ComputeAuditRowHash(row, prev)
+		recomputed := domain.ComputeAuditRowHash(tenant, row, prev)
 		if recomputed != row.RowHash {
 			t.Fatalf("row %d: recomputed hash %q != stored row_hash %q", i, recomputed, row.RowHash)
 		}
@@ -135,7 +135,7 @@ func TestAuditHashChainDetectsTamper(t *testing.T) {
 		t.Fatalf("audit rows = %d, want 1", len(before))
 	}
 	row := before[0]
-	if recomputed := domain.ComputeAuditRowHash(row, domain.AuditGenesisHash); recomputed != row.RowHash {
+	if recomputed := domain.ComputeAuditRowHash(tenant, row, domain.AuditGenesisHash); recomputed != row.RowHash {
 		t.Fatalf("row failed to verify before any tampering: recomputed %q != stored %q", recomputed, row.RowHash)
 	}
 
@@ -171,8 +171,79 @@ func TestAuditHashChainDetectsTamper(t *testing.T) {
 	tampered := after[0]
 	// The row_hash on disk is untouched (we only rewrote `after`), so
 	// recomputing from the now-tampered content must no longer match it.
-	if recomputed := domain.ComputeAuditRowHash(tampered, tampered.PrevHash); recomputed == tampered.RowHash {
+	if recomputed := domain.ComputeAuditRowHash(tenant, tampered, tampered.PrevHash); recomputed == tampered.RowHash {
 		t.Error("tampering with `after` was not detected: recomputed hash still matched stored row_hash")
+	}
+}
+
+// TestAuditHashChainDetectsTenantRewrite proves the tenant id is genuinely
+// part of what row_hash covers, not just a structural scoping detail: a
+// privileged raw UPDATE that rewrites a row's tenant_id (moving it into
+// another tenant's chain), bypassing the immutability trigger the same way
+// TestAuditHashChainDetectsTamper does, is detectable. Recomputing the hash
+// with the row's current (rewritten) tenant id no longer matches the
+// row_hash that was stored under the row's original tenant id.
+func TestAuditHashChainDetectsTenantRewrite(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenantA := uuid.NewString()
+	tenantB := uuid.NewString()
+
+	txnID, _, _ := seedTxn(t, repo, tenantA)
+	appendAudit(t, repo, tenantA, txnID)
+
+	before, err := repo.ListAuditForVerify(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("list audit for verify (before rewrite): %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(before))
+	}
+	row := before[0]
+	if recomputed := domain.ComputeAuditRowHash(tenantA, row, domain.AuditGenesisHash); recomputed != row.RowHash {
+		t.Fatalf("row failed to verify before any rewrite: recomputed %q != stored %q", recomputed, row.RowHash)
+	}
+
+	// Rewrite: move the row into tenant B's chain by changing only tenant_id,
+	// bypassing the application entirely. This only succeeds because we
+	// deliberately flip the same GUC gate the seeder uses; the application
+	// path never does this.
+	rowID := uuid.MustParse(row.ID)
+	tamperTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin rewrite tx: %v", err)
+	}
+	defer tamperTx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
+	if _, err := tamperTx.Exec(ctx, `SET LOCAL audit.allow_purge = 'on'`); err != nil {
+		t.Fatalf("set local: %v", err)
+	}
+	if _, err := tamperTx.Exec(ctx,
+		`UPDATE audit_log SET tenant_id = $1 WHERE id = $2`,
+		uuid.MustParse(tenantB), rowID,
+	); err != nil {
+		t.Fatalf("rewrite tenant_id: %v", err)
+	}
+	if err := tamperTx.Commit(ctx); err != nil {
+		t.Fatalf("commit rewrite: %v", err)
+	}
+
+	// The row now surfaces under tenant B's chain.
+	rewritten, err := repo.ListAuditForVerify(ctx, tenantB)
+	if err != nil {
+		t.Fatalf("list audit for verify (after rewrite): %v", err)
+	}
+	if len(rewritten) != 1 {
+		t.Fatalf("tenant B audit rows after rewrite = %d, want 1", len(rewritten))
+	}
+	claimed := rewritten[0]
+
+	// The row_hash on disk is untouched (only tenant_id changed), so
+	// recomputing with the tenant the row currently claims (tenant B) must no
+	// longer match the row_hash stored under its original tenant (tenant A).
+	if recomputed := domain.ComputeAuditRowHash(tenantB, claimed, claimed.PrevHash); recomputed == claimed.RowHash {
+		t.Error("tenant_id rewrite was not detected: recomputed hash still matched stored row_hash")
 	}
 }
 

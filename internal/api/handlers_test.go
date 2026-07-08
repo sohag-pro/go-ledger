@@ -123,7 +123,7 @@ func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, 
 	return nil
 }
 
-func (f *fakeRepo) AppendAudit(_ context.Context, _ string, e domain.AuditEntry) error {
+func (f *fakeRepo) AppendAudit(_ context.Context, tenantID string, e domain.AuditEntry) error {
 	if e.ID == "" {
 		e.ID = uuid.NewString()
 	}
@@ -136,7 +136,7 @@ func (f *fakeRepo) AppendAudit(_ context.Context, _ string, e domain.AuditEntry)
 		prev = f.audit[len(f.audit)-1].RowHash
 	}
 	e.PrevHash = prev
-	e.RowHash = domain.ComputeAuditRowHash(e, prev)
+	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prev)
 	f.audit = append(f.audit, e)
 	return nil
 }

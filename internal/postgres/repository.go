@@ -372,12 +372,17 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	case err != nil:
 		return fmt.Errorf("postgres: get last audit hash: %w", err)
 	default:
-		// A pre-migration legacy row (NULL row_hash) surfaces as an invalid
-		// pgtype.Text, whose zero-value String is "": the same as genesis. That
-		// is deliberate, not a bug: those rows predate the hash chain and are
+		// A pre-migration legacy row has a NULL row_hash, which surfaces here
+		// as an invalid pgtype.Text. Those rows predate the hash chain and are
 		// cleared by the seeder's reset within four hours, so treating them as
-		// an unchained starting point is the only meaningful choice.
-		prevHash = last.String
+		// an unchained starting point (genesis) is the only meaningful choice.
+		// Made explicit rather than relying on the zero-value .String of an
+		// invalid pgtype.Text happening to equal genesis ("").
+		if last.Valid {
+			prevHash = last.String
+		} else {
+			prevHash = domain.AuditGenesisHash
+		}
 	}
 
 	e.ID = id.String()
@@ -390,7 +395,7 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	// would make every stored row_hash permanently unrecomputable.
 	e.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
 	e.PrevHash = prevHash
-	e.RowHash = domain.ComputeAuditRowHash(e, prevHash)
+	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prevHash)
 
 	if err := tr.q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
 		ID:            id,
