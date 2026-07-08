@@ -163,16 +163,19 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 
 	repo := postgres.NewRepository(pool)
-	// The REST tenant now comes only from the caller's API key (ADR-012), so
-	// unlike gRPC below there is no DefaultTenant fallback here: every /v1
-	// request must resolve through auth.HumaMiddleware. Key rows are
-	// provisioned directly in api_keys (see the ADR); a zero ttl falls back to
-	// the resolver's default cache TTL.
+	// The tenant for both REST and gRPC now comes only from the caller's API
+	// key (ADR-012): there is no DefaultTenant fallback for either surface.
+	// Every /v1 request resolves through auth.HumaMiddleware and every gRPC
+	// call resolves through the gRPC auth interceptor, both sharing this one
+	// resolver instance (and its in-memory cache). Key rows are provisioned
+	// directly in api_keys (see the ADR); a zero ttl falls back to the
+	// resolver's default cache TTL.
+	resolver := auth.NewResolver(repo, 0)
 	deps := api.Deps{
 		Accounts:     ledger.NewAccountService(repo),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
 		Audit:        ledger.NewAuditService(repo),
-		Auth:         auth.NewResolver(repo, 0),
+		Auth:         resolver,
 	}
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
@@ -231,10 +234,10 @@ func run(logger *slog.Logger) error {
 	}()
 
 	grpcSrv := grpcserver.NewGRPCServer(grpcserver.Deps{
-		Accounts:      deps.Accounts,
-		Transactions:  deps.Transactions,
-		Audit:         deps.Audit,
-		DefaultTenant: cfg.defaultTenant,
+		Accounts:     deps.Accounts,
+		Transactions: deps.Transactions,
+		Audit:        deps.Audit,
+		Auth:         resolver,
 	}, logger)
 	grpcListener, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {

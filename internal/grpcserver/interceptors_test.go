@@ -8,22 +8,119 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/domain"
 )
 
-func TestTenantInterceptorInjectsTenant(t *testing.T) {
-	var seen string
-	handler := func(ctx context.Context, _ any) (any, error) {
-		seen = tenantFrom(ctx)
+// fakeLookup is a minimal keyLookup (see internal/auth) backed by a fixed
+// hash to APIKey map, so authUnaryInterceptor can be tested against a real
+// auth.Resolver without a database.
+type fakeLookup struct {
+	keys map[string]domain.APIKey
+}
+
+func (f *fakeLookup) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
+	k, ok := f.keys[hash]
+	if !ok {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	return k, nil
+}
+
+const testPlaintextKey = "glk_interceptor-test-key" //nolint:gosec // test fixture key, not a real credential
+
+func newTestResolver() *auth.Resolver {
+	lookup := &fakeLookup{keys: map[string]domain.APIKey{
+		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test"},
+	}}
+	return auth.NewResolver(lookup, time.Minute)
+}
+
+func ctxWithAuthMetadata(bearer string) context.Context {
+	if bearer == "" {
+		return context.Background()
+	}
+	return metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", bearer))
+}
+
+func TestAuthInterceptorRejectsMissingMetadata(t *testing.T) {
+	called := false
+	handler := func(_ context.Context, _ any) (any, error) {
+		called = true
 		return nil, nil
 	}
-	interceptor := tenantUnaryInterceptor("tenant-xyz")
-	_, _ = interceptor(context.Background(), nil, &grpc.UnaryServerInfo{}, handler)
-	if seen != "tenant-xyz" {
-		t.Errorf("tenantFrom = %q, want tenant-xyz", seen)
+	interceptor := authUnaryInterceptor(newTestResolver())
+	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated", status.Code(err))
+	}
+	if called {
+		t.Error("handler should not run when authorization metadata is missing")
+	}
+}
+
+func TestAuthInterceptorRejectsInvalidKey(t *testing.T) {
+	called := false
+	handler := func(_ context.Context, _ any) (any, error) {
+		called = true
+		return nil, nil
+	}
+	interceptor := authUnaryInterceptor(newTestResolver())
+	ctx := ctxWithAuthMetadata("Bearer glk_does-not-exist")
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated", status.Code(err))
+	}
+	if called {
+		t.Error("handler should not run with an invalid key")
+	}
+}
+
+func TestAuthInterceptorInjectsTenantAndKeyForValidKey(t *testing.T) {
+	var seenTenant string
+	var seenKey domain.APIKey
+	handler := func(ctx context.Context, _ any) (any, error) {
+		seenTenant = tenantFrom(ctx)
+		seenKey, _ = auth.KeyFromContext(ctx)
+		return nil, nil
+	}
+	interceptor := authUnaryInterceptor(newTestResolver())
+	ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
+	if err != nil {
+		t.Fatalf("interceptor returned error for a valid key: %v", err)
+	}
+	if seenTenant != "tenant-xyz" {
+		t.Errorf("tenantFrom = %q, want tenant-xyz", seenTenant)
+	}
+	if seenKey.ID != "key-1" {
+		t.Errorf("key id = %q, want key-1", seenKey.ID)
+	}
+}
+
+func TestAuthInterceptorAllowsHealthCheckWithoutKey(t *testing.T) {
+	called := false
+	handler := func(ctx context.Context, _ any) (any, error) {
+		called = true
+		if tenant := tenantFrom(ctx); tenant != "" {
+			t.Errorf("health check should not have a tenant, got %q", tenant)
+		}
+		return nil, nil
+	}
+	interceptor := authUnaryInterceptor(newTestResolver())
+	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/grpc.health.v1.Health/Check"}, handler)
+	if err != nil {
+		t.Fatalf("health check should be allowed through without a key: %v", err)
+	}
+	if !called {
+		t.Error("handler should run for the health check even without authorization metadata")
 	}
 }
 

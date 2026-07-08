@@ -1,8 +1,10 @@
 // Command grpc-client is a small example that exercises the go-ledger gRPC API:
 // it creates two accounts, posts a balanced transaction between them, and reads
-// a balance back. Run the server first (GRPC_ADDR defaults to :9091), then:
+// a balance back. Run the server first (GRPC_ADDR defaults to :9091). The gRPC
+// surface authenticates like /v1 (see ADR-012): every call but the health check
+// needs a bearer API key, passed here via GRPC_API_KEY.
 //
-//	go run ./examples/grpc-client
+//	GRPC_API_KEY=glk_... go run ./examples/grpc-client
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	ledgerv1 "github.com/sohag-pro/go-ledger/internal/genproto/ledger/v1"
 )
@@ -22,6 +25,10 @@ func main() {
 	addr := os.Getenv("GRPC_ADDR")
 	if addr == "" {
 		addr = "localhost:9091"
+	}
+	apiKey := os.Getenv("GRPC_API_KEY")
+	if apiKey == "" {
+		log.Fatal("GRPC_API_KEY is required: the gRPC surface authenticates every call with a bearer API key")
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -32,6 +39,7 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+apiKey)
 
 	cash, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Cash", Type: "asset", Currency: "USD"})
 	if err != nil {

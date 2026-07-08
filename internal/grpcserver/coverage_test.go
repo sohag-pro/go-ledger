@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	ledgerv1 "github.com/sohag-pro/go-ledger/internal/genproto/ledger/v1"
 	"github.com/sohag-pro/go-ledger/internal/grpcserver"
@@ -29,7 +30,7 @@ const missingID = "00000000-0000-0000-0000-000000000000"
 // newDepsAndServer builds the same Deps dialClient uses, plus the raw
 // *grpcserver.Server (no grpc.Server, no bufconn, no interceptor chain). Tests
 // that need to observe a handler's behavior when called directly, without the
-// tenant interceptor injecting a tenant, use it instead of dialClient.
+// auth interceptor injecting a tenant, use it instead of dialClient.
 func newDepsAndServer(t *testing.T) (grpcserver.Deps, *grpcserver.Server) {
 	t.Helper()
 	if poolErr != nil {
@@ -37,17 +38,17 @@ func newDepsAndServer(t *testing.T) (grpcserver.Deps, *grpcserver.Server) {
 	}
 	repo := postgres.NewRepository(sharedPool)
 	deps := grpcserver.Deps{
-		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, nil, nil),
-		Audit:         ledger.NewAuditService(repo),
-		DefaultTenant: testTenant,
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, nil, nil),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, time.Minute),
 	}
 	return deps, grpcserver.NewServer(deps)
 }
 
 func TestGRPCAccountLifecycle(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 
 	created, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Coverage Checking", Type: "asset", Currency: "USD"})
 	if err != nil {
@@ -85,7 +86,7 @@ func TestGRPCAccountLifecycle(t *testing.T) {
 
 func TestGRPCCreateAccountInvalidType(t *testing.T) {
 	client := dialClient(t)
-	_, err := client.CreateAccount(context.Background(), &ledgerv1.CreateAccountRequest{Name: "Bad Type", Type: "not-a-type", Currency: "USD"})
+	_, err := client.CreateAccount(authedCtx(context.Background()), &ledgerv1.CreateAccountRequest{Name: "Bad Type", Type: "not-a-type", Currency: "USD"})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("code = %v, want InvalidArgument", status.Code(err))
 	}
@@ -93,7 +94,7 @@ func TestGRPCCreateAccountInvalidType(t *testing.T) {
 
 func TestGRPCCreateAccountInvalidAccount(t *testing.T) {
 	client := dialClient(t)
-	_, err := client.CreateAccount(context.Background(), &ledgerv1.CreateAccountRequest{Name: "", Type: "asset", Currency: "USD"})
+	_, err := client.CreateAccount(authedCtx(context.Background()), &ledgerv1.CreateAccountRequest{Name: "", Type: "asset", Currency: "USD"})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("code = %v, want InvalidArgument", status.Code(err))
 	}
@@ -101,7 +102,7 @@ func TestGRPCCreateAccountInvalidAccount(t *testing.T) {
 
 func TestGRPCGetBalanceNotFound(t *testing.T) {
 	client := dialClient(t)
-	_, err := client.GetBalance(context.Background(), &ledgerv1.GetBalanceRequest{AccountId: missingID})
+	_, err := client.GetBalance(authedCtx(context.Background()), &ledgerv1.GetBalanceRequest{AccountId: missingID})
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("code = %v, want NotFound", status.Code(err))
 	}
@@ -109,7 +110,7 @@ func TestGRPCGetBalanceNotFound(t *testing.T) {
 
 func TestGRPCPostTransactionInvalidCurrency(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 	a, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Bad Currency A", Type: "asset", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("create a: %v", err)
@@ -138,7 +139,7 @@ func TestGRPCPostTransactionInvalidCurrency(t *testing.T) {
 // reach.
 func TestGRPCPostTransactionIdempotencyMetadataWithoutKey(t *testing.T) {
 	client := dialClient(t)
-	ctx := metadata.AppendToOutgoingContext(context.Background(), "trace-id", "abc123")
+	ctx := metadata.AppendToOutgoingContext(authedCtx(context.Background()), "trace-id", "abc123")
 
 	a, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "No Idem A", Type: "asset", Currency: "USD"})
 	if err != nil {
@@ -166,7 +167,7 @@ func TestGRPCPostTransactionIdempotencyMetadataWithoutKey(t *testing.T) {
 
 func TestGRPCGetTransaction(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 	a, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Get Txn A", Type: "asset", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("create a: %v", err)
@@ -202,7 +203,7 @@ func TestGRPCGetTransaction(t *testing.T) {
 
 func TestGRPCGetTransactionAudit(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 	a, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Txn Audit A", Type: "asset", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("create a: %v", err)
@@ -249,7 +250,7 @@ func TestGRPCGetTransactionAudit(t *testing.T) {
 
 func TestGRPCGetStatementPaginatesAndValidatesCursor(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 	cash, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Statement Cash", Type: "asset", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("create cash: %v", err)
@@ -295,7 +296,7 @@ func TestGRPCGetStatementPaginatesAndValidatesCursor(t *testing.T) {
 
 func TestGRPCGetAccountAuditPaginatesAndValidatesCursor(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 	cash, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Audit Cash", Type: "asset", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("create cash: %v", err)

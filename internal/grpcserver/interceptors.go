@@ -4,32 +4,57 @@ import (
 	"context"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/sohag-pro/go-ledger/internal/auth"
 )
 
-type ctxKey int
+// healthMethodPrefix is the gRPC health service's method prefix
+// (grpc.health.v1.Health). Calls to it bypass authentication so liveness
+// probes work without an API key, matching /healthz on the REST side.
+const healthMethodPrefix = "/grpc.health.v1.Health/"
 
-const tenantKey ctxKey = iota
-
-// tenantFrom returns the tenant id the tenant interceptor stored on the context,
-// or "" if none. Handlers use it as REST handlers use deps.DefaultTenant.
+// tenantFrom returns the tenant id the auth interceptor resolved from the
+// caller's API key and stored on the context via auth.WithTenant, or "" if
+// none (an unauthenticated call, e.g. the health check).
 func tenantFrom(ctx context.Context) string {
-	if v, ok := ctx.Value(tenantKey).(string); ok {
-		return v
-	}
-	return ""
+	tenant, _ := auth.TenantFromContext(ctx)
+	return tenant
 }
 
-// tenantUnaryInterceptor injects the tenant into the context for every call.
-// For now it is a single configured default, the same seam as the REST layer;
-// when auth lands it will resolve the tenant from a token here instead.
-func tenantUnaryInterceptor(defaultTenant string) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		return handler(context.WithValue(ctx, tenantKey, defaultTenant), req)
+// authUnaryInterceptor authenticates every unary call except the gRPC health
+// check: it reads the "authorization" metadata value, resolves it to an API
+// key through resolver, and on success injects the key's tenant and the key
+// itself into the context (auth.WithTenant, auth.WithKey) before calling the
+// handler. A missing token or a resolver error (including auth.ErrUnauthorized)
+// is rejected with codes.Unauthenticated before the handler ever runs. The
+// token itself is never logged.
+func authUnaryInterceptor(resolver *auth.Resolver) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if strings.HasPrefix(info.FullMethod, healthMethodPrefix) {
+			return handler(ctx, req)
+		}
+
+		var bearer string
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if vals := md.Get("authorization"); len(vals) > 0 {
+				bearer = vals[0]
+			}
+		}
+
+		key, err := resolver.Resolve(ctx, bearer)
+		if err != nil {
+			return nil, status.Error(codes.Unauthenticated, "missing or invalid API key")
+		}
+
+		ctx = auth.WithKey(auth.WithTenant(ctx, key.TenantID), key)
+		return handler(ctx, req)
 	}
 }
 

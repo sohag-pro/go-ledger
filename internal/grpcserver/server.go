@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	ledgerv1 "github.com/sohag-pro/go-ledger/internal/genproto/ledger/v1"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
@@ -46,12 +47,13 @@ func clampLimit(requested, def, maxVal int) int {
 }
 
 // Deps are the shared services the gRPC handlers call, the same ones the REST
-// layer uses, plus the default tenant injected by the tenant interceptor.
+// layer uses, plus the resolver the auth interceptor uses to authenticate
+// every call and derive its tenant (see ADR-012).
 type Deps struct {
-	Accounts      *ledger.AccountService
-	Transactions  *ledger.TransactionService
-	Audit         *ledger.AuditService
-	DefaultTenant string
+	Accounts     *ledger.AccountService
+	Transactions *ledger.TransactionService
+	Audit        *ledger.AuditService
+	Auth         *auth.Resolver
 }
 
 // Server implements the generated LedgerServiceServer as a thin adapter: it
@@ -71,6 +73,10 @@ func NewServer(d Deps) *Server {
 
 // NewGRPCServer builds a *grpc.Server with the interceptor chain, the
 // LedgerService, server reflection (so grpcurl works), and the health service.
+// Every LedgerService call must authenticate through d.Auth (ADR-012); the
+// gRPC health check is exempt so liveness probes work without an API key.
+// Reflection is likewise left open: it only describes the service, it does
+// not call it, so there is nothing to authenticate.
 func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 	if log == nil {
 		log = slog.Default()
@@ -80,7 +86,7 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 		grpc.ChainUnaryInterceptor(
 			recoveryUnaryInterceptor(log),
 			loggingUnaryInterceptor(log),
-			tenantUnaryInterceptor(d.DefaultTenant),
+			authUnaryInterceptor(d.Auth),
 		),
 	)
 	ledgerv1.RegisterLedgerServiceServer(s, NewServer(d))
