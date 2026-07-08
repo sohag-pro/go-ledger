@@ -36,6 +36,7 @@ const dbMaxConns = 25
 // not overwhelmed by one container per test.
 var (
 	sharedPool *pgxpool.Pool
+	sharedDSN  string
 	poolErr    error
 )
 
@@ -81,6 +82,7 @@ func runWithContainer(m *testing.M) int {
 	}
 	defer pool.Close()
 	sharedPool = pool
+	sharedDSN = dsn
 	return m.Run()
 }
 
@@ -106,6 +108,24 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 	return sharedPool
 }
 
+// newTestPoolWithMaxConns returns a dedicated pool against the same shared
+// container, capped at maxConns. Some tests (the no-starvation test below)
+// need a small, deliberately scarce pool to make connection contention
+// observable; the package-wide sharedPool's dbMaxConns is sized for
+// throughput tests instead. The caller's test closes the pool via t.Cleanup.
+func newTestPoolWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+	if poolErr != nil {
+		t.Skipf("skipping integration test: %v", poolErr)
+	}
+	pool, err := postgres.NewPool(context.Background(), sharedDSN, maxConns)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -119,8 +139,8 @@ func discardLogger() *slog.Logger {
 // how real traffic looks: tenants are independent API-key holders, and this
 // test's job is to exercise cross-account contention and the retry loop, not
 // to be the definitive single-tenant concurrency test (see
-// TestPostConcurrentStressSingleTenant for that: since RunInTx acquires a
-// per-tenant session advisory lock before opening its transaction, see
+// TestPostConcurrentStressSingleTenant for that: since RunInTx holds a
+// per-tenant in-process mutex before opening its transaction, see
 // internal/postgres/repository.go, same-tenant posts now serialize one at a
 // time and different tenants run fully in parallel, which is what this test
 // exercises across its 10 tenants).
@@ -231,15 +251,15 @@ func TestPostConcurrentStress(t *testing.T) {
 
 // TestPostConcurrentStressSingleTenant is the single-tenant counterpart to
 // TestPostConcurrentStress, and the regression test for the fix described in
-// internal/postgres/repository.go's RunInTx: before the per-tenant session
-// advisory lock existed, 100 fully concurrent posts to one tenant reliably
-// exhausted the SERIALIZABLE retry budget. Every post reads the tenant's
-// latest audit row_hash and then inserts the next row (ADR-012's hash chain),
-// so concurrent same-tenant posts raced on that read; PostgreSQL aborted the
+// internal/postgres/repository.go's RunInTx: without any per-tenant
+// serialization, 100 fully concurrent posts to one tenant reliably exhausted
+// the SERIALIZABLE retry budget. Every post reads the tenant's latest audit
+// row_hash and then inserts the next row (ADR-012's hash chain), so
+// concurrent same-tenant posts raced on that read; PostgreSQL aborted the
 // loser with a serialization failure (SQLSTATE 40001), and at 100-way
 // concurrency the 25-attempt retry budget ran out, surfacing as
-// domain.ErrConflict (a 503 at the API layer). RunInTx now takes a per-tenant
-// session advisory lock before opening any transaction, so these 100 posts
+// domain.ErrConflict (a 503 at the API layer). RunInTx now holds a per-tenant
+// in-process mutex before opening any transaction, so these 100 posts
 // serialize one at a time instead of racing: this test asserts every one of
 // them succeeds, and then walks the tenant's full audit chain
 // (AuditService.Verify) to prove the serialized posts produced a genuinely
@@ -295,12 +315,12 @@ func TestPostConcurrentStressSingleTenant(t *testing.T) {
 	}
 	wg.Wait()
 
-	// The crux of this test: before the advisory lock, this reliably failed
-	// with domain.ErrConflict (serialization retries exhausted) under 100-way
-	// single-tenant concurrency. It must now be zero.
+	// The crux of this test: before per-tenant serialization existed, this
+	// reliably failed with domain.ErrConflict (serialization retries
+	// exhausted) under 100-way single-tenant concurrency. It must now be zero.
 	if f := failures.Load(); f != 0 {
 		t.Fatalf("%d of %d single-tenant concurrent posts failed; expected zero now that same-tenant "+
-			"posts serialize on the per-tenant advisory lock", f, goroutines)
+			"posts serialize on the per-tenant in-process mutex", f, goroutines)
 	}
 
 	// Same core invariant as TestPostConcurrentStress: the ledger nets to zero.
@@ -331,6 +351,172 @@ func TestPostConcurrentStressSingleTenant(t *testing.T) {
 	}
 	t.Logf("posted %d transactions to a single tenant via %d fully concurrent goroutines; audit chain valid (checked=%d rows)",
 		goroutines, goroutines, result.Checked)
+}
+
+// TestPostNoCrossTenantStarvation is the regression test for the second
+// critical flaw in the DB-advisory-lock approach this rework replaced: a
+// session advisory lock was taken on a connection checked out from the pool
+// before the lock wait even began, and held for the whole call including
+// every retry's backoff. A hot tenant's backlog of same-tenant posts could
+// therefore check out and hold most or all of the pool's connections while
+// merely waiting on the lock, starving every other tenant of a connection.
+// That defeated the entire point of scoping the lock per tenant: different
+// tenants are supposed to stay fully parallel.
+//
+// The fix (RunInTx holding a per-tenant in-process mutex, see
+// internal/postgres/repository.go) never lets a waiter touch the pool: a
+// goroutine blocked on another same-tenant call's mutex holds no database
+// connection at all, and only acquires one once it is its turn to actually
+// run an attempt. So a hot tenant's backlog, however long, never uses more
+// than one connection at a time; the rest of a small pool stays free for
+// other tenants throughout.
+//
+// This is checked by completion order, not wall-clock thresholds (which
+// would be flaky across machines): a shared counter tracks how many of the
+// hot tenant's posts have completed, and every "other" tenant's post records
+// that counter's value the instant it completes. If other tenants were
+// starved behind the hot backlog (the bug this replaces), that snapshot would
+// be close to the full backlog size, since an other-tenant post could not get
+// a connection until the backlog had largely drained. With the fix, other
+// tenants should complete almost immediately, while the hot backlog's counter
+// is still small.
+func TestPostNoCrossTenantStarvation(t *testing.T) {
+	const (
+		// A deliberately scarce pool: small enough that the old bug (waiters
+		// holding connections) would visibly starve other tenants, but with
+		// at least one connection to spare for the fix to demonstrate leaves
+		// free.
+		starvationMaxConns = 2
+		hotAccounts        = 6
+		hotBacklog         = 80
+		otherTenants       = 3
+		postsPerOther      = 5
+	)
+
+	pool := newTestPoolWithMaxConns(t, starvationMaxConns)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	ctx := context.Background()
+
+	setupTenant := func(accounts int) (string, []string) {
+		tenant := uuid.NewString()
+		ids := make([]string, accounts)
+		for i := range ids {
+			a := &domain.Account{Name: "acct", Type: domain.Asset, Currency: "USD"}
+			if err := repo.CreateAccount(ctx, tenant, a); err != nil {
+				t.Fatalf("create account %d: %v", i, err)
+			}
+			ids[i] = a.ID
+		}
+		return tenant, ids
+	}
+
+	hotTenant, hotIDs := setupTenant(hotAccounts)
+	otherTenantIDs := make([]string, otherTenants)
+	otherAccountIDs := make([][]string, otherTenants)
+	for i := range otherTenantIDs {
+		otherTenantIDs[i], otherAccountIDs[i] = setupTenant(2)
+	}
+
+	post := func(tenant string, ids []string, seed int) error {
+		rng := rand.New(rand.NewSource(int64(seed) + 1)) //nolint:gosec // test data, not crypto
+		from := rng.Intn(len(ids))
+		to := rng.Intn(len(ids) - 1)
+		if to >= from { // pick a distinct second account
+			to++
+		}
+		amt := rng.Int63n(1_000_000) + 1
+		debit, _ := domain.NewMoney(amt, "USD")
+		credit, _ := domain.NewMoney(-amt, "USD")
+		txn := &domain.Transaction{Postings: []domain.Posting{
+			{AccountID: ids[from], Amount: debit},
+			{AccountID: ids[to], Amount: credit},
+		}}
+		_, err := svc.Post(ctx, tenant, txn, nil)
+		return err
+	}
+
+	var (
+		wg          sync.WaitGroup
+		hotFailures atomic.Int64
+		hotDone     atomic.Int64
+		othFailures atomic.Int64
+		snapMu      sync.Mutex
+		snapshots   = make([]int64, 0, otherTenants*postsPerOther)
+	)
+
+	// Launch the hot tenant's whole backlog at once. With the in-process
+	// mutex these all serialize on Go: at most one is ever actually running
+	// an attempt (and therefore holding a connection) at a time.
+	for g := 0; g < hotBacklog; g++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			if err := post(hotTenant, hotIDs, seed); err != nil {
+				hotFailures.Add(1)
+				t.Errorf("hot tenant post failed: %v", err)
+				return
+			}
+			hotDone.Add(1)
+		}(g)
+	}
+
+	// A short head start so the hot backlog is genuinely queued up, and (if
+	// the bug were present) would already be monopolizing the pool's
+	// connections, before the other tenants start.
+	time.Sleep(20 * time.Millisecond)
+
+	for ti := 0; ti < otherTenants; ti++ {
+		tenant, ids := otherTenantIDs[ti], otherAccountIDs[ti]
+		for g := 0; g < postsPerOther; g++ {
+			wg.Add(1)
+			go func(seed int) {
+				defer wg.Done()
+				if err := post(tenant, ids, seed); err != nil {
+					othFailures.Add(1)
+					t.Errorf("other tenant post failed: %v", err)
+					return
+				}
+				snap := hotDone.Load()
+				snapMu.Lock()
+				snapshots = append(snapshots, snap)
+				snapMu.Unlock()
+			}(ti*1000 + g)
+		}
+	}
+
+	wg.Wait()
+
+	if f := hotFailures.Load(); f != 0 {
+		t.Fatalf("%d of %d hot-tenant posts failed", f, hotBacklog)
+	}
+	if f := othFailures.Load(); f != 0 {
+		t.Fatalf("%d other-tenant posts failed", f)
+	}
+	if len(snapshots) != otherTenants*postsPerOther {
+		t.Fatalf("got %d other-tenant completions, want %d", len(snapshots), otherTenants*postsPerOther)
+	}
+
+	// The property under test: other tenants complete while the hot backlog
+	// is still mostly in flight, not after it has drained. A generous bound
+	// (half the backlog) still cleanly separates "starved" from "not
+	// starved": before this fix, a same-sized pool made every other-tenant
+	// post wait for nearly the entire hot backlog to complete first, since
+	// waiting hot goroutines had already checked out the pool's connections.
+	var maxSnap int64
+	for _, s := range snapshots {
+		if s > maxSnap {
+			maxSnap = s
+		}
+	}
+	if limit := int64(hotBacklog) / 2; maxSnap >= limit {
+		t.Fatalf("slowest other-tenant post did not complete until %d of %d hot-tenant posts had finished "+
+			"(wanted under %d); other tenants appear to be starved behind the hot tenant's backlog",
+			maxSnap, hotBacklog, limit)
+	}
+	t.Logf("hot tenant backlog=%d (pool MaxConns=%d); %d other-tenant posts across %d tenants all completed "+
+		"while at most %d of the hot backlog had finished",
+		hotBacklog, starvationMaxConns, otherTenants*postsPerOther, otherTenants, maxSnap)
 }
 
 // percentile returns the q-quantile (0..1) of ds. Returns 0 for an empty slice.

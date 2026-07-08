@@ -141,6 +141,71 @@ so tamper-evidence is not just stored but checkable. This sits on top of, not
 instead of, the existing immutability trigger: the trigger prevents casual
 mutation, and the chain detects a privileged rewrite that bypasses it.
 
+### Same-tenant posts serialize with an in-process mutex
+
+The audit chain's read-then-insert above is a genuine same-tenant conflict.
+Every post reads the tenant's latest `row_hash` and then inserts the next row,
+in the same SERIALIZABLE transaction as the ledger posting, so two concurrent
+same-tenant posts reading the same chain tail is a real read-write
+antidependency. PostgreSQL aborts the loser with a serialization failure
+(SQLSTATE 40001), and under sustained same-tenant concurrency the repeated
+abort can exhaust the retry budget (25 attempts) and surface to the caller as
+a `503`.
+
+We first tried closing this with a per-tenant PostgreSQL session advisory
+lock (`pg_advisory_lock`), taken on a connection checked out from the pool
+before the SERIALIZABLE transaction began, so a blocked waiter's snapshot was
+not fixed until the lock holder had committed. A review found this had two
+problems specific to this service's own configuration, serious enough to
+replace rather than patch:
+
+1. The connection pool sets `lock_timeout` to 3 seconds. `pg_advisory_lock`
+   waits are subject to `lock_timeout`, so a waiter under sustained
+   contention could be aborted by Postgres with SQLSTATE 55P03. That code is
+   not a serialization failure, was not retried, and was not mapped to
+   `domain.ErrConflict`, so it surfaced as an opaque `500` instead of the
+   intended `503`.
+2. The lock was acquired on a connection checked out from the pool before the
+   wait began, and held for the whole call, including every retry's backoff.
+   A burst of same-tenant posts could check out and hold most or all of the
+   pool's connections while merely waiting on the lock, starving every other
+   tenant's posts of a connection. That defeats the entire point of scoping
+   the lock per tenant: different tenants are supposed to stay fully
+   parallel.
+
+The fix, since go-ledger runs as a single VPS instance rather than a fleet, is
+an in-process keyed mutex in the repository adapter
+(`internal/postgres/repository.go`): one `sync.Mutex` per tenant id, held for
+the whole `RunInTx` call but never around a checked-out database connection.
+A post for a tenant that already has one in flight blocks on that Go mutex,
+holding no connection while it waits; once unblocked it begins its own
+attempt exactly as before the advisory lock existed, acquiring a connection
+from the pool only when it actually runs, and releasing it between attempts
+(including during backoff). Different tenants use different mutexes and never
+wait on each other. The map of per-tenant mutexes grows with the number of
+distinct tenants ever seen and is never evicted; at this service's tenant
+count that stays small and cheap, so eviction was not built.
+
+This closes both problems above: there is no database lock wait, so
+`lock_timeout` and SQLSTATE 55P03 do not apply, and a waiting goroutine never
+holds a pool connection, so a hot tenant's backlog cannot starve other
+tenants of connections. The SERIALIZABLE retry loop is unchanged and remains
+the correctness backstop, not the primary serialization mechanism for
+same-tenant posts: on today's single instance it now runs only after the
+in-process mutex has already made same-tenant execution one at a time, so it
+should rarely see a same-tenant conflict at all. If go-ledger is ever run as
+more than one instance, the in-process mutex only serializes posts within one
+instance; the retry loop is what still guarantees correctness across
+instances, since a same-tenant race between two different instances remains
+possible (rare) and would retry rather than corrupt the chain.
+
+This supersedes ADR-004's negative consequence "conflicts cost retries, not
+blocked connections," specifically for same-tenant posting. That trade still
+holds for the SERIALIZABLE mechanism itself and for any cross-instance
+conflict, but for same-tenant posts on today's single instance the practical
+cost is now waiting on an in-process mutex, not a retry, and not a blocked
+database connection.
+
 ## Consequences
 
 ### Positive
@@ -160,10 +225,13 @@ mutation, and the chain detects a privileged rewrite that bypasses it.
 
 - Every `/v1` request now does a key lookup; the in-memory cache keeps that off
   the database on the hot path but means revocation lags by up to the cache TTL.
-- The audit chain serializes audit writes per tenant and adds one indexed read
-  inside the posting transaction under SERIALIZABLE. For a per-tenant write rate
-  this is negligible, but it is real coupling that a very high-throughput single
-  tenant would feel.
+- The audit chain requires same-tenant posts to serialize: one at a time, in
+  the order they arrive. On today's single-instance deployment this is
+  enforced by an in-process per-tenant mutex (see the Decision section above),
+  not by a database lock, so different tenants stay fully parallel and a hot
+  tenant's queued posts hold no database connection while they wait. It is
+  still real coupling that a very high-throughput single tenant would feel as
+  added latency, just not as blocked connections or a database lock timeout.
 - Key management for real tenants is still manual this pass (insert a row, or a
   small CLI): there is no self-service key issuance UI, which is out of scope.
 - The demo key is public by design. That is safe only because it is tenant-scoped,
@@ -194,3 +262,12 @@ mutation, and the chain detects a privileged rewrite that bypasses it.
   deletion, which is the property the audit needed. Signing adds authenticity of
   the writer on top, which matters once there is more than one writer identity;
   that is a later concern.
+- **A per-tenant PostgreSQL session advisory lock, to serialize same-tenant
+  posts**: tried and reverted. It closed the audit-chain serialization storm
+  but introduced two problems of its own: the lock wait was subject to the
+  pool's `lock_timeout` and could abort with an unmapped SQLSTATE 55P03 (an
+  opaque `500` instead of a `503`), and the lock was held on a connection
+  checked out before the wait began, so a same-tenant burst could hold most or
+  all of the pool's connections purely waiting, starving other tenants. An
+  in-process per-tenant mutex has neither problem, since it never touches a
+  database connection while waiting.

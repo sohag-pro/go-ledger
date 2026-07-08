@@ -412,14 +412,15 @@ func TestRunInTxExhaustionReturnsConflict(t *testing.T) {
 	}
 }
 
-// TestRunInTxDifferentTenantsRunConcurrently proves the per-tenant session
-// advisory lock (added to stop the audit-chain serialization storm, see
-// RunInTx's doc comment) only ever serializes calls for the SAME tenant.
-// Tenant A's call holds the lock (and an open transaction) for a deliberate
-// pause; tenant B's call, started while A's is still running, must complete
-// long before that pause elapses. If different tenants shared a lock (or a
-// key collision), B would block behind A and take at least as long as the
-// pause.
+// TestRunInTxDifferentTenantsRunConcurrently proves the per-tenant in-process
+// mutex (added to stop the audit-chain serialization storm, see RunInTx's doc
+// comment) only ever serializes calls for the SAME tenant. Tenant A's call
+// holds its mutex (and an open transaction) for a deliberate pause; tenant
+// B's call, started while A's is still running, must complete long before
+// that pause elapses. If different tenants shared a mutex, B would block
+// behind A and take at least as long as the pause. Unlike a hashed lock key,
+// a mutex keyed by the exact tenant id string has no collision risk to guard
+// against.
 func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
@@ -450,7 +451,7 @@ func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
 	}
 	if elapsed >= pause {
 		t.Fatalf("tenant B's RunInTx took %s, at least as long as tenant A's %s pause: "+
-			"it appears to have waited on tenant A's advisory lock", elapsed, pause)
+			"it appears to have waited on tenant A's mutex", elapsed, pause)
 	}
 	wg.Wait()
 }
