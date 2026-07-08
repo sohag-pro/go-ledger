@@ -50,6 +50,12 @@ func retryBackoff(attempt int) time.Duration {
 // connection: waiters block on ordinary Go scheduling, not on anything held
 // against Postgres.
 //
+// Each key's mutex is a capacity-1 channel rather than a sync.Mutex so that a
+// waiter can give up: acquiring it is a select between sending on the channel
+// and the caller's context being done, so a cancelled or timed-out caller
+// stops waiting immediately instead of blocking until the current holder
+// releases.
+//
 // The underlying sync.Map grows by one entry per distinct key ever seen and
 // is never evicted. That is deliberate: keys here are tenant ids, bounded by
 // the number of tenants the service has, not by request volume, so the map
@@ -57,13 +63,19 @@ func retryBackoff(attempt int) time.Duration {
 // for no real memory benefit at this scale.
 type keyedMutex struct{ m sync.Map }
 
-// lock blocks until key's mutex is free, then locks it and returns a func
-// that unlocks it. The caller is expected to defer the returned func.
-func (k *keyedMutex) lock(key string) func() {
-	mu, _ := k.m.LoadOrStore(key, &sync.Mutex{})
-	m := mu.(*sync.Mutex) //nolint:forcetypeassert // this map only ever stores *sync.Mutex, set two lines up
-	m.Lock()
-	return m.Unlock
+// lock blocks until key's mutex is free or ctx is done, whichever comes
+// first. On success it returns a func that releases the mutex; the caller is
+// expected to defer it. On cancellation it returns ctx.Err() and a nil func;
+// the mutex is left exactly as it was, since this caller never acquired it.
+func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
+	chAny, _ := k.m.LoadOrStore(key, make(chan struct{}, 1))
+	ch := chAny.(chan struct{}) //nolint:forcetypeassert // this map only ever stores chan struct{}, set two lines up
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // Repository is a domain.Repository backed by a pgx connection pool.
@@ -195,14 +207,19 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // same-tenant concurrency that repeated abort can exhaust the retry budget
 // and surface as a 503.
 //
-// The lock is a plain in-process sync.Mutex, not a database lock, and that is
-// the point (see ADR-012). A waiter blocks on Go's scheduler; it has not
-// acquired a database connection and never will until it is its turn to run
-// an attempt, so a burst of same-tenant callers cannot exhaust the connection
-// pool or starve other tenants of connections the way a lock held on a
-// checked-out connection can. It also means Postgres's lock_timeout, which
-// bounds how long a session will wait on a database-level lock, never applies
-// here: there is no database lock wait to time out.
+// The lock is a channel-backed in-process mutex, not a database lock, and
+// that is the point (see ADR-012). A waiter blocks on Go's scheduler; it has
+// not acquired a database connection and never will until it is its turn to
+// run an attempt, so a burst of same-tenant callers cannot exhaust the
+// connection pool or starve other tenants of connections the way a lock held
+// on a checked-out connection can. It also means Postgres's lock_timeout,
+// which bounds how long a session will wait on a database-level lock, never
+// applies here: there is no database lock wait to time out. Unlike a plain
+// sync.Mutex, the wait itself respects ctx: if the caller's context is
+// cancelled or times out while parked waiting for the tenant lock, lock
+// returns ctx.Err() immediately instead of leaving the goroutine parked until
+// the current holder finishes, so a pile of abandoned client requests cannot
+// accumulate blocked goroutines under sustained same-tenant overload.
 //
 // This only serializes same-tenant posting within one process. go-ledger runs
 // as a single instance (a VPS, not a fleet), so that is a complete fix today.
@@ -211,7 +228,10 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // above remains in place as the backstop for that case; it would simply see
 // same-tenant conflicts occasionally instead of never.
 func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error {
-	unlock := r.tenantLocks.lock(tenantID)
+	unlock, err := r.tenantLocks.lock(ctx, tenantID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	var lastErr error

@@ -456,6 +456,64 @@ func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
 	wg.Wait()
 }
 
+// TestRunInTxCancelledWaiterReturnsPromptly is the regression test for the
+// context-cancellation fix to the per-tenant keyed mutex (see keyedMutex.lock
+// in internal/postgres/repository.go). Before the fix, a caller parked
+// waiting for another same-tenant RunInTx to release the mutex was not
+// cancellable: it blocked on a plain sync.Mutex until its turn regardless of
+// its own context. Under sustained same-tenant overload with client
+// timeouts, that piles up parked goroutines that can never give up.
+//
+// Goroutine A holds the tenant's lock for a long pause via a slow fn.
+// Goroutine B starts a RunInTx for the same tenant with a context cancelled
+// shortly after B begins waiting. B must return promptly with a context
+// error, well before A's pause elapses, and its fn must never run: B never
+// got the lock, so it never had a transaction to run fn in.
+func TestRunInTxCancelledWaiterReturnsPromptly(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	const pause = 2 * time.Second
+	tenant := uuid.NewString()
+
+	holding := make(chan struct{})
+	var wgA sync.WaitGroup
+	wgA.Add(1)
+	go func() {
+		defer wgA.Done()
+		_ = repo.RunInTx(context.Background(), tenant, func(_ context.Context, _ domain.Tx) error {
+			close(holding)
+			time.Sleep(pause)
+			return nil
+		})
+	}()
+	<-holding // goroutine A now holds tenant's lock and will for ~pause.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel) // cancel while B is still waiting for the lock.
+
+	bRan := false
+	start := time.Now()
+	err := repo.RunInTx(ctx, tenant, func(_ context.Context, _ domain.Tx) error {
+		bRan = true
+		return nil
+	})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if bRan {
+		t.Error("fn ran even though the waiter never acquired the tenant lock")
+	}
+	if elapsed >= pause {
+		t.Fatalf("cancelled waiter took %s, at least as long as the %s pause holding the lock: "+
+			"it did not return promptly on cancellation", elapsed, pause)
+	}
+
+	wgA.Wait()
+}
+
 // TestRunInTxNonRetryablePropagates checks that an ordinary error is returned
 // immediately, without retrying.
 func TestRunInTxNonRetryablePropagates(t *testing.T) {
