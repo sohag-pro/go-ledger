@@ -91,6 +91,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		Tags:          []string{"transactions"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
+		Security:      bearerSecurity,
 	}, func(ctx context.Context, in *CreateTransactionInput) (*CreateTransactionOutput, error) {
 		if in.IdempotencyKey == "" {
 			return nil, huma.Error400BadRequest("Idempotency-Key header is required")
@@ -127,6 +128,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		Path:        "/v1/transactions/{id}",
 		Summary:     "Get a transaction",
 		Tags:        []string{"transactions"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *transactionIDInput) (*TransactionOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {

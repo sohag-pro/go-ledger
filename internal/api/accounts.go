@@ -98,6 +98,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		Tags:          []string{"accounts"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
+		Security:      bearerSecurity,
 	}, func(ctx context.Context, in *CreateAccountInput) (*AccountOutput, error) {
 		at, err := domain.ParseAccountType(in.Body.Type)
 		if err != nil {
@@ -120,6 +121,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		Path:        "/v1/accounts",
 		Summary:     "List accounts",
 		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *ListAccountsInput) (*AccountsOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
@@ -143,6 +145,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		Path:        "/v1/accounts/{id}",
 		Summary:     "Get an account",
 		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *accountIDInput) (*AccountOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
@@ -161,6 +164,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		Path:        "/v1/accounts/{id}/balance",
 		Summary:     "Get an account's balance",
 		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *accountIDInput) (*BalanceOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
@@ -183,6 +187,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		Path:        "/v1/accounts/{id}/statement",
 		Summary:     "List an account's postings with running balance",
 		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *StatementInput) (*StatementOutput, error) {
 		after, err := decodeCursor(in.Cursor)
 		if err != nil {

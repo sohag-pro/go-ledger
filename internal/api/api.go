@@ -33,6 +33,15 @@ const APIVersion = "0.2.0"
 // directly without the wrapping middleware.
 const MaxRequestBodyBytes int64 = 64 * 1024
 
+// bearerSecurity is the per-operation Security requirement every /v1
+// operation sets, referencing the "bearerAuth" scheme registered on
+// config.Components.SecuritySchemes in New. huma's OpenAPI security model
+// is per-operation (an empty inner slice means no scopes, which is right
+// for a plain bearer token), so this is attached individually to each /v1
+// huma.Operation literal rather than as a single global default; health,
+// openapi.json/yaml, and schemas simply never set it.
+var bearerSecurity = []map[string][]string{{"bearerAuth": {}}}
+
 // Deps are the services the operations call, plus the auth resolver every /v1
 // request goes through to derive its tenant, and the per-key rate limiter
 // applied after auth. The tenant is never a request field: HumaMiddleware
@@ -87,6 +96,13 @@ func New(router chi.Router, deps Deps) huma.API {
 		"Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.\n\n" +
 		"Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. " +
 		"A transaction's postings must sum to zero.\n\n" +
+		"Authentication: every /v1 endpoint requires a bearer API key, sent as `Authorization: Bearer <api-key>`. " +
+		"A missing, unknown, or revoked key returns 401. To try the API without provisioning your own key, use the public demo key " +
+		"`glk_demo_public_key_reset_every_4h` (also wired into the try-it console and the Scalar playground below): it is scoped to " +
+		"the demo tenant and rate limited, so it is safe to expose.\n\n" +
+		"Idempotency: POST /v1/transactions requires an `Idempotency-Key` header so retries are safe. Repeating a request with the " +
+		"same key returns the original transaction unchanged (with `Idempotent-Replayed: true`) instead of posting again; reusing a " +
+		"key with a different request body returns 409 Conflict.\n\n" +
 		"This is a public demo: the data resets every 4 hours to a fresh, realistic ledger.\n\n" +
 		"- Source: [github.com/sohag-pro/go-ledger](https://github.com/sohag-pro/go-ledger)\n" +
 		"- Landing page: [go.sohag.pro](https://go.sohag.pro)\n" +
@@ -98,6 +114,22 @@ func New(router chi.Router, deps Deps) huma.API {
 	}
 	config.Servers = []*huma.Server{
 		{URL: "https://go.sohag.pro", Description: "production"},
+	}
+
+	// Advertise bearer-key auth in the spec itself, so the Scalar playground
+	// renders an Authorization input and generated clients know the scheme.
+	// This is declared once here and referenced by name (bearerSecurity,
+	// below) from every /v1 operation's Security field. It is deliberately
+	// not set as a global default: health, openapi.json/yaml, and schemas
+	// are unauthenticated (see New's middleware comment), and per-operation
+	// Security keeps that true in the spec instead of listing them as
+	// exceptions to a blanket requirement.
+	config.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
+		"bearerAuth": {
+			Type:        "http",
+			Scheme:      "bearer",
+			Description: "API key issued per tenant. Send as `Authorization: Bearer <api-key>`. Use `glk_demo_public_key_reset_every_4h` to try the API against the demo tenant.",
+		},
 	}
 
 	api := humachi.New(router, config)

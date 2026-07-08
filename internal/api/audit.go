@@ -77,6 +77,7 @@ func registerAudit(api huma.API, deps Deps) {
 		Path:        "/v1/transactions/{id}/audit",
 		Summary:     "List a transaction's audit log",
 		Tags:        []string{"transactions"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *transactionIDInput) (*AuditListOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
@@ -95,6 +96,7 @@ func registerAudit(api huma.API, deps Deps) {
 		Path:        "/v1/accounts/{id}/audit",
 		Summary:     "List an account's audit log",
 		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *AccountAuditInput) (*AccountAuditOutput, error) {
 		after, err := decodeCursor(in.Cursor)
 		if err != nil {
@@ -130,7 +132,8 @@ func registerAudit(api huma.API, deps Deps) {
 		Summary:     "Verify the tamper-evident audit chain",
 		Description: "Walks the caller's tenant audit chain oldest first and recomputes every row's hash, " +
 			"detecting any row that was altered after it was written (ADR-012).",
-		Tags: []string{"audit"},
+		Tags:     []string{"audit"},
+		Security: bearerSecurity,
 	}, func(ctx context.Context, _ *struct{}) (*VerifyAuditOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
