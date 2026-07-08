@@ -26,6 +26,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/sohag-pro/go-ledger/internal/api"
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
@@ -162,11 +163,16 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 
 	repo := postgres.NewRepository(pool)
+	// The REST tenant now comes only from the caller's API key (ADR-012), so
+	// unlike gRPC below there is no DefaultTenant fallback here: every /v1
+	// request must resolve through auth.HumaMiddleware. Key rows are
+	// provisioned directly in api_keys (see the ADR); a zero ttl falls back to
+	// the resolver's default cache TTL.
 	deps := api.Deps{
-		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
-		Audit:         ledger.NewAuditService(repo),
-		DefaultTenant: cfg.defaultTenant,
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, 0),
 	}
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an

@@ -7,10 +7,14 @@
 package api
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
@@ -19,14 +23,31 @@ import (
 // snapshot stays reproducible across machines and CI.
 const APIVersion = "0.2.0"
 
-// Deps are the services the operations call, plus the tenant every request acts
-// as until an auth layer resolves a real one. Spec generation passes a zero Deps
-// because the handler bodies are never invoked while serializing the schema.
+// Deps are the services the operations call, plus the auth resolver every /v1
+// request goes through to derive its tenant. The tenant is never a request
+// field: HumaMiddleware resolves it from the bearer key and handlers read it
+// back with auth.TenantFromContext. Spec generation passes a zero Deps because
+// the handler bodies (and the middleware, which only runs on a served request)
+// are never invoked while serializing the schema.
 type Deps struct {
-	Accounts      *ledger.AccountService
-	Transactions  *ledger.TransactionService
-	Audit         *ledger.AuditService
-	DefaultTenant string
+	Accounts     *ledger.AccountService
+	Transactions *ledger.TransactionService
+	Audit        *ledger.AuditService
+	Auth         *auth.Resolver
+}
+
+// tenantFromCtx reads the tenant HumaMiddleware resolved from the caller's API
+// key. Every /v1 handler calls this instead of trusting a request field: the
+// tenant comes only from the key. A missing tenant means the middleware did
+// not run, which should be impossible for a served /v1 request, so it is
+// reported as an internal error rather than silently defaulting to any
+// tenant.
+func tenantFromCtx(ctx context.Context) (string, error) {
+	tenant, ok := auth.TenantFromContext(ctx)
+	if !ok {
+		return "", huma.Error500InternalServerError("tenant not resolved")
+	}
+	return tenant, nil
 }
 
 // New builds the huma API on the given chi router, registers every operation,
@@ -64,6 +85,15 @@ func New(router chi.Router, deps Deps) huma.API {
 	}
 
 	api := humachi.New(router, config)
+
+	// Require a bearer API key on every /v1 operation and derive its tenant
+	// from the resolved key. Health, openapi.json/yaml, and schemas are huma
+	// operations on this same API, so the middleware scopes itself by the
+	// matched operation's path rather than by chi-level routing (see
+	// docs/adr/012-api-authentication-and-hardening.md and
+	// internal/auth/middleware.go).
+	api.UseMiddleware(auth.HumaMiddleware(api, deps.Auth, slog.Default()))
+
 	registerOperations(api, deps)
 	return api
 }

@@ -102,8 +102,12 @@ func registerAccounts(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
 		acct := &domain.Account{Name: in.Body.Name, Type: at, Currency: domain.Currency(in.Body.Currency)}
-		if err := deps.Accounts.Create(ctx, deps.DefaultTenant, acct); err != nil {
+		if err := deps.Accounts.Create(ctx, tenant, acct); err != nil {
 			return nil, toHumaErr(err)
 		}
 		return &AccountOutput{Body: toAccountBody(*acct)}, nil
@@ -116,7 +120,11 @@ func registerAccounts(api huma.API, deps Deps) {
 		Summary:     "List accounts",
 		Tags:        []string{"accounts"},
 	}, func(ctx context.Context, in *ListAccountsInput) (*AccountsOutput, error) {
-		accts, err := deps.Accounts.List(ctx, deps.DefaultTenant, in.Limit)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		accts, err := deps.Accounts.List(ctx, tenant, in.Limit)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
@@ -135,7 +143,11 @@ func registerAccounts(api huma.API, deps Deps) {
 		Summary:     "Get an account",
 		Tags:        []string{"accounts"},
 	}, func(ctx context.Context, in *accountIDInput) (*AccountOutput, error) {
-		acct, err := deps.Accounts.Get(ctx, deps.DefaultTenant, in.ID)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		acct, err := deps.Accounts.Get(ctx, tenant, in.ID)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
@@ -149,7 +161,11 @@ func registerAccounts(api huma.API, deps Deps) {
 		Summary:     "Get an account's balance",
 		Tags:        []string{"accounts"},
 	}, func(ctx context.Context, in *accountIDInput) (*BalanceOutput, error) {
-		bal, err := deps.Accounts.Balance(ctx, deps.DefaultTenant, in.ID)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		bal, err := deps.Accounts.Balance(ctx, tenant, in.ID)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
@@ -171,7 +187,11 @@ func registerAccounts(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, huma.Error422UnprocessableEntity(err.Error())
 		}
-		acct, entries, err := deps.Accounts.Statement(ctx, deps.DefaultTenant, in.ID, after, in.Limit)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		acct, entries, err := deps.Accounts.Statement(ctx, tenant, in.ID, after, in.Limit)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}

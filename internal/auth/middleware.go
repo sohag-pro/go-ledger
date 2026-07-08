@@ -1,0 +1,118 @@
+package auth
+
+import (
+	"errors"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"github.com/danielgtaylor/huma/v2"
+)
+
+// authHeader is the header a bearer token is read from. Handlers and this
+// middleware never log its value, only the outcome of resolving it.
+const authHeader = "Authorization"
+
+// v1PathPrefix is the only path prefix that requires a bearer API key. Health,
+// the OpenAPI/schema documents, the playground, the console, and static assets
+// are huma operations or chi routes outside this prefix and are deliberately
+// left open (see docs/adr/012-api-authentication-and-hardening.md).
+const v1PathPrefix = "/v1"
+
+// isV1Path reports whether path is under /v1, treating "/v1" itself and any
+// "/v1/..." path as in scope, but not an unrelated path that merely starts
+// with the same four characters (e.g. "/v1beta").
+func isV1Path(path string) bool {
+	return path == v1PathPrefix || strings.HasPrefix(path, v1PathPrefix+"/")
+}
+
+// HumaMiddleware returns a huma middleware, registered with api.UseMiddleware,
+// that requires a valid bearer API key on every operation whose path is under
+// /v1 and lets every other operation (health, openapi.json/yaml, schemas)
+// through unauthenticated. Health and openapi are huma operations on the same
+// API as the rest of /v1, so this middleware scopes itself by the matched
+// operation's path rather than relying on chi-level routing.
+//
+// On success it derives the tenant from the resolved key and injects both the
+// tenant id and the key into the request context (WithTenant, WithKey) so
+// downstream handlers read the tenant with TenantFromContext instead of
+// trusting any request field: the tenant comes only from the key. On failure
+// it writes a 401 problem+json body ({"status":401,"title":"Unauthorized"})
+// and never calls next, so the handler body never runs.
+//
+// api is the same huma.API this middleware is registered on; huma.WriteErr
+// needs it for content negotiation when writing the error body.
+func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(huma.Context, func(huma.Context)) {
+	if log == nil {
+		log = slog.Default()
+	}
+	return func(ctx huma.Context, next func(huma.Context)) {
+		op := ctx.Operation()
+		if op == nil || !isV1Path(op.Path) {
+			next(ctx)
+			return
+		}
+
+		if resolver == nil {
+			log.LogAttrs(ctx.Context(), slog.LevelError, "auth: no resolver configured for a /v1 request",
+				slog.String("path", op.Path))
+			_ = huma.WriteErr(api, ctx, http.StatusInternalServerError, "")
+			return
+		}
+
+		key, err := resolver.Resolve(ctx.Context(), ctx.Header(authHeader))
+		if err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				_ = huma.WriteErr(api, ctx, http.StatusUnauthorized, "")
+				return
+			}
+			log.LogAttrs(ctx.Context(), slog.LevelError, "auth: resolve failed",
+				slog.String("path", op.Path), slog.String("error", err.Error()))
+			_ = huma.WriteErr(api, ctx, http.StatusInternalServerError, "")
+			return
+		}
+
+		newCtx := WithKey(WithTenant(ctx.Context(), key.TenantID), key)
+		next(huma.WithContext(ctx, newCtx))
+	}
+}
+
+// Middleware returns a net/http middleware equivalent to HumaMiddleware: it
+// resolves the Authorization header on every request through it, injecting
+// the tenant and key into the request context on success or writing a 401
+// problem+json body on failure. It is the chi-level fallback described in
+// docs/adr/012 for a huma version where operation middleware cannot scope by
+// path or mutate the downstream context; go-ledger's huma v2.38.0 does both
+// cleanly (huma.Context.Operation().Path and huma.WithContext), so this
+// function is not wired into cmd/server today, but is kept ready if a huma
+// upgrade or a non-huma route ever needs chi-level auth.
+func Middleware(resolver *Resolver, log *slog.Logger) func(http.Handler) http.Handler {
+	if log == nil {
+		log = slog.Default()
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key, err := resolver.Resolve(r.Context(), r.Header.Get(authHeader))
+			if err != nil {
+				if !errors.Is(err, ErrUnauthorized) {
+					log.LogAttrs(r.Context(), slog.LevelError, "auth: resolve failed",
+						slog.String("path", r.URL.Path), slog.String("error", err.Error()))
+				}
+				writeUnauthorized(w)
+				return
+			}
+
+			ctx := WithKey(WithTenant(r.Context(), key.TenantID), key)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// writeUnauthorized writes the same 401 problem+json shape as HumaMiddleware,
+// for the net/http fallback path which has no huma.API to negotiate content
+// through.
+func writeUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(`{"status":401,"title":"Unauthorized"}`))
+}

@@ -16,11 +16,18 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 const testTenant = "00000000-0000-0000-0000-000000000001"
+
+// testAPIKeyPlaintext is the bearer token every handler test authenticates
+// with by default (do, postJSON, getJSON all set it). newAPIRouter provisions
+// it against testTenant on the fake repo it is given, so every existing test
+// keeps exercising the real auth middleware instead of bypassing it.
+const testAPIKeyPlaintext = "glk_handlers-test-default-key" //nolint:gosec // test fixture key, not a real credential
 
 // fakeRepo is an in-memory domain.Repository for handler tests: no database, no
 // concurrency semantics, just enough to exercise the HTTP layer end to end.
@@ -256,13 +263,24 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 
 var _ domain.Repository = (*fakeRepo)(nil)
 
+// newAPIRouter wires the API over repo, provisioning testAPIKeyPlaintext
+// against testTenant so the default request helpers below (do, postJSON,
+// getJSON) authenticate as testTenant through the real auth middleware rather
+// than bypassing it.
 func newAPIRouter(repo domain.Repository) chi.Router {
+	if err := repo.InsertAPIKey(context.Background(),
+		domain.APIKey{TenantID: testTenant, Name: "handlers test default key"},
+		domain.HashAPIKey(testAPIKeyPlaintext),
+	); err != nil {
+		panic("newAPIRouter: provision default test key: " + err.Error())
+	}
+
 	r := chi.NewRouter()
 	New(r, Deps{
-		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
-		Audit:         ledger.NewAuditService(repo),
-		DefaultTenant: testTenant,
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, time.Minute),
 	})
 	return r
 }
@@ -281,6 +299,7 @@ func do(t *testing.T, r chi.Router, method, path string, body any) *httptest.Res
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -293,6 +312,7 @@ func postJSON(t *testing.T, r chi.Router, path, body string, headers map[string]
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -301,10 +321,11 @@ func postJSON(t *testing.T, r chi.Router, path, body string, headers map[string]
 	return rec
 }
 
-// getJSON GETs path with no body.
+// getJSON GETs path with no body, authenticated as testTenant.
 func getJSON(t *testing.T, r chi.Router, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec

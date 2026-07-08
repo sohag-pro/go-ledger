@@ -106,7 +106,11 @@ func registerTransactions(api huma.API, deps Deps) {
 		if in.IdempotencyKey != "" {
 			idem = &domain.Idempotency{Key: in.IdempotencyKey}
 		}
-		replayed, err := deps.Transactions.Post(ctx, deps.DefaultTenant, txn, idem)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		replayed, err := deps.Transactions.Post(ctx, tenant, txn, idem)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
@@ -120,7 +124,11 @@ func registerTransactions(api huma.API, deps Deps) {
 		Summary:     "Get a transaction",
 		Tags:        []string{"transactions"},
 	}, func(ctx context.Context, in *transactionIDInput) (*TransactionOutput, error) {
-		txn, err := deps.Transactions.Get(ctx, deps.DefaultTenant, in.ID)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		txn, err := deps.Transactions.Get(ctx, tenant, in.ID)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}

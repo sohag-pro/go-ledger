@@ -67,7 +67,11 @@ func registerAudit(api huma.API, deps Deps) {
 		Summary:     "List a transaction's audit log",
 		Tags:        []string{"transactions"},
 	}, func(ctx context.Context, in *transactionIDInput) (*AuditListOutput, error) {
-		entries, err := deps.Audit.ByTransaction(ctx, deps.DefaultTenant, in.ID)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := deps.Audit.ByTransaction(ctx, tenant, in.ID)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
@@ -85,7 +89,11 @@ func registerAudit(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, huma.Error422UnprocessableEntity(err.Error())
 		}
-		entries, err := deps.Audit.ByAccount(ctx, deps.DefaultTenant, in.ID, after, in.Limit)
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := deps.Audit.ByAccount(ctx, tenant, in.ID, after, in.Limit)
 		if err != nil {
 			return nil, toHumaErr(err)
 		}
