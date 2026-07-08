@@ -316,6 +316,24 @@ components:
         - currency
         - postings
       type: object
+    VerifyAuditOutputBody:
+      additionalProperties: false
+      properties:
+        checked:
+          format: int64
+          type: integer
+        first_break_id:
+          description: Id of the first audit row that failed to verify, or null if the chain is intact
+          type:
+            - string
+            - "null"
+        valid:
+          type: boolean
+      required:
+        - valid
+        - checked
+        - first_break_id
+      type: object
 info:
   contact:
     name: Sohag Hasan
@@ -560,6 +578,26 @@ paths:
       summary: List an account's postings with running balance
       tags:
         - accounts
+  /v1/audit/verify:
+    get:
+      description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012).
+      operationId: verify-audit-chain
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyAuditOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Verify the tamper-evident audit chain
+      tags:
+        - audit
   /v1/transactions:
     post:
       description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
