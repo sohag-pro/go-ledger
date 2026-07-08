@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -129,21 +130,24 @@ func TestProvisionAPIKeysIsIdempotent(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	tests := []struct {
-		name        string
-		loadTestKey string
-		wantRows    int // distinct api_keys rows after provisioning
+		name            string
+		loadTestKey     string
+		loadTestTenants int
+		wantRows        int // distinct api_keys rows after provisioning
 	}{
 		{name: "demo only", loadTestKey: "", wantRows: 1},
 		{name: "demo plus load-test", loadTestKey: "glk_load_test_key", wantRows: 2},
+		{name: "demo plus load-test plus multi-tenant", loadTestKey: "glk_load_test_key", loadTestTenants: 3, wantRows: 5},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := newFakeKeyStore()
 			cfg := config{
-				defaultTenant: demoTenant,
-				demoAPIKey:    defaultDemoAPIKey,
-				loadTestKey:   tt.loadTestKey,
+				defaultTenant:   demoTenant,
+				demoAPIKey:      defaultDemoAPIKey,
+				loadTestKey:     tt.loadTestKey,
+				loadTestTenants: tt.loadTestTenants,
 			}
 
 			// First provisioning: fresh store.
@@ -184,6 +188,24 @@ func TestProvisionAPIKeysIsIdempotent(t *testing.T) {
 				}
 			} else if loadErr != nil {
 				t.Errorf("load-test key resolve: %v", loadErr)
+			}
+
+			// Each multi-tenant load-test key resolves to its own distinct
+			// tenant, so aggregate throughput across them is not bounded by
+			// any one tenant's serialized audit-chain writes.
+			seenTenants := map[string]bool{}
+			for i := 0; i < tt.loadTestTenants; i++ {
+				tenantKey, err := resolver.Resolve(context.Background(), "Bearer "+tt.loadTestKey+"-t"+strconv.Itoa(i))
+				if err != nil {
+					t.Fatalf("resolve multi-tenant load-test key %d: %v", i, err)
+				}
+				if tenantKey.TenantID == demoTenant {
+					t.Errorf("multi-tenant load-test key %d resolved to the demo tenant, want a distinct tenant", i)
+				}
+				if seenTenants[tenantKey.TenantID] {
+					t.Errorf("multi-tenant load-test key %d reused tenant %q already seen", i, tenantKey.TenantID)
+				}
+				seenTenants[tenantKey.TenantID] = true
 			}
 		})
 	}

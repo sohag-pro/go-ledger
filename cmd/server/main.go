@@ -70,37 +70,45 @@ const (
 	loadTestAPIKeyRateLimitRPM = 100000
 )
 
+// loadTestTenantBase is the first tenant id offset used when provisioning
+// multi-tenant load-test keys (see provisionAPIKeys). Starting at 200 keeps
+// generated tenants clear of the demo tenant (...001) and the single load
+// tenant docker-compose's DEFAULT_TENANT_ID typically points at (...002).
+const loadTestTenantBase = 200
+
 type config struct {
-	port          string
-	metricsAddr   string
-	grpcAddr      string
-	databaseURL   string
-	defaultTenant string
-	env           string
-	serviceName   string
-	seedEnabled   bool
-	seedInterval  time.Duration
-	demoAPIKey    string
-	loadTestKey   string
-	rateLimitRPM  int
-	authCacheTTL  time.Duration
+	port            string
+	metricsAddr     string
+	grpcAddr        string
+	databaseURL     string
+	defaultTenant   string
+	env             string
+	serviceName     string
+	seedEnabled     bool
+	seedInterval    time.Duration
+	demoAPIKey      string
+	loadTestKey     string
+	loadTestTenants int
+	rateLimitRPM    int
+	authCacheTTL    time.Duration
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		port:          getenv("PORT", "8080"),
-		metricsAddr:   getenv("METRICS_ADDR", "127.0.0.1:9090"),
-		grpcAddr:      getenv("GRPC_ADDR", ":9091"),
-		databaseURL:   os.Getenv("DATABASE_URL"),
-		defaultTenant: getenv("DEFAULT_TENANT_ID", defaultTenantID),
-		env:           getenv("APP_ENV", "development"),
-		serviceName:   getenv("OTEL_SERVICE_NAME", "go-ledger"),
-		seedEnabled:   getenvBool("SEED_ENABLED", true),
-		seedInterval:  getenvDuration("SEED_INTERVAL", 4*time.Hour),
-		demoAPIKey:    getenv("DEMO_API_KEY", defaultDemoAPIKey),
-		loadTestKey:   getenv("LOAD_TEST_API_KEY", ""),
-		rateLimitRPM:  getenvInt("RATE_LIMIT_RPM", 120),
-		authCacheTTL:  getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
+		port:            getenv("PORT", "8080"),
+		metricsAddr:     getenv("METRICS_ADDR", "127.0.0.1:9090"),
+		grpcAddr:        getenv("GRPC_ADDR", ":9091"),
+		databaseURL:     os.Getenv("DATABASE_URL"),
+		defaultTenant:   getenv("DEFAULT_TENANT_ID", defaultTenantID),
+		env:             getenv("APP_ENV", "development"),
+		serviceName:     getenv("OTEL_SERVICE_NAME", "go-ledger"),
+		seedEnabled:     getenvBool("SEED_ENABLED", true),
+		seedInterval:    getenvDuration("SEED_INTERVAL", 4*time.Hour),
+		demoAPIKey:      getenv("DEMO_API_KEY", defaultDemoAPIKey),
+		loadTestKey:     getenv("LOAD_TEST_API_KEY", ""),
+		loadTestTenants: getenvInt("LOAD_TEST_TENANTS", 8),
+		rateLimitRPM:    getenvInt("RATE_LIMIT_RPM", 120),
+		authCacheTTL:    getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -368,12 +376,13 @@ type apiKeyStore interface {
 }
 
 // provisionAPIKeys provisions the public demo key, and when LOAD_TEST_API_KEY
-// is set the high-limit load-test key, idempotently. It hashes each plaintext
-// and inserts a row for cfg.defaultTenant; a unique-violation on key_hash (the
-// row already exists from a previous boot) is treated as success, so this is
-// safe to run on every startup and after the four-hour demo wipe (which never
-// touches api_keys). The key plaintext is never logged, only the fact that a
-// key is active (ADR-012).
+// is set both the single-tenant load-test key (kept for backward compat) and
+// a set of LOAD_TEST_TENANTS high-limit keys spread across distinct tenants,
+// idempotently. It hashes each plaintext and inserts one row per key; a
+// unique-violation on key_hash (the row already exists from a previous boot)
+// is treated as success, so this is safe to run on every startup and after
+// the four-hour demo wipe (which never touches api_keys). The key plaintext
+// is never logged, only the fact that a key is active (ADR-012).
 func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger *slog.Logger) error {
 	demoRPM := demoAPIKeyRateLimitRPM
 	if err := provisionKey(ctx, store, domain.APIKey{
@@ -385,17 +394,39 @@ func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger
 	}
 	logger.Info("demo api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", demoRPM)
 
-	if cfg.loadTestKey != "" {
-		loadRPM := loadTestAPIKeyRateLimitRPM
-		if err := provisionKey(ctx, store, domain.APIKey{
-			TenantID:     cfg.defaultTenant,
-			Name:         "load-test",
-			RateLimitRPM: &loadRPM,
-		}, cfg.loadTestKey); err != nil {
-			return fmt.Errorf("provision load-test api key: %w", err)
-		}
-		logger.Info("load-test api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", loadRPM)
+	if cfg.loadTestKey == "" {
+		return nil
 	}
+
+	loadRPM := loadTestAPIKeyRateLimitRPM
+	if err := provisionKey(ctx, store, domain.APIKey{
+		TenantID:     cfg.defaultTenant,
+		Name:         "load-test",
+		RateLimitRPM: &loadRPM,
+	}, cfg.loadTestKey); err != nil {
+		return fmt.Errorf("provision load-test api key: %w", err)
+	}
+	logger.Info("load-test api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", loadRPM)
+
+	// Multi-tenant load-test keys: each tenant's audit hash chain serializes
+	// same-tenant transaction posts through an in-process mutex, so a single
+	// tenant's throughput is bounded no matter how high its rate limit is.
+	// Spreading the load across LOAD_TEST_TENANTS distinct tenants lets
+	// aggregate throughput scale instead. Tenant ids are deterministic so a
+	// restart provisions the same set (and provisionKey's unique-violation
+	// swallow keeps this idempotent).
+	for i := range cfg.loadTestTenants {
+		tenantID := fmt.Sprintf("00000000-0000-0000-0000-%012d", loadTestTenantBase+i)
+		plaintext := fmt.Sprintf("%s-t%d", cfg.loadTestKey, i)
+		if err := provisionKey(ctx, store, domain.APIKey{
+			TenantID:     tenantID,
+			Name:         fmt.Sprintf("load-test-%d", i),
+			RateLimitRPM: &loadRPM,
+		}, plaintext); err != nil {
+			return fmt.Errorf("provision load-test tenant %d api key: %w", i, err)
+		}
+	}
+	logger.Info("multi-tenant load-test api keys active", "tenants", cfg.loadTestTenants, "rate_limit_rpm", loadRPM)
 	return nil
 }
 
