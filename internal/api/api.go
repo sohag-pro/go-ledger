@@ -34,16 +34,22 @@ const APIVersion = "0.2.0"
 const MaxRequestBodyBytes int64 = 64 * 1024
 
 // Deps are the services the operations call, plus the auth resolver every /v1
-// request goes through to derive its tenant. The tenant is never a request
-// field: HumaMiddleware resolves it from the bearer key and handlers read it
-// back with auth.TenantFromContext. Spec generation passes a zero Deps because
-// the handler bodies (and the middleware, which only runs on a served request)
+// request goes through to derive its tenant, and the per-key rate limiter
+// applied after auth. The tenant is never a request field: HumaMiddleware
+// resolves it from the bearer key and handlers read it back with
+// auth.TenantFromContext. Spec generation passes a zero Deps because the
+// handler bodies (and the middleware, which only runs on a served request)
 // are never invoked while serializing the schema.
 type Deps struct {
 	Accounts     *ledger.AccountService
 	Transactions *ledger.TransactionService
 	Audit        *ledger.AuditService
 	Auth         *auth.Resolver
+	// RateLimiter, if set, is registered immediately after the auth middleware
+	// (see New). It is optional: a zero Deps (spec generation, and tests that
+	// only exercise unauthenticated routes) leaves it nil and no rate-limit
+	// middleware is registered at all, rather than one that always fails open.
+	RateLimiter *auth.Limiter
 }
 
 // tenantFromCtx reads the tenant HumaMiddleware resolved from the caller's API
@@ -103,6 +109,19 @@ func New(router chi.Router, deps Deps) huma.API {
 	// docs/adr/012-api-authentication-and-hardening.md and
 	// internal/auth/middleware.go).
 	api.UseMiddleware(auth.HumaMiddleware(api, deps.Auth, slog.Default()))
+
+	// Rate limiting is registered immediately after auth, never before: it
+	// reads the key auth.HumaMiddleware just resolved into the context
+	// (auth.KeyFromContext) and fails OPEN when no key is present there (see
+	// auth.Limiter.HumaMiddleware). If this ran before auth, a request with
+	// no key at all would sail through the limiter and rely on auth alone to
+	// reject it, which happens to still work today, but a key that IS
+	// present would never be checked against its bucket, silently disabling
+	// rate limiting. Registering it here, after auth, is what makes "valid
+	// key over its limit" actually 429 (see docs/adr/012-api-authentication-and-hardening.md).
+	if deps.RateLimiter != nil {
+		api.UseMiddleware(deps.RateLimiter.HumaMiddleware(api))
+	}
 
 	registerOperations(api, deps)
 	return api

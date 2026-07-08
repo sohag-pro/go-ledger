@@ -27,6 +27,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/domain"
 	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
@@ -52,6 +53,23 @@ func main() {
 	}
 }
 
+// defaultDemoAPIKey is a known, public value (see ADR-012, "A public demo key
+// keeps the console open"): shipping it in the console and playground is fine
+// on purpose, since the key it names is tenant-scoped to the demo tenant,
+// carries a tight rate limit, and that tenant is wiped every four hours.
+const defaultDemoAPIKey = "glk_demo_public_key_reset_every_4h" //nolint:gosec // public by design: a tenant-scoped, rate-limited demo key that the console and playground ship, not a real secret (ADR-012)
+
+// demoAPIKeyRateLimitRPM and loadTestAPIKeyRateLimitRPM are the per-key
+// overrides provisioned for the demo and load-test keys respectively (see
+// ADR-012, "Per-key rate limiting"): the demo key is deliberately tighter
+// than the server default so the public demo cannot be used to flood the
+// service, and the load-test key is deliberately far looser so a k6 run
+// exercises the ledger, not the limiter.
+const (
+	demoAPIKeyRateLimitRPM     = 60
+	loadTestAPIKeyRateLimitRPM = 100000
+)
+
 type config struct {
 	port          string
 	metricsAddr   string
@@ -62,6 +80,10 @@ type config struct {
 	serviceName   string
 	seedEnabled   bool
 	seedInterval  time.Duration
+	demoAPIKey    string
+	loadTestKey   string
+	rateLimitRPM  int
+	authCacheTTL  time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -75,6 +97,10 @@ func loadConfig() (config, error) {
 		serviceName:   getenv("OTEL_SERVICE_NAME", "go-ledger"),
 		seedEnabled:   getenvBool("SEED_ENABLED", true),
 		seedInterval:  getenvDuration("SEED_INTERVAL", 4*time.Hour),
+		demoAPIKey:    getenv("DEMO_API_KEY", defaultDemoAPIKey),
+		loadTestKey:   getenv("LOAD_TEST_API_KEY", ""),
+		rateLimitRPM:  getenvInt("RATE_LIMIT_RPM", 120),
+		authCacheTTL:  getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -85,6 +111,16 @@ func loadConfig() (config, error) {
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getenvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			return n
+		}
 	}
 	return fallback
 }
@@ -170,12 +206,27 @@ func run(logger *slog.Logger) error {
 	// resolver instance (and its in-memory cache). Key rows are provisioned
 	// directly in api_keys (see the ADR); a zero ttl falls back to the
 	// resolver's default cache TTL.
-	resolver := auth.NewResolver(repo, 0)
+	resolver := auth.NewResolver(repo, cfg.authCacheTTL)
+
+	// Provision the public demo key (and, when configured, a high-limit
+	// load-test key) before serving. Both are idempotent: a row with the same
+	// key_hash already existing is treated as success, so a restart or the
+	// four-hour demo wipe (which clears tenant DATA tables, never api_keys)
+	// leaves the console working with the same key against a fresh ledger.
+	if err := provisionAPIKeys(ctx, repo, cfg, logger); err != nil {
+		return err
+	}
+
+	// Per-key rate limiter, wired AFTER the auth middleware inside api.New so
+	// the key auth resolved into the context is present when it runs (see
+	// ADR-012, "Per-key rate limiting", and internal/api/api.go).
+	limiter := auth.NewLimiter(cfg.rateLimitRPM)
 	deps := api.Deps{
 		Accounts:     ledger.NewAccountService(repo),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
 		Audit:        ledger.NewAuditService(repo),
 		Auth:         resolver,
+		RateLimiter:  limiter,
 	}
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
@@ -307,6 +358,55 @@ func runMigrations(dsn string, logger *slog.Logger) error {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
 	logger.Info("migrations applied")
+	return nil
+}
+
+// apiKeyStore is the slice of the repository provisionAPIKeys needs: insert a
+// key row by hash. The postgres repository satisfies it; a test uses a fake.
+type apiKeyStore interface {
+	InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error
+}
+
+// provisionAPIKeys provisions the public demo key, and when LOAD_TEST_API_KEY
+// is set the high-limit load-test key, idempotently. It hashes each plaintext
+// and inserts a row for cfg.defaultTenant; a unique-violation on key_hash (the
+// row already exists from a previous boot) is treated as success, so this is
+// safe to run on every startup and after the four-hour demo wipe (which never
+// touches api_keys). The key plaintext is never logged, only the fact that a
+// key is active (ADR-012).
+func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger *slog.Logger) error {
+	demoRPM := demoAPIKeyRateLimitRPM
+	if err := provisionKey(ctx, store, domain.APIKey{
+		TenantID:     cfg.defaultTenant,
+		Name:         "demo",
+		RateLimitRPM: &demoRPM,
+	}, cfg.demoAPIKey); err != nil {
+		return fmt.Errorf("provision demo api key: %w", err)
+	}
+	logger.Info("demo api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", demoRPM)
+
+	if cfg.loadTestKey != "" {
+		loadRPM := loadTestAPIKeyRateLimitRPM
+		if err := provisionKey(ctx, store, domain.APIKey{
+			TenantID:     cfg.defaultTenant,
+			Name:         "load-test",
+			RateLimitRPM: &loadRPM,
+		}, cfg.loadTestKey); err != nil {
+			return fmt.Errorf("provision load-test api key: %w", err)
+		}
+		logger.Info("load-test api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", loadRPM)
+	}
+	return nil
+}
+
+// provisionKey inserts one key row for the given plaintext, idempotently: a
+// unique-violation (a row with this key_hash already exists) is swallowed as
+// success. It never logs or returns the plaintext.
+func provisionKey(ctx context.Context, store apiKeyStore, k domain.APIKey, plaintext string) error {
+	err := store.InsertAPIKey(ctx, k, domain.HashAPIKey(plaintext))
+	if err != nil && !postgres.IsUniqueViolationError(err) {
+		return err
+	}
 	return nil
 }
 

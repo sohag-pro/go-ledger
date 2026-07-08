@@ -222,6 +222,15 @@ func isUniqueViolation(err error) bool {
 	return false
 }
 
+// IsUniqueViolationError reports whether err is a Postgres unique-violation
+// (23505). Exported so a caller outside this package (cmd/server's idempotent
+// API key provisioning, see ADR-012) can treat "a row with this key already
+// exists" as success rather than an error, without duplicating the pgconn
+// error-code check.
+func IsUniqueViolationError(err error) bool {
+	return isUniqueViolation(err)
+}
+
 // pgConstraint returns the constraint name on a Postgres error, or "". The
 // invariant triggers tag their exceptions with a constraint name (migration
 // 0005), so the adapter can translate them to typed domain errors.
