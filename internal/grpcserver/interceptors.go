@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/debug"
 	"strings"
@@ -32,10 +33,15 @@ func tenantFrom(ctx context.Context) string {
 // check: it reads the "authorization" metadata value, resolves it to an API
 // key through resolver, and on success injects the key's tenant and the key
 // itself into the context (auth.WithTenant, auth.WithKey) before calling the
-// handler. A missing token or a resolver error (including auth.ErrUnauthorized)
-// is rejected with codes.Unauthenticated before the handler ever runs. The
-// token itself is never logged.
-func authUnaryInterceptor(resolver *auth.Resolver) grpc.UnaryServerInterceptor {
+// handler. A missing token or an auth.ErrUnauthorized from resolver (an
+// unknown or empty key) is rejected with codes.Unauthenticated before the
+// handler ever runs, with nothing logged. Any other resolver error is an
+// unexpected infra failure (e.g. the key-lookup datastore is down): it is
+// logged at error level with the method and the underlying cause, then
+// rejected with codes.Internal, mirroring the REST auth middleware
+// (internal/auth/middleware.go) so a backend outage does not read as "bad
+// key". The token itself is never logged in either branch.
+func authUnaryInterceptor(resolver *auth.Resolver, log *slog.Logger) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if strings.HasPrefix(info.FullMethod, healthMethodPrefix) {
 			return handler(ctx, req)
@@ -50,7 +56,12 @@ func authUnaryInterceptor(resolver *auth.Resolver) grpc.UnaryServerInterceptor {
 
 		key, err := resolver.Resolve(ctx, bearer)
 		if err != nil {
-			return nil, status.Error(codes.Unauthenticated, "missing or invalid API key")
+			if errors.Is(err, auth.ErrUnauthorized) {
+				return nil, status.Error(codes.Unauthenticated, "missing or invalid API key")
+			}
+			log.LogAttrs(ctx, slog.LevelError, "auth: resolve failed",
+				slog.String("method", info.FullMethod), slog.String("error", err.Error()))
+			return nil, status.Error(codes.Internal, "authentication backend error")
 		}
 
 		ctx = auth.WithKey(auth.WithTenant(ctx, key.TenantID), key)

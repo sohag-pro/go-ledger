@@ -86,7 +86,7 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 		grpc.ChainUnaryInterceptor(
 			recoveryUnaryInterceptor(log),
 			loggingUnaryInterceptor(log),
-			authUnaryInterceptor(d.Auth),
+			authUnaryInterceptor(d.Auth, log),
 		),
 	)
 	ledgerv1.RegisterLedgerServiceServer(s, NewServer(d))

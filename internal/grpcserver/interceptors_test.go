@@ -21,12 +21,19 @@ import (
 
 // fakeLookup is a minimal keyLookup (see internal/auth) backed by a fixed
 // hash to APIKey map, so authUnaryInterceptor can be tested against a real
-// auth.Resolver without a database.
+// auth.Resolver without a database. If err is set, GetAPIKeyByHash returns it
+// unconditionally instead of consulting keys, simulating an infra failure
+// (e.g. the datastore backing the key lookup is down) that is distinct from
+// domain.ErrAPIKeyNotFound.
 type fakeLookup struct {
 	keys map[string]domain.APIKey
+	err  error
 }
 
 func (f *fakeLookup) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
+	if f.err != nil {
+		return domain.APIKey{}, f.err
+	}
 	k, ok := f.keys[hash]
 	if !ok {
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
@@ -43,6 +50,19 @@ func newTestResolver() *auth.Resolver {
 	return auth.NewResolver(lookup, time.Minute)
 }
 
+// newFailingTestResolver returns a resolver whose backing lookup always fails
+// with a generic (non-auth) error, simulating a key-lookup datastore outage.
+func newFailingTestResolver(cause error) *auth.Resolver {
+	return auth.NewResolver(&fakeLookup{err: cause}, time.Minute)
+}
+
+// discardLogger is a *slog.Logger used by tests that do not care about log
+// output, so authUnaryInterceptor's required logger parameter never panics
+// on a nil receiver.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 func ctxWithAuthMetadata(bearer string) context.Context {
 	if bearer == "" {
 		return context.Background()
@@ -56,7 +76,7 @@ func TestAuthInterceptorRejectsMissingMetadata(t *testing.T) {
 		called = true
 		return nil, nil
 	}
-	interceptor := authUnaryInterceptor(newTestResolver())
+	interceptor := authUnaryInterceptor(newTestResolver(), discardLogger())
 	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
 	if status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("code = %v, want Unauthenticated", status.Code(err))
@@ -72,7 +92,9 @@ func TestAuthInterceptorRejectsInvalidKey(t *testing.T) {
 		called = true
 		return nil, nil
 	}
-	interceptor := authUnaryInterceptor(newTestResolver())
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	interceptor := authUnaryInterceptor(newTestResolver(), log)
 	ctx := ctxWithAuthMetadata("Bearer glk_does-not-exist")
 	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
 	if status.Code(err) != codes.Unauthenticated {
@@ -80,6 +102,42 @@ func TestAuthInterceptorRejectsInvalidKey(t *testing.T) {
 	}
 	if called {
 		t.Error("handler should not run with an invalid key")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("an unknown key is a normal auth rejection and should not be logged, got: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), "glk_does-not-exist") {
+		t.Error("the token must never be logged")
+	}
+}
+
+func TestAuthInterceptorLogsAndRejectsInfraErrorAsInternal(t *testing.T) {
+	called := false
+	handler := func(_ context.Context, _ any) (any, error) {
+		called = true
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	cause := errors.New("db down")
+	interceptor := authUnaryInterceptor(newFailingTestResolver(cause), log)
+	ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal", status.Code(err))
+	}
+	if called {
+		t.Error("handler should not run when the key resolver fails with an infra error")
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "db down") {
+		t.Fatalf("expected the underlying cause to be logged, got: %s", logged)
+	}
+	if !strings.Contains(logged, "/ledger.v1.LedgerService/GetAccount") {
+		t.Fatalf("expected the method to be logged, got: %s", logged)
+	}
+	if strings.Contains(logged, testPlaintextKey) {
+		t.Error("the token must never be logged")
 	}
 }
 
@@ -91,7 +149,7 @@ func TestAuthInterceptorInjectsTenantAndKeyForValidKey(t *testing.T) {
 		seenKey, _ = auth.KeyFromContext(ctx)
 		return nil, nil
 	}
-	interceptor := authUnaryInterceptor(newTestResolver())
+	interceptor := authUnaryInterceptor(newTestResolver(), discardLogger())
 	ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
 	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
 	if err != nil {
@@ -114,7 +172,7 @@ func TestAuthInterceptorAllowsHealthCheckWithoutKey(t *testing.T) {
 		}
 		return nil, nil
 	}
-	interceptor := authUnaryInterceptor(newTestResolver())
+	interceptor := authUnaryInterceptor(newTestResolver(), discardLogger())
 	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/grpc.health.v1.Health/Check"}, handler)
 	if err != nil {
 		t.Fatalf("health check should be allowed through without a key: %v", err)
