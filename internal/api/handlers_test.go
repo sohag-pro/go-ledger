@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -285,7 +286,10 @@ func newAPIRouter(repo domain.Repository) chi.Router {
 	return r
 }
 
-func do(t *testing.T, r chi.Router, method, path string, body any) *httptest.ResponseRecorder {
+// do issues a request authenticated as testTenant. An optional trailing
+// headers map (e.g. {"Idempotency-Key": "..."}) is applied on top of the
+// defaults; only the first map, if any, is used.
+func do(t *testing.T, r chi.Router, method, path string, body any, headers ...map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	var rdr io.Reader
 	if body != nil {
@@ -300,6 +304,11 @@ func do(t *testing.T, r chi.Router, method, path string, body any) *httptest.Res
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
+	if len(headers) > 0 {
+		for k, v := range headers[0] {
+			req.Header.Set(k, v)
+		}
+	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -421,7 +430,7 @@ func TestPostTransactionAndBalance(t *testing.T) {
 				{"account_id": cash, "amount": 10000, "description": "sale"},
 				{"account_id": rev, "amount": -10000},
 			},
-		})
+		}, map[string]string{"Idempotency-Key": "post-and-balance-1"})
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
 		}
@@ -449,7 +458,7 @@ func TestPostTransactionAndBalance(t *testing.T) {
 				{"account_id": cash, "amount": 10000},
 				{"account_id": rev, "amount": -9999},
 			},
-		})
+		}, map[string]string{"Idempotency-Key": "post-and-balance-unbalanced"})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
 		}
@@ -459,9 +468,25 @@ func TestPostTransactionAndBalance(t *testing.T) {
 		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
 			"currency": "USD",
 			"postings": []map[string]any{{"account_id": cash, "amount": 0}},
-		})
+		}, map[string]string{"Idempotency-Key": "post-and-balance-too-few"})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422", rec.Code)
+		}
+	})
+
+	t.Run("missing idempotency key 400", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 100},
+				{"account_id": rev, "amount": -100},
+			},
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 (%s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "Idempotency-Key header is required") {
+			t.Errorf("body = %s, want the missing-key message", rec.Body.String())
 		}
 	})
 }
@@ -471,7 +496,9 @@ func TestStatementPagination(t *testing.T) {
 	cash := createAccount(t, r, "Cash", "asset")
 	other := createAccount(t, r, "Other", "asset")
 
-	// Post three transactions so cash has three postings.
+	// Post three transactions so cash has three postings. Each needs its own
+	// idempotency key: the bodies are identical, and reusing one key across
+	// them would replay the first post instead of creating three.
 	for i := 0; i < 3; i++ {
 		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
 			"currency": "USD",
@@ -479,7 +506,7 @@ func TestStatementPagination(t *testing.T) {
 				{"account_id": cash, "amount": 100, "description": "deposit"},
 				{"account_id": other, "amount": -100},
 			},
-		})
+		}, map[string]string{"Idempotency-Key": fmt.Sprintf("statement-pagination-%d", i)})
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("post %d: %d (%s)", i, rec.Code, rec.Body.String())
 		}
@@ -597,7 +624,7 @@ func TestAuditEndpoints(t *testing.T) {
 	body := `{"currency":"USD","postings":[` +
 		`{"account_id":"` + a.ID + `","amount":100},` +
 		`{"account_id":"` + b.ID + `","amount":-100}]}`
-	rec := postJSON(t, router, "/v1/transactions", body, nil)
+	rec := postJSON(t, router, "/v1/transactions", body, map[string]string{"Idempotency-Key": "audit-endpoints"})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("post status = %d body=%s", rec.Code, rec.Body.String())
 	}

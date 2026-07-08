@@ -561,14 +561,14 @@ paths:
         - accounts
   /v1/transactions:
     post:
-      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Supply an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
+      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
       operationId: create-transaction
       parameters:
-        - description: Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+        - description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
           in: header
           name: Idempotency-Key
           schema:
-            description: Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+            description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
             maxLength: 255
             type: string
       requestBody:

@@ -211,10 +211,16 @@ func (s *Server) GetStatement(ctx context.Context, req *ledgerv1.GetStatementReq
 	return resp, nil
 }
 
-// PostTransaction posts a balanced set of postings as a new transaction. When
-// an idempotency-key is present in the metadata and was already used with the
-// same request body, it replays the original result instead of posting again.
+// PostTransaction posts a balanced set of postings as a new transaction. The
+// idempotency-key metadata is required (ADR-012): when it was already used
+// with the same request body, the original result is replayed instead of
+// posting again.
 func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransactionRequest) (*ledgerv1.PostTransactionResponse, error) {
+	key := idempotencyKeyFrom(ctx)
+	if key == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency-key metadata is required")
+	}
+
 	currency := domain.Currency(req.Currency)
 	postings := make([]domain.Posting, 0, len(req.Postings))
 	for _, p := range req.Postings {
@@ -225,11 +231,7 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 		postings = append(postings, domain.Posting{AccountID: p.AccountId, Amount: amount, Description: p.Description})
 	}
 	txn := &domain.Transaction{Postings: postings}
-
-	var idem *domain.Idempotency
-	if key := idempotencyKeyFrom(ctx); key != "" {
-		idem = &domain.Idempotency{Key: key}
-	}
+	idem := &domain.Idempotency{Key: key}
 	replayed, err := s.txns.Post(ctx, tenantFrom(ctx), txn, idem)
 	if err != nil {
 		return nil, toStatus(err)

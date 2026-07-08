@@ -175,7 +175,8 @@ func TestGRPCPostAndBalance(t *testing.T) {
 		t.Fatalf("create revenue: %v", err)
 	}
 
-	post, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+	postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "post-and-balance")
+	post, err := client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{
 			{AccountId: cash.Account.Id, Amount: 10000},

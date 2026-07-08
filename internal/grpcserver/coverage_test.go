@@ -10,6 +10,7 @@ package grpcserver_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -110,7 +111,7 @@ func TestGRPCGetBalanceNotFound(t *testing.T) {
 
 func TestGRPCPostTransactionInvalidCurrency(t *testing.T) {
 	client := dialClient(t)
-	ctx := authedCtx(context.Background())
+	ctx := metadata.AppendToOutgoingContext(authedCtx(context.Background()), "idempotency-key", "bad-currency")
 	a, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Bad Currency A", Type: "asset", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("create a: %v", err)
@@ -136,7 +137,9 @@ func TestGRPCPostTransactionInvalidCurrency(t *testing.T) {
 // metadata that does not include an idempotency-key. On the server side this
 // makes metadata.FromIncomingContext report ok=true with an empty lookup, the
 // idempotencyKeyFrom branch that a bare request (no metadata at all) does not
-// reach.
+// reach. Since the idempotency key is mandatory (ADR-012), this is still
+// rejected, as InvalidArgument, distinctly from the "no metadata at all"
+// case exercised in TestGRPCHandlersWithoutInterceptorChain.
 func TestGRPCPostTransactionIdempotencyMetadataWithoutKey(t *testing.T) {
 	client := dialClient(t)
 	ctx := metadata.AppendToOutgoingContext(authedCtx(context.Background()), "trace-id", "abc123")
@@ -150,18 +153,15 @@ func TestGRPCPostTransactionIdempotencyMetadataWithoutKey(t *testing.T) {
 		t.Fatalf("create b: %v", err)
 	}
 
-	resp, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+	_, err = client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{
 			{AccountId: a.Account.Id, Amount: 250},
 			{AccountId: b.Account.Id, Amount: -250},
 		},
 	})
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
-	if resp.Replayed {
-		t.Error("post without an idempotency key should never report a replay")
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument", status.Code(err))
 	}
 }
 
@@ -177,7 +177,8 @@ func TestGRPCGetTransaction(t *testing.T) {
 		t.Fatalf("create b: %v", err)
 	}
 
-	post, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+	postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "get-transaction")
+	post, err := client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{
 			{AccountId: a.Account.Id, Amount: 777, Description: "coverage"},
@@ -212,7 +213,8 @@ func TestGRPCGetTransactionAudit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create b: %v", err)
 	}
-	post, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+	postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "get-transaction-audit")
+	post, err := client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{
 			{AccountId: a.Account.Id, Amount: 400},
@@ -260,8 +262,12 @@ func TestGRPCGetStatementPaginatesAndValidatesCursor(t *testing.T) {
 		t.Fatalf("create revenue: %v", err)
 	}
 
+	// Each post needs its own idempotency key: the bodies are identical, and
+	// reusing one key across them would replay the first post instead of
+	// creating two.
 	for i := 0; i < 2; i++ {
-		if _, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+		postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", fmt.Sprintf("get-statement-%d", i))
+		if _, err := client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
 			Currency: "USD",
 			Postings: []*ledgerv1.Posting{
 				{AccountId: cash.Account.Id, Amount: 100, Description: "coverage statement"},
@@ -306,8 +312,12 @@ func TestGRPCGetAccountAuditPaginatesAndValidatesCursor(t *testing.T) {
 		t.Fatalf("create revenue: %v", err)
 	}
 
+	// Each post needs its own idempotency key: the bodies are identical, and
+	// reusing one key across them would replay the first post instead of
+	// creating two.
 	for i := 0; i < 2; i++ {
-		if _, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+		postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", fmt.Sprintf("get-account-audit-%d", i))
+		if _, err := client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
 			Currency: "USD",
 			Postings: []*ledgerv1.Posting{
 				{AccountId: cash.Account.Id, Amount: 100},
@@ -366,6 +376,13 @@ func TestGRPCNewGRPCServerDefaultsNilLogger(t *testing.T) {
 // ListAuditByTransaction/ListAuditByAccount return an empty page rather than
 // an error for an unknown transaction or account, so a well-formed tenant
 // never reaches that branch.
+//
+// PostTransaction is exercised twice: once with no incoming metadata at all
+// (idempotencyKeyFrom's !ok branch), which the mandatory check now rejects
+// before ever reaching tenantFrom, as InvalidArgument; and once with
+// idempotency-key metadata attached directly via metadata.NewIncomingContext
+// (bypassing the interceptor chain but not the mandatory check), which reaches
+// the same Internal-on-missing-tenant behavior as the other handlers above.
 func TestGRPCHandlersWithoutInterceptorChain(t *testing.T) {
 	_, s := newDepsAndServer(t)
 	bg := context.Background()
@@ -386,7 +403,18 @@ func TestGRPCHandlersWithoutInterceptorChain(t *testing.T) {
 		t.Errorf("GetAccountAudit without a tenant code = %v, want Internal", status.Code(err))
 	}
 
-	_, err := s.PostTransaction(bg, &ledgerv1.PostTransactionRequest{
+	if _, err := s.PostTransaction(bg, &ledgerv1.PostTransactionRequest{
+		Currency: "USD",
+		Postings: []*ledgerv1.Posting{
+			{AccountId: missingID, Amount: 100},
+			{AccountId: missingID, Amount: -100},
+		},
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("PostTransaction with no metadata at all code = %v, want InvalidArgument", status.Code(err))
+	}
+
+	withKey := metadata.NewIncomingContext(bg, metadata.Pairs("idempotency-key", "no-interceptor-chain"))
+	_, err := s.PostTransaction(withKey, &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{
 			{AccountId: missingID, Amount: 100},

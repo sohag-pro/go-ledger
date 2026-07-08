@@ -32,7 +32,10 @@ type TransactionBody struct {
 
 // CreateTransactionInput is the post-transaction request body.
 type CreateTransactionInput struct {
-	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409."`
+	// The schema field is left optional (not required:"true") so a missing
+	// header fails our explicit 400 check below with a clear message,
+	// rather than huma's generic schema-validation 422.
+	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409."`
 	Body           struct {
 		Currency string         `json:"currency" pattern:"^[A-Z]{3}$" doc:"ISO 4217 code shared by every posting"`
 		Postings []PostingInput `json:"postings" minItems:"2" doc:"Two or more legs that must sum to zero"`
@@ -84,10 +87,13 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/transactions",
 		Summary:       "Post a transaction",
-		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Supply an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict.",
+		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict.",
 		Tags:          []string{"transactions"},
 		DefaultStatus: http.StatusCreated,
 	}, func(ctx context.Context, in *CreateTransactionInput) (*CreateTransactionOutput, error) {
+		if in.IdempotencyKey == "" {
+			return nil, huma.Error400BadRequest("Idempotency-Key header is required")
+		}
 		currency := domain.Currency(in.Body.Currency)
 		postings := make([]domain.Posting, 0, len(in.Body.Postings))
 		for _, p := range in.Body.Postings {
@@ -102,10 +108,7 @@ func registerTransactions(api huma.API, deps Deps) {
 			})
 		}
 		txn := &domain.Transaction{Postings: postings}
-		var idem *domain.Idempotency
-		if in.IdempotencyKey != "" {
-			idem = &domain.Idempotency{Key: in.IdempotencyKey}
-		}
+		idem := &domain.Idempotency{Key: in.IdempotencyKey}
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
 			return nil, err
