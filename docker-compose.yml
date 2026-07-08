@@ -35,7 +35,11 @@ services:
   # The app self-migrates on boot (embedded goose migrations in main.go), so
   # no separate migration or init step is needed here. SEED_ENABLED is off
   # and DEFAULT_TENANT_ID points at a dedicated load tenant so the demo
-  # seeder never collides with load traffic.
+  # seeder never collides with load traffic. LOAD_TEST_API_KEY provisions a
+  # high-limit key (see ADR-012, "Per-key rate limiting") for that tenant at
+  # startup, so k6 authenticates instead of hitting the 401 the API now
+  # requires on /v1. It is a fixed, hardcoded test credential, fine for a
+  # local, disposable load-test stack.
   app:
     build: .
     container_name: go-ledger-app
@@ -47,6 +51,7 @@ services:
       DATABASE_URL: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
       SEED_ENABLED: "false"
       DEFAULT_TENANT_ID: "00000000-0000-0000-0000-000000000002"
+      LOAD_TEST_API_KEY: "glk_loadtest_fixed_local_key"
       PORT: "8080"
     ports:
       - "8080:8080"

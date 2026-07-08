@@ -21,6 +21,14 @@ import { check } from 'k6';
 const BASE = __ENV.BASE_URL || 'http://localhost:8080';
 const SMOKE = __ENV.SMOKE === '1';
 
+// The load-test Compose stack provisions a high-limit key for the load
+// tenant at startup from LOAD_TEST_API_KEY (see docker-compose.yml and
+// ADR-012, "Per-key rate limiting"). The default here matches that compose
+// value so `make load` works with no extra setup; API_KEY overrides it for
+// CI or any other stack.
+const API_KEY = __ENV.API_KEY || 'glk_loadtest_fixed_local_key';
+const AUTH_HEADERS = { Authorization: `Bearer ${API_KEY}` };
+
 // Pool of accounts used for the fan-out scenario. The hot_account scenario
 // uses one additional, dedicated account created in setup().
 const FANOUT_ACCOUNTS = 20;
@@ -110,7 +118,7 @@ export function setup() {
     const res = http.post(
       `${BASE}/v1/accounts`,
       JSON.stringify({ name: `k6-load-acct-${i}`, type: 'asset', currency: 'USD' }),
-      { headers: { 'Content-Type': 'application/json' } }
+      { headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS } }
     );
     if (res.status !== 201) {
       throw new Error(`setup: failed to create fanout account ${i}: ${res.status} ${res.body}`);
@@ -121,7 +129,7 @@ export function setup() {
   const hotRes = http.post(
     `${BASE}/v1/accounts`,
     JSON.stringify({ name: 'k6-load-hot-account', type: 'asset', currency: 'USD' }),
-    { headers: { 'Content-Type': 'application/json' } }
+    { headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS } }
   );
   if (hotRes.status !== 201) {
     throw new Error(`setup: failed to create hot account: ${hotRes.status} ${hotRes.body}`);
@@ -167,7 +175,7 @@ function postTransaction(debitAcct, creditAcct, amount) {
   }
 
   const res = http.post(`${BASE}/v1/transactions`, bodyStr, {
-    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key, ...AUTH_HEADERS },
   });
 
   // The server returns 201 both for a fresh write and for a replayed
