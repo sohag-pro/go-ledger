@@ -6,6 +6,9 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
@@ -22,6 +25,10 @@ type Querier interface {
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (Account, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
+	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
+	// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
+	// caller treats that as the chain's genesis (domain.AuditGenesisHash).
+	GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
@@ -32,6 +39,9 @@ type Querier interface {
 	// pass a far-future timestamp and the max uuid for the first page.
 	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error)
 	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error)
+	// Every audit row for the tenant, oldest first: the full walk used to
+	// recompute and check the tamper-evident hash chain end to end.
+	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 }
 

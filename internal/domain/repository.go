@@ -93,6 +93,12 @@ type Repository interface {
 	// unknown account yields no rows.
 	ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *StatementCursor, limit int) ([]AuditEntry, error)
 
+	// ListAuditForVerify returns every audit row for the tenant, oldest first
+	// (created_at, id ascending), including PrevHash and RowHash. It is the
+	// full per-tenant walk used to recompute and check the tamper-evident hash
+	// chain end to end, not a paged read for display.
+	ListAuditForVerify(ctx context.Context, tenantID string) ([]AuditEntry, error)
+
 	// Balance returns the derived balance of an account: the sum of its postings'
 	// signed amounts. It returns ErrAccountNotFound if the account does not exist.
 	//

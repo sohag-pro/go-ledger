@@ -10,11 +10,29 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getLastAuditHash = `-- name: GetLastAuditHash :one
+SELECT row_hash FROM audit_log
+WHERE tenant_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
+// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
+// caller treats that as the chain's genesis (domain.AuditGenesisHash).
+func (q *Queries) GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, getLastAuditHash, tenantID)
+	var row_hash pgtype.Text
+	err := row.Scan(&row_hash)
+	return row_hash, err
+}
+
 const insertAuditLog = `-- name: InsertAuditLog :exec
-INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 `
 
 type InsertAuditLogParams struct {
@@ -25,6 +43,9 @@ type InsertAuditLogParams struct {
 	Actor         string
 	Before        []byte
 	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
 }
 
 func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error {
@@ -36,13 +57,17 @@ func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) 
 		arg.Actor,
 		arg.Before,
 		arg.After,
+		arg.CreatedAt,
+		arg.PrevHash,
+		arg.RowHash,
 	)
 	return err
 }
 
 const listAuditByAccount = `-- name: ListAuditByAccount :many
 SELECT audit_log.id, audit_log.tenant_id, audit_log.action, audit_log.transaction_id,
-       audit_log.actor, audit_log.before, audit_log.after, audit_log.created_at
+       audit_log.actor, audit_log.before, audit_log.after, audit_log.created_at,
+       audit_log.prev_hash, audit_log.row_hash
 FROM audit_log
 WHERE audit_log.tenant_id = $1
   AND audit_log.transaction_id IN (
@@ -91,6 +116,8 @@ func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccount
 			&i.Before,
 			&i.After,
 			&i.CreatedAt,
+			&i.PrevHash,
+			&i.RowHash,
 		); err != nil {
 			return nil, err
 		}
@@ -103,7 +130,7 @@ func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccount
 }
 
 const listAuditByTransaction = `-- name: ListAuditByTransaction :many
-SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
 FROM audit_log
 WHERE tenant_id = $1 AND transaction_id = $2
 ORDER BY created_at, id
@@ -132,6 +159,48 @@ func (q *Queries) ListAuditByTransaction(ctx context.Context, arg ListAuditByTra
 			&i.Before,
 			&i.After,
 			&i.CreatedAt,
+			&i.PrevHash,
+			&i.RowHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditForVerify = `-- name: ListAuditForVerify :many
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
+FROM audit_log
+WHERE tenant_id = $1
+ORDER BY created_at, id
+`
+
+// Every audit row for the tenant, oldest first: the full walk used to
+// recompute and check the tamper-evident hash chain end to end.
+func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error) {
+	rows, err := q.db.Query(ctx, listAuditForVerify, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Action,
+			&i.TransactionID,
+			&i.Actor,
+			&i.Before,
+			&i.After,
+			&i.CreatedAt,
+			&i.PrevHash,
+			&i.RowHash,
 		); err != nil {
 			return nil, err
 		}

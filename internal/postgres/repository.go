@@ -330,8 +330,26 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 	return nil
 }
 
-// AppendAudit writes one audit row inside the surrounding transaction. The id is
-// a fresh UUIDv7 so rows sort by creation time.
+// AppendAudit writes one audit row inside the surrounding transaction,
+// extending that tenant's tamper-evident hash chain (ADR-012). The id is a
+// fresh UUIDv7 so rows sort by creation time.
+//
+// The chain extension happens entirely within this call, inside the caller's
+// transaction: it reads the tenant's current latest row_hash (GetLastAuditHash;
+// no rows yet means this is the tenant's first row, so prev is
+// domain.AuditGenesisHash), stamps CreatedAt with the application clock (not a
+// database default, so the exact value hashed is the exact value stored),
+// computes RowHash over that content plus prev, and inserts all of it
+// together. Because the read and the write are in the same SERIALIZABLE
+// transaction, two concurrent posts for the same tenant conflict on this read
+// (one sees the other's insert as a predicate change) and one is retried by
+// RunInTx, which keeps the chain a single line, not a fork. This is the
+// coupling ADR-012 calls out as a real cost at very high single-tenant
+// concurrency: an advisory lock cannot fix it (PostgreSQL fixes each
+// SERIALIZABLE transaction's snapshot at its first statement, so blocking
+// later in the same transaction never lets it observe a competitor's
+// meanwhile-committed row; a lock only delays the same eventual abort), so
+// the only real lever is RunInTx's existing retry-with-backoff loop.
 func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.AuditEntry) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -345,6 +363,35 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	if err != nil {
 		return fmt.Errorf("postgres: generate audit id: %w", err)
 	}
+
+	prevHash := domain.AuditGenesisHash
+	last, err := tr.q.GetLastAuditHash(ctx, tid)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No prior row for this tenant: genesis.
+	case err != nil:
+		return fmt.Errorf("postgres: get last audit hash: %w", err)
+	default:
+		// A pre-migration legacy row (NULL row_hash) surfaces as an invalid
+		// pgtype.Text, whose zero-value String is "": the same as genesis. That
+		// is deliberate, not a bug: those rows predate the hash chain and are
+		// cleared by the seeder's reset within four hours, so treating them as
+		// an unchained starting point is the only meaningful choice.
+		prevHash = last.String
+	}
+
+	e.ID = id.String()
+	// Truncated to microseconds: Postgres timestamptz only stores microsecond
+	// precision, so a nanosecond-precision time.Now() would silently lose its
+	// last three digits on the round trip through the column. Truncating here,
+	// before it is both hashed and stored, guarantees the value fed to
+	// ComputeAuditRowHash is bit-for-bit the same value a later read (and thus
+	// a later recompute, for the verify walk) will see; skipping this step
+	// would make every stored row_hash permanently unrecomputable.
+	e.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
+	e.PrevHash = prevHash
+	e.RowHash = domain.ComputeAuditRowHash(e, prevHash)
+
 	if err := tr.q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
 		ID:            id,
 		TenantID:      tid,
@@ -353,6 +400,9 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 		Actor:         e.Actor,
 		Before:        e.Before,
 		After:         e.After,
+		CreatedAt:     e.CreatedAt,
+		PrevHash:      pgtype.Text{String: e.PrevHash, Valid: true},
+		RowHash:       pgtype.Text{String: e.RowHash, Valid: true},
 	}); err != nil {
 		return fmt.Errorf("postgres: insert audit log: %w", err)
 	}
@@ -473,8 +523,27 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 	return auditEntriesFromRows(rows), nil
 }
 
+// ListAuditForVerify returns every audit row for the tenant, oldest first,
+// including PrevHash and RowHash: the full walk used to recompute and check
+// the tamper-evident hash chain end to end.
+func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.ListAuditForVerify(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
+	}
+	return auditEntriesFromRows(rows), nil
+}
+
 // auditEntriesFromRows converts sqlc audit rows to domain entries. Before/After
 // are jsonb columns surfaced as []byte; they convert to json.RawMessage.
+// PrevHash/RowHash are nullable at the column level only for rows written
+// before migration 0009; every row this application writes populates both, and
+// .String on an invalid (NULL) pgtype.Text zero-values to "" for those legacy
+// rows.
 func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
 	out := make([]domain.AuditEntry, 0, len(rows))
 	for _, row := range rows {
@@ -486,6 +555,8 @@ func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
 			Before:        row.Before,
 			After:         row.After,
 			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
 		})
 	}
 	return out

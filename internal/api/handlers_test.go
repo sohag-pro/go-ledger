@@ -129,8 +129,25 @@ func (f *fakeRepo) AppendAudit(_ context.Context, _ string, e domain.AuditEntry)
 	}
 	f.clock++
 	e.CreatedAt = time.Unix(f.clock, 0).UTC()
+	// Mirror the real repository's chain extension: prev is the last row's
+	// RowHash (genesis if this is the first row appended by this fake repo).
+	prev := domain.AuditGenesisHash
+	if len(f.audit) > 0 {
+		prev = f.audit[len(f.audit)-1].RowHash
+	}
+	e.PrevHash = prev
+	e.RowHash = domain.ComputeAuditRowHash(e, prev)
 	f.audit = append(f.audit, e)
 	return nil
+}
+
+// ListAuditForVerify returns every audit row this fake repo holds, oldest
+// first, mirroring the postgres adapter's ordering. It does not scope by
+// tenant: fakeRepo is single-tenant in these handler tests.
+func (f *fakeRepo) ListAuditForVerify(_ context.Context, _ string) ([]domain.AuditEntry, error) {
+	out := make([]domain.AuditEntry, len(f.audit))
+	copy(out, f.audit)
+	return out, nil
 }
 
 func (f *fakeRepo) GetIdempotencyKey(_ context.Context, _, key string) (domain.IdempotencyRecord, error) {

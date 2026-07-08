@@ -39,6 +39,8 @@ type AuditLog struct {
 	Before        []byte
 	After         []byte
 	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
 }
 
 type IdempotencyKey struct {
