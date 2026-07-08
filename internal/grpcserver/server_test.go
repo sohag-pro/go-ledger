@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,10 +20,14 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/domain"
 	ledgerv1 "github.com/sohag-pro/go-ledger/internal/genproto/ledger/v1"
 	"github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
@@ -88,6 +93,24 @@ func runWithContainer(m *testing.M) int {
 
 const testTenant = "00000000-0000-0000-0000-0000000000aa"
 
+// testAPIKeyPlaintext is the bearer token every integration test in this file
+// authenticates with. dialClient provisions it against testTenant on the
+// real Postgres repository before the server starts, so the tests exercise
+// the real auth interceptor rather than bypassing it.
+const testAPIKeyPlaintext = "glk_grpc-server-test-key" //nolint:gosec // test fixture key, not a real credential
+
+// authedCtx returns ctx with the test API key attached as gRPC authorization
+// metadata, the same shape a real client sends: "Bearer <token>".
+func authedCtx(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+testAPIKeyPlaintext)
+}
+
+// provisionTestAPIKeyOnce inserts testAPIKeyPlaintext for testTenant exactly
+// once per test binary run: dialClient is called from many test functions
+// sharing the same Postgres container, and a second insert of the same key
+// hash would violate the api_keys unique constraint.
+var provisionTestAPIKeyOnce sync.Once
+
 // dialClient starts the real gRPC server on a bufconn and returns a connected
 // generated client plus a cleanup func.
 func dialClient(t *testing.T) ledgerv1.LedgerServiceClient {
@@ -96,11 +119,21 @@ func dialClient(t *testing.T) ledgerv1.LedgerServiceClient {
 		t.Skipf("skipping integration test: %v", poolErr)
 	}
 	repo := postgres.NewRepository(sharedPool)
+	var provisionErr error
+	provisionTestAPIKeyOnce.Do(func() {
+		provisionErr = repo.InsertAPIKey(context.Background(),
+			domain.APIKey{TenantID: testTenant, Name: "grpc server test key"},
+			domain.HashAPIKey(testAPIKeyPlaintext),
+		)
+	})
+	if provisionErr != nil {
+		t.Fatalf("provision test api key: %v", provisionErr)
+	}
 	deps := grpcserver.Deps{
-		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, nil, nil),
-		Audit:         ledger.NewAuditService(repo),
-		DefaultTenant: testTenant,
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, nil, nil),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, time.Minute),
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := grpcserver.NewGRPCServer(deps, log)
@@ -121,9 +154,17 @@ func dialClient(t *testing.T) ledgerv1.LedgerServiceClient {
 	return ledgerv1.NewLedgerServiceClient(conn)
 }
 
+func TestGRPCWithoutAPIKeyIsUnauthenticated(t *testing.T) {
+	client := dialClient(t)
+	_, err := client.CreateAccount(context.Background(), &ledgerv1.CreateAccountRequest{Name: "Cash", Type: "asset", Currency: "USD"})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code = %v, want Unauthenticated", status.Code(err))
+	}
+}
+
 func TestGRPCPostAndBalance(t *testing.T) {
 	client := dialClient(t)
-	ctx := context.Background()
+	ctx := authedCtx(context.Background())
 
 	cash, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Cash", Type: "asset", Currency: "USD"})
 	if err != nil {
@@ -134,7 +175,8 @@ func TestGRPCPostAndBalance(t *testing.T) {
 		t.Fatalf("create revenue: %v", err)
 	}
 
-	post, err := client.PostTransaction(ctx, &ledgerv1.PostTransactionRequest{
+	postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "post-and-balance")
+	post, err := client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{
 			{AccountId: cash.Account.Id, Amount: 10000},
@@ -159,7 +201,7 @@ func TestGRPCPostAndBalance(t *testing.T) {
 
 func TestGRPCIdempotentReplay(t *testing.T) {
 	client := dialClient(t)
-	base := context.Background()
+	base := authedCtx(context.Background())
 
 	a, _ := client.CreateAccount(base, &ledgerv1.CreateAccountRequest{Name: "A", Type: "asset", Currency: "USD"})
 	b, _ := client.CreateAccount(base, &ledgerv1.CreateAccountRequest{Name: "B", Type: "income", Currency: "USD"})

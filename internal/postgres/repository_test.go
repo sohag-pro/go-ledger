@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -379,7 +380,7 @@ func TestRunInTxRetriesThenCommits(t *testing.T) {
 
 	before := testutil.ToFloat64(metrics.SerializationRetries)
 	calls := 0
-	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(context.Background(), uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		calls++
 		if calls == 1 {
 			return serErr()
@@ -403,12 +404,114 @@ func TestRunInTxExhaustionReturnsConflict(t *testing.T) {
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
 
-	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(context.Background(), uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		return serErr()
 	})
 	if !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("expected ErrConflict after exhaustion, got %v", err)
 	}
+}
+
+// TestRunInTxDifferentTenantsRunConcurrently proves the per-tenant in-process
+// mutex (added to stop the audit-chain serialization storm, see RunInTx's doc
+// comment) only ever serializes calls for the SAME tenant. Tenant A's call
+// holds its mutex (and an open transaction) for a deliberate pause; tenant
+// B's call, started while A's is still running, must complete long before
+// that pause elapses. If different tenants shared a mutex, B would block
+// behind A and take at least as long as the pause. Unlike a hashed lock key,
+// a mutex keyed by the exact tenant id string has no collision risk to guard
+// against.
+func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	const pause = 300 * time.Millisecond
+	tenantA, tenantB := uuid.NewString(), uuid.NewString()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = repo.RunInTx(context.Background(), tenantA, func(_ context.Context, _ domain.Tx) error {
+			time.Sleep(pause)
+			return nil
+		})
+	}()
+	// Give tenant A's goroutine a head start so it is holding its lock (and an
+	// open transaction) by the time tenant B's call below starts.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	err := repo.RunInTx(context.Background(), tenantB, func(_ context.Context, _ domain.Tx) error {
+		return nil
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("tenant B's RunInTx failed: %v", err)
+	}
+	if elapsed >= pause {
+		t.Fatalf("tenant B's RunInTx took %s, at least as long as tenant A's %s pause: "+
+			"it appears to have waited on tenant A's mutex", elapsed, pause)
+	}
+	wg.Wait()
+}
+
+// TestRunInTxCancelledWaiterReturnsPromptly is the regression test for the
+// context-cancellation fix to the per-tenant keyed mutex (see keyedMutex.lock
+// in internal/postgres/repository.go). Before the fix, a caller parked
+// waiting for another same-tenant RunInTx to release the mutex was not
+// cancellable: it blocked on a plain sync.Mutex until its turn regardless of
+// its own context. Under sustained same-tenant overload with client
+// timeouts, that piles up parked goroutines that can never give up.
+//
+// Goroutine A holds the tenant's lock for a long pause via a slow fn.
+// Goroutine B starts a RunInTx for the same tenant with a context cancelled
+// shortly after B begins waiting. B must return promptly with a context
+// error, well before A's pause elapses, and its fn must never run: B never
+// got the lock, so it never had a transaction to run fn in.
+func TestRunInTxCancelledWaiterReturnsPromptly(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	const pause = 2 * time.Second
+	tenant := uuid.NewString()
+
+	holding := make(chan struct{})
+	var wgA sync.WaitGroup
+	wgA.Add(1)
+	go func() {
+		defer wgA.Done()
+		_ = repo.RunInTx(context.Background(), tenant, func(_ context.Context, _ domain.Tx) error {
+			close(holding)
+			time.Sleep(pause)
+			return nil
+		})
+	}()
+	<-holding // goroutine A now holds tenant's lock and will for ~pause.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel) // cancel while B is still waiting for the lock.
+
+	bRan := false
+	start := time.Now()
+	err := repo.RunInTx(ctx, tenant, func(_ context.Context, _ domain.Tx) error {
+		bRan = true
+		return nil
+	})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if bRan {
+		t.Error("fn ran even though the waiter never acquired the tenant lock")
+	}
+	if elapsed >= pause {
+		t.Fatalf("cancelled waiter took %s, at least as long as the %s pause holding the lock: "+
+			"it did not return promptly on cancellation", elapsed, pause)
+	}
+
+	wgA.Wait()
 }
 
 // TestRunInTxNonRetryablePropagates checks that an ordinary error is returned
@@ -419,7 +522,7 @@ func TestRunInTxNonRetryablePropagates(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	calls := 0
-	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(context.Background(), uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		calls++
 		return sentinel
 	})

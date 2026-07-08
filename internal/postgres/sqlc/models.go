@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Account struct {
@@ -19,6 +20,16 @@ type Account struct {
 	CreatedAt time.Time
 }
 
+type ApiKey struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	Name         string
+	KeyHash      string
+	RateLimitRpm pgtype.Int4
+	CreatedAt    time.Time
+	RevokedAt    pgtype.Timestamptz
+}
+
 type AuditLog struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
@@ -28,6 +39,8 @@ type AuditLog struct {
 	Before        []byte
 	After         []byte
 	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
 }
 
 type IdempotencyKey struct {

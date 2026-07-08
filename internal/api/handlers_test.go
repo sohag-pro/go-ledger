@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,11 +17,18 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 const testTenant = "00000000-0000-0000-0000-000000000001"
+
+// testAPIKeyPlaintext is the bearer token every handler test authenticates
+// with by default (do, postJSON, getJSON all set it). newAPIRouter provisions
+// it against testTenant on the fake repo it is given, so every existing test
+// keeps exercising the real auth middleware instead of bypassing it.
+const testAPIKeyPlaintext = "glk_handlers-test-default-key" //nolint:gosec // test fixture key, not a real credential
 
 // fakeRepo is an in-memory domain.Repository for handler tests: no database, no
 // concurrency semantics, just enough to exercise the HTTP layer end to end.
@@ -31,6 +39,7 @@ type fakeRepo struct {
 	clock    int64
 	idem     map[string]domain.IdempotencyRecord // key -> record
 	audit    []domain.AuditEntry
+	apiKeys  map[string]domain.APIKey // key_hash -> resolved key
 }
 
 type postingRec struct {
@@ -44,6 +53,7 @@ func newFakeRepo() *fakeRepo {
 		accounts: map[string]domain.Account{},
 		txns:     map[string]domain.Transaction{},
 		idem:     map[string]domain.IdempotencyRecord{},
+		apiKeys:  map[string]domain.APIKey{},
 	}
 }
 
@@ -113,14 +123,31 @@ func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, 
 	return nil
 }
 
-func (f *fakeRepo) AppendAudit(_ context.Context, _ string, e domain.AuditEntry) error {
+func (f *fakeRepo) AppendAudit(_ context.Context, tenantID string, e domain.AuditEntry) error {
 	if e.ID == "" {
 		e.ID = uuid.NewString()
 	}
 	f.clock++
 	e.CreatedAt = time.Unix(f.clock, 0).UTC()
+	// Mirror the real repository's chain extension: prev is the last row's
+	// RowHash (genesis if this is the first row appended by this fake repo).
+	prev := domain.AuditGenesisHash
+	if len(f.audit) > 0 {
+		prev = f.audit[len(f.audit)-1].RowHash
+	}
+	e.PrevHash = prev
+	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prev)
 	f.audit = append(f.audit, e)
 	return nil
+}
+
+// ListAuditForVerify returns every audit row this fake repo holds, oldest
+// first, mirroring the postgres adapter's ordering. It does not scope by
+// tenant: fakeRepo is single-tenant in these handler tests.
+func (f *fakeRepo) ListAuditForVerify(_ context.Context, _ string) ([]domain.AuditEntry, error) {
+	out := make([]domain.AuditEntry, len(f.audit))
+	copy(out, f.audit)
+	return out, nil
 }
 
 func (f *fakeRepo) GetIdempotencyKey(_ context.Context, _, key string) (domain.IdempotencyRecord, error) {
@@ -232,24 +259,54 @@ func (f *fakeRepo) Statement(_ context.Context, _, accountID string, currency do
 	return out, nil
 }
 
-func (f *fakeRepo) RunInTx(ctx context.Context, fn func(context.Context, domain.Tx) error) error {
+func (f *fakeRepo) RunInTx(ctx context.Context, _ string, fn func(context.Context, domain.Tx) error) error {
 	return fn(ctx, f)
+}
+
+func (f *fakeRepo) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
+	k, ok := f.apiKeys[hash]
+	if !ok {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	return k, nil
+}
+
+func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash string) error {
+	if k.ID == "" {
+		k.ID = uuid.NewString()
+	}
+	f.apiKeys[keyHash] = k
+	return nil
 }
 
 var _ domain.Repository = (*fakeRepo)(nil)
 
+// newAPIRouter wires the API over repo, provisioning testAPIKeyPlaintext
+// against testTenant so the default request helpers below (do, postJSON,
+// getJSON) authenticate as testTenant through the real auth middleware rather
+// than bypassing it.
 func newAPIRouter(repo domain.Repository) chi.Router {
+	if err := repo.InsertAPIKey(context.Background(),
+		domain.APIKey{TenantID: testTenant, Name: "handlers test default key"},
+		domain.HashAPIKey(testAPIKeyPlaintext),
+	); err != nil {
+		panic("newAPIRouter: provision default test key: " + err.Error())
+	}
+
 	r := chi.NewRouter()
 	New(r, Deps{
-		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
-		Audit:         ledger.NewAuditService(repo),
-		DefaultTenant: testTenant,
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, time.Minute),
 	})
 	return r
 }
 
-func do(t *testing.T, r chi.Router, method, path string, body any) *httptest.ResponseRecorder {
+// do issues a request authenticated as testTenant. An optional trailing
+// headers map (e.g. {"Idempotency-Key": "..."}) is applied on top of the
+// defaults; only the first map, if any, is used.
+func do(t *testing.T, r chi.Router, method, path string, body any, headers ...map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	var rdr io.Reader
 	if body != nil {
@@ -263,6 +320,12 @@ func do(t *testing.T, r chi.Router, method, path string, body any) *httptest.Res
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
+	if len(headers) > 0 {
+		for k, v := range headers[0] {
+			req.Header.Set(k, v)
+		}
+	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -275,6 +338,7 @@ func postJSON(t *testing.T, r chi.Router, path, body string, headers map[string]
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -283,10 +347,11 @@ func postJSON(t *testing.T, r chi.Router, path, body string, headers map[string]
 	return rec
 }
 
-// getJSON GETs path with no body.
+// getJSON GETs path with no body, authenticated as testTenant.
 func getJSON(t *testing.T, r chi.Router, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKeyPlaintext)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -382,7 +447,7 @@ func TestPostTransactionAndBalance(t *testing.T) {
 				{"account_id": cash, "amount": 10000, "description": "sale"},
 				{"account_id": rev, "amount": -10000},
 			},
-		})
+		}, map[string]string{"Idempotency-Key": "post-and-balance-1"})
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
 		}
@@ -410,7 +475,7 @@ func TestPostTransactionAndBalance(t *testing.T) {
 				{"account_id": cash, "amount": 10000},
 				{"account_id": rev, "amount": -9999},
 			},
-		})
+		}, map[string]string{"Idempotency-Key": "post-and-balance-unbalanced"})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
 		}
@@ -420,9 +485,82 @@ func TestPostTransactionAndBalance(t *testing.T) {
 		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
 			"currency": "USD",
 			"postings": []map[string]any{{"account_id": cash, "amount": 0}},
-		})
+		}, map[string]string{"Idempotency-Key": "post-and-balance-too-few"})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422", rec.Code)
+		}
+	})
+
+	// ADR-012 "Input hardening": the postings array has a maxItems of 100, so
+	// one request can no longer become an arbitrarily large transaction. This
+	// is huma schema validation (maxItems), so it rejects before the handler
+	// (and the balance check) ever runs. The 101 postings here deliberately DO
+	// sum to zero (100 legs of +1 on cash, one leg of -100 on rev): if
+	// maxItems were removed, this would be a perfectly valid balanced
+	// transaction and the handler would accept it. That is the point: the
+	// only thing that can reject this request is the array-length schema
+	// check, so asserting on the huma error location below actually pins
+	// maxItems instead of coincidentally tripping the unrelated unbalanced
+	// check.
+	t.Run("too many postings 422", func(t *testing.T) {
+		postings := make([]map[string]any, 101)
+		for i := 0; i < 100; i++ {
+			postings[i] = map[string]any{"account_id": cash, "amount": 1}
+		}
+		postings[100] = map[string]any{"account_id": rev, "amount": -100}
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": postings,
+		}, map[string]string{"Idempotency-Key": "post-and-balance-too-many"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Errors []struct {
+				Location string `json:"location"`
+				Message  string `json:"message"`
+			} `json:"errors"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal error body: %v (%s)", err, rec.Body.String())
+		}
+		found := false
+		for _, e := range out.Errors {
+			if strings.Contains(e.Location, "postings") && strings.Contains(e.Message, "array length") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("errors = %+v, want an entry naming postings and array length (schema maxItems rejection), got body %s", out.Errors, rec.Body.String())
+		}
+	})
+
+	// ADR-012 "Input hardening": create-transaction sets MaxBodyBytes to
+	// MaxRequestBodyBytes (64 KiB), so huma's own body read stops at the limit
+	// and returns 413, independent of the router-level body-size middleware in
+	// cmd/server (which is not present on this test router).
+	t.Run("oversized body 413", func(t *testing.T) {
+		body := strings.Repeat("a", int(MaxRequestBodyBytes)+1)
+		rec := postJSON(t, r, "/v1/transactions", body, map[string]string{"Idempotency-Key": "oversized-body"})
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("status %d, want 413 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("missing idempotency key 400", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 100},
+				{"account_id": rev, "amount": -100},
+			},
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 (%s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "Idempotency-Key header is required") {
+			t.Errorf("body = %s, want the missing-key message", rec.Body.String())
 		}
 	})
 }
@@ -432,7 +570,9 @@ func TestStatementPagination(t *testing.T) {
 	cash := createAccount(t, r, "Cash", "asset")
 	other := createAccount(t, r, "Other", "asset")
 
-	// Post three transactions so cash has three postings.
+	// Post three transactions so cash has three postings. Each needs its own
+	// idempotency key: the bodies are identical, and reusing one key across
+	// them would replay the first post instead of creating three.
 	for i := 0; i < 3; i++ {
 		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
 			"currency": "USD",
@@ -440,7 +580,7 @@ func TestStatementPagination(t *testing.T) {
 				{"account_id": cash, "amount": 100, "description": "deposit"},
 				{"account_id": other, "amount": -100},
 			},
-		})
+		}, map[string]string{"Idempotency-Key": fmt.Sprintf("statement-pagination-%d", i)})
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("post %d: %d (%s)", i, rec.Code, rec.Body.String())
 		}
@@ -558,7 +698,7 @@ func TestAuditEndpoints(t *testing.T) {
 	body := `{"currency":"USD","postings":[` +
 		`{"account_id":"` + a.ID + `","amount":100},` +
 		`{"account_id":"` + b.ID + `","amount":-100}]}`
-	rec := postJSON(t, router, "/v1/transactions", body, nil)
+	rec := postJSON(t, router, "/v1/transactions", body, map[string]string{"Idempotency-Key": "audit-endpoints"})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("post status = %d body=%s", rec.Code, rec.Body.String())
 	}

@@ -23,7 +23,7 @@ func TestIdempotencyKeyTenantIsolation(t *testing.T) {
 	owner := uuid.NewString()
 	txnID, _, _ := seedTxn(t, repo, owner)
 
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
 		return tx.InsertIdempotencyKey(ctx, owner, "shared-key", "fp-1", txnID)
 	})
 	if err != nil {
@@ -47,7 +47,7 @@ func TestListAuditByTransactionTenantIsolation(t *testing.T) {
 	owner := uuid.NewString()
 	txnID, _, _ := seedTxn(t, repo, owner)
 
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
 		return tx.AppendAudit(ctx, owner, domain.AuditEntry{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
@@ -82,7 +82,7 @@ func TestListAuditByAccountTenantIsolation(t *testing.T) {
 	owner := uuid.NewString()
 	txnID, debit, _ := seedTxn(t, repo, owner)
 
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
 		return tx.AppendAudit(ctx, owner, domain.AuditEntry{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,

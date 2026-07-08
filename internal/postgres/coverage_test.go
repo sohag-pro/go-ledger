@@ -211,7 +211,7 @@ func TestCreateTransactionUnbalancedViaRunInTx(t *testing.T) {
 	unbalanced := &domain.Transaction{Postings: []domain.Posting{
 		{AccountID: a.ID, Amount: money(t, 100, "USD")},
 	}}
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
 		return tx.CreateTransaction(ctx, tenant, unbalanced)
 	})
 	if !errors.Is(err, domain.ErrUnbalanced) {
@@ -233,7 +233,7 @@ func TestCreateTransactionBadPostingAccountID(t *testing.T) {
 		{AccountID: "not-a-uuid", Amount: money(t, 100, "USD")},
 		{AccountID: uuid.NewString(), Amount: money(t, -100, "USD")},
 	}}
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
 		return tx.CreateTransaction(ctx, tenant, txn)
 	})
 	if err == nil {
@@ -283,7 +283,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
-		err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
 			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", uuid.NewString())
 		})
 		if err == nil {
@@ -293,7 +293,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
-		err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
 			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "not-a-uuid")
 		})
 		if err == nil {
@@ -303,7 +303,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
-		err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
 			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", uuid.NewString())
 		})
 		if err == nil {
@@ -326,7 +326,7 @@ func TestAppendAuditEdges(t *testing.T) {
 
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
-		err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
 			return tx.AppendAudit(ctx, "not-a-uuid", domain.AuditEntry{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: uuid.NewString(),
@@ -341,7 +341,7 @@ func TestAppendAuditEdges(t *testing.T) {
 
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
-		err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
 			return tx.AppendAudit(ctx, uuid.NewString(), domain.AuditEntry{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: "not-a-uuid",
@@ -356,7 +356,7 @@ func TestAppendAuditEdges(t *testing.T) {
 
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
-		err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
 			return tx.AppendAudit(ctx, uuid.NewString(), domain.AuditEntry{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: uuid.NewString(),
@@ -382,7 +382,7 @@ func TestRunInTxCancelledDuringBackoff(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	err := repo.RunInTx(ctx, func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(ctx, uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		calls++
 		if calls == 1 {
 			cancel()

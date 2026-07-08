@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
+	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	ledgerv1 "github.com/sohag-pro/go-ledger/internal/genproto/ledger/v1"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
@@ -46,12 +47,13 @@ func clampLimit(requested, def, maxVal int) int {
 }
 
 // Deps are the shared services the gRPC handlers call, the same ones the REST
-// layer uses, plus the default tenant injected by the tenant interceptor.
+// layer uses, plus the resolver the auth interceptor uses to authenticate
+// every call and derive its tenant (see ADR-012).
 type Deps struct {
-	Accounts      *ledger.AccountService
-	Transactions  *ledger.TransactionService
-	Audit         *ledger.AuditService
-	DefaultTenant string
+	Accounts     *ledger.AccountService
+	Transactions *ledger.TransactionService
+	Audit        *ledger.AuditService
+	Auth         *auth.Resolver
 }
 
 // Server implements the generated LedgerServiceServer as a thin adapter: it
@@ -71,6 +73,10 @@ func NewServer(d Deps) *Server {
 
 // NewGRPCServer builds a *grpc.Server with the interceptor chain, the
 // LedgerService, server reflection (so grpcurl works), and the health service.
+// Every LedgerService call must authenticate through d.Auth (ADR-012); the
+// gRPC health check is exempt so liveness probes work without an API key.
+// Reflection is likewise left open: it only describes the service, it does
+// not call it, so there is nothing to authenticate.
 func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 	if log == nil {
 		log = slog.Default()
@@ -80,7 +86,7 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 		grpc.ChainUnaryInterceptor(
 			recoveryUnaryInterceptor(log),
 			loggingUnaryInterceptor(log),
-			tenantUnaryInterceptor(d.DefaultTenant),
+			authUnaryInterceptor(d.Auth, log),
 		),
 	)
 	ledgerv1.RegisterLedgerServiceServer(s, NewServer(d))
@@ -205,10 +211,16 @@ func (s *Server) GetStatement(ctx context.Context, req *ledgerv1.GetStatementReq
 	return resp, nil
 }
 
-// PostTransaction posts a balanced set of postings as a new transaction. When
-// an idempotency-key is present in the metadata and was already used with the
-// same request body, it replays the original result instead of posting again.
+// PostTransaction posts a balanced set of postings as a new transaction. The
+// idempotency-key metadata is required (ADR-012): when it was already used
+// with the same request body, the original result is replayed instead of
+// posting again.
 func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransactionRequest) (*ledgerv1.PostTransactionResponse, error) {
+	key := idempotencyKeyFrom(ctx)
+	if key == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency-key metadata is required")
+	}
+
 	currency := domain.Currency(req.Currency)
 	postings := make([]domain.Posting, 0, len(req.Postings))
 	for _, p := range req.Postings {
@@ -219,11 +231,7 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 		postings = append(postings, domain.Posting{AccountID: p.AccountId, Amount: amount, Description: p.Description})
 	}
 	txn := &domain.Transaction{Postings: postings}
-
-	var idem *domain.Idempotency
-	if key := idempotencyKeyFrom(ctx); key != "" {
-		idem = &domain.Idempotency{Key: key}
-	}
+	idem := &domain.Idempotency{Key: key}
 	replayed, err := s.txns.Post(ctx, tenantFrom(ctx), txn, idem)
 	if err != nil {
 		return nil, toStatus(err)

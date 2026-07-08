@@ -47,32 +47,43 @@ SMOKE=1 k6 run test/load/post_transactions.js
 
 ## What it does
 
-`setup()` runs once before any traffic starts. It creates 20 real USD asset
-accounts through POST /v1/accounts plus one extra dedicated account for the
-hot_account scenario, and passes their real UUIDs into the scenario
+Each tenant's audit hash chain serializes same-tenant transaction posts
+through an in-process mutex, so a single tenant's throughput is bounded no
+matter how high its rate limit is. To reach 500 requests per second in
+aggregate, this script spreads traffic across `LOAD_TENANTS` tenants
+(default 8, matching the load-test Compose stack's `LOAD_TEST_TENANTS`),
+each with its own derived key `<API_KEY>-t<i>`.
+
+`setup()` runs once before any traffic starts. For each tenant it creates 20
+real USD asset accounts through POST /v1/accounts plus one extra dedicated
+account for the hot_account scenario, all authenticated with that tenant's
+key, and passes the real UUIDs (grouped per tenant) into the scenario
 functions. The script never invents account ids: every posting's account_id
-has to reference an account that actually exists and matches the
-transaction's currency, so setup has to create them first.
+has to reference an account that actually exists, belongs to the caller's
+tenant, and matches the transaction's currency, so setup has to create them
+first.
 
 Every POST /v1/transactions carries a unique `Idempotency-Key` header built
 from the VU id, iteration counter, a random suffix, and the clock, so keys
 are unique across VUs and iterations. A small fraction of requests (about 5
 percent) deliberately reuse a prior key together with its original request
-body, to exercise the replay path (the server answers with the same
-transaction and an `Idempotent-Replayed: true` response header, still with
-status 201).
+body and tenant, to exercise the replay path (the server answers with the
+same transaction and an `Idempotent-Replayed: true` response header, still
+with status 201).
 
 ### Scenarios
 
 - **fanout**: ramps up over 15 seconds and then holds at 500 requests per
-  second for 45 seconds (1 minute total). Each request picks two different
-  accounts at random out of the 20 created in setup, so writes and their row
-  locks are spread across many accounts.
+  second for 45 seconds (1 minute total). Each request first picks a random
+  tenant, then picks two different accounts at random out of that tenant's
+  20 accounts created in setup, so writes and their row locks are spread
+  across many tenants and, within each tenant, many accounts.
 - **hot_account**: runs for 1 minute right after fanout, holding a steady 200
-  requests per second. Every request uses the same dedicated account on one
-  leg and a random account from the pool on the other leg, so every write
-  contends for that one account's balance and row lock. This is the scenario
-  meant to expose lock contention under the append-only posting model.
+  requests per second. Each request picks a random tenant, then uses that
+  tenant's dedicated hot account on one leg and a random account from that
+  same tenant's pool on the other leg, so writes contend for one account's
+  balance and row lock within a tenant, while the contention itself is
+  spread across tenants.
 
 Both scenarios post a balanced two-leg transaction (`amount` and `-amount`,
 signed minor units), matching the domain's double-entry invariant.
@@ -99,14 +110,21 @@ On a local Apple Silicon development machine with the load-test Compose stack
 (50 requests per second for 30 seconds) came back with 0 failed requests, 100
 percent checks passing, and p99 around 180 milliseconds.
 
-A full, non-smoke run (`make load` followed by
-`k6 run test/load/post_transactions.js`) on that same machine completed both
-scenarios with 0 failed requests out of 38,271 and 100 percent checks
-passing: fanout held 500 requests per second with p99 at 3.53 milliseconds,
-and hot_account held 200 requests per second with p99 at 3.81 milliseconds.
-Those numbers are far under the 100 and 150 millisecond thresholds, but they
-came from a single-node Compose stack with everything, app, Postgres, and k6
-itself, on one machine talking over localhost, which is a best case. Your
-numbers on a different machine, or with the components on separate hosts,
-will differ. Rerun it locally rather than trusting these figures for your own
-setup.
+The numbers below are from after the multi-tenant spread (this script now
+spreads load across 8 tenants instead of posting everything to one): a full,
+non-smoke run (`make load` followed by `k6 run test/load/post_transactions.js`)
+on that same machine completed both scenarios with 0 failed requests out of
+38,417 and 100 percent checks passing: fanout held 500 requests per second
+with p99 at 4.68 milliseconds, and hot_account held 200 requests per second
+with p99 at 4.98 milliseconds. The app logs for that run show zero 503s, zero
+500s, and zero serialization or retries-exhausted messages, with transactions
+spread evenly across all 8 tenants (roughly 4,700 to 5,500 each). Before this
+change, driving 500 requests per second at a single tenant ran into the
+audit hash chain's in-process mutex, which serializes same-tenant transaction
+posts and exhausted its serialization retries under that load; spreading
+across tenants removes that bottleneck. Those numbers are far under the 100
+and 150 millisecond thresholds, but they came from a single-node Compose
+stack with everything, app, Postgres, and k6 itself, on one machine talking
+over localhost, which is a best case. Your numbers on a different machine, or
+with the components on separate hosts, will differ. Rerun it locally rather
+than trusting these figures for your own setup.

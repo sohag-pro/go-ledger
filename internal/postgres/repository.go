@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
@@ -42,15 +44,55 @@ func retryBackoff(attempt int) time.Duration {
 	return time.Duration(rand.Int64N(int64(exp) + 1)) //nolint:gosec // jitter, not crypto
 }
 
+// keyedMutex is a set of independent mutexes, one per key, created lazily on
+// first use. It serializes callers that share a key while leaving callers
+// with different keys fully concurrent, without ever touching a database
+// connection: waiters block on ordinary Go scheduling, not on anything held
+// against Postgres.
+//
+// Each key's mutex is a capacity-1 channel rather than a sync.Mutex so that a
+// waiter can give up: acquiring it is a select between sending on the channel
+// and the caller's context being done, so a cancelled or timed-out caller
+// stops waiting immediately instead of blocking until the current holder
+// releases.
+//
+// The underlying sync.Map grows by one entry per distinct key ever seen and
+// is never evicted. That is deliberate: keys here are tenant ids, bounded by
+// the number of tenants the service has, not by request volume, so the map
+// stays small for the life of the process and eviction would add complexity
+// for no real memory benefit at this scale.
+type keyedMutex struct{ m sync.Map }
+
+// lock blocks until key's mutex is free or ctx is done, whichever comes
+// first. On success it returns a func that releases the mutex; the caller is
+// expected to defer it. On cancellation it returns ctx.Err() and a nil func;
+// the mutex is left exactly as it was, since this caller never acquired it.
+func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
+	chAny, _ := k.m.LoadOrStore(key, make(chan struct{}, 1))
+	ch := chAny.(chan struct{}) //nolint:forcetypeassert // this map only ever stores chan struct{}, set two lines up
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // Repository is a domain.Repository backed by a pgx connection pool.
 type Repository struct {
 	pool *pgxpool.Pool
 	q    *sqlc.Queries
+	// tenantLocks serializes RunInTx calls per tenant (see RunInTx's doc
+	// comment for why). Its zero value is ready to use, since sync.Map needs
+	// no initialization, but the field is spelled out explicitly here rather
+	// than left implicit so the serialization mechanism is visible on the
+	// struct, not just inside RunInTx.
+	tenantLocks keyedMutex
 }
 
 // NewRepository returns a Repository that uses pool for all queries.
 func NewRepository(pool *pgxpool.Pool) *Repository {
-	return &Repository{pool: pool, q: sqlc.New(pool)}
+	return &Repository{pool: pool, q: sqlc.New(pool), tenantLocks: keyedMutex{}}
 }
 
 // compile-time check that Repository satisfies the domain port.
@@ -139,7 +181,7 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 	if err := t.Validate(); err != nil {
 		return err
 	}
-	return r.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	return r.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		return tx.CreateTransaction(ctx, tenantID, t)
 	})
 }
@@ -149,8 +191,49 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // serialization conflict (SQLSTATE 40001), and the conflict often surfaces only
 // at COMMIT, so both fn and the commit are watched and the whole unit of work is
 // replayed up to maxPostAttempts times. fn must therefore be safe to run more
-// than once.
-func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domain.Tx) error) error {
+// than once. Each attempt acquires its own connection from the pool via
+// BeginTx and releases it (Commit or Rollback) before the next attempt's
+// backoff wait, exactly as if RunInTx had no notion of tenants at all: no
+// connection is ever held across a backoff or across attempts.
+//
+// Before any of that, RunInTx acquires tenantID's lock from an in-process
+// keyed mutex and holds it for every attempt, releasing it only when the
+// whole call returns. This serializes same-tenant calls one at a time while
+// leaving different tenants (different keys) fully concurrent. It exists
+// because of the per-tenant audit hash chain (ADR-012): each attempt reads
+// the tenant's latest audit row_hash and then inserts the next one, and two
+// concurrent same-tenant attempts reading the same chain tail is a genuine
+// read-write antidependency that SERIALIZABLE must abort. Under high
+// same-tenant concurrency that repeated abort can exhaust the retry budget
+// and surface as a 503.
+//
+// The lock is a channel-backed in-process mutex, not a database lock, and
+// that is the point (see ADR-012). A waiter blocks on Go's scheduler; it has
+// not acquired a database connection and never will until it is its turn to
+// run an attempt, so a burst of same-tenant callers cannot exhaust the
+// connection pool or starve other tenants of connections the way a lock held
+// on a checked-out connection can. It also means Postgres's lock_timeout,
+// which bounds how long a session will wait on a database-level lock, never
+// applies here: there is no database lock wait to time out. Unlike a plain
+// sync.Mutex, the wait itself respects ctx: if the caller's context is
+// cancelled or times out while parked waiting for the tenant lock, lock
+// returns ctx.Err() immediately instead of leaving the goroutine parked until
+// the current holder finishes, so a pile of abandoned client requests cannot
+// accumulate blocked goroutines under sustained same-tenant overload.
+//
+// This only serializes same-tenant posting within one process. go-ledger runs
+// as a single instance (a VPS, not a fleet), so that is a complete fix today.
+// If the service ever runs as more than one instance, two different
+// instances could still race on the same tenant; the SERIALIZABLE retry loop
+// above remains in place as the backstop for that case; it would simply see
+// same-tenant conflicts occasionally instead of never.
+func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error {
+	unlock, err := r.tenantLocks.lock(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	var lastErr error
 	for attempt := 0; attempt < maxPostAttempts; attempt++ {
 		if attempt > 0 {
@@ -219,6 +302,15 @@ func isUniqueViolation(err error) bool {
 		return pgErr.Code == "23505"
 	}
 	return false
+}
+
+// IsUniqueViolationError reports whether err is a Postgres unique-violation
+// (23505). Exported so a caller outside this package (cmd/server's idempotent
+// API key provisioning, see ADR-012) can treat "a row with this key already
+// exists" as success rather than an error, without duplicating the pgconn
+// error-code check.
+func IsUniqueViolationError(err error) bool {
+	return isUniqueViolation(err)
 }
 
 // pgConstraint returns the constraint name on a Postgres error, or "". The
@@ -329,8 +421,24 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 	return nil
 }
 
-// AppendAudit writes one audit row inside the surrounding transaction. The id is
-// a fresh UUIDv7 so rows sort by creation time.
+// AppendAudit writes one audit row inside the surrounding transaction,
+// extending that tenant's tamper-evident hash chain (ADR-012). The id is a
+// fresh UUIDv7 so rows sort by creation time.
+//
+// The chain extension happens entirely within this call, inside the caller's
+// transaction: it reads the tenant's current latest row_hash (GetLastAuditHash;
+// no rows yet means this is the tenant's first row, so prev is
+// domain.AuditGenesisHash), stamps CreatedAt with the application clock (not a
+// database default, so the exact value hashed is the exact value stored),
+// computes RowHash over that content plus prev, and inserts all of it
+// together. Because the read and the write are in the same SERIALIZABLE
+// transaction, two concurrent posts for the same tenant would conflict on
+// this read (one sees the other's insert as a predicate change) were they
+// allowed to race at all. RunInTx prevents the race up front instead: it
+// holds tenantID's in-process mutex for the whole call, so only one posting
+// transaction per tenant is ever open at a time, and this read always sees
+// the tenant's true latest row. See RunInTx's doc comment and ADR-012 for why
+// an in-process mutex, not a database lock, is what makes that true.
 func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.AuditEntry) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -344,6 +452,40 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	if err != nil {
 		return fmt.Errorf("postgres: generate audit id: %w", err)
 	}
+
+	prevHash := domain.AuditGenesisHash
+	last, err := tr.q.GetLastAuditHash(ctx, tid)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No prior row for this tenant: genesis.
+	case err != nil:
+		return fmt.Errorf("postgres: get last audit hash: %w", err)
+	default:
+		// A pre-migration legacy row has a NULL row_hash, which surfaces here
+		// as an invalid pgtype.Text. Those rows predate the hash chain and are
+		// cleared by the seeder's reset within four hours, so treating them as
+		// an unchained starting point (genesis) is the only meaningful choice.
+		// Made explicit rather than relying on the zero-value .String of an
+		// invalid pgtype.Text happening to equal genesis ("").
+		if last.Valid {
+			prevHash = last.String
+		} else {
+			prevHash = domain.AuditGenesisHash
+		}
+	}
+
+	e.ID = id.String()
+	// Truncated to microseconds: Postgres timestamptz only stores microsecond
+	// precision, so a nanosecond-precision time.Now() would silently lose its
+	// last three digits on the round trip through the column. Truncating here,
+	// before it is both hashed and stored, guarantees the value fed to
+	// ComputeAuditRowHash is bit-for-bit the same value a later read (and thus
+	// a later recompute, for the verify walk) will see; skipping this step
+	// would make every stored row_hash permanently unrecomputable.
+	e.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
+	e.PrevHash = prevHash
+	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prevHash)
+
 	if err := tr.q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
 		ID:            id,
 		TenantID:      tid,
@@ -352,6 +494,9 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 		Actor:         e.Actor,
 		Before:        e.Before,
 		After:         e.After,
+		CreatedAt:     e.CreatedAt,
+		PrevHash:      pgtype.Text{String: e.PrevHash, Valid: true},
+		RowHash:       pgtype.Text{String: e.RowHash, Valid: true},
 	}); err != nil {
 		return fmt.Errorf("postgres: insert audit log: %w", err)
 	}
@@ -472,8 +617,27 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 	return auditEntriesFromRows(rows), nil
 }
 
+// ListAuditForVerify returns every audit row for the tenant, oldest first,
+// including PrevHash and RowHash: the full walk used to recompute and check
+// the tamper-evident hash chain end to end.
+func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.ListAuditForVerify(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
+	}
+	return auditEntriesFromRows(rows), nil
+}
+
 // auditEntriesFromRows converts sqlc audit rows to domain entries. Before/After
 // are jsonb columns surfaced as []byte; they convert to json.RawMessage.
+// PrevHash/RowHash are nullable at the column level only for rows written
+// before migration 0009; every row this application writes populates both, and
+// .String on an invalid (NULL) pgtype.Text zero-values to "" for those legacy
+// rows.
 func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
 	out := make([]domain.AuditEntry, 0, len(rows))
 	for _, row := range rows {
@@ -485,6 +649,8 @@ func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
 			Before:        row.Before,
 			After:         row.After,
 			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
 		})
 	}
 	return out
@@ -570,6 +736,72 @@ func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, 
 		})
 	}
 	return entries, nil
+}
+
+// GetAPIKeyByHash resolves an unrevoked api_keys row by hash, or
+// domain.ErrAPIKeyNotFound if none exists.
+func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.APIKey, error) {
+	row, err := r.q.GetAPIKeyByHash(ctx, hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if err != nil {
+		return domain.APIKey{}, fmt.Errorf("postgres: get api key by hash: %w", err)
+	}
+	return domain.APIKey{
+		ID:           row.ID.String(),
+		TenantID:     row.TenantID.String(),
+		Name:         row.Name,
+		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+	}, nil
+}
+
+// InsertAPIKey assigns an identity if k.ID is empty and inserts k with keyHash
+// as its stored credential. Only the hash is ever written.
+func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error {
+	if k.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate api key id: %w", err)
+		}
+		k.ID = id.String()
+	}
+	id, err := uuid.Parse(k.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	tid, err := uuid.Parse(k.TenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if err := r.q.InsertAPIKey(ctx, sqlc.InsertAPIKeyParams{
+		ID:           id,
+		TenantID:     tid,
+		Name:         k.Name,
+		KeyHash:      keyHash,
+		RateLimitRpm: ptrToInt4(k.RateLimitRPM),
+	}); err != nil {
+		return fmt.Errorf("postgres: insert api key: %w", err)
+	}
+	return nil
+}
+
+// int4ToPtr converts a nullable Postgres int4 to *int, nil when the column is
+// NULL (no per-key rate limit override).
+func int4ToPtr(v pgtype.Int4) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int32)
+	return &n
+}
+
+// ptrToInt4 converts *int to a nullable Postgres int4, NULL when p is nil.
+func ptrToInt4(p *int) pgtype.Int4 {
+	if p == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(*p), Valid: true} //nolint:gosec // rate limits are small, application-set values
 }
 
 func accountFromRow(row sqlc.Account) (domain.Account, error) {

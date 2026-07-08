@@ -26,6 +26,8 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/sohag-pro/go-ledger/internal/api"
+	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/domain"
 	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
@@ -51,29 +53,62 @@ func main() {
 	}
 }
 
+// defaultDemoAPIKey is a known, public value (see ADR-012, "A public demo key
+// keeps the console open"): shipping it in the console and playground is fine
+// on purpose, since the key it names is tenant-scoped to the demo tenant,
+// carries a tight rate limit, and that tenant is wiped every four hours.
+const defaultDemoAPIKey = "glk_demo_public_key_reset_every_4h" //nolint:gosec // public by design: a tenant-scoped, rate-limited demo key that the console and playground ship, not a real secret (ADR-012)
+
+// demoAPIKeyRateLimitRPM and loadTestAPIKeyRateLimitRPM are the per-key
+// overrides provisioned for the demo and load-test keys respectively (see
+// ADR-012, "Per-key rate limiting"): the demo key is deliberately tighter
+// than the server default so the public demo cannot be used to flood the
+// service, and the load-test key is deliberately far looser so a k6 run
+// exercises the ledger, not the limiter.
+const (
+	demoAPIKeyRateLimitRPM     = 60
+	loadTestAPIKeyRateLimitRPM = 100000
+)
+
+// loadTestTenantBase is the first tenant id offset used when provisioning
+// multi-tenant load-test keys (see provisionAPIKeys). Starting at 200 keeps
+// generated tenants clear of the demo tenant (...001) and the single load
+// tenant docker-compose's DEFAULT_TENANT_ID typically points at (...002).
+const loadTestTenantBase = 200
+
 type config struct {
-	port          string
-	metricsAddr   string
-	grpcAddr      string
-	databaseURL   string
-	defaultTenant string
-	env           string
-	serviceName   string
-	seedEnabled   bool
-	seedInterval  time.Duration
+	port            string
+	metricsAddr     string
+	grpcAddr        string
+	databaseURL     string
+	defaultTenant   string
+	env             string
+	serviceName     string
+	seedEnabled     bool
+	seedInterval    time.Duration
+	demoAPIKey      string
+	loadTestKey     string
+	loadTestTenants int
+	rateLimitRPM    int
+	authCacheTTL    time.Duration
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		port:          getenv("PORT", "8080"),
-		metricsAddr:   getenv("METRICS_ADDR", "127.0.0.1:9090"),
-		grpcAddr:      getenv("GRPC_ADDR", ":9091"),
-		databaseURL:   os.Getenv("DATABASE_URL"),
-		defaultTenant: getenv("DEFAULT_TENANT_ID", defaultTenantID),
-		env:           getenv("APP_ENV", "development"),
-		serviceName:   getenv("OTEL_SERVICE_NAME", "go-ledger"),
-		seedEnabled:   getenvBool("SEED_ENABLED", true),
-		seedInterval:  getenvDuration("SEED_INTERVAL", 4*time.Hour),
+		port:            getenv("PORT", "8080"),
+		metricsAddr:     getenv("METRICS_ADDR", "127.0.0.1:9090"),
+		grpcAddr:        getenv("GRPC_ADDR", ":9091"),
+		databaseURL:     os.Getenv("DATABASE_URL"),
+		defaultTenant:   getenv("DEFAULT_TENANT_ID", defaultTenantID),
+		env:             getenv("APP_ENV", "development"),
+		serviceName:     getenv("OTEL_SERVICE_NAME", "go-ledger"),
+		seedEnabled:     getenvBool("SEED_ENABLED", true),
+		seedInterval:    getenvDuration("SEED_INTERVAL", 4*time.Hour),
+		demoAPIKey:      getenv("DEMO_API_KEY", defaultDemoAPIKey),
+		loadTestKey:     getenv("LOAD_TEST_API_KEY", ""),
+		loadTestTenants: getenvInt("LOAD_TEST_TENANTS", 8),
+		rateLimitRPM:    getenvInt("RATE_LIMIT_RPM", 120),
+		authCacheTTL:    getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -84,6 +119,16 @@ func loadConfig() (config, error) {
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getenvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			return n
+		}
 	}
 	return fallback
 }
@@ -162,11 +207,34 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 
 	repo := postgres.NewRepository(pool)
+	// The tenant for both REST and gRPC now comes only from the caller's API
+	// key (ADR-012): there is no DefaultTenant fallback for either surface.
+	// Every /v1 request resolves through auth.HumaMiddleware and every gRPC
+	// call resolves through the gRPC auth interceptor, both sharing this one
+	// resolver instance (and its in-memory cache). Key rows are provisioned
+	// directly in api_keys (see the ADR); a zero ttl falls back to the
+	// resolver's default cache TTL.
+	resolver := auth.NewResolver(repo, cfg.authCacheTTL)
+
+	// Provision the public demo key (and, when configured, a high-limit
+	// load-test key) before serving. Both are idempotent: a row with the same
+	// key_hash already existing is treated as success, so a restart or the
+	// four-hour demo wipe (which clears tenant DATA tables, never api_keys)
+	// leaves the console working with the same key against a fresh ledger.
+	if err := provisionAPIKeys(ctx, repo, cfg, logger); err != nil {
+		return err
+	}
+
+	// Per-key rate limiter, wired AFTER the auth middleware inside api.New so
+	// the key auth resolved into the context is present when it runs (see
+	// ADR-012, "Per-key rate limiting", and internal/api/api.go).
+	limiter := auth.NewLimiter(cfg.rateLimitRPM)
 	deps := api.Deps{
-		Accounts:      ledger.NewAccountService(repo),
-		Transactions:  ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
-		Audit:         ledger.NewAuditService(repo),
-		DefaultTenant: cfg.defaultTenant,
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         resolver,
+		RateLimiter:  limiter,
 	}
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
@@ -181,7 +249,10 @@ func run(logger *slog.Logger) error {
 	router := chi.NewRouter()
 	// No RealIP middleware: it trusts client-set forwarding headers and is
 	// spoofable. Revisit with a trusted-proxy allowlist when one is in front.
-	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger))
+	// maxBodyBytes is last (innermost, closest to the handlers) so RequestID,
+	// Recoverer, the trace span, and the request log all still wrap and
+	// observe a request it rejects.
+	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger), maxBodyBytes(api.MaxRequestBodyBytes))
 	router.Get("/", web.Index)
 	router.Get("/console", web.Console)
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
@@ -198,16 +269,24 @@ func run(logger *slog.Logger) error {
 		Addr:              ":" + cfg.port,
 		Handler:           tracedHandler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Metrics on a separate loopback server so the Prometheus endpoint is never
-	// exposed on the public interface (see ADR-004).
+	// exposed on the public interface (see ADR-004). Same timeouts as the main
+	// server: it is loopback-only, but a slow scrape should not hold a
+	// connection open indefinitely either.
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", metrics.Handler())
 	metricsSrv := &http.Server{
 		Addr:              cfg.metricsAddr,
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	errCh := make(chan error, 3)
@@ -225,10 +304,10 @@ func run(logger *slog.Logger) error {
 	}()
 
 	grpcSrv := grpcserver.NewGRPCServer(grpcserver.Deps{
-		Accounts:      deps.Accounts,
-		Transactions:  deps.Transactions,
-		Audit:         deps.Audit,
-		DefaultTenant: cfg.defaultTenant,
+		Accounts:     deps.Accounts,
+		Transactions: deps.Transactions,
+		Audit:        deps.Audit,
+		Auth:         resolver,
 	}, logger)
 	grpcListener, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {
@@ -290,6 +369,78 @@ func runMigrations(dsn string, logger *slog.Logger) error {
 	return nil
 }
 
+// apiKeyStore is the slice of the repository provisionAPIKeys needs: insert a
+// key row by hash. The postgres repository satisfies it; a test uses a fake.
+type apiKeyStore interface {
+	InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error
+}
+
+// provisionAPIKeys provisions the public demo key, and when LOAD_TEST_API_KEY
+// is set both the single-tenant load-test key (kept for backward compat) and
+// a set of LOAD_TEST_TENANTS high-limit keys spread across distinct tenants,
+// idempotently. It hashes each plaintext and inserts one row per key; a
+// unique-violation on key_hash (the row already exists from a previous boot)
+// is treated as success, so this is safe to run on every startup and after
+// the four-hour demo wipe (which never touches api_keys). The key plaintext
+// is never logged, only the fact that a key is active (ADR-012).
+func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger *slog.Logger) error {
+	demoRPM := demoAPIKeyRateLimitRPM
+	if err := provisionKey(ctx, store, domain.APIKey{
+		TenantID:     cfg.defaultTenant,
+		Name:         "demo",
+		RateLimitRPM: &demoRPM,
+	}, cfg.demoAPIKey); err != nil {
+		return fmt.Errorf("provision demo api key: %w", err)
+	}
+	logger.Info("demo api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", demoRPM)
+
+	if cfg.loadTestKey == "" {
+		return nil
+	}
+
+	loadRPM := loadTestAPIKeyRateLimitRPM
+	if err := provisionKey(ctx, store, domain.APIKey{
+		TenantID:     cfg.defaultTenant,
+		Name:         "load-test",
+		RateLimitRPM: &loadRPM,
+	}, cfg.loadTestKey); err != nil {
+		return fmt.Errorf("provision load-test api key: %w", err)
+	}
+	logger.Info("load-test api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", loadRPM)
+
+	// Multi-tenant load-test keys: each tenant's audit hash chain serializes
+	// same-tenant transaction posts through an in-process mutex, so a single
+	// tenant's throughput is bounded no matter how high its rate limit is.
+	// Spreading the load across LOAD_TEST_TENANTS distinct tenants lets
+	// aggregate throughput scale instead. Tenant ids are deterministic so a
+	// restart provisions the same set (and provisionKey's unique-violation
+	// swallow keeps this idempotent).
+	for i := range cfg.loadTestTenants {
+		tenantID := fmt.Sprintf("00000000-0000-0000-0000-%012d", loadTestTenantBase+i)
+		plaintext := fmt.Sprintf("%s-t%d", cfg.loadTestKey, i)
+		if err := provisionKey(ctx, store, domain.APIKey{
+			TenantID:     tenantID,
+			Name:         fmt.Sprintf("load-test-%d", i),
+			RateLimitRPM: &loadRPM,
+		}, plaintext); err != nil {
+			return fmt.Errorf("provision load-test tenant %d api key: %w", i, err)
+		}
+	}
+	logger.Info("multi-tenant load-test api keys active", "tenants", cfg.loadTestTenants, "rate_limit_rpm", loadRPM)
+	return nil
+}
+
+// provisionKey inserts one key row for the given plaintext, idempotently: a
+// unique-violation (a row with this key_hash already exists) is swallowed as
+// success. It never logs or returns the plaintext.
+func provisionKey(ctx context.Context, store apiKeyStore, k domain.APIKey, plaintext string) error {
+	err := store.InsertAPIKey(ctx, k, domain.HashAPIKey(plaintext))
+	if err != nil && !postgres.IsUniqueViolationError(err) {
+		return err
+	}
+	return nil
+}
+
 // runSeeder seeds the demo ledger once immediately, then every interval, until
 // ctx is cancelled. A failed seed is logged and the loop continues.
 func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant string, interval time.Duration) {
@@ -329,6 +480,31 @@ func otelRouteName(next http.Handler) http.Handler {
 			}
 		}
 	})
+}
+
+// maxBodyBytes caps every request body at limit bytes (see ADR-012, "Input
+// hardening"), so one request can no longer become an arbitrarily large
+// transaction or exhaust memory before validation runs. A request that
+// declares a Content-Length over the limit is rejected with 413 before any
+// handler reads a byte of it. The body reader is also wrapped with
+// http.MaxBytesReader so a request with no declared length (or one that
+// understates it, for example chunked transfer-encoding) is still capped once
+// a handler starts reading; huma's write operations set the same limit as
+// their own MaxBodyBytes, so that path also ends in a clean 413 rather than a
+// generic read error. GET requests such as the console, static assets, and
+// the playground are unaffected: they carry no body, so the check and the
+// wrapper are both no-ops for them.
+func maxBodyBytes(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ContentLength > limit {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // slogLogger logs one structured line per request: method, path, status, size,

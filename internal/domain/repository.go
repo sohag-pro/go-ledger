@@ -93,6 +93,12 @@ type Repository interface {
 	// unknown account yields no rows.
 	ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *StatementCursor, limit int) ([]AuditEntry, error)
 
+	// ListAuditForVerify returns every audit row for the tenant, oldest first
+	// (created_at, id ascending), including PrevHash and RowHash. It is the
+	// full per-tenant walk used to recompute and check the tamper-evident hash
+	// chain end to end, not a paged read for display.
+	ListAuditForVerify(ctx context.Context, tenantID string) ([]AuditEntry, error)
+
 	// Balance returns the derived balance of an account: the sum of its postings'
 	// signed amounts. It returns ErrAccountNotFound if the account does not exist.
 	//
@@ -111,11 +117,27 @@ type Repository interface {
 	// account simply yields no entries.
 	Statement(ctx context.Context, tenantID, accountID string, currency Currency, after *StatementCursor, limit int) ([]StatementEntry, error)
 
-	// RunInTx executes fn inside a SERIALIZABLE database transaction. It commits
-	// if fn returns nil and rolls back otherwise. Because SERIALIZABLE can abort a
-	// transaction with a serialization conflict under concurrency, the adapter
-	// retries fn automatically a bounded number of times; fn must therefore be
-	// safe to run more than once. It returns the last error if retries are
-	// exhausted, or any non-retryable error from fn.
-	RunInTx(ctx context.Context, fn func(context.Context, Tx) error) error
+	// RunInTx executes fn inside a SERIALIZABLE database transaction, scoped to
+	// tenantID. It commits if fn returns nil and rolls back otherwise. Because
+	// SERIALIZABLE can abort a transaction with a serialization conflict under
+	// concurrency, the adapter retries fn automatically a bounded number of
+	// times; fn must therefore be safe to run more than once. It returns the
+	// last error if retries are exhausted, or any non-retryable error from fn.
+	//
+	// tenantID also picks the per-tenant in-process mutex the adapter holds
+	// for the whole call, acquired before opening any transaction: same-tenant
+	// calls serialize one at a time, while different tenants run fully
+	// concurrently. This is what keeps the per-tenant audit hash chain
+	// (ADR-012) from repeatedly aborting concurrent same-tenant writers with a
+	// serialization failure (SQLSTATE 40001); see the adapter's RunInTx and
+	// ADR-012 for why the lock is in-process rather than a database lock.
+	RunInTx(ctx context.Context, tenantID string, fn func(context.Context, Tx) error) error
+
+	// GetAPIKeyByHash resolves an unrevoked api_keys row by the SHA-256 hex hash
+	// of a presented key, or ErrAPIKeyNotFound if no such unrevoked key exists.
+	GetAPIKeyByHash(ctx context.Context, hash string) (APIKey, error)
+
+	// InsertAPIKey persists k with keyHash as its stored credential. Only the
+	// hash is ever written; the plaintext is never stored.
+	InsertAPIKey(ctx context.Context, k APIKey, keyHash string) error
 }

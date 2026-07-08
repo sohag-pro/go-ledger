@@ -28,3 +28,38 @@ func (s *AuditService) ByTransaction(ctx context.Context, tenantID, transactionI
 func (s *AuditService) ByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
 	return s.repo.ListAuditByAccount(ctx, tenantID, accountID, after, limit)
 }
+
+// VerifyResult is the outcome of walking a tenant's audit hash chain
+// (ADR-012, "A per-tenant, tamper-evident audit chain"). Checked is how many
+// rows were confirmed to chain correctly before the walk stopped: the full
+// chain length when Valid is true, or the count up to and including the first
+// broken row when Valid is false. FirstBreakID is empty when Valid is true.
+type VerifyResult struct {
+	Valid        bool
+	Checked      int
+	FirstBreakID string
+}
+
+// Verify walks tenantID's audit chain oldest first and recomputes every row's
+// hash from its own stored content and its predecessor's stored hash, the
+// same recomputation domain.ComputeAuditRowHash performs when a row is first
+// appended. It stops at the first row whose stored PrevHash or RowHash does
+// not match what recomputation expects: that row (or the one before it) was
+// altered after the fact. An empty chain is valid by definition (nothing to
+// break).
+func (s *AuditService) Verify(ctx context.Context, tenantID string) (VerifyResult, error) {
+	rows, err := s.repo.ListAuditForVerify(ctx, tenantID)
+	if err != nil {
+		return VerifyResult{}, err
+	}
+
+	prev := domain.AuditGenesisHash
+	for i, row := range rows {
+		checked := i + 1
+		if row.PrevHash != prev || row.RowHash != domain.ComputeAuditRowHash(tenantID, row, prev) {
+			return VerifyResult{Valid: false, Checked: checked, FirstBreakID: row.ID}, nil
+		}
+		prev = row.RowHash
+	}
+	return VerifyResult{Valid: true, Checked: len(rows)}, nil
+}

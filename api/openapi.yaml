@@ -139,6 +139,7 @@ components:
           description: Two or more legs that must sum to zero
           items:
             $ref: "#/components/schemas/PostingInput"
+          maxItems: 100
           minItems: 2
           type:
             - array
@@ -315,6 +316,29 @@ components:
         - currency
         - postings
       type: object
+    VerifyAuditOutputBody:
+      additionalProperties: false
+      properties:
+        checked:
+          format: int64
+          type: integer
+        first_break_id:
+          description: Id of the first audit row that failed to verify, or null if the chain is intact
+          type:
+            - string
+            - "null"
+        valid:
+          type: boolean
+      required:
+        - valid
+        - checked
+        - first_break_id
+      type: object
+  securitySchemes:
+    bearerAuth:
+      description: "API key issued per tenant. Send as `Authorization: Bearer <api-key>`. Use `glk_demo_public_key_reset_every_4h` to try the API against the demo tenant."
+      scheme: bearer
+      type: http
 info:
   contact:
     name: Sohag Hasan
@@ -323,6 +347,10 @@ info:
     A production-grade payment ledger built on double-entry accounting. Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.
 
     Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. A transaction's postings must sum to zero.
+
+    Authentication: every /v1 endpoint requires a bearer API key, sent as `Authorization: Bearer <api-key>`. A missing, unknown, or revoked key returns 401. To try the API without provisioning your own key, use the public demo key `glk_demo_public_key_reset_every_4h` (also wired into the try-it console and the Scalar playground below): it is scoped to the demo tenant and rate limited, so it is safe to expose.
+
+    Idempotency: POST /v1/transactions requires an `Idempotency-Key` header so retries are safe. Repeating a request with the same key returns the original transaction unchanged (with `Idempotent-Replayed: true`) instead of posting again; reusing a key with a different request body returns 409 Conflict.
 
     This is a public demo: the data resets every 4 hours to a fresh, realistic ledger.
 
@@ -384,6 +412,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: List accounts
       tags:
         - accounts
@@ -408,6 +438,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: Create an account
       tags:
         - accounts
@@ -436,6 +468,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: Get an account
       tags:
         - accounts
@@ -482,6 +516,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: List an account's audit log
       tags:
         - accounts
@@ -510,6 +546,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: Get an account's balance
       tags:
         - accounts
@@ -556,19 +594,43 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: List an account's postings with running balance
       tags:
         - accounts
+  /v1/audit/verify:
+    get:
+      description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012).
+      operationId: verify-audit-chain
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyAuditOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Verify the tamper-evident audit chain
+      tags:
+        - audit
   /v1/transactions:
     post:
-      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Supply an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
+      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
       operationId: create-transaction
       parameters:
-        - description: Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+        - description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
           in: header
           name: Idempotency-Key
           schema:
-            description: Optional. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+            description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
             maxLength: 255
             type: string
       requestBody:
@@ -594,6 +656,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: Post a transaction
       tags:
         - transactions
@@ -622,6 +686,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: Get a transaction
       tags:
         - transactions
@@ -650,6 +716,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
+      security:
+        - bearerAuth: []
       summary: List a transaction's audit log
       tags:
         - transactions
