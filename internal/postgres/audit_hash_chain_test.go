@@ -17,7 +17,7 @@ import (
 func appendAudit(t *testing.T, repo *postgres.Repository, tenant, txnID string) {
 	t.Helper()
 	ctx := context.Background()
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
 		return tx.AppendAudit(ctx, tenant, domain.AuditEntry{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,

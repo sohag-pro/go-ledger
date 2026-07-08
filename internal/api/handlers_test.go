@@ -259,7 +259,7 @@ func (f *fakeRepo) Statement(_ context.Context, _, accountID string, currency do
 	return out, nil
 }
 
-func (f *fakeRepo) RunInTx(ctx context.Context, fn func(context.Context, domain.Tx) error) error {
+func (f *fakeRepo) RunInTx(ctx context.Context, _ string, fn func(context.Context, domain.Tx) error) error {
 	return fn(ctx, f)
 }
 

@@ -43,7 +43,7 @@ func TestIdempotencyKeyInsertAndDuplicate(t *testing.T) {
 	txnID, _, _ := seedTxn(t, repo, tenant)
 
 	// First insert of the key succeeds inside a Tx.
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
 		return tx.InsertIdempotencyKey(ctx, tenant, "key-1", "fp-1", txnID)
 	})
 	if err != nil {
@@ -51,7 +51,7 @@ func TestIdempotencyKeyInsertAndDuplicate(t *testing.T) {
 	}
 
 	// Second insert of the same key returns ErrDuplicateIdempotencyKey.
-	err = repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err = repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
 		return tx.InsertIdempotencyKey(ctx, tenant, "key-1", "fp-1", txnID)
 	})
 	if !errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
@@ -81,7 +81,7 @@ func TestAuditAppendAndQuery(t *testing.T) {
 	tenant := uuid.NewString()
 	txnID, debit, _ := seedTxn(t, repo, tenant)
 
-	err := repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
 		return tx.AppendAudit(ctx, tenant, domain.AuditEntry{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,

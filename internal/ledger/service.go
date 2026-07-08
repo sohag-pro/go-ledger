@@ -65,7 +65,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 
 	fingerprint := t.Fingerprint()
 	start := time.Now()
-	runErr := s.repo.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {
 			return err
 		}

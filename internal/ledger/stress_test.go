@@ -115,24 +115,15 @@ func discardLogger() *slog.Logger {
 // correct under SERIALIZABLE contention. Correctness check: the sum of every
 // account balance is exactly zero (money only moved, never appeared or vanished).
 //
-// Load is spread across multiple tenants rather than hammering one: since
-// ADR-012, every posted transaction also extends its tenant's tamper-evident
-// audit hash chain (read the tenant's latest row_hash, then insert the next
-// row, in the same SERIALIZABLE transaction as the posting). That is a real,
-// documented per-tenant serialization point (ADR-012, "Negative
-// consequences"), and no amount of retrying inside one tenant's chain changes
-// that a hash chain is inherently a sequential structure: a transaction whose
-// snapshot predates a sibling's commit cannot "see" that commit mid-flight
-// under PostgreSQL SERIALIZABLE, so it aborts and must retry with a fresh
-// snapshot regardless of any locking scheme. A single tenant absorbing all
-// goroutines here would mean every one of them contends on that one tenant's
-// chain tail, which is not how real traffic looks (tenants are independent
-// API-key holders) and is exactly the "very high-throughput single tenant"
-// case the ADR calls out as a real felt cost, not the normal per-tenant write
-// rate the design targets. Partitioning goroutines and accounts across
-// several tenants keeps the concurrency and account-contention this test was
-// written to exercise, while keeping the per-tenant chain contention at a
-// realistic level.
+// Load is spread across multiple tenants rather than hammering one, mirroring
+// how real traffic looks: tenants are independent API-key holders, and this
+// test's job is to exercise cross-account contention and the retry loop, not
+// to be the definitive single-tenant concurrency test (see
+// TestPostConcurrentStressSingleTenant for that: since RunInTx acquires a
+// per-tenant session advisory lock before opening its transaction, see
+// internal/postgres/repository.go, same-tenant posts now serialize one at a
+// time and different tenants run fully in parallel, which is what this test
+// exercises across its 10 tenants).
 func TestPostConcurrentStress(t *testing.T) {
 	const (
 		tenantCount       = 10
@@ -236,6 +227,110 @@ func TestPostConcurrentStress(t *testing.T) {
 	t.Logf("posted %d transactions across %d tenants x %d accounts via %d goroutines (DB concurrency capped at MaxConns=%d)",
 		len(lats), tenantCount, accountsPerTenant, goroutines, dbMaxConns)
 	t.Logf("latency baselines: p50=%s p99=%s", p50, p99)
+}
+
+// TestPostConcurrentStressSingleTenant is the single-tenant counterpart to
+// TestPostConcurrentStress, and the regression test for the fix described in
+// internal/postgres/repository.go's RunInTx: before the per-tenant session
+// advisory lock existed, 100 fully concurrent posts to one tenant reliably
+// exhausted the SERIALIZABLE retry budget. Every post reads the tenant's
+// latest audit row_hash and then inserts the next row (ADR-012's hash chain),
+// so concurrent same-tenant posts raced on that read; PostgreSQL aborted the
+// loser with a serialization failure (SQLSTATE 40001), and at 100-way
+// concurrency the 25-attempt retry budget ran out, surfacing as
+// domain.ErrConflict (a 503 at the API layer). RunInTx now takes a per-tenant
+// session advisory lock before opening any transaction, so these 100 posts
+// serialize one at a time instead of racing: this test asserts every one of
+// them succeeds, and then walks the tenant's full audit chain
+// (AuditService.Verify) to prove the serialized posts produced a genuinely
+// unbroken, correctly ordered hash chain, not just "no errors returned."
+func TestPostConcurrentStressSingleTenant(t *testing.T) {
+	const (
+		accounts   = 10
+		goroutines = 100
+	)
+
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	auditSvc := ledger.NewAuditService(repo)
+	ctx := context.Background()
+
+	tenant := uuid.NewString()
+	ids := make([]string, accounts)
+	for i := range ids {
+		a := &domain.Account{Name: "acct", Type: domain.Asset, Currency: "USD"}
+		if err := repo.CreateAccount(ctx, tenant, a); err != nil {
+			t.Fatalf("create account %d: %v", i, err)
+		}
+		ids[i] = a.ID
+	}
+
+	var (
+		failures atomic.Int64
+		wg       sync.WaitGroup
+	)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(seed) + 1)) //nolint:gosec // test data, not crypto
+			from := rng.Intn(accounts)
+			to := rng.Intn(accounts - 1)
+			if to >= from { // pick a distinct second account
+				to++
+			}
+			amt := rng.Int63n(1_000_000) + 1
+			debit, _ := domain.NewMoney(amt, "USD")
+			credit, _ := domain.NewMoney(-amt, "USD")
+			txn := &domain.Transaction{Postings: []domain.Posting{
+				{AccountID: ids[from], Amount: debit},
+				{AccountID: ids[to], Amount: credit},
+			}}
+			if _, err := svc.Post(ctx, tenant, txn, nil); err != nil {
+				failures.Add(1)
+				t.Errorf("post failed: %v", err)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// The crux of this test: before the advisory lock, this reliably failed
+	// with domain.ErrConflict (serialization retries exhausted) under 100-way
+	// single-tenant concurrency. It must now be zero.
+	if f := failures.Load(); f != 0 {
+		t.Fatalf("%d of %d single-tenant concurrent posts failed; expected zero now that same-tenant "+
+			"posts serialize on the per-tenant advisory lock", f, goroutines)
+	}
+
+	// Same core invariant as TestPostConcurrentStress: the ledger nets to zero.
+	var total int64
+	for _, id := range ids {
+		bal, err := repo.Balance(ctx, tenant, id)
+		if err != nil {
+			t.Fatalf("balance %s: %v", id, err)
+		}
+		total += bal.Amount()
+	}
+	if total != 0 {
+		t.Fatalf("ledger does not net to zero: sum of balances = %d", total)
+	}
+
+	// The chain itself must be genuinely valid, not merely error-free: every
+	// row's stored hash must recompute from its own content and its
+	// predecessor's hash, in order.
+	result, err := auditSvc.Verify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify audit chain: %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("audit chain invalid: checked=%d first_break_id=%s", result.Checked, result.FirstBreakID)
+	}
+	if result.Checked != goroutines {
+		t.Fatalf("audit chain checked %d rows, want %d (one per successful post)", result.Checked, goroutines)
+	}
+	t.Logf("posted %d transactions to a single tenant via %d fully concurrent goroutines; audit chain valid (checked=%d rows)",
+		goroutines, goroutines, result.Checked)
 }
 
 // percentile returns the q-quantile (0..1) of ds. Returns 0 for an empty slice.

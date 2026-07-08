@@ -6,6 +6,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -140,9 +142,24 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 	if err := t.Validate(); err != nil {
 		return err
 	}
-	return r.RunInTx(ctx, func(ctx context.Context, tx domain.Tx) error {
+	return r.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		return tx.CreateTransaction(ctx, tenantID, t)
 	})
+}
+
+// tenantAdvisoryKey derives a deterministic int64 lock key from a tenant id,
+// used as the pg_advisory_lock key that RunInTx holds for the tenant's whole
+// unit of work. It hashes the tenant id (SHA-256) rather than parsing it as a
+// UUID, so it works uniformly no matter the tenant id's exact string form, and
+// takes the first 8 bytes of the digest, big-endian, as the int64 key.
+//
+// Two different tenants hashing to the same key is astronomically unlikely (1
+// in 2^63) and is never a correctness bug if it happens: it only makes those
+// two tenants serialize against each other unnecessarily, the same as if they
+// were briefly the same tenant. It can never cause a wrong result.
+func tenantAdvisoryKey(tenantID string) int64 {
+	sum := sha256.Sum256([]byte(tenantID))
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deterministic hash, not a security boundary
 }
 
 // RunInTx executes fn inside a SERIALIZABLE transaction, committing on success
@@ -151,7 +168,48 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // at COMMIT, so both fn and the commit are watched and the whole unit of work is
 // replayed up to maxPostAttempts times. fn must therefore be safe to run more
 // than once.
-func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domain.Tx) error) error {
+//
+// Before any of that, RunInTx acquires tenantID's session advisory lock
+// (pg_advisory_lock) on an explicitly checked-out connection, and holds it for
+// every attempt, releasing it only when the whole call returns. This serializes
+// same-tenant calls one at a time while leaving different tenants (different
+// lock keys) fully concurrent. It exists because of the per-tenant audit hash
+// chain (ADR-012): each attempt reads the tenant's latest audit row_hash and
+// then inserts the next one, and two concurrent same-tenant attempts reading
+// the same chain tail is a genuine read-write antidependency that SERIALIZABLE
+// must abort. Under high same-tenant concurrency that repeated abort can
+// exhaust the retry budget and surface as a 503.
+//
+// The lock has to be a SESSION lock taken on the connection before BeginTx, not
+// an xact lock taken as the first statement inside the SERIALIZABLE
+// transaction. A SERIALIZABLE transaction's snapshot is fixed at its first
+// statement; if that first statement were an xact lock, a blocked second
+// transaction would already hold a snapshot taken before the first one
+// committed, so once unblocked it would still read the stale chain tail and
+// still abort with 40001. Locking on the connection before the transaction
+// begins means the second transaction's first statement, and therefore its
+// snapshot, happens only after the first has committed and released the lock,
+// so it always sees the fresh chain tail.
+func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error {
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: acquire connection: %w", err)
+	}
+	defer conn.Release()
+
+	key := tenantAdvisoryKey(tenantID)
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
+		return fmt.Errorf("postgres: advisory lock: %w", err)
+	}
+	defer func() {
+		// Release on a detached context: a request whose context is already
+		// cancelled must still free the lock, or every later post for this
+		// tenant would block behind it forever. A crashed process releases the
+		// session lock automatically when its connection closes, so there is no
+		// leak on that path either.
+		_, _ = conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", key)
+	}()
+
 	var lastErr error
 	for attempt := 0; attempt < maxPostAttempts; attempt++ {
 		if attempt > 0 {
@@ -165,7 +223,7 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(context.Context, domai
 			}
 		}
 
-		tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 		if err != nil {
 			return fmt.Errorf("postgres: begin: %w", err)
 		}
@@ -350,15 +408,17 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 // database default, so the exact value hashed is the exact value stored),
 // computes RowHash over that content plus prev, and inserts all of it
 // together. Because the read and the write are in the same SERIALIZABLE
-// transaction, two concurrent posts for the same tenant conflict on this read
-// (one sees the other's insert as a predicate change) and one is retried by
-// RunInTx, which keeps the chain a single line, not a fork. This is the
-// coupling ADR-012 calls out as a real cost at very high single-tenant
-// concurrency: an advisory lock cannot fix it (PostgreSQL fixes each
-// SERIALIZABLE transaction's snapshot at its first statement, so blocking
-// later in the same transaction never lets it observe a competitor's
-// meanwhile-committed row; a lock only delays the same eventual abort), so
-// the only real lever is RunInTx's existing retry-with-backoff loop.
+// transaction, two concurrent posts for the same tenant would conflict on
+// this read (one sees the other's insert as a predicate change) were they
+// allowed to race at all. RunInTx prevents the race up front instead: it
+// holds tenantID's session advisory lock for the whole call, so only one
+// posting transaction per tenant is ever open at a time, and this read always
+// sees the tenant's true latest row. See RunInTx's doc comment for why the
+// lock has to be a session lock taken before the transaction begins, not an
+// xact lock taken inside it (the latter does not work: a SERIALIZABLE
+// transaction's snapshot is fixed at its first statement, so blocking later
+// in the same transaction never lets it observe a competitor's
+// meanwhile-committed row).
 func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.AuditEntry) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {

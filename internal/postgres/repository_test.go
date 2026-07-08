@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -379,7 +380,7 @@ func TestRunInTxRetriesThenCommits(t *testing.T) {
 
 	before := testutil.ToFloat64(metrics.SerializationRetries)
 	calls := 0
-	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(context.Background(), uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		calls++
 		if calls == 1 {
 			return serErr()
@@ -403,12 +404,55 @@ func TestRunInTxExhaustionReturnsConflict(t *testing.T) {
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
 
-	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(context.Background(), uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		return serErr()
 	})
 	if !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("expected ErrConflict after exhaustion, got %v", err)
 	}
+}
+
+// TestRunInTxDifferentTenantsRunConcurrently proves the per-tenant session
+// advisory lock (added to stop the audit-chain serialization storm, see
+// RunInTx's doc comment) only ever serializes calls for the SAME tenant.
+// Tenant A's call holds the lock (and an open transaction) for a deliberate
+// pause; tenant B's call, started while A's is still running, must complete
+// long before that pause elapses. If different tenants shared a lock (or a
+// key collision), B would block behind A and take at least as long as the
+// pause.
+func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	const pause = 300 * time.Millisecond
+	tenantA, tenantB := uuid.NewString(), uuid.NewString()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = repo.RunInTx(context.Background(), tenantA, func(_ context.Context, _ domain.Tx) error {
+			time.Sleep(pause)
+			return nil
+		})
+	}()
+	// Give tenant A's goroutine a head start so it is holding its lock (and an
+	// open transaction) by the time tenant B's call below starts.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	err := repo.RunInTx(context.Background(), tenantB, func(_ context.Context, _ domain.Tx) error {
+		return nil
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("tenant B's RunInTx failed: %v", err)
+	}
+	if elapsed >= pause {
+		t.Fatalf("tenant B's RunInTx took %s, at least as long as tenant A's %s pause: "+
+			"it appears to have waited on tenant A's advisory lock", elapsed, pause)
+	}
+	wg.Wait()
 }
 
 // TestRunInTxNonRetryablePropagates checks that an ordinary error is returned
@@ -419,7 +463,7 @@ func TestRunInTxNonRetryablePropagates(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	calls := 0
-	err := repo.RunInTx(context.Background(), func(_ context.Context, _ domain.Tx) error {
+	err := repo.RunInTx(context.Background(), uuid.NewString(), func(_ context.Context, _ domain.Tx) error {
 		calls++
 		return sentinel
 	})

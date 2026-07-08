@@ -117,13 +117,21 @@ type Repository interface {
 	// account simply yields no entries.
 	Statement(ctx context.Context, tenantID, accountID string, currency Currency, after *StatementCursor, limit int) ([]StatementEntry, error)
 
-	// RunInTx executes fn inside a SERIALIZABLE database transaction. It commits
-	// if fn returns nil and rolls back otherwise. Because SERIALIZABLE can abort a
-	// transaction with a serialization conflict under concurrency, the adapter
-	// retries fn automatically a bounded number of times; fn must therefore be
-	// safe to run more than once. It returns the last error if retries are
-	// exhausted, or any non-retryable error from fn.
-	RunInTx(ctx context.Context, fn func(context.Context, Tx) error) error
+	// RunInTx executes fn inside a SERIALIZABLE database transaction, scoped to
+	// tenantID. It commits if fn returns nil and rolls back otherwise. Because
+	// SERIALIZABLE can abort a transaction with a serialization conflict under
+	// concurrency, the adapter retries fn automatically a bounded number of
+	// times; fn must therefore be safe to run more than once. It returns the
+	// last error if retries are exhausted, or any non-retryable error from fn.
+	//
+	// tenantID also picks the per-tenant session advisory lock the adapter
+	// acquires before opening the transaction: same-tenant calls serialize one
+	// at a time, while different tenants run fully concurrently. This is what
+	// keeps the per-tenant audit hash chain (ADR-012) from repeatedly aborting
+	// concurrent same-tenant writers with a serialization failure (SQLSTATE
+	// 40001); see the adapter's RunInTx for why the lock must be a session lock
+	// taken before the transaction begins, not one taken inside it.
+	RunInTx(ctx context.Context, tenantID string, fn func(context.Context, Tx) error) error
 
 	// GetAPIKeyByHash resolves an unrevoked api_keys row by the SHA-256 hex hash
 	// of a presented key, or ErrAPIKeyNotFound if no such unrevoked key exists.
