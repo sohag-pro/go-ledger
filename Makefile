@@ -4,7 +4,7 @@ BUILD_DIR   := bin
 
 MIGRATIONS  := internal/postgres/migrations
 
-.PHONY: run build test lint tidy clean dev docker-build openapi sqlc proto migrate-up migrate-down jaeger help
+.PHONY: run build test cover load lint tidy clean dev docker-build openapi sqlc proto migrate-up migrate-down jaeger help
 
 run: ## Run the server
 	go run $(CMD)
@@ -14,6 +14,16 @@ build: ## Build the server binary
 
 test: ## Run all tests
 	go test -race -cover ./...
+
+cover: ## Run coverage and enforce floors (needs Docker for full numbers)
+	@bash scripts/coverage.sh
+
+load: ## Run the k6 load test against the local load-test Compose stack
+	@docker compose --profile load-test up -d --build
+	@echo "waiting for app health..."
+	@until curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; do sleep 1; done
+	@k6 run test/load/post_transactions.js || true
+	@docker compose --profile load-test down
 
 lint: ## Run golangci-lint
 	golangci-lint run ./...

@@ -1,5 +1,8 @@
 # go-ledger
 
+[![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sohag-pro/go-ledger/badges/coverage.json)](https://github.com/sohag-pro/go-ledger/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/sohag-pro/go-ledger)](https://goreportcard.com/report/github.com/sohag-pro/go-ledger)
+
 **A production-grade payment ledger service in Go, built in public over twelve weeks.**
 
 Money never appears or disappears. It only moves. go-ledger takes that 500-year-old rule of double-entry bookkeeping and enforces it with Go's type system, Postgres constraints, and tests that throw 10,000 concurrent transactions at the ledger and expect zero violations. Every balance is the sum of an immutable, append-only history; if a transaction doesn't sum to zero, it never persists.

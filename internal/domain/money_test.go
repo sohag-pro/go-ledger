@@ -116,6 +116,12 @@ func TestMoneySub(t *testing.T) {
 	if _, err := mn.Sub(one); !errors.Is(err, ErrOverflow) {
 		t.Errorf("Sub() underflow err = %v, want ErrOverflow", err)
 	}
+	// Sub negates other before adding; when other itself cannot be negated
+	// (MinInt64), Sub must surface that ErrOverflow directly from Neg,
+	// without ever reaching Add.
+	if _, err := a.Sub(mn); !errors.Is(err, ErrOverflow) {
+		t.Errorf("Sub() with unnegatable operand err = %v, want ErrOverflow", err)
+	}
 }
 
 func TestMoneyNeg(t *testing.T) {

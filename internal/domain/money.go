@@ -59,10 +59,11 @@ func (m Money) Add(other Money) (Money, error) {
 		return Money{}, ErrCurrencyMismatch
 	}
 	sum := m.amount + other.amount
-	// Overflow occurred iff both operands share a sign and the result's sign
-	// differs from theirs.
-	if (m.amount > 0 && other.amount > 0 && sum < 0) ||
-		(m.amount < 0 && other.amount < 0 && sum > 0) {
+	// Signed overflow: adding a positive must not decrease the value, and
+	// adding a negative must not increase it. This also catches
+	// MinInt64 + MinInt64, which wraps all the way back to zero and would
+	// otherwise be missed by a same-sign-flip check.
+	if (other.amount > 0 && sum < m.amount) || (other.amount < 0 && sum > m.amount) {
 		return Money{}, ErrOverflow
 	}
 	return Money{amount: sum, currency: m.currency}, nil

@@ -7,12 +7,12 @@ on:
     branches: [main]
 
 concurrency:
-  group: cicd-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.ref) || format('cicd-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    name: Test and lint
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -21,17 +21,129 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run tests
-        run: go test -race -cover ./...
-
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
 
+  test:
+    name: Test with coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build and test cmd (no business logic, no coverage floor)
+        run: go test -race ./cmd/...
+
+      - name: Run tests (unit, integration, chaos, property; Docker available on the runner)
+        # -p 2 caps how many packages spin testcontainers at once, so a small
+        # runner is not starting Postgres and toxiproxy for several packages in
+        # parallel and racing on container startup.
+        run: go test -race -p 2 ./internal/... -covermode=atomic -coverprofile=cover.out
+
+      - name: Enforce coverage gate
+        run: COVER_PROFILE=cover.out make cover
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cover.out
+
+  smoke-load:
+    name: Smoke load test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Boot the load-test stack
+        run: docker compose --profile load-test up -d --build
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "app never became healthy"
+          docker compose --profile load-test logs app
+          exit 1
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install -y k6
+
+      - name: Smoke load (gate on errors and a loose p99 ceiling only)
+        run: SMOKE=1 k6 run test/load/post_transactions.js
+
+      - name: Teardown
+        if: always()
+        run: docker compose --profile load-test down
+
+  coverage-badge:
+    name: Publish coverage badge
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+
+      - name: Build shields endpoint JSON
+        run: |
+          # Match scripts/coverage.sh: strip generated packages (0% coverage,
+          # no tests of their own) before computing the total, so the badge
+          # reports the same number the coverage gate enforces, not a number
+          # dragged down by generated code.
+          EXCLUDE='internal/genproto/|internal/postgres/sqlc/'
+          FILTERED="$(mktemp)"
+          head -n 1 cover.out > "$FILTERED"
+          grep -vE "$EXCLUDE" cover.out | tail -n +2 >> "$FILTERED" || true
+          PCT=$(go tool cover -func="$FILTERED" | grep '^total:' | awk '{print $3}' | tr -d '%')
+          rm -f "$FILTERED"
+          COLOR=red
+          awk "BEGIN{exit !($PCT>=70 && $PCT<80)}" && COLOR=yellow
+          awk "BEGIN{exit !($PCT>=80)}" && COLOR=brightgreen
+          mkdir -p out
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > out/coverage.json
+
+      - name: Publish to badges branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cp out/coverage.json /tmp/coverage.json
+          git fetch origin badges || true
+          if git checkout badges 2>/dev/null; then
+            find . -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +
+          else
+            git checkout --orphan badges
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          cp /tmp/coverage.json coverage.json
+          git add coverage.json
+          git commit -m "chore: update coverage badge" || echo "no change"
+          git push origin badges
+
   deploy:
     name: Deploy to VPS
-    needs: test
+    needs: [lint, test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
