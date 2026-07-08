@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
@@ -570,6 +571,72 @@ func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, 
 		})
 	}
 	return entries, nil
+}
+
+// GetAPIKeyByHash resolves an unrevoked api_keys row by hash, or
+// domain.ErrAPIKeyNotFound if none exists.
+func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.APIKey, error) {
+	row, err := r.q.GetAPIKeyByHash(ctx, hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if err != nil {
+		return domain.APIKey{}, fmt.Errorf("postgres: get api key by hash: %w", err)
+	}
+	return domain.APIKey{
+		ID:           row.ID.String(),
+		TenantID:     row.TenantID.String(),
+		Name:         row.Name,
+		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+	}, nil
+}
+
+// InsertAPIKey assigns an identity if k.ID is empty and inserts k with keyHash
+// as its stored credential. Only the hash is ever written.
+func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error {
+	if k.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate api key id: %w", err)
+		}
+		k.ID = id.String()
+	}
+	id, err := uuid.Parse(k.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	tid, err := uuid.Parse(k.TenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if err := r.q.InsertAPIKey(ctx, sqlc.InsertAPIKeyParams{
+		ID:           id,
+		TenantID:     tid,
+		Name:         k.Name,
+		KeyHash:      keyHash,
+		RateLimitRpm: ptrToInt4(k.RateLimitRPM),
+	}); err != nil {
+		return fmt.Errorf("postgres: insert api key: %w", err)
+	}
+	return nil
+}
+
+// int4ToPtr converts a nullable Postgres int4 to *int, nil when the column is
+// NULL (no per-key rate limit override).
+func int4ToPtr(v pgtype.Int4) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int32)
+	return &n
+}
+
+// ptrToInt4 converts *int to a nullable Postgres int4, NULL when p is nil.
+func ptrToInt4(p *int) pgtype.Int4 {
+	if p == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(*p), Valid: true} //nolint:gosec // rate limits are small, application-set values
 }
 
 func accountFromRow(row sqlc.Account) (domain.Account, error) {

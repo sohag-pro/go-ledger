@@ -1,0 +1,37 @@
+package domain
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+)
+
+const apiKeyPrefix = "glk_"
+
+// APIKey is a resolved credential: which tenant it acts as and its optional
+// per-key rate limit (nil means the server default).
+type APIKey struct {
+	ID           string
+	TenantID     string
+	Name         string
+	RateLimitRPM *int
+}
+
+// GenerateAPIKey returns a new random key plaintext ("glk_<base64url>") and its
+// SHA-256 hex hash. Only the hash is ever stored.
+func GenerateAPIKey() (plaintext, hash string, err error) {
+	var b [32]byte
+	if _, err = rand.Read(b[:]); err != nil {
+		return "", "", err
+	}
+	plaintext = apiKeyPrefix + base64.RawURLEncoding.EncodeToString(b[:])
+	return plaintext, HashAPIKey(plaintext), nil
+}
+
+// HashAPIKey returns the SHA-256 hex of a key plaintext. Deterministic so a
+// presented key can be looked up by hash.
+func HashAPIKey(plaintext string) string {
+	sum := sha256.Sum256([]byte(plaintext))
+	return hex.EncodeToString(sum[:])
+}

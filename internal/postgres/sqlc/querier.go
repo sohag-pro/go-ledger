@@ -19,9 +19,11 @@ type Querier interface {
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
+	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (Account, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
+	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error)

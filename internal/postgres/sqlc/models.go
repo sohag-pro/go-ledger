@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Account struct {
@@ -17,6 +18,16 @@ type Account struct {
 	Type      string
 	Currency  string
 	CreatedAt time.Time
+}
+
+type ApiKey struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	Name         string
+	KeyHash      string
+	RateLimitRpm pgtype.Int4
+	CreatedAt    time.Time
+	RevokedAt    pgtype.Timestamptz
 }
 
 type AuditLog struct {

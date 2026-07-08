@@ -118,4 +118,12 @@ type Repository interface {
 	// safe to run more than once. It returns the last error if retries are
 	// exhausted, or any non-retryable error from fn.
 	RunInTx(ctx context.Context, fn func(context.Context, Tx) error) error
+
+	// GetAPIKeyByHash resolves an unrevoked api_keys row by the SHA-256 hex hash
+	// of a presented key, or ErrAPIKeyNotFound if no such unrevoked key exists.
+	GetAPIKeyByHash(ctx context.Context, hash string) (APIKey, error)
+
+	// InsertAPIKey persists k with keyHash as its stored credential. Only the
+	// hash is ever written; the plaintext is never stored.
+	InsertAPIKey(ctx context.Context, k APIKey, keyHash string) error
 }

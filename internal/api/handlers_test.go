@@ -31,6 +31,7 @@ type fakeRepo struct {
 	clock    int64
 	idem     map[string]domain.IdempotencyRecord // key -> record
 	audit    []domain.AuditEntry
+	apiKeys  map[string]domain.APIKey // key_hash -> resolved key
 }
 
 type postingRec struct {
@@ -44,6 +45,7 @@ func newFakeRepo() *fakeRepo {
 		accounts: map[string]domain.Account{},
 		txns:     map[string]domain.Transaction{},
 		idem:     map[string]domain.IdempotencyRecord{},
+		apiKeys:  map[string]domain.APIKey{},
 	}
 }
 
@@ -234,6 +236,22 @@ func (f *fakeRepo) Statement(_ context.Context, _, accountID string, currency do
 
 func (f *fakeRepo) RunInTx(ctx context.Context, fn func(context.Context, domain.Tx) error) error {
 	return fn(ctx, f)
+}
+
+func (f *fakeRepo) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
+	k, ok := f.apiKeys[hash]
+	if !ok {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	return k, nil
+}
+
+func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash string) error {
+	if k.ID == "" {
+		k.ID = uuid.NewString()
+	}
+	f.apiKeys[keyHash] = k
+	return nil
 }
 
 var _ domain.Repository = (*fakeRepo)(nil)

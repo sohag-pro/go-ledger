@@ -47,4 +47,7 @@ var (
 	ErrDuplicateIdempotencyKey = errors.New("domain: idempotency key already exists")
 	// ErrIdempotencyKeyNotFound is returned when a lookup finds no row for a key.
 	ErrIdempotencyKeyNotFound = errors.New("domain: idempotency key not found")
+	// ErrAPIKeyNotFound is returned when no unrevoked api_keys row matches a
+	// presented key's hash. A transport layer should map it to 401 Unauthorized.
+	ErrAPIKeyNotFound = errors.New("domain: api key not found")
 )
