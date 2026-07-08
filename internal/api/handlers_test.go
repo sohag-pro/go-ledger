@@ -477,19 +477,45 @@ func TestPostTransactionAndBalance(t *testing.T) {
 	// ADR-012 "Input hardening": the postings array has a maxItems of 100, so
 	// one request can no longer become an arbitrarily large transaction. This
 	// is huma schema validation (maxItems), so it rejects before the handler
-	// (and the balance check) ever runs; the 101 postings here deliberately
-	// do not sum to zero.
+	// (and the balance check) ever runs. The 101 postings here deliberately DO
+	// sum to zero (100 legs of +1 on cash, one leg of -100 on rev): if
+	// maxItems were removed, this would be a perfectly valid balanced
+	// transaction and the handler would accept it. That is the point: the
+	// only thing that can reject this request is the array-length schema
+	// check, so asserting on the huma error location below actually pins
+	// maxItems instead of coincidentally tripping the unrelated unbalanced
+	// check.
 	t.Run("too many postings 422", func(t *testing.T) {
 		postings := make([]map[string]any, 101)
-		for i := range postings {
+		for i := 0; i < 100; i++ {
 			postings[i] = map[string]any{"account_id": cash, "amount": 1}
 		}
+		postings[100] = map[string]any{"account_id": rev, "amount": -100}
 		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
 			"currency": "USD",
 			"postings": postings,
 		}, map[string]string{"Idempotency-Key": "post-and-balance-too-many"})
 		if rec.Code != http.StatusUnprocessableEntity {
-			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+			t.Fatalf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Errors []struct {
+				Location string `json:"location"`
+				Message  string `json:"message"`
+			} `json:"errors"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal error body: %v (%s)", err, rec.Body.String())
+		}
+		found := false
+		for _, e := range out.Errors {
+			if strings.Contains(e.Location, "postings") && strings.Contains(e.Message, "array length") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("errors = %+v, want an entry naming postings and array length (schema maxItems rejection), got body %s", out.Errors, rec.Body.String())
 		}
 	})
 

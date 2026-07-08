@@ -25,11 +25,12 @@ const APIVersion = "0.2.0"
 
 // MaxRequestBodyBytes bounds every request body, so one request can no longer
 // exhaust memory before validation runs (see ADR-012, "Input hardening").
-// cmd/server applies the same limit as a router-level middleware, ahead of
-// huma, and the write operations below set it again as their own
-// MaxBodyBytes so huma's own accounting reaches its limit (and returns a
-// clean 413) before an oversized-but-declared body ever reaches the router
-// middleware's harder cutoff.
+// cmd/server applies the same limit as a router-level maxBodyBytes
+// middleware that wraps huma, so it runs first and enforces the hard cutoff.
+// The write operations below also set MaxBodyBytes as their own huma option,
+// so huma's own accounting returns a clean 413 for the same limit when it is
+// the one reading the body, such as in tests that exercise the huma router
+// directly without the wrapping middleware.
 const MaxRequestBodyBytes int64 = 64 * 1024
 
 // Deps are the services the operations call, plus the auth resolver every /v1
