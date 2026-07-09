@@ -10,17 +10,42 @@ import (
 // statements. Like TransactionService it is thin, delegating persistence to the
 // repository port and holding no SQL.
 type AccountService struct {
-	repo domain.Repository
+	repo            domain.Repository
+	defaultCurrency domain.Currency
+}
+
+// AccountOption configures optional AccountService dependencies, mirroring
+// TransactionService's ServiceOption: most existing callers and tests do not
+// need one, so NewAccountService's required parameters stay unchanged.
+type AccountOption func(*AccountService)
+
+// WithDefaultCurrency sets the currency Create stamps on a new account when
+// the caller does not specify one (ADR-014, "New-account default currency is
+// env-configured"). Without this option, Create leaves an empty Currency
+// as-is, which fails domain.Account.Validate with ErrInvalidCurrency, the
+// same behavior as before this option existed.
+func WithDefaultCurrency(c domain.Currency) AccountOption {
+	return func(s *AccountService) { s.defaultCurrency = c }
 }
 
 // NewAccountService returns an AccountService backed by repo.
-func NewAccountService(repo domain.Repository) *AccountService {
-	return &AccountService{repo: repo}
+func NewAccountService(repo domain.Repository, opts ...AccountOption) *AccountService {
+	s := &AccountService{repo: repo}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Create persists a new account. The repository assigns an id if a.ID is empty
-// and validates the account.
+// and validates the account. If a.Currency is empty and WithDefaultCurrency was
+// set, the configured default is stamped on before validation, so a caller that
+// does not specify a currency gets the deployment's configured default rather
+// than a validation error.
 func (s *AccountService) Create(ctx context.Context, tenantID string, a *domain.Account) error {
+	if a.Currency == "" && s.defaultCurrency != "" {
+		a.Currency = s.defaultCurrency
+	}
 	return s.repo.CreateAccount(ctx, tenantID, a)
 }
 

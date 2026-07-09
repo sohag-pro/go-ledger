@@ -90,10 +90,17 @@ type txn struct {
 // accounts and a few hundred backdated transactions. It is atomic: everything
 // happens in one database transaction, so the API never observes a half-seeded
 // ledger. now is the reference time (the most recent possible transaction).
-func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time) error {
+// currency is the ISO 4217 code stamped on every seeded account and posting
+// (ADR-014, "New-account default currency is env-configured"); an empty
+// currency falls back to "USD" so a direct caller that does not care about
+// multi-currency still gets a valid, single-currency demo ledger.
+func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("seed: parse tenant id: %w", err)
+	}
+	if currency == "" {
+		currency = "USD"
 	}
 	rng := rand.New(rand.NewSource(now.UnixNano())) //nolint:gosec // demo data, not crypto
 
@@ -159,24 +166,28 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	}
 	for _, a := range accounts {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO accounts (id, tenant_id, name, type, currency, created_at) VALUES ($1,$2,$3,$4,'USD',$5)`,
-			a.id, tid, a.name, a.typ, accountsAt); err != nil {
+			`INSERT INTO accounts (id, tenant_id, name, type, currency, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+			a.id, tid, a.name, a.typ, currency, accountsAt); err != nil {
 			return fmt.Errorf("seed: insert account %s: %w", a.name, err)
 		}
 	}
 
+	// transactions no longer carries a currency column (ADR-014, migration
+	// 0010): currency lives on each posting instead, since an FX transaction
+	// spans two currencies. Every seeded leg below stamps the same currency,
+	// since the demo ledger is single-currency by construction.
 	for _, t := range txns {
 		txID := newID()
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO transactions (id, tenant_id, currency, created_at) VALUES ($1,$2,'USD',$3)`,
+			`INSERT INTO transactions (id, tenant_id, created_at) VALUES ($1,$2,$3)`,
 			txID, tid, t.at); err != nil {
 			return fmt.Errorf("seed: insert transaction: %w", err)
 		}
 		for _, leg := range t.legs {
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, description, created_at)
-				 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-				newID(), tid, txID, leg.accountID, leg.amount, leg.desc, t.at); err != nil {
+				`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, description, currency, created_at)
+				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+				newID(), tid, txID, leg.accountID, leg.amount, leg.desc, currency, t.at); err != nil {
 				return fmt.Errorf("seed: insert posting: %w", err)
 			}
 		}

@@ -92,6 +92,8 @@ type config struct {
 	loadTestTenants int
 	rateLimitRPM    int
 	authCacheTTL    time.Duration
+	defaultCurrency string
+	fxRates         string
 }
 
 func loadConfig() (config, error) {
@@ -110,6 +112,8 @@ func loadConfig() (config, error) {
 		loadTestTenants: getenvInt("LOAD_TEST_TENANTS", 8),
 		rateLimitRPM:    getenvInt("RATE_LIMIT_RPM", 120),
 		authCacheTTL:    getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
+		defaultCurrency: getenv("DEFAULT_CURRENCY", "USD"),
+		fxRates:         os.Getenv("FX_RATES"),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -226,12 +230,20 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// Seed static FX rates from FX_RATES (ADR-014). fx.Seed is a no-op on an
+	// empty/unset value, and it only inserts a pair when its parsed rate or
+	// spread differs from the current row, so restarting the server does not
+	// pile up redundant history for a pair whose configured rate never changed.
+	if err := fx.Seed(ctx, pool, cfg.fxRates); err != nil {
+		return fmt.Errorf("seed fx rates: %w", err)
+	}
+
 	// Per-key rate limiter, wired AFTER the auth middleware inside api.New so
 	// the key auth resolved into the context is present when it runs (see
 	// ADR-012, "Per-key rate limiting", and internal/api/api.go).
 	limiter := auth.NewLimiter(cfg.rateLimitRPM)
 	deps := api.Deps{
-		Accounts: ledger.NewAccountService(repo),
+		Accounts: ledger.NewAccountService(repo, ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency))),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
 			ledger.WithFXProvider(fx.NewDBProvider(pool))),
 		Audit:       ledger.NewAuditService(repo),
@@ -245,7 +257,7 @@ func run(logger *slog.Logger) error {
 	if cfg.seedEnabled {
 		seedCtx, cancelSeed := context.WithCancel(context.Background())
 		defer cancelSeed()
-		go runSeeder(seedCtx, logger, pool, cfg.defaultTenant, cfg.seedInterval)
+		go runSeeder(seedCtx, logger, pool, cfg.defaultTenant, cfg.defaultCurrency, cfg.seedInterval)
 	}
 
 	router := chi.NewRouter()
@@ -444,11 +456,13 @@ func provisionKey(ctx context.Context, store apiKeyStore, k domain.APIKey, plain
 }
 
 // runSeeder seeds the demo ledger once immediately, then every interval, until
-// ctx is cancelled. A failed seed is logged and the loop continues.
-func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant string, interval time.Duration) {
+// ctx is cancelled. A failed seed is logged and the loop continues. currency
+// is stamped on every seeded account and posting (ADR-014): it is the same
+// DEFAULT_CURRENCY used as the fallback for a caller-created account.
+func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant, currency string, interval time.Duration) {
 	doSeed := func() {
 		start := time.Now()
-		if err := seed.Seed(ctx, pool, tenant, time.Now()); err != nil {
+		if err := seed.Seed(ctx, pool, tenant, time.Now(), currency); err != nil {
 			logger.Error("demo seed failed", "error", err)
 			return
 		}

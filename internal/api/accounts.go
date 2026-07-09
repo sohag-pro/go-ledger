@@ -22,12 +22,14 @@ func toAccountBody(a domain.Account) AccountBody {
 	return AccountBody{ID: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency)}
 }
 
-// CreateAccountInput is the create-account request body.
+// CreateAccountInput is the create-account request body. Currency is
+// optional (omitempty): when the caller omits it, the server stamps the
+// deployment's configured DEFAULT_CURRENCY instead (ADR-014).
 type CreateAccountInput struct {
 	Body struct {
 		Name     string `json:"name" minLength:"1" maxLength:"200" doc:"Human-readable account name"`
 		Type     string `json:"type" enum:"asset,liability,equity,income,expense" doc:"Fundamental account class"`
-		Currency string `json:"currency" pattern:"^[A-Z]{3}$" doc:"ISO 4217 alphabetic code"`
+		Currency string `json:"currency,omitempty" pattern:"^[A-Z]{3}$" doc:"ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted."`
 	}
 }
 

@@ -31,7 +31,7 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 	tenant := uuid.NewString()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) // fixed, deterministic
 
-	if err := seed.Seed(ctx, pool, tenant, now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant, now, "USD"); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
 
@@ -100,10 +100,10 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 	tenant := uuid.NewString()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	if err := seed.Seed(ctx, pool, tenant, now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant, now, "USD"); err != nil {
 		t.Fatalf("first Seed: %v", err)
 	}
-	if err := seed.Seed(ctx, pool, tenant, now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant, now, "USD"); err != nil {
 		t.Fatalf("second Seed: %v", err)
 	}
 

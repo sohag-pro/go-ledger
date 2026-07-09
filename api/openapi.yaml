@@ -137,7 +137,7 @@ components:
       additionalProperties: false
       properties:
         currency:
-          description: ISO 4217 alphabetic code
+          description: ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted.
           pattern: ^[A-Z]{3}$
           type: string
         name:
@@ -157,7 +157,6 @@ components:
       required:
         - name
         - type
-        - currency
       type: object
     CreateTransactionInputBody:
       additionalProperties: false
