@@ -10,7 +10,7 @@ overtaken by the deployment decision recorded when the service went live.
 
 ## Context
 
-The 12-week plan's Week 10 targets AWS: a multi-stage Dockerfile plus Terraform
+The 14-week plan's Week 10 targets AWS: a multi-stage Dockerfile plus Terraform
 modules (VPC, ECS Fargate, RDS Postgres, ALB, IAM, ECR) and a `make deploy` that
 stands the ledger up on AWS in one command. Two things have made that plan
 stale:

@@ -3,7 +3,7 @@
 [![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sohag-pro/go-ledger/badges/coverage.json)](https://github.com/sohag-pro/go-ledger/actions)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sohag-pro/go-ledger)](https://goreportcard.com/report/github.com/sohag-pro/go-ledger)
 
-**A production-grade payment ledger service in Go, built in public over twelve weeks.**
+**A production-grade payment ledger service in Go, built in public over fourteen weeks.**
 
 Money never appears or disappears. It only moves. go-ledger takes that 500-year-old rule of double-entry bookkeeping and enforces it with Go's type system, Postgres constraints, and tests that throw 10,000 concurrent transactions at the ledger and expect zero violations. Every balance is the sum of an immutable, append-only history; if a transaction doesn't sum to zero, it never persists.
 
@@ -65,7 +65,7 @@ Design decisions live in [docs/adr](docs/adr). Start with [ADR-001: why double-e
 
 ## Roadmap
 
-Built over a 12-week public roadmap: domain model, Postgres schema, atomic transaction posting under SERIALIZABLE isolation, REST + gRPC APIs, idempotency keys, audit log, OpenTelemetry, load and chaos testing, then a live deployment via GitHub Actions. The [blog series](https://notes.sohag.pro/series/go-ledger) tracks each week, including what went wrong.
+Built over a 14-week public roadmap: domain model, Postgres schema, atomic transaction posting under SERIALIZABLE isolation, REST + gRPC APIs, idempotency keys, audit log, OpenTelemetry, load and chaos testing, a live deployment via GitHub Actions, then multi-currency and FX, nested accounts and reporting, approvals and an event stream, and webhooks. The [blog series](https://notes.sohag.pro/series/go-ledger) tracks each week, including what went wrong.
 
 Deliberately out of scope for v1: multi-currency, FX, webhooks, web UI, event streaming. Shipping beats feature lists.
 
