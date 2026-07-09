@@ -57,4 +57,7 @@ var (
 	// ErrConversionDust is returned when an FX conversion rounds a nonzero
 	// source amount to zero in the quote currency.
 	ErrConversionDust = errors.New("domain: conversion rounds to zero")
+	// ErrFXRateNotFound is returned when no fx_rates row exists for a currency
+	// pair, in either direction, at or before the requested time.
+	ErrFXRateNotFound = errors.New("domain: fx rate not found")
 )
