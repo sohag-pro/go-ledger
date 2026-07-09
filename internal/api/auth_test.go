@@ -26,8 +26,10 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
+	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
 )
 
 // --- Unit-level auth tests, backed by fakeRepo (no Docker required). ---
@@ -287,5 +289,72 @@ func TestV1CrossTenantIsolation_Postgres(t *testing.T) {
 	r.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusNotFound {
 		t.Errorf("tenant B get-by-id status = %d, want 404 (cross-tenant leak): %s", getRec.Code, getRec.Body.String())
+	}
+}
+
+// TestConvertCrossTenantIsolation_Postgres checks that POST
+// /v1/transactions/convert rejects a to_account belonging to a different
+// tenant with 404, exactly like any other account lookup (ADR-012's tenant
+// scoping). This needs real Postgres, not fakeRepo, for the same reason
+// TestV1CrossTenantIsolation_Postgres above does: fakeRepo does not filter by
+// tenant at all.
+func TestConvertCrossTenantIsolation_Postgres(t *testing.T) {
+	if authPoolErr != nil {
+		t.Skipf("skipping integration test: %v", authPoolErr)
+	}
+
+	repo := postgres.NewRepository(sharedAuthPool)
+	ctx := context.Background()
+
+	q := sqlc.New(sharedAuthPool)
+	if _, err := q.InsertFXRate(ctx, sqlc.InsertFXRateParams{
+		Base:        "USD",
+		Quote:       "PLN",
+		MidRateE8:   100_000_000,
+		SpreadBps:   0,
+		Source:      "test",
+		EffectiveAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed fx rate: %v", err)
+	}
+
+	tenantA := newUUID(t)
+	tenantB := newUUID(t)
+	const plaintextA = "glk_convert-cross-tenant-test-key-a"
+	const plaintextB = "glk_convert-cross-tenant-test-key-b"
+
+	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenantA, Name: "tenant A"}, domain.HashAPIKey(plaintextA)); err != nil {
+		t.Fatalf("insert tenant A key: %v", err)
+	}
+	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenantB, Name: "tenant B"}, domain.HashAPIKey(plaintextB)); err != nil {
+		t.Fatalf("insert tenant B key: %v", err)
+	}
+
+	r := chi.NewRouter()
+	New(r, Deps{
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, ledger.WithFXProvider(fx.NewDBProvider(sharedAuthPool))),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, time.Minute),
+	})
+
+	usdA := &domain.Account{Name: "Tenant A USD", Type: domain.Asset, Currency: "USD"}
+	if err := repo.CreateAccount(ctx, tenantA, usdA); err != nil {
+		t.Fatalf("create tenant A account: %v", err)
+	}
+	plnB := &domain.Account{Name: "Tenant B PLN", Type: domain.Asset, Currency: "PLN"}
+	if err := repo.CreateAccount(ctx, tenantB, plnB); err != nil {
+		t.Fatalf("create tenant B account: %v", err)
+	}
+
+	convReq := httptest.NewRequest(http.MethodPost, "/v1/transactions/convert",
+		jsonBody(t, map[string]any{"from_account": usdA.ID, "to_account": plnB.ID, "source_amount": 100}))
+	convReq.Header.Set("Content-Type", "application/json")
+	convReq.Header.Set("Authorization", "Bearer "+plaintextA)
+	convReq.Header.Set("Idempotency-Key", "convert-cross-tenant-1")
+	convRec := httptest.NewRecorder()
+	r.ServeHTTP(convRec, convReq)
+	if convRec.Code != http.StatusNotFound {
+		t.Errorf("convert to tenant B's account status = %d, want 404 (cross-tenant leak): %s", convRec.Code, convRec.Body.String())
 	}
 }
