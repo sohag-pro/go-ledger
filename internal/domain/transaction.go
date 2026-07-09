@@ -6,8 +6,9 @@ const MaxPostingDescriptionLen = 256
 // Posting is one signed entry against a single account. The sign carries
 // direction: a positive Amount is a debit, a negative Amount is a credit. This
 // is the convention referenced throughout the domain (see ADR-002). A
-// transaction's postings must sum to zero. Description is an optional free-text
-// narration for the line (for example "dinner repayment").
+// transaction's postings must sum to zero within each currency (see ADR-014).
+// Description is an optional free-text narration for the line (for example
+// "dinner repayment").
 type Posting struct {
 	AccountID   string
 	Amount      Money
@@ -27,19 +28,27 @@ func (p Posting) Validate() error {
 }
 
 // Transaction is an atomic, immutable set of postings that move money between
-// accounts. Its defining invariant: the postings sum to zero in a single
-// currency. Validate is the one place that invariant is enforced in the domain
-// (the database adds a CHECK constraint in Week 4).
+// accounts. Its defining invariant: for each currency present in the
+// transaction, that currency's postings sum to zero (see ADR-014). A
+// single-currency transaction is just the special case with one currency
+// group; a cross-currency (FX) transaction routes each currency through its
+// own clearing account so every currency group nets independently.
 type Transaction struct {
 	ID       string
 	Postings []Posting
 }
 
 // Validate enforces the double-entry invariant. It requires at least two
-// postings, every posting valid, all postings in the same currency, and the
-// signed amounts summing to exactly zero. It returns the first error found:
-// ErrTooFewPostings, ErrInvalidPosting, ErrCurrencyMismatch, ErrOverflow, or
-// ErrUnbalanced.
+// postings, every posting valid, and, for each currency present across the
+// postings, that currency's signed amounts summing to exactly zero. It
+// returns the first error found: ErrTooFewPostings, ErrInvalidPosting,
+// ErrOverflow, or ErrUnbalanced.
+//
+// Postings are grouped by currency and accumulated with Money.Add, which is
+// only ever called on two Money values of the same currency (every add is
+// within one group), so ErrCurrencyMismatch can never fire here; a
+// cross-currency transaction is not an error, it is the normal FX shape.
+// Overflow detection stays centralized in Money.Add.
 //
 // Two things are deliberately allowed. A zero-amount posting is valid: a
 // balanced set can legitimately include a zero leg (for example a zero fee), and
@@ -56,16 +65,24 @@ func (t Transaction) Validate() error {
 			return err
 		}
 	}
-	sum := t.Postings[0].Amount
-	for _, p := range t.Postings[1:] {
-		next, err := sum.Add(p.Amount) // surfaces ErrCurrencyMismatch and ErrOverflow
+	sums := make(map[Currency]Money, len(t.Postings))
+	for _, p := range t.Postings {
+		cur := p.Amount.Currency()
+		running, seen := sums[cur]
+		if !seen {
+			sums[cur] = p.Amount // first posting of this currency seeds the sum
+			continue
+		}
+		next, err := running.Add(p.Amount) // same currency, so only ErrOverflow can fire
 		if err != nil {
 			return err
 		}
-		sum = next
+		sums[cur] = next
 	}
-	if !sum.IsZero() {
-		return ErrUnbalanced
+	for _, s := range sums {
+		if !s.IsZero() {
+			return ErrUnbalanced
+		}
 	}
 	return nil
 }

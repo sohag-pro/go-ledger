@@ -77,11 +77,29 @@ func ParseAccountType(s string) (AccountType, error) {
 // Account is a named ledger account of a given type and currency. It is
 // identity plus classification only; the balance is never stored here, it is
 // derived by summing postings (see ADR-001).
+//
+// System marks an account as infrastructure rather than a user-owned account:
+// the FX clearing accounts introduced in ADR-014 are the current example, one
+// per tenant per currency, created lazily to absorb the open position of a
+// cross-currency transaction. A system account still has a normal accounting
+// type (an FX clearing account is a Liability), so no accounting rule
+// changes; System only changes how the account is treated outside the
+// balance invariant. System accounts are hidden from user-facing balance
+// listings, and unlike a user account they are expected to carry a
+// permanent, often negative, open position rather than settle to zero: that
+// open position, revalued at current rates, is the tenant's FX exposure.
 type Account struct {
 	ID       string
 	Name     string
 	Type     AccountType
 	Currency Currency
+	System   bool
+}
+
+// IsSystem reports whether the account is a system account (for example an
+// FX clearing account) rather than a user-owned account.
+func (a Account) IsSystem() bool {
+	return a.System
 }
 
 // Validate checks that the account has an id and name, a defined type, and a
