@@ -50,4 +50,11 @@ var (
 	// ErrAPIKeyNotFound is returned when no unrevoked api_keys row matches a
 	// presented key's hash. A transport layer should map it to 401 Unauthorized.
 	ErrAPIKeyNotFound = errors.New("domain: api key not found")
+	// ErrNonPositiveRate is returned when an FX conversion rate is zero or negative.
+	ErrNonPositiveRate = errors.New("domain: fx rate must be positive")
+	// ErrInvalidSpread is returned when an FX spread is negative or 100% or more.
+	ErrInvalidSpread = errors.New("domain: fx spread out of range")
+	// ErrConversionDust is returned when an FX conversion rounds a nonzero
+	// source amount to zero in the quote currency.
+	ErrConversionDust = errors.New("domain: conversion rounds to zero")
 )
