@@ -4,7 +4,7 @@ BUILD_DIR   := bin
 
 MIGRATIONS  := internal/postgres/migrations
 
-.PHONY: run build test cover load lint tidy clean dev docker-build openapi sqlc proto migrate-up migrate-down jaeger help
+.PHONY: run build test cover load lint tidy clean dev docker-build image-size openapi sqlc proto migrate-up migrate-down jaeger help
 
 run: ## Run the server
 	go run $(CMD)
@@ -54,7 +54,16 @@ jaeger: ## Start Jaeger all-in-one for local tracing (UI on :16686)
 	docker compose up -d jaeger
 
 docker-build: ## Build the Docker image
-	docker build -t $(BINARY):latest .
+	DOCKER_BUILDKIT=1 docker build -t $(BINARY):latest .
+
+image-size: docker-build ## Build the image and fail if it exceeds 20MB
+	@bytes=$$(docker image inspect $(BINARY):latest --format '{{.Size}}'); \
+	mb=$$((bytes / 1000000)); \
+	echo "image size: $${mb}MB ($${bytes} bytes)"; \
+	if [ $$bytes -gt 20000000 ]; then \
+		echo "FAIL: image exceeds 20MB budget"; exit 1; \
+	fi; \
+	echo "OK: under 20MB budget"
 
 clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR)
