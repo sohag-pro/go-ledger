@@ -9,26 +9,56 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createTransaction = `-- name: CreateTransaction :exec
-INSERT INTO transactions (id, tenant_id, currency)
-VALUES ($1, $2, $3)
+INSERT INTO transactions (
+    id, tenant_id,
+    fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
+    fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 `
 
 type CreateTransactionParams struct {
-	ID       uuid.UUID
-	TenantID uuid.UUID
-	Currency string
+	ID                uuid.UUID
+	TenantID          uuid.UUID
+	FxSourceAmount    pgtype.Int8
+	FxConvertedAmount pgtype.Int8
+	FxMidRateE8       pgtype.Int8
+	FxSpreadBps       pgtype.Int4
+	FxAppliedE8       pgtype.Int8
+	FxRateSource      pgtype.Text
+	FxEffectiveAt     pgtype.Timestamptz
+	FxRateID          pgtype.Int8
 }
 
+// currency lives on each posting now (ADR-014), not here: an FX transaction
+// spans two currencies, so there is no single transaction-level value left to
+// store. The fx_* columns are the immutable snapshot of the conversion
+// actually applied; all nullable, since a single-currency transaction (still
+// the common case) has none of this.
 func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionParams) error {
-	_, err := q.db.Exec(ctx, createTransaction, arg.ID, arg.TenantID, arg.Currency)
+	_, err := q.db.Exec(ctx, createTransaction,
+		arg.ID,
+		arg.TenantID,
+		arg.FxSourceAmount,
+		arg.FxConvertedAmount,
+		arg.FxMidRateE8,
+		arg.FxSpreadBps,
+		arg.FxAppliedE8,
+		arg.FxRateSource,
+		arg.FxEffectiveAt,
+		arg.FxRateID,
+	)
 	return err
 }
 
 const getTransaction = `-- name: GetTransaction :one
-SELECT id, tenant_id, currency, created_at
+SELECT id, tenant_id, created_at,
+       fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
+       fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id
 FROM transactions
 WHERE tenant_id = $1 AND id = $2
 `
@@ -44,8 +74,15 @@ func (q *Queries) GetTransaction(ctx context.Context, arg GetTransactionParams) 
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
-		&i.Currency,
 		&i.CreatedAt,
+		&i.FxSourceAmount,
+		&i.FxConvertedAmount,
+		&i.FxMidRateE8,
+		&i.FxSpreadBps,
+		&i.FxAppliedE8,
+		&i.FxRateSource,
+		&i.FxEffectiveAt,
+		&i.FxRateID,
 	)
 	return i, err
 }

@@ -17,27 +17,46 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 )
 
 // TransactionService posts transactions to the ledger. It is the single entry
 // point both the REST and gRPC layers will call to move money.
 type TransactionService struct {
-	repo   domain.Repository
-	log    *slog.Logger
-	tracer oteltrace.Tracer
+	repo       domain.Repository
+	log        *slog.Logger
+	tracer     oteltrace.Tracer
+	fxProvider fx.Provider
+}
+
+// ServiceOption configures optional TransactionService dependencies that most
+// callers (and most existing tests, which only ever call Post) do not need,
+// so NewTransactionService's required parameters stay unchanged.
+type ServiceOption func(*TransactionService)
+
+// WithFXProvider sets the fx.Provider Convert uses to resolve the current
+// rate for a currency pair. A TransactionService constructed without this
+// option has a nil fxProvider; Convert reports a clear error rather than
+// panicking on the nil interface call (see Convert).
+func WithFXProvider(p fx.Provider) ServiceOption {
+	return func(s *TransactionService) { s.fxProvider = p }
 }
 
 // NewTransactionService returns a TransactionService backed by repo. If log is
 // nil the default slog logger is used; if tracer is nil the global tracer is used.
-func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer oteltrace.Tracer) *TransactionService {
+func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer oteltrace.Tracer, opts ...ServiceOption) *TransactionService {
 	if log == nil {
 		log = slog.Default()
 	}
 	if tracer == nil {
 		tracer = otel.Tracer("github.com/sohag-pro/go-ledger/internal/ledger")
 	}
-	return &TransactionService{repo: repo, log: log, tracer: tracer}
+	s := &TransactionService{repo: repo, log: log, tracer: tracer}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Post validates t and persists it atomically inside a SERIALIZABLE transaction,
@@ -130,24 +149,42 @@ func (s *TransactionService) replay(ctx context.Context, tenantID, key, fingerpr
 
 // auditSnapshot is the JSON-serializable view of a transaction stored in the
 // audit log's after column. Using a map gives deterministic, sorted keys.
+//
+// Each posting carries its own currency (ADR-014): a cross-currency convert
+// spans two currencies in one transaction, so there is no single top-level
+// currency that could label every posting correctly, and stamping one from
+// postings[0] (the pre-ADR-014 shape) would mislabel every leg in the other
+// currency. When t.FX is set (a convert), the snapshot also carries the rate
+// detail actually applied: the mid rate, spread, applied rate, source, and
+// effective time, so the audit row is a full, self-contained record of what
+// happened without needing to join back to the transaction row.
 func auditSnapshot(t *domain.Transaction) map[string]any {
-	currency := ""
-	if len(t.Postings) > 0 {
-		currency = string(t.Postings[0].Amount.Currency())
-	}
 	postings := make([]map[string]any, 0, len(t.Postings))
 	for _, p := range t.Postings {
 		postings = append(postings, map[string]any{
 			"account_id":  p.AccountID,
 			"amount":      p.Amount.Amount(),
+			"currency":    string(p.Amount.Currency()),
 			"description": p.Description,
 		})
 	}
-	return map[string]any{
+	snapshot := map[string]any{
 		"id":       t.ID,
-		"currency": currency,
 		"postings": postings,
 	}
+	if t.FX != nil {
+		snapshot["fx"] = map[string]any{
+			"source_amount":    t.FX.SourceAmount,
+			"converted_amount": t.FX.ConvertedAmount,
+			"mid_rate_e8":      t.FX.MidRateE8,
+			"applied_e8":       t.FX.AppliedE8,
+			"spread_bps":       t.FX.SpreadBps,
+			"rate_source":      t.FX.RateSource,
+			"effective_at":     t.FX.EffectiveAt,
+			"rate_id":          t.FX.RateID,
+		}
+	}
+	return snapshot
 }
 
 // Get returns a transaction and its postings, or domain.ErrTransactionNotFound.

@@ -145,7 +145,7 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
 	}
-	return accountFromRow(row)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency)
 }
 
 // ListAccounts returns up to limit of the tenant's accounts, ordered by name.
@@ -163,13 +163,57 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	}
 	out := make([]domain.Account, 0, len(rows))
 	for _, row := range rows {
-		acct, err := accountFromRow(row)
+		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, acct)
 	}
 	return out, nil
+}
+
+// clearingAccountName is the reserved, deterministic name of a tenant's FX
+// clearing account for currency (ADR-014): "fx.clearing.<CURRENCY>". Building
+// it the same way on every call is what lets GetOrCreateClearingAccount
+// resolve two calls for the same tenant and currency to the same row.
+func clearingAccountName(currency domain.Currency) string {
+	return "fx.clearing." + string(currency)
+}
+
+// GetOrCreateClearingAccount returns the tenant's per-currency FX clearing
+// account, creating it (as a Liability, System account) on first use. The
+// underlying query is INSERT ... ON CONFLICT (tenant_id, name) WHERE
+// is_system DO UPDATE (a no-op update, just to force Postgres to return the
+// existing row), so two callers racing to create the same tenant's first
+// clearing account for a currency (including two callers in different
+// processes) resolve to the same row rather than creating duplicates,
+// erroring, or (the DO NOTHING version's bug) both losing the race against
+// each other's snapshot and returning no row at all.
+func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID string, currency domain.Currency) (domain.Account, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: generate clearing account id: %w", err)
+	}
+	row, err := r.q.GetOrCreateClearingAccount(ctx, sqlc.GetOrCreateClearingAccountParams{
+		ID:       id,
+		TenantID: tid,
+		Name:     clearingAccountName(currency),
+		Type:     domain.Liability.String(),
+		Currency: string(currency),
+	})
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("postgres: get or create clearing account: %w", err)
+	}
+	acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	acct.System = row.IsSystem
+	return acct, nil
 }
 
 // CreateTransaction validates t and writes the transaction and all its postings
@@ -353,14 +397,23 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 	if err != nil {
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	// A valid transaction has at least one posting in a single shared currency.
-	currency := string(t.Postings[0].Amount.Currency())
-
-	if err := tr.q.CreateTransaction(ctx, sqlc.CreateTransactionParams{
-		ID:       txID,
-		TenantID: tid,
-		Currency: currency,
-	}); err != nil {
+	// currency now lives on each posting, not on the transaction (ADR-014): an
+	// FX transaction spans two currencies, so there is no single value to
+	// insert here. The fx_* snapshot columns are all nullable: t.FX is nil for
+	// a plain, single-currency transaction, and every field below stays its
+	// zero (invalid, i.e. NULL) pgtype value in that case.
+	params := sqlc.CreateTransactionParams{ID: txID, TenantID: tid}
+	if t.FX != nil {
+		params.FxSourceAmount = pgtype.Int8{Int64: t.FX.SourceAmount, Valid: true}
+		params.FxConvertedAmount = pgtype.Int8{Int64: t.FX.ConvertedAmount, Valid: true}
+		params.FxMidRateE8 = pgtype.Int8{Int64: t.FX.MidRateE8, Valid: true}
+		params.FxSpreadBps = pgtype.Int4{Int32: t.FX.SpreadBps, Valid: true}
+		params.FxAppliedE8 = pgtype.Int8{Int64: t.FX.AppliedE8, Valid: true}
+		params.FxRateSource = pgtype.Text{String: t.FX.RateSource, Valid: true}
+		params.FxEffectiveAt = pgtype.Timestamptz{Time: t.FX.EffectiveAt, Valid: true}
+		params.FxRateID = pgtype.Int8{Int64: t.FX.RateID, Valid: true}
+	}
+	if err := tr.q.CreateTransaction(ctx, params); err != nil {
 		if isUniqueViolation(err) {
 			return domain.ErrDuplicateTransaction
 		}
@@ -382,6 +435,7 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 			TransactionID: txID,
 			AccountID:     aid,
 			Amount:        p.Amount.Amount(),
+			Currency:      string(p.Amount.Currency()),
 			Description:   p.Description,
 		}); err != nil {
 			// The currency-integrity trigger rejects a posting into an account
@@ -528,10 +582,12 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: list postings: %w", err)
 	}
-	currency := domain.Currency(row.Currency)
 	out := domain.Transaction{ID: row.ID.String(), Postings: make([]domain.Posting, 0, len(postings))}
 	for _, p := range postings {
-		money, err := domain.NewMoney(p.Amount, currency)
+		// Each posting carries its own currency (ADR-014): an FX transaction has
+		// two currencies in play, so Money is rebuilt per row, never from one
+		// transaction-wide currency.
+		money, err := domain.NewMoney(p.Amount, domain.Currency(p.Currency))
 		if err != nil {
 			return domain.Transaction{}, fmt.Errorf("postgres: build posting money: %w", err)
 		}
@@ -540,6 +596,21 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 			Amount:      money,
 			Description: p.Description,
 		})
+	}
+	// fx_mid_rate_e8 is only ever NULL together with the other seven fx_*
+	// columns (all written in the same CreateTransaction call, see txRepo);
+	// its validity is enough to tell an FX transaction from a plain one.
+	if row.FxMidRateE8.Valid {
+		out.FX = &domain.FXDetail{
+			SourceAmount:    row.FxSourceAmount.Int64,
+			ConvertedAmount: row.FxConvertedAmount.Int64,
+			MidRateE8:       row.FxMidRateE8.Int64,
+			AppliedE8:       row.FxAppliedE8.Int64,
+			SpreadBps:       row.FxSpreadBps.Int32,
+			RateSource:      row.FxRateSource.String,
+			EffectiveAt:     row.FxEffectiveAt.Time,
+			RateID:          row.FxRateID.Int64,
+		}
 	}
 	return out, nil
 }
@@ -804,15 +875,22 @@ func ptrToInt4(p *int) pgtype.Int4 {
 	return pgtype.Int4{Int32: int32(*p), Valid: true} //nolint:gosec // rate limits are small, application-set values
 }
 
-func accountFromRow(row sqlc.Account) (domain.Account, error) {
-	at, err := domain.ParseAccountType(row.Type)
+// accountFromRow builds a domain.Account from the scalar fields common to every
+// account-shaped row sqlc generates (GetAccountRow, ListAccountsRow, ...). Taking
+// individual fields rather than one sqlc row type is deliberate: sqlc gives each
+// query its own row struct whenever its column list doesn't exactly match every
+// column of the accounts table (which stopped being true once the schema grew
+// columns like is_system that not every query selects), so a single shared
+// struct type would not compile across call sites.
+func accountFromRow(id uuid.UUID, name, accountType, currency string) (domain.Account, error) {
+	at, err := domain.ParseAccountType(accountType)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
 	}
 	return domain.Account{
-		ID:       row.ID.String(),
-		Name:     row.Name,
+		ID:       id.String(),
+		Name:     name,
 		Type:     at,
-		Currency: domain.Currency(row.Currency),
+		Currency: domain.Currency(currency),
 	}, nil
 }

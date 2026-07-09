@@ -52,6 +52,20 @@ func toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, "posting description is too long")
 	case errors.Is(err, domain.ErrOverflow):
 		return status.Error(codes.InvalidArgument, "amount is out of range")
+	case errors.Is(err, domain.ErrConversionDust):
+		return status.Error(codes.InvalidArgument, "conversion amount rounds to zero in the destination currency")
+	case errors.Is(err, domain.ErrNonPositiveRate):
+		return status.Error(codes.InvalidArgument, "fx rate must be positive")
+	case errors.Is(err, domain.ErrInvalidSpread):
+		return status.Error(codes.InvalidArgument, "fx spread is out of range")
+	case errors.Is(err, domain.ErrFXRateNotFound):
+		return status.Error(codes.InvalidArgument, "no fx rate is configured for this currency pair")
+	case errors.Is(err, domain.ErrNonPositiveConvertAmount):
+		return status.Error(codes.InvalidArgument, "source_amount must be positive")
+	case errors.Is(err, domain.ErrSelfConversion):
+		return status.Error(codes.InvalidArgument, "from_account and to_account must differ")
+	case errors.Is(err, domain.ErrSameCurrencyConversion):
+		return status.Error(codes.InvalidArgument, "from_account and to_account must have different currencies")
 	default:
 		return status.Error(codes.Internal, "internal error")
 	}

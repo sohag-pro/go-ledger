@@ -19,6 +19,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
@@ -113,6 +114,22 @@ func (f *fakeRepo) GetTransaction(_ context.Context, _, id string) (domain.Trans
 		return domain.Transaction{}, domain.ErrTransactionNotFound
 	}
 	return t, nil
+}
+
+// GetOrCreateClearingAccount is a minimal in-memory stand-in: it looks up the
+// reserved clearing account name in the same accounts map a real user account
+// would live in, creating it (System, Liability) on first use. Handler tests
+// do not yet exercise Convert, so this only needs to satisfy the interface.
+func (f *fakeRepo) GetOrCreateClearingAccount(_ context.Context, _ string, currency domain.Currency) (domain.Account, error) {
+	name := "fx.clearing." + string(currency)
+	for _, a := range f.accounts {
+		if a.Name == name && a.System {
+			return a, nil
+		}
+	}
+	a := domain.Account{ID: uuid.NewString(), Name: name, Type: domain.Liability, Currency: currency, System: true}
+	f.accounts[a.ID] = a
+	return a, nil
 }
 
 func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, transactionID string) error {
@@ -281,11 +298,38 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 
 var _ domain.Repository = (*fakeRepo)(nil)
 
+// fakeFXProvider is a fixed-rate fx.Provider for handler tests: it stands in
+// for internal/fx's Postgres-backed provider the same way fakeRepo stands in
+// for the database repository, returning a canned quote (or a canned error,
+// e.g. domain.ErrFXRateNotFound) regardless of the requested pair.
+type fakeFXProvider struct {
+	quote     domain.FXQuote
+	spreadBps int32
+	err       error
+}
+
+func (f *fakeFXProvider) Rate(_ context.Context, _, _ domain.Currency) (domain.FXQuote, int32, error) {
+	if f.err != nil {
+		return domain.FXQuote{}, 0, f.err
+	}
+	return f.quote, f.spreadBps, nil
+}
+
+var _ fx.Provider = (*fakeFXProvider)(nil)
+
 // newAPIRouter wires the API over repo, provisioning testAPIKeyPlaintext
 // against testTenant so the default request helpers below (do, postJSON,
 // getJSON) authenticate as testTenant through the real auth middleware rather
 // than bypassing it.
 func newAPIRouter(repo domain.Repository) chi.Router {
+	return newAPIRouterWithOptions(repo)
+}
+
+// newAPIRouterWithOptions is newAPIRouter plus any ledger.ServiceOption, e.g.
+// ledger.WithFXProvider(...) for tests that exercise POST
+// /v1/transactions/convert (which errors with ledger.ErrNoFXProvider without
+// one).
+func newAPIRouterWithOptions(repo domain.Repository, opts ...ledger.ServiceOption) chi.Router {
 	if err := repo.InsertAPIKey(context.Background(),
 		domain.APIKey{TenantID: testTenant, Name: "handlers test default key"},
 		domain.HashAPIKey(testAPIKeyPlaintext),
@@ -296,7 +340,7 @@ func newAPIRouter(repo domain.Repository) chi.Router {
 	r := chi.NewRouter()
 	New(r, Deps{
 		Accounts:     ledger.NewAccountService(repo),
-		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
+		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, opts...),
 		Audit:        ledger.NewAuditService(repo),
 		Auth:         auth.NewResolver(repo, time.Minute),
 	})
@@ -359,7 +403,14 @@ func getJSON(t *testing.T, r chi.Router, path string) *httptest.ResponseRecorder
 
 func createAccount(t *testing.T, r chi.Router, name, typ string) string {
 	t.Helper()
-	rec := do(t, r, http.MethodPost, "/v1/accounts", map[string]string{"name": name, "type": typ, "currency": "USD"})
+	return createAccountCurrency(t, r, name, typ, "USD")
+}
+
+// createAccountCurrency is createAccount with an explicit currency, for tests
+// (e.g. convert) that need an account in something other than USD.
+func createAccountCurrency(t *testing.T, r chi.Router, name, typ, currency string) string {
+	t.Helper()
+	rec := do(t, r, http.MethodPost, "/v1/accounts", map[string]string{"name": name, "type": typ, "currency": currency})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create account %s: status %d (%s)", name, rec.Code, rec.Body.String())
 	}
@@ -561,6 +612,195 @@ func TestPostTransactionAndBalance(t *testing.T) {
 		}
 		if !strings.Contains(rec.Body.String(), "Idempotency-Key header is required") {
 			t.Errorf("body = %s, want the missing-key message", rec.Body.String())
+		}
+	})
+}
+
+// newConvertRouter builds a router whose transaction service is wired with a
+// fakeFXProvider returning the given quote and spread (or providerErr, e.g.
+// domain.ErrFXRateNotFound, when set), the convert-specific counterpart to
+// newAPIRouter above.
+func newConvertRouter(t *testing.T, quote domain.FXQuote, spreadBps int32, providerErr error) chi.Router {
+	t.Helper()
+	provider := &fakeFXProvider{quote: quote, spreadBps: spreadBps, err: providerErr}
+	return newAPIRouterWithOptions(newFakeRepo(), ledger.WithFXProvider(provider))
+}
+
+// TestConvertTransaction covers POST /v1/transactions/convert end to end: a
+// valid conversion returns 201 with the FX rate detail and per-posting
+// currency (and that per-posting currency survives a later GET), and every
+// rejection the brief calls out maps to the right status.
+func TestConvertTransaction(t *testing.T) {
+	usdEUR := domain.FXQuote{
+		Base: "USD", Quote: "EUR", MidRateE8: 92_000_000, RateID: 7,
+		Source: "test", EffectiveAt: time.Now().UTC(),
+	}
+
+	t.Run("happy path 201 with fx detail and per-posting currency", func(t *testing.T) {
+		r := newConvertRouter(t, usdEUR, 50, nil)
+		usd := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		eur := createAccountCurrency(t, r, "Savings EUR", "asset", "EUR")
+
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account":  usd,
+			"to_account":    eur,
+			"source_amount": 10000,
+		}, map[string]string{"Idempotency-Key": "convert-happy-1"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+
+		var out struct {
+			Transaction TransactionBody `json:"transaction"`
+			FX          FXDetailBody    `json:"fx"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Transaction.Postings) != 4 {
+			t.Fatalf("postings = %d, want 4", len(out.Transaction.Postings))
+		}
+		var sawUSDLeg, sawEURLeg bool
+		for _, p := range out.Transaction.Postings {
+			if p.AccountID == usd && p.Currency == "USD" {
+				sawUSDLeg = true
+			}
+			if p.AccountID == eur && p.Currency == "EUR" {
+				sawEURLeg = true
+			}
+		}
+		if !sawUSDLeg || !sawEURLeg {
+			t.Errorf("postings = %+v, want a USD leg on %s and a EUR leg on %s", out.Transaction.Postings, usd, eur)
+		}
+		if out.FX.SourceAmount != 10000 {
+			t.Errorf("fx.source_amount = %d, want 10000", out.FX.SourceAmount)
+		}
+		if out.FX.MidRateE8 != 92_000_000 || out.FX.SpreadBps != 50 {
+			t.Errorf("fx = %+v, want mid_rate_e8 92000000 spread_bps 50", out.FX)
+		}
+		if out.FX.ConvertedAmount <= 0 {
+			t.Errorf("fx.converted_amount = %d, want > 0", out.FX.ConvertedAmount)
+		}
+		if out.FX.RateSource != "test" || out.FX.RateID != 7 {
+			t.Errorf("fx rate provenance = %+v, want rate_source test rate_id 7", out.FX)
+		}
+
+		// GET /v1/transactions/{id} must report per-posting currency too (just
+		// not the fx_* snapshot, which ADR-014 keeps convert-response-only).
+		getRec := do(t, r, http.MethodGet, "/v1/transactions/"+out.Transaction.ID, nil)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("get status %d, want 200 (%s)", getRec.Code, getRec.Body.String())
+		}
+		var getOut TransactionBody
+		if err := json.Unmarshal(getRec.Body.Bytes(), &getOut); err != nil {
+			t.Fatalf("decode get: %v", err)
+		}
+		sawUSDLeg, sawEURLeg = false, false
+		for _, p := range getOut.Postings {
+			if p.AccountID == usd && p.Currency == "USD" {
+				sawUSDLeg = true
+			}
+			if p.AccountID == eur && p.Currency == "EUR" {
+				sawEURLeg = true
+			}
+		}
+		if !sawUSDLeg || !sawEURLeg {
+			t.Errorf("GET postings = %+v, want a USD leg on %s and a EUR leg on %s", getOut.Postings, usd, eur)
+		}
+		if !strings.Contains(getRec.Body.String(), `"currency"`) {
+			t.Errorf("GET body has no per-posting currency field: %s", getRec.Body.String())
+		}
+	})
+
+	t.Run("dust 422", func(t *testing.T) {
+		// A mid rate of 1 (1e-8 quote units per base unit) with a source of 1
+		// minor unit rounds to zero quote-currency minor units: dust.
+		r := newConvertRouter(t, domain.FXQuote{Base: "USD", Quote: "JPY", MidRateE8: 1, EffectiveAt: time.Now().UTC()}, 0, nil)
+		usd := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		jpy := createAccountCurrency(t, r, "Savings JPY", "asset", "JPY")
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account": usd, "to_account": jpy, "source_amount": 1,
+		}, map[string]string{"Idempotency-Key": "convert-dust"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("self account 422", func(t *testing.T) {
+		r := newConvertRouter(t, usdEUR, 0, nil)
+		usd := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account": usd, "to_account": usd, "source_amount": 100,
+		}, map[string]string{"Idempotency-Key": "convert-self"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("same currency 422", func(t *testing.T) {
+		r := newConvertRouter(t, usdEUR, 0, nil)
+		usd1 := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		usd2 := createAccountCurrency(t, r, "Savings", "asset", "USD")
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account": usd1, "to_account": usd2, "source_amount": 100,
+		}, map[string]string{"Idempotency-Key": "convert-same-currency"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("missing rate pair 422", func(t *testing.T) {
+		r := newConvertRouter(t, domain.FXQuote{}, 0, domain.ErrFXRateNotFound)
+		usd := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		eur := createAccountCurrency(t, r, "Savings EUR", "asset", "EUR")
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account": usd, "to_account": eur, "source_amount": 100,
+		}, map[string]string{"Idempotency-Key": "convert-no-rate"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("non-positive source amount 422", func(t *testing.T) {
+		r := newConvertRouter(t, usdEUR, 0, nil)
+		usd := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		eur := createAccountCurrency(t, r, "Savings EUR", "asset", "EUR")
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account": usd, "to_account": eur, "source_amount": 0,
+		}, map[string]string{"Idempotency-Key": "convert-non-positive"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("missing idempotency key 400", func(t *testing.T) {
+		r := newConvertRouter(t, usdEUR, 0, nil)
+		usd := createAccountCurrency(t, r, "Checking", "asset", "USD")
+		eur := createAccountCurrency(t, r, "Savings EUR", "asset", "EUR")
+		rec := do(t, r, http.MethodPost, "/v1/transactions/convert", map[string]any{
+			"from_account": usd, "to_account": eur, "source_amount": 100,
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 (%s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "Idempotency-Key header is required") {
+			t.Errorf("body = %s, want the missing-key message", rec.Body.String())
+		}
+	})
+
+	t.Run("unauthenticated 401", func(t *testing.T) {
+		r := newConvertRouter(t, usdEUR, 0, nil)
+		body, err := json.Marshal(map[string]any{"from_account": "x", "to_account": "y", "source_amount": 100})
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/transactions/convert", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "convert-unauth")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status %d, want 401 (%s)", rec.Code, rec.Body.String())
 		}
 	})
 }

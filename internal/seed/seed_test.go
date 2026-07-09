@@ -105,7 +105,7 @@ func TestSeed(t *testing.T) {
 	tenant := uuid.New()
 	now := time.Now()
 
-	if err := seed.Seed(ctx, pool, tenant.String(), now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -144,7 +144,7 @@ func TestSeed(t *testing.T) {
 
 	// Re-seeding resets rather than appends: the transaction count is stable.
 	before := countTxns(t, pool, tenant)
-	if err := seed.Seed(ctx, pool, tenant.String(), now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
 		t.Fatalf("re-seed: %v", err)
 	}
 	if after := countTxns(t, pool, tenant); after != before {
@@ -166,7 +166,7 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 	tenant := uuid.New()
 	now := time.Now()
 
-	if err := seed.Seed(ctx, pool, tenant.String(), now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 
 	// Re-seeding must clear both, even though audit_log rejects DELETE outside
 	// the seeder's gated transaction.
-	if err := seed.Seed(ctx, pool, tenant.String(), now); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
 		t.Fatalf("re-seed over idempotency and audit rows: %v", err)
 	}
 

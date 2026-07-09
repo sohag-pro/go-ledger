@@ -21,19 +21,57 @@ type Querier interface {
 	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
+	// currency lives on each posting now (ADR-014), not here: an FX transaction
+	// spans two currencies, so there is no single transaction-level value left to
+	// store. The fx_* columns are the immutable snapshot of the conversion
+	// actually applied; all nullable, since a single-currency transaction (still
+	// the common case) has none of this.
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
+	// The latest quote for (base, quote) at or before now. id DESC is the
+	// deterministic tiebreaker when two rows share the same effective_at (for
+	// example a re-seed within the same second), so "current" always resolves to
+	// exactly one row.
+	CurrentFXRate(ctx context.Context, arg CurrentFXRateParams) (FxRate, error)
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
-	GetAccount(ctx context.Context, arg GetAccountParams) (Account, error)
+	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
 	// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
 	// caller treats that as the chain's genesis (domain.AuditGenesisHash).
 	GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error)
+	// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
+	// created lazily on first use. Keyed by (tenant_id, name): name is the
+	// reserved, deterministic "fx.clearing.<CURRENCY>" string the caller builds,
+	// so a second call for the same tenant and currency always resolves to the
+	// same row instead of creating a duplicate. The ON CONFLICT arbiter is the
+	// partial unique index accounts_system_name_uniq (migration 0010), which only
+	// covers is_system rows, so this can never collide with an ordinary
+	// user-named account.
+	//
+	// On conflict this does a no-op DO UPDATE (id set to its own current value)
+	// rather than DO NOTHING. DO NOTHING never RETURNs the conflicting row, which
+	// an earlier version of this query worked around with a CTE plus a fallback
+	// SELECT unioned into the same statement, guarded by NOT EXISTS. That
+	// fallback ran against the single statement's original snapshot: when two
+	// callers raced to create the same tenant's first clearing account for a
+	// currency, the loser blocked on the conflict, and by the time it unblocked
+	// (after the winner committed) its own fallback SELECT could still miss the
+	// now-committed row, since the snapshot predated that commit. Both branches
+	// of the UNION then returned zero rows to the loser, surfacing as "no rows in
+	// result set" under concurrent Converts targeting the same pair. DO UPDATE
+	// instead forces Postgres's own EvalPlanQual re-fetch of the current row
+	// version as part of resolving the conflict, so RETURNING always yields
+	// exactly one row, new or existing, in a single round trip with no second
+	// snapshot to race against.
+	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
+	// fx_rates is append-only (ADR-014): a new quote is a new row, never an
+	// update, so every rate ever applied to a transaction stays reconstructible.
+	InsertFXRate(ctx context.Context, arg InsertFXRateParams) (FxRate, error)
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
-	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error)
+	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error)
 	// Keyset page of audit rows for every transaction with a posting touching the
 	// account, newest first. after_created_at / after_id are the keyset position:
 	// pass a far-future timestamp and the max uuid for the first page.

@@ -1,9 +1,9 @@
 -- name: CreatePosting :exec
-INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, description)
-VALUES ($1, $2, $3, $4, $5, $6);
+INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, currency, description)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
 
 -- name: ListPostingsByTransaction :many
-SELECT id, tenant_id, transaction_id, account_id, amount, description, created_at
+SELECT id, tenant_id, transaction_id, account_id, amount, currency, description, created_at
 FROM postings
 WHERE tenant_id = $1 AND transaction_id = $2
 ORDER BY created_at, id;

@@ -4,15 +4,23 @@ package ledger.v1;
 
 // Posting is one signed leg of a transaction. A positive amount is a debit, a
 // negative amount is a credit. Amounts are minor units (for example cents).
+// Currency is the posting's own currency: a cross-currency (FX) convert
+// transaction spans two currencies, so each leg is labeled with its own
+// rather than inheriting one shared transaction-level currency.
 message Posting {
   string account_id = 1;
   int64 amount = 2;
   string description = 3;
+  string currency = 4;
 }
 
+// Transaction deliberately has no transaction-level currency field: a convert
+// transaction spans two currencies, so a single top-level currency could
+// never label every posting correctly. Each Posting carries its own instead.
 message Transaction {
+  reserved 2;
+  reserved "currency";
   string id = 1;
-  string currency = 2;
   repeated Posting postings = 3;
 }
 
@@ -119,6 +127,37 @@ message GetAccountAuditResponse {
   string next_cursor = 2;
 }
 
+// FXDetail is the applied-rate detail for a cross-currency convert: the
+// requested and converted amounts, the mid rate and spread applied, and
+// where that rate came from (ADR-014 decision 7).
+message FXDetail {
+  int64 source_amount = 1;
+  int64 converted_amount = 2;
+  int64 mid_rate_e8 = 3;
+  int64 applied_e8 = 4;
+  int32 spread_bps = 5;
+  string rate_source = 6;
+  string effective_at = 7; // RFC3339 timestamp
+  int64 rate_id = 8;
+}
+
+// ConvertRequest converts source_amount from the from_account's currency into
+// the to_account's currency, at the tenant's current FX rate. The
+// idempotency key, when supplied, travels in the gRPC metadata key
+// "idempotency-key", the same as PostTransactionRequest, not in this message.
+// The destination currency always comes from the to account: a client cannot
+// supply a rate or target currency directly.
+message ConvertRequest {
+  string from_account = 1;
+  string to_account = 2;
+  int64 source_amount = 3;
+}
+message ConvertResponse {
+  Transaction transaction = 1;
+  FXDetail fx = 2;
+  bool replayed = 3;
+}
+
 service LedgerService {
   rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
   rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
@@ -126,6 +165,7 @@ service LedgerService {
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
   rpc GetStatement(GetStatementRequest) returns (GetStatementResponse);
   rpc PostTransaction(PostTransactionRequest) returns (PostTransactionResponse);
+  rpc Convert(ConvertRequest) returns (ConvertResponse);
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
   rpc GetTransactionAudit(GetTransactionAuditRequest) returns (GetTransactionAuditResponse);
   rpc GetAccountAudit(GetAccountAuditRequest) returns (GetAccountAuditResponse);

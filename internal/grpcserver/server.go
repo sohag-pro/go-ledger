@@ -105,20 +105,40 @@ func toProtoAccount(a domain.Account) *ledgerv1.Account {
 	return &ledgerv1.Account{Id: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency)}
 }
 
+// toProtoTransaction translates a domain.Transaction to its protobuf shape.
+// There is deliberately no transaction-level currency: a convert transaction
+// spans two currencies, so a single top-level currency could never label
+// every posting correctly (the same reasoning as the REST TransactionBody).
+// Each Posting carries its own currency instead.
 func toProtoTransaction(t domain.Transaction) *ledgerv1.Transaction {
 	postings := make([]*ledgerv1.Posting, 0, len(t.Postings))
-	currency := ""
-	if len(t.Postings) > 0 {
-		currency = string(t.Postings[0].Amount.Currency())
-	}
 	for _, p := range t.Postings {
 		postings = append(postings, &ledgerv1.Posting{
 			AccountId:   p.AccountID,
 			Amount:      p.Amount.Amount(),
 			Description: p.Description,
+			Currency:    string(p.Amount.Currency()),
 		})
 	}
-	return &ledgerv1.Transaction{Id: t.ID, Currency: currency, Postings: postings}
+	return &ledgerv1.Transaction{Id: t.ID, Postings: postings}
+}
+
+// toProtoFXDetail translates a domain.FXDetail to its protobuf shape. Nil
+// stays nil: an ordinary (non-converting) transaction has no FX detail.
+func toProtoFXDetail(fx *domain.FXDetail) *ledgerv1.FXDetail {
+	if fx == nil {
+		return nil
+	}
+	return &ledgerv1.FXDetail{
+		SourceAmount:    fx.SourceAmount,
+		ConvertedAmount: fx.ConvertedAmount,
+		MidRateE8:       fx.MidRateE8,
+		AppliedE8:       fx.AppliedE8,
+		SpreadBps:       fx.SpreadBps,
+		RateSource:      fx.RateSource,
+		EffectiveAt:     fx.EffectiveAt.UTC().Format(time.RFC3339Nano),
+		RateId:          fx.RateID,
+	}
 }
 
 func toProtoAuditEntry(e domain.AuditEntry) *ledgerv1.AuditEntry {
@@ -237,6 +257,35 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.PostTransactionResponse{Transaction: toProtoTransaction(*txn), Replayed: replayed}, nil
+}
+
+// Convert exchanges source_amount from the from account's currency into the
+// to account's currency at the tenant's current FX rate, and posts the four
+// resulting legs, mirroring POST /v1/transactions/convert (ADR-014). Like
+// PostTransaction, the idempotency-key metadata is required (ADR-012): a
+// repeat with the same key replays the original conversion instead of
+// converting again.
+func (s *Server) Convert(ctx context.Context, req *ledgerv1.ConvertRequest) (*ledgerv1.ConvertResponse, error) {
+	key := idempotencyKeyFrom(ctx)
+	if key == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency-key metadata is required")
+	}
+
+	creq := ledger.ConvertRequest{
+		FromAccountID: req.FromAccount,
+		ToAccountID:   req.ToAccount,
+		SourceAmount:  req.SourceAmount,
+	}
+	idem := &domain.Idempotency{Key: key}
+	txn, replayed, err := s.txns.Convert(ctx, tenantFrom(ctx), creq, idem)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &ledgerv1.ConvertResponse{
+		Transaction: toProtoTransaction(*txn),
+		Fx:          toProtoFXDetail(txn.FX),
+		Replayed:    replayed,
+	}, nil
 }
 
 // GetTransaction fetches a single transaction by id for the calling tenant.

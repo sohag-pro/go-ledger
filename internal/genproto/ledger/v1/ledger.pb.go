@@ -23,11 +23,15 @@ const (
 
 // Posting is one signed leg of a transaction. A positive amount is a debit, a
 // negative amount is a credit. Amounts are minor units (for example cents).
+// Currency is the posting's own currency: a cross-currency (FX) convert
+// transaction spans two currencies, so each leg is labeled with its own
+// rather than inheriting one shared transaction-level currency.
 type Posting struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AccountId     string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
 	Amount        int64                  `protobuf:"varint,2,opt,name=amount,proto3" json:"amount,omitempty"`
 	Description   string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
+	Currency      string                 `protobuf:"bytes,4,opt,name=currency,proto3" json:"currency,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -83,10 +87,19 @@ func (x *Posting) GetDescription() string {
 	return ""
 }
 
+func (x *Posting) GetCurrency() string {
+	if x != nil {
+		return x.Currency
+	}
+	return ""
+}
+
+// Transaction deliberately has no transaction-level currency field: a convert
+// transaction spans two currencies, so a single top-level currency could
+// never label every posting correctly. Each Posting carries its own instead.
 type Transaction struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Currency      string                 `protobuf:"bytes,2,opt,name=currency,proto3" json:"currency,omitempty"`
 	Postings      []*Posting             `protobuf:"bytes,3,rep,name=postings,proto3" json:"postings,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -125,13 +138,6 @@ func (*Transaction) Descriptor() ([]byte, []int) {
 func (x *Transaction) GetId() string {
 	if x != nil {
 		return x.Id
-	}
-	return ""
-}
-
-func (x *Transaction) GetCurrency() string {
-	if x != nil {
-		return x.Currency
 	}
 	return ""
 }
@@ -1294,20 +1300,249 @@ func (x *GetAccountAuditResponse) GetNextCursor() string {
 	return ""
 }
 
+// FXDetail is the applied-rate detail for a cross-currency convert: the
+// requested and converted amounts, the mid rate and spread applied, and
+// where that rate came from (ADR-014 decision 7).
+type FXDetail struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	SourceAmount    int64                  `protobuf:"varint,1,opt,name=source_amount,json=sourceAmount,proto3" json:"source_amount,omitempty"`
+	ConvertedAmount int64                  `protobuf:"varint,2,opt,name=converted_amount,json=convertedAmount,proto3" json:"converted_amount,omitempty"`
+	MidRateE8       int64                  `protobuf:"varint,3,opt,name=mid_rate_e8,json=midRateE8,proto3" json:"mid_rate_e8,omitempty"`
+	AppliedE8       int64                  `protobuf:"varint,4,opt,name=applied_e8,json=appliedE8,proto3" json:"applied_e8,omitempty"`
+	SpreadBps       int32                  `protobuf:"varint,5,opt,name=spread_bps,json=spreadBps,proto3" json:"spread_bps,omitempty"`
+	RateSource      string                 `protobuf:"bytes,6,opt,name=rate_source,json=rateSource,proto3" json:"rate_source,omitempty"`
+	EffectiveAt     string                 `protobuf:"bytes,7,opt,name=effective_at,json=effectiveAt,proto3" json:"effective_at,omitempty"` // RFC3339 timestamp
+	RateId          int64                  `protobuf:"varint,8,opt,name=rate_id,json=rateId,proto3" json:"rate_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *FXDetail) Reset() {
+	*x = FXDetail{}
+	mi := &file_ledger_v1_ledger_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FXDetail) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FXDetail) ProtoMessage() {}
+
+func (x *FXDetail) ProtoReflect() protoreflect.Message {
+	mi := &file_ledger_v1_ledger_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FXDetail.ProtoReflect.Descriptor instead.
+func (*FXDetail) Descriptor() ([]byte, []int) {
+	return file_ledger_v1_ledger_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *FXDetail) GetSourceAmount() int64 {
+	if x != nil {
+		return x.SourceAmount
+	}
+	return 0
+}
+
+func (x *FXDetail) GetConvertedAmount() int64 {
+	if x != nil {
+		return x.ConvertedAmount
+	}
+	return 0
+}
+
+func (x *FXDetail) GetMidRateE8() int64 {
+	if x != nil {
+		return x.MidRateE8
+	}
+	return 0
+}
+
+func (x *FXDetail) GetAppliedE8() int64 {
+	if x != nil {
+		return x.AppliedE8
+	}
+	return 0
+}
+
+func (x *FXDetail) GetSpreadBps() int32 {
+	if x != nil {
+		return x.SpreadBps
+	}
+	return 0
+}
+
+func (x *FXDetail) GetRateSource() string {
+	if x != nil {
+		return x.RateSource
+	}
+	return ""
+}
+
+func (x *FXDetail) GetEffectiveAt() string {
+	if x != nil {
+		return x.EffectiveAt
+	}
+	return ""
+}
+
+func (x *FXDetail) GetRateId() int64 {
+	if x != nil {
+		return x.RateId
+	}
+	return 0
+}
+
+// ConvertRequest converts source_amount from the from_account's currency into
+// the to_account's currency, at the tenant's current FX rate. The
+// idempotency key, when supplied, travels in the gRPC metadata key
+// "idempotency-key", the same as PostTransactionRequest, not in this message.
+// The destination currency always comes from the to account: a client cannot
+// supply a rate or target currency directly.
+type ConvertRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	FromAccount   string                 `protobuf:"bytes,1,opt,name=from_account,json=fromAccount,proto3" json:"from_account,omitempty"`
+	ToAccount     string                 `protobuf:"bytes,2,opt,name=to_account,json=toAccount,proto3" json:"to_account,omitempty"`
+	SourceAmount  int64                  `protobuf:"varint,3,opt,name=source_amount,json=sourceAmount,proto3" json:"source_amount,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConvertRequest) Reset() {
+	*x = ConvertRequest{}
+	mi := &file_ledger_v1_ledger_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConvertRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConvertRequest) ProtoMessage() {}
+
+func (x *ConvertRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_ledger_v1_ledger_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConvertRequest.ProtoReflect.Descriptor instead.
+func (*ConvertRequest) Descriptor() ([]byte, []int) {
+	return file_ledger_v1_ledger_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ConvertRequest) GetFromAccount() string {
+	if x != nil {
+		return x.FromAccount
+	}
+	return ""
+}
+
+func (x *ConvertRequest) GetToAccount() string {
+	if x != nil {
+		return x.ToAccount
+	}
+	return ""
+}
+
+func (x *ConvertRequest) GetSourceAmount() int64 {
+	if x != nil {
+		return x.SourceAmount
+	}
+	return 0
+}
+
+type ConvertResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Transaction   *Transaction           `protobuf:"bytes,1,opt,name=transaction,proto3" json:"transaction,omitempty"`
+	Fx            *FXDetail              `protobuf:"bytes,2,opt,name=fx,proto3" json:"fx,omitempty"`
+	Replayed      bool                   `protobuf:"varint,3,opt,name=replayed,proto3" json:"replayed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConvertResponse) Reset() {
+	*x = ConvertResponse{}
+	mi := &file_ledger_v1_ledger_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConvertResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConvertResponse) ProtoMessage() {}
+
+func (x *ConvertResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_ledger_v1_ledger_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConvertResponse.ProtoReflect.Descriptor instead.
+func (*ConvertResponse) Descriptor() ([]byte, []int) {
+	return file_ledger_v1_ledger_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *ConvertResponse) GetTransaction() *Transaction {
+	if x != nil {
+		return x.Transaction
+	}
+	return nil
+}
+
+func (x *ConvertResponse) GetFx() *FXDetail {
+	if x != nil {
+		return x.Fx
+	}
+	return nil
+}
+
+func (x *ConvertResponse) GetReplayed() bool {
+	if x != nil {
+		return x.Replayed
+	}
+	return false
+}
+
 var File_ledger_v1_ledger_proto protoreflect.FileDescriptor
 
 const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\n" +
-	"\x16ledger/v1/ledger.proto\x12\tledger.v1\"b\n" +
+	"\x16ledger/v1/ledger.proto\x12\tledger.v1\"~\n" +
 	"\aPosting\x12\x1d\n" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x16\n" +
 	"\x06amount\x18\x02 \x01(\x03R\x06amount\x12 \n" +
-	"\vdescription\x18\x03 \x01(\tR\vdescription\"i\n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\x12\x1a\n" +
+	"\bcurrency\x18\x04 \x01(\tR\bcurrency\"]\n" +
 	"\vTransaction\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
-	"\bcurrency\x18\x02 \x01(\tR\bcurrency\x12.\n" +
-	"\bpostings\x18\x03 \x03(\v2\x12.ledger.v1.PostingR\bpostings\"]\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12.\n" +
+	"\bpostings\x18\x03 \x03(\v2\x12.ledger.v1.PostingR\bpostingsJ\x04\b\x02\x10\x03R\bcurrency\"]\n" +
 	"\aAccount\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -1387,7 +1622,28 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\x17GetAccountAuditResponse\x12/\n" +
 	"\aentries\x18\x01 \x03(\v2\x15.ledger.v1.AuditEntryR\aentries\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +
-	"nextCursor2\x8c\x06\n" +
+	"nextCursor\"\x95\x02\n" +
+	"\bFXDetail\x12#\n" +
+	"\rsource_amount\x18\x01 \x01(\x03R\fsourceAmount\x12)\n" +
+	"\x10converted_amount\x18\x02 \x01(\x03R\x0fconvertedAmount\x12\x1e\n" +
+	"\vmid_rate_e8\x18\x03 \x01(\x03R\tmidRateE8\x12\x1d\n" +
+	"\n" +
+	"applied_e8\x18\x04 \x01(\x03R\tappliedE8\x12\x1d\n" +
+	"\n" +
+	"spread_bps\x18\x05 \x01(\x05R\tspreadBps\x12\x1f\n" +
+	"\vrate_source\x18\x06 \x01(\tR\n" +
+	"rateSource\x12!\n" +
+	"\feffective_at\x18\a \x01(\tR\veffectiveAt\x12\x17\n" +
+	"\arate_id\x18\b \x01(\x03R\x06rateId\"w\n" +
+	"\x0eConvertRequest\x12!\n" +
+	"\ffrom_account\x18\x01 \x01(\tR\vfromAccount\x12\x1d\n" +
+	"\n" +
+	"to_account\x18\x02 \x01(\tR\ttoAccount\x12#\n" +
+	"\rsource_amount\x18\x03 \x01(\x03R\fsourceAmount\"\x8c\x01\n" +
+	"\x0fConvertResponse\x128\n" +
+	"\vtransaction\x18\x01 \x01(\v2\x16.ledger.v1.TransactionR\vtransaction\x12#\n" +
+	"\x02fx\x18\x02 \x01(\v2\x13.ledger.v1.FXDetailR\x02fx\x12\x1a\n" +
+	"\breplayed\x18\x03 \x01(\bR\breplayed2\xce\x06\n" +
 	"\rLedgerService\x12R\n" +
 	"\rCreateAccount\x12\x1f.ledger.v1.CreateAccountRequest\x1a .ledger.v1.CreateAccountResponse\x12I\n" +
 	"\n" +
@@ -1396,7 +1652,8 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\n" +
 	"GetBalance\x12\x1c.ledger.v1.GetBalanceRequest\x1a\x1d.ledger.v1.GetBalanceResponse\x12O\n" +
 	"\fGetStatement\x12\x1e.ledger.v1.GetStatementRequest\x1a\x1f.ledger.v1.GetStatementResponse\x12X\n" +
-	"\x0fPostTransaction\x12!.ledger.v1.PostTransactionRequest\x1a\".ledger.v1.PostTransactionResponse\x12U\n" +
+	"\x0fPostTransaction\x12!.ledger.v1.PostTransactionRequest\x1a\".ledger.v1.PostTransactionResponse\x12@\n" +
+	"\aConvert\x12\x19.ledger.v1.ConvertRequest\x1a\x1a.ledger.v1.ConvertResponse\x12U\n" +
 	"\x0eGetTransaction\x12 .ledger.v1.GetTransactionRequest\x1a!.ledger.v1.GetTransactionResponse\x12d\n" +
 	"\x13GetTransactionAudit\x12%.ledger.v1.GetTransactionAuditRequest\x1a&.ledger.v1.GetTransactionAuditResponse\x12X\n" +
 	"\x0fGetAccountAudit\x12!.ledger.v1.GetAccountAuditRequest\x1a\".ledger.v1.GetAccountAuditResponseB\xa6\x01\n" +
@@ -1415,7 +1672,7 @@ func file_ledger_v1_ledger_proto_rawDescGZIP() []byte {
 	return file_ledger_v1_ledger_proto_rawDescData
 }
 
-var file_ledger_v1_ledger_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_ledger_v1_ledger_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_ledger_v1_ledger_proto_goTypes = []any{
 	(*Posting)(nil),                     // 0: ledger.v1.Posting
 	(*Transaction)(nil),                 // 1: ledger.v1.Transaction
@@ -1440,6 +1697,9 @@ var file_ledger_v1_ledger_proto_goTypes = []any{
 	(*GetTransactionAuditResponse)(nil), // 20: ledger.v1.GetTransactionAuditResponse
 	(*GetAccountAuditRequest)(nil),      // 21: ledger.v1.GetAccountAuditRequest
 	(*GetAccountAuditResponse)(nil),     // 22: ledger.v1.GetAccountAuditResponse
+	(*FXDetail)(nil),                    // 23: ledger.v1.FXDetail
+	(*ConvertRequest)(nil),              // 24: ledger.v1.ConvertRequest
+	(*ConvertResponse)(nil),             // 25: ledger.v1.ConvertResponse
 }
 var file_ledger_v1_ledger_proto_depIdxs = []int32{
 	0,  // 0: ledger.v1.Transaction.postings:type_name -> ledger.v1.Posting
@@ -1452,29 +1712,33 @@ var file_ledger_v1_ledger_proto_depIdxs = []int32{
 	1,  // 7: ledger.v1.GetTransactionResponse.transaction:type_name -> ledger.v1.Transaction
 	18, // 8: ledger.v1.GetTransactionAuditResponse.entries:type_name -> ledger.v1.AuditEntry
 	18, // 9: ledger.v1.GetAccountAuditResponse.entries:type_name -> ledger.v1.AuditEntry
-	3,  // 10: ledger.v1.LedgerService.CreateAccount:input_type -> ledger.v1.CreateAccountRequest
-	5,  // 11: ledger.v1.LedgerService.GetAccount:input_type -> ledger.v1.GetAccountRequest
-	7,  // 12: ledger.v1.LedgerService.ListAccounts:input_type -> ledger.v1.ListAccountsRequest
-	9,  // 13: ledger.v1.LedgerService.GetBalance:input_type -> ledger.v1.GetBalanceRequest
-	12, // 14: ledger.v1.LedgerService.GetStatement:input_type -> ledger.v1.GetStatementRequest
-	14, // 15: ledger.v1.LedgerService.PostTransaction:input_type -> ledger.v1.PostTransactionRequest
-	16, // 16: ledger.v1.LedgerService.GetTransaction:input_type -> ledger.v1.GetTransactionRequest
-	19, // 17: ledger.v1.LedgerService.GetTransactionAudit:input_type -> ledger.v1.GetTransactionAuditRequest
-	21, // 18: ledger.v1.LedgerService.GetAccountAudit:input_type -> ledger.v1.GetAccountAuditRequest
-	4,  // 19: ledger.v1.LedgerService.CreateAccount:output_type -> ledger.v1.CreateAccountResponse
-	6,  // 20: ledger.v1.LedgerService.GetAccount:output_type -> ledger.v1.GetAccountResponse
-	8,  // 21: ledger.v1.LedgerService.ListAccounts:output_type -> ledger.v1.ListAccountsResponse
-	10, // 22: ledger.v1.LedgerService.GetBalance:output_type -> ledger.v1.GetBalanceResponse
-	13, // 23: ledger.v1.LedgerService.GetStatement:output_type -> ledger.v1.GetStatementResponse
-	15, // 24: ledger.v1.LedgerService.PostTransaction:output_type -> ledger.v1.PostTransactionResponse
-	17, // 25: ledger.v1.LedgerService.GetTransaction:output_type -> ledger.v1.GetTransactionResponse
-	20, // 26: ledger.v1.LedgerService.GetTransactionAudit:output_type -> ledger.v1.GetTransactionAuditResponse
-	22, // 27: ledger.v1.LedgerService.GetAccountAudit:output_type -> ledger.v1.GetAccountAuditResponse
-	19, // [19:28] is the sub-list for method output_type
-	10, // [10:19] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	1,  // 10: ledger.v1.ConvertResponse.transaction:type_name -> ledger.v1.Transaction
+	23, // 11: ledger.v1.ConvertResponse.fx:type_name -> ledger.v1.FXDetail
+	3,  // 12: ledger.v1.LedgerService.CreateAccount:input_type -> ledger.v1.CreateAccountRequest
+	5,  // 13: ledger.v1.LedgerService.GetAccount:input_type -> ledger.v1.GetAccountRequest
+	7,  // 14: ledger.v1.LedgerService.ListAccounts:input_type -> ledger.v1.ListAccountsRequest
+	9,  // 15: ledger.v1.LedgerService.GetBalance:input_type -> ledger.v1.GetBalanceRequest
+	12, // 16: ledger.v1.LedgerService.GetStatement:input_type -> ledger.v1.GetStatementRequest
+	14, // 17: ledger.v1.LedgerService.PostTransaction:input_type -> ledger.v1.PostTransactionRequest
+	24, // 18: ledger.v1.LedgerService.Convert:input_type -> ledger.v1.ConvertRequest
+	16, // 19: ledger.v1.LedgerService.GetTransaction:input_type -> ledger.v1.GetTransactionRequest
+	19, // 20: ledger.v1.LedgerService.GetTransactionAudit:input_type -> ledger.v1.GetTransactionAuditRequest
+	21, // 21: ledger.v1.LedgerService.GetAccountAudit:input_type -> ledger.v1.GetAccountAuditRequest
+	4,  // 22: ledger.v1.LedgerService.CreateAccount:output_type -> ledger.v1.CreateAccountResponse
+	6,  // 23: ledger.v1.LedgerService.GetAccount:output_type -> ledger.v1.GetAccountResponse
+	8,  // 24: ledger.v1.LedgerService.ListAccounts:output_type -> ledger.v1.ListAccountsResponse
+	10, // 25: ledger.v1.LedgerService.GetBalance:output_type -> ledger.v1.GetBalanceResponse
+	13, // 26: ledger.v1.LedgerService.GetStatement:output_type -> ledger.v1.GetStatementResponse
+	15, // 27: ledger.v1.LedgerService.PostTransaction:output_type -> ledger.v1.PostTransactionResponse
+	25, // 28: ledger.v1.LedgerService.Convert:output_type -> ledger.v1.ConvertResponse
+	17, // 29: ledger.v1.LedgerService.GetTransaction:output_type -> ledger.v1.GetTransactionResponse
+	20, // 30: ledger.v1.LedgerService.GetTransactionAudit:output_type -> ledger.v1.GetTransactionAuditResponse
+	22, // 31: ledger.v1.LedgerService.GetAccountAudit:output_type -> ledger.v1.GetAccountAuditResponse
+	22, // [22:32] is the sub-list for method output_type
+	12, // [12:22] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_ledger_v1_ledger_proto_init() }
@@ -1488,7 +1752,7 @@ func file_ledger_v1_ledger_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_ledger_v1_ledger_proto_rawDesc), len(file_ledger_v1_ledger_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   23,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -213,8 +213,8 @@ func TestTenantIsolation(t *testing.T) {
 }
 
 // TestCurrencyMismatchRejectedByTrigger proves the DB-level guarantee from
-// ADR-005: a posting into an account whose currency differs from its
-// transaction's currency is rejected, even when inserted as raw rows.
+// ADR-005 (as updated by ADR-014): a posting whose own currency differs from
+// its account's currency is rejected, even when inserted as a raw row.
 func TestCurrencyMismatchRejectedByTrigger(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -224,22 +224,23 @@ func TestCurrencyMismatchRejectedByTrigger(t *testing.T) {
 	txn := uuid.New()
 	posting := uuid.New()
 
-	// Account holds EUR; the transaction is in USD.
+	// Account holds EUR; the posting claims USD.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO accounts (id, tenant_id, name, type, currency) VALUES ($1,$2,'a','asset','EUR')`,
 		acct, tenant); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO transactions (id, tenant_id, currency) VALUES ($1,$2,'USD')`,
+		`INSERT INTO transactions (id, tenant_id) VALUES ($1,$2)`,
 		txn, tenant); err != nil {
 		t.Fatalf("insert transaction: %v", err)
 	}
-	// The immediate trigger fires on this insert and must reject it.
+	// The immediate trigger fires on this insert and must reject it: the
+	// posting's own currency (USD) does not match its account's currency (EUR).
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4,$5)`,
+		`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, currency) VALUES ($1,$2,$3,$4,$5,'USD')`,
 		posting, tenant, txn, acct, int64(100)); err == nil {
-		t.Fatal("expected posting into a EUR account from a USD transaction to be rejected, got nil")
+		t.Fatal("expected posting with mismatched currency into a EUR account to be rejected, got nil")
 	}
 }
 

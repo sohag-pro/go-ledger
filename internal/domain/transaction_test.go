@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -97,12 +98,24 @@ func TestTransactionValidate(t *testing.T) {
 			wantErr: ErrTooFewPostings,
 		},
 		{
-			name: "currency mismatch",
+			name: "cross-currency, each currency balances on its own",
 			postings: []Posting{
 				{AccountID: "a", Amount: mustMoney(t, 100, "USD")},
-				{AccountID: "b", Amount: mustMoney(t, -100, "EUR")},
+				{AccountID: "b", Amount: mustMoney(t, -100, "USD")},
+				{AccountID: "c", Amount: mustMoney(t, 200, "EUR")},
+				{AccountID: "d", Amount: mustMoney(t, -200, "EUR")},
 			},
-			wantErr: ErrCurrencyMismatch,
+			wantErr: nil,
+		},
+		{
+			name: "cross-currency, one currency unbalanced",
+			postings: []Posting{
+				{AccountID: "a", Amount: mustMoney(t, 100, "USD")},
+				{AccountID: "b", Amount: mustMoney(t, -100, "USD")},
+				{AccountID: "c", Amount: mustMoney(t, 200, "EUR")},
+				{AccountID: "d", Amount: mustMoney(t, -190, "EUR")},
+			},
+			wantErr: ErrUnbalanced,
 		},
 		{
 			name: "empty account id",
@@ -120,5 +133,60 @@ func TestTransactionValidate(t *testing.T) {
 				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidate_MultiCurrencyPerCurrencyZeroSum exercises the realistic FX
+// shape from ADR-014: a user leg and a clearing leg per currency. Each
+// currency group nets to zero independently, so the whole transaction
+// validates even though no single running sum across all postings is zero
+// in one currency.
+func TestValidate_MultiCurrencyPerCurrencyZeroSum(t *testing.T) {
+	usdA := mustMoney(t, -10000, "USD")
+	usdB := mustMoney(t, 10000, "USD")
+	eurA := mustMoney(t, -9200, "EUR")
+	eurB := mustMoney(t, 9200, "EUR")
+	tx := Transaction{Postings: []Posting{
+		{AccountID: "u_usd", Amount: usdA},
+		{AccountID: "fx_usd", Amount: usdB},
+		{AccountID: "fx_eur", Amount: eurA},
+		{AccountID: "u_eur", Amount: eurB},
+	}}
+	if err := tx.Validate(); err != nil {
+		t.Fatalf("balanced per currency: %v", err)
+	}
+}
+
+// TestValidate_PerCurrencyImbalanceRejected checks that a currency group
+// that fails to net to zero is rejected even though other groups in the
+// same transaction do balance.
+func TestValidate_PerCurrencyImbalanceRejected(t *testing.T) {
+	usdA := mustMoney(t, -10000, "USD")
+	usdB := mustMoney(t, 10000, "USD")
+	eurA := mustMoney(t, -9200, "EUR")
+	eurB := mustMoney(t, 9100, "EUR") // EUR off by 100
+	tx := Transaction{Postings: []Posting{
+		{AccountID: "a", Amount: usdA},
+		{AccountID: "b", Amount: usdB},
+		{AccountID: "c", Amount: eurA},
+		{AccountID: "d", Amount: eurB},
+	}}
+	if err := tx.Validate(); !errors.Is(err, ErrUnbalanced) {
+		t.Fatalf("EUR does not net to zero, want ErrUnbalanced, got %v", err)
+	}
+}
+
+// TestValidate_PerCurrencyOverflow checks that an overflow in one currency's
+// accumulation is still surfaced as ErrOverflow, even with other currencies
+// present in the same transaction.
+func TestValidate_PerCurrencyOverflow(t *testing.T) {
+	tx := Transaction{Postings: []Posting{
+		{AccountID: "a", Amount: mustMoney(t, math.MaxInt64, "USD")},
+		{AccountID: "b", Amount: mustMoney(t, math.MaxInt64, "USD")},
+		{AccountID: "c", Amount: mustMoney(t, 100, "EUR")},
+		{AccountID: "d", Amount: mustMoney(t, -100, "EUR")},
+	}}
+	if err := tx.Validate(); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("want ErrOverflow, got %v", err)
 	}
 }

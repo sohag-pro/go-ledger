@@ -106,8 +106,8 @@ func (q *Queries) AccountStatement(ctx context.Context, arg AccountStatementPara
 }
 
 const createPosting = `-- name: CreatePosting :exec
-INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, description)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, currency, description)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type CreatePostingParams struct {
@@ -116,6 +116,7 @@ type CreatePostingParams struct {
 	TransactionID uuid.UUID
 	AccountID     uuid.UUID
 	Amount        int64
+	Currency      string
 	Description   string
 }
 
@@ -126,13 +127,14 @@ func (q *Queries) CreatePosting(ctx context.Context, arg CreatePostingParams) er
 		arg.TransactionID,
 		arg.AccountID,
 		arg.Amount,
+		arg.Currency,
 		arg.Description,
 	)
 	return err
 }
 
 const listPostingsByTransaction = `-- name: ListPostingsByTransaction :many
-SELECT id, tenant_id, transaction_id, account_id, amount, description, created_at
+SELECT id, tenant_id, transaction_id, account_id, amount, currency, description, created_at
 FROM postings
 WHERE tenant_id = $1 AND transaction_id = $2
 ORDER BY created_at, id
@@ -149,6 +151,7 @@ type ListPostingsByTransactionRow struct {
 	TransactionID uuid.UUID
 	AccountID     uuid.UUID
 	Amount        int64
+	Currency      string
 	Description   string
 	CreatedAt     time.Time
 }
@@ -168,6 +171,7 @@ func (q *Queries) ListPostingsByTransaction(ctx context.Context, arg ListPosting
 			&i.TransactionID,
 			&i.AccountID,
 			&i.Amount,
+			&i.Currency,
 			&i.Description,
 			&i.CreatedAt,
 		); err != nil {

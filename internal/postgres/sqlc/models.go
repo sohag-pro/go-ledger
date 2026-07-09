@@ -18,6 +18,7 @@ type Account struct {
 	Type      string
 	Currency  string
 	CreatedAt time.Time
+	IsSystem  bool
 }
 
 type ApiKey struct {
@@ -43,6 +44,17 @@ type AuditLog struct {
 	RowHash       pgtype.Text
 }
 
+type FxRate struct {
+	ID          int64
+	Base        string
+	Quote       string
+	MidRateE8   int64
+	SpreadBps   int32
+	Source      string
+	EffectiveAt time.Time
+	CreatedAt   time.Time
+}
+
 type IdempotencyKey struct {
 	TenantID       uuid.UUID
 	IdempotencyKey string
@@ -59,11 +71,19 @@ type Posting struct {
 	Amount        int64
 	CreatedAt     time.Time
 	Description   string
+	Currency      string
 }
 
 type Transaction struct {
-	ID        uuid.UUID
-	TenantID  uuid.UUID
-	Currency  string
-	CreatedAt time.Time
+	ID                uuid.UUID
+	TenantID          uuid.UUID
+	CreatedAt         time.Time
+	FxSourceAmount    pgtype.Int8
+	FxConvertedAmount pgtype.Int8
+	FxMidRateE8       pgtype.Int8
+	FxSpreadBps       pgtype.Int4
+	FxAppliedE8       pgtype.Int8
+	FxRateSource      pgtype.Text
+	FxEffectiveAt     pgtype.Timestamptz
+	FxRateID          pgtype.Int8
 }

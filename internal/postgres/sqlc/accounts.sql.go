@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -46,15 +47,95 @@ type GetAccountParams struct {
 	ID       uuid.UUID
 }
 
-func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (Account, error) {
+type GetAccountRow struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	Name      string
+	Type      string
+	Currency  string
+	CreatedAt time.Time
+}
+
+func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error) {
 	row := q.db.QueryRow(ctx, getAccount, arg.TenantID, arg.ID)
-	var i Account
+	var i GetAccountRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
 		&i.Name,
 		&i.Type,
 		&i.Currency,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getOrCreateClearingAccount = `-- name: GetOrCreateClearingAccount :one
+INSERT INTO accounts (id, tenant_id, name, type, currency, is_system)
+VALUES ($1, $2, $3, $4, $5, true)
+ON CONFLICT (tenant_id, name) WHERE is_system
+    DO UPDATE SET id = accounts.id
+RETURNING id, tenant_id, name, type, currency, is_system, created_at
+`
+
+type GetOrCreateClearingAccountParams struct {
+	ID       uuid.UUID
+	TenantID uuid.UUID
+	Name     string
+	Type     string
+	Currency string
+}
+
+type GetOrCreateClearingAccountRow struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	Name      string
+	Type      string
+	Currency  string
+	IsSystem  bool
+	CreatedAt time.Time
+}
+
+// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
+// created lazily on first use. Keyed by (tenant_id, name): name is the
+// reserved, deterministic "fx.clearing.<CURRENCY>" string the caller builds,
+// so a second call for the same tenant and currency always resolves to the
+// same row instead of creating a duplicate. The ON CONFLICT arbiter is the
+// partial unique index accounts_system_name_uniq (migration 0010), which only
+// covers is_system rows, so this can never collide with an ordinary
+// user-named account.
+//
+// On conflict this does a no-op DO UPDATE (id set to its own current value)
+// rather than DO NOTHING. DO NOTHING never RETURNs the conflicting row, which
+// an earlier version of this query worked around with a CTE plus a fallback
+// SELECT unioned into the same statement, guarded by NOT EXISTS. That
+// fallback ran against the single statement's original snapshot: when two
+// callers raced to create the same tenant's first clearing account for a
+// currency, the loser blocked on the conflict, and by the time it unblocked
+// (after the winner committed) its own fallback SELECT could still miss the
+// now-committed row, since the snapshot predated that commit. Both branches
+// of the UNION then returned zero rows to the loser, surfacing as "no rows in
+// result set" under concurrent Converts targeting the same pair. DO UPDATE
+// instead forces Postgres's own EvalPlanQual re-fetch of the current row
+// version as part of resolving the conflict, so RETURNING always yields
+// exactly one row, new or existing, in a single round trip with no second
+// snapshot to race against.
+func (q *Queries) GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error) {
+	row := q.db.QueryRow(ctx, getOrCreateClearingAccount,
+		arg.ID,
+		arg.TenantID,
+		arg.Name,
+		arg.Type,
+		arg.Currency,
+	)
+	var i GetOrCreateClearingAccountRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Type,
+		&i.Currency,
+		&i.IsSystem,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -73,15 +154,24 @@ type ListAccountsParams struct {
 	Limit    int32
 }
 
-func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error) {
+type ListAccountsRow struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	Name      string
+	Type      string
+	Currency  string
+	CreatedAt time.Time
+}
+
+func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error) {
 	rows, err := q.db.Query(ctx, listAccounts, arg.TenantID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Account
+	var items []ListAccountsRow
 	for rows.Next() {
-		var i Account
+		var i ListAccountsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,

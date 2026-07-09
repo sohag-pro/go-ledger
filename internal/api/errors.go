@@ -12,7 +12,11 @@ import (
 // RFC 7807 application/problem+json response. Validation and invariant failures
 // are client errors (422), missing resources are 404, a duplicate id is 409, a
 // transient write conflict is 503, and anything unrecognized is a 500 that does
-// not leak internals.
+// not leak internals. FX conversion failures (bad rate, bad spread, dust, no
+// rate for the pair, self or same-currency conversion, non-positive source
+// amount) are all client errors too, so they map to 422 like the other
+// validation/invariant failures (ADR-014); a cross-tenant or unknown account on
+// either leg still falls through to the existing ErrAccountNotFound case above.
 func toHumaErr(err error) error {
 	switch {
 	case err == nil:
@@ -45,6 +49,20 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("posting description is too long")
 	case errors.Is(err, domain.ErrOverflow):
 		return huma.Error422UnprocessableEntity("amount is out of range")
+	case errors.Is(err, domain.ErrConversionDust):
+		return huma.Error422UnprocessableEntity("conversion amount rounds to zero in the destination currency")
+	case errors.Is(err, domain.ErrNonPositiveRate):
+		return huma.Error422UnprocessableEntity("fx rate must be positive")
+	case errors.Is(err, domain.ErrInvalidSpread):
+		return huma.Error422UnprocessableEntity("fx spread is out of range")
+	case errors.Is(err, domain.ErrFXRateNotFound):
+		return huma.Error422UnprocessableEntity("no fx rate is configured for this currency pair")
+	case errors.Is(err, domain.ErrNonPositiveConvertAmount):
+		return huma.Error422UnprocessableEntity("source_amount must be positive")
+	case errors.Is(err, domain.ErrSelfConversion):
+		return huma.Error422UnprocessableEntity("from_account and to_account must differ")
+	case errors.Is(err, domain.ErrSameCurrencyConversion):
+		return huma.Error422UnprocessableEntity("from_account and to_account must have different currencies")
 	default:
 		return huma.Error500InternalServerError("internal error")
 	}

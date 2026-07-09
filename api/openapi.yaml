@@ -102,11 +102,42 @@ components:
         - amount
         - currency
       type: object
+    ConvertInputBody:
+      additionalProperties: false
+      properties:
+        from_account:
+          description: Account to debit, in its own currency
+          format: uuid
+          type: string
+        source_amount:
+          description: Amount to convert, in minor units of the from account's currency; must be positive
+          format: int64
+          type: integer
+        to_account:
+          description: Account to credit; its currency is the conversion's destination currency
+          format: uuid
+          type: string
+      required:
+        - from_account
+        - to_account
+        - source_amount
+      type: object
+    ConvertResponseBody:
+      additionalProperties: false
+      properties:
+        fx:
+          $ref: "#/components/schemas/FXDetailBody"
+        transaction:
+          $ref: "#/components/schemas/TransactionBody"
+      required:
+        - transaction
+        - fx
+      type: object
     CreateAccountInputBody:
       additionalProperties: false
       properties:
         currency:
-          description: ISO 4217 alphabetic code
+          description: ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted.
           pattern: ^[A-Z]{3}$
           type: string
         name:
@@ -126,7 +157,6 @@ components:
       required:
         - name
         - type
-        - currency
       type: object
     CreateTransactionInputBody:
       additionalProperties: false
@@ -200,6 +230,50 @@ components:
           format: uri
           type: string
       type: object
+    FXDetailBody:
+      additionalProperties: false
+      properties:
+        applied_e8:
+          description: Informational, spread-adjusted rate actually reflected in converted_amount
+          format: int64
+          type: integer
+        converted_amount:
+          description: Amount credited, in minor units of the destination account's currency
+          format: int64
+          type: integer
+        effective_at:
+          description: When the applied fx_rates row went live
+          format: date-time
+          type: string
+        mid_rate_e8:
+          description: Mid rate (destination units per source unit), scaled by 1e8, before the spread
+          format: int64
+          type: integer
+        rate_id:
+          description: The fx_rates row id the mid rate and spread were read from
+          format: int64
+          type: integer
+        rate_source:
+          description: Where the mid rate came from
+          type: string
+        source_amount:
+          description: Amount converted, in minor units of the source account's currency
+          format: int64
+          type: integer
+        spread_bps:
+          description: Spread widened against the customer, in basis points
+          format: int32
+          type: integer
+      required:
+        - source_amount
+        - converted_amount
+        - mid_rate_e8
+        - applied_e8
+        - spread_bps
+        - rate_source
+        - effective_at
+        - rate_id
+      type: object
     HealthOutputBody:
       additionalProperties: false
       properties:
@@ -219,11 +293,14 @@ components:
         amount:
           format: int64
           type: integer
+        currency:
+          type: string
         description:
           type: string
       required:
         - account_id
         - amount
+        - currency
         - description
       type: object
     PostingInput:
@@ -301,8 +378,6 @@ components:
     TransactionBody:
       additionalProperties: false
       properties:
-        currency:
-          type: string
         id:
           type: string
         postings:
@@ -313,7 +388,6 @@ components:
             - "null"
       required:
         - id
-        - currency
         - postings
       type: object
     VerifyAuditOutputBody:
@@ -659,6 +733,46 @@ paths:
       security:
         - bearerAuth: []
       summary: Post a transaction
+      tags:
+        - transactions
+  /v1/transactions/convert:
+    post:
+      description: "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict."
+      operationId: convert-transaction
+      parameters:
+        - description: Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409.
+          in: header
+          name: Idempotency-Key
+          schema:
+            description: Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409.
+            maxLength: 255
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConvertInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConvertResponseBody"
+          description: Created
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Convert between currencies
       tags:
         - transactions
   /v1/transactions/{id}:

@@ -79,6 +79,15 @@ type Repository interface {
 	// including all its postings, or ErrTransactionNotFound if none exists.
 	GetTransaction(ctx context.Context, tenantID, id string) (Transaction, error)
 
+	// GetOrCreateClearingAccount returns the tenant's per-currency FX clearing
+	// system account (ADR-014), creating it on first use. name is reserved and
+	// deterministic ("fx.clearing.<CURRENCY>"), so two callers converting the
+	// same tenant's currency for the first time, even concurrently, resolve to
+	// the same row rather than creating duplicates. The account is a Liability
+	// type and is marked System (see Account.System): it is expected to carry a
+	// permanent, often nonzero, open position, unlike a user account.
+	GetOrCreateClearingAccount(ctx context.Context, tenantID string, currency Currency) (Account, error)
+
 	// GetIdempotencyKey returns the stored record for (tenantID, key), or
 	// ErrIdempotencyKeyNotFound if none exists.
 	GetIdempotencyKey(ctx context.Context, tenantID, key string) (IdempotencyRecord, error)
