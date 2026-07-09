@@ -11,3 +11,6 @@ docs/*
 !docs/adr/
 CLAUDE.md
 .claude/
+
+# Subagent-driven-development scratch (briefs, reports, review diffs, ledger)
+.superpowers/
