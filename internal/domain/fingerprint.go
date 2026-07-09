@@ -46,6 +46,27 @@ func (t Transaction) Fingerprint() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// ConvertRequestFingerprint returns a stable hex SHA-256 over a convert
+// request's semantic content: the from account, the to account, and the
+// source amount. Unlike Transaction.Fingerprint, which hashes the postings a
+// transaction is made of, this hashes the REQUEST that produced them. That
+// distinction is the point: a convert's idempotency key must be resolved
+// before the FX rate is looked up (see internal/ledger's Convert), so a retry
+// submitted after the rate moved still matches the same fingerprint and
+// replays the original converted amount, instead of rebuilding a different
+// set of postings, hashing those, and spuriously 409ing a legitimate retry.
+//
+// Each field is length-prefixed via writeField, the same self-delimiting
+// framing Transaction.Fingerprint uses, so no field's bytes can be mistaken
+// for a field boundary.
+func ConvertRequestFingerprint(fromAccountID, toAccountID string, sourceAmount int64) string {
+	h := sha256.New()
+	writeField(h, []byte(fromAccountID))
+	writeField(h, []byte(toAccountID))
+	writeField(h, []byte(strconv.FormatInt(sourceAmount, 10)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // writeField hashes b framed by its length, making the stream self-delimiting.
 func writeField(h hash.Hash, b []byte) {
 	var n [8]byte

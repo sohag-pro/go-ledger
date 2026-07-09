@@ -36,6 +36,13 @@ func (p Posting) Validate() error {
 type Transaction struct {
 	ID       string
 	Postings []Posting
+	// FX is the immutable snapshot of the conversion applied, when this
+	// transaction is a cross-currency convert (ADR-014 decision 7). It is nil
+	// for an ordinary transaction: Fingerprint deliberately does not hash FX,
+	// since it is not part of the double-entry content Fingerprint protects
+	// (a convert's idempotency fingerprint is computed over the request, not
+	// the postings; see internal/ledger's Convert).
+	FX *FXDetail
 }
 
 // Validate enforces the double-entry invariant. It requires at least two

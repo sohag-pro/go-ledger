@@ -115,6 +115,22 @@ func (f *fakeRepo) GetTransaction(_ context.Context, _, id string) (domain.Trans
 	return t, nil
 }
 
+// GetOrCreateClearingAccount is a minimal in-memory stand-in: it looks up the
+// reserved clearing account name in the same accounts map a real user account
+// would live in, creating it (System, Liability) on first use. Handler tests
+// do not yet exercise Convert, so this only needs to satisfy the interface.
+func (f *fakeRepo) GetOrCreateClearingAccount(_ context.Context, _ string, currency domain.Currency) (domain.Account, error) {
+	name := "fx.clearing." + string(currency)
+	for _, a := range f.accounts {
+		if a.Name == name && a.System {
+			return a, nil
+		}
+	}
+	a := domain.Account{ID: uuid.NewString(), Name: name, Type: domain.Liability, Currency: currency, System: true}
+	f.accounts[a.ID] = a
+	return a, nil
+}
+
 func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, transactionID string) error {
 	if _, ok := f.idem[key]; ok {
 		return domain.ErrDuplicateIdempotencyKey

@@ -52,7 +52,10 @@ func NewDBProvider(db sqlc.DBTX) Provider {
 func (p *dbRateProvider) Rate(ctx context.Context, base, quote domain.Currency) (domain.FXQuote, int32, error) {
 	direct, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{Base: string(base), Quote: string(quote)})
 	if err == nil {
-		return domain.FXQuote{Base: base, Quote: quote, MidRateE8: direct.MidRateE8}, direct.SpreadBps, nil
+		return domain.FXQuote{
+			Base: base, Quote: quote, MidRateE8: direct.MidRateE8,
+			RateID: direct.ID, Source: direct.Source, EffectiveAt: direct.EffectiveAt,
+		}, direct.SpreadBps, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return domain.FXQuote{}, 0, fmt.Errorf("fx: lookup %s/%s: %w", base, quote, err)
@@ -82,5 +85,10 @@ func (p *dbRateProvider) Rate(ctx context.Context, base, quote domain.Currency) 
 	// stays exact integer division throughout.
 	invertedMidE8 := (domain.RateScale * domain.RateScale) / inverse.MidRateE8
 
-	return domain.FXQuote{Base: base, Quote: quote, MidRateE8: invertedMidE8}, inverse.SpreadBps, nil
+	return domain.FXQuote{
+		Base: base, Quote: quote, MidRateE8: invertedMidE8,
+		// Provenance is the row that was actually found and inverted: there is
+		// no separate stored row for this direction (see FXQuote's doc comment).
+		RateID: inverse.ID, Source: inverse.Source, EffectiveAt: inverse.EffectiveAt,
+	}, inverse.SpreadBps, nil
 }

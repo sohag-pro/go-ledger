@@ -60,4 +60,16 @@ var (
 	// ErrFXRateNotFound is returned when no fx_rates row exists for a currency
 	// pair, in either direction, at or before the requested time.
 	ErrFXRateNotFound = errors.New("domain: fx rate not found")
+	// ErrNonPositiveConvertAmount is returned when a Convert request's source
+	// amount is zero or negative. Zero would silently pass the conversion's
+	// dust guard (a zero source converts to a zero result, and dust is only
+	// detected when a nonzero source rounds to zero), and a negative amount
+	// would run the conversion in reverse under a legitimate-looking request.
+	ErrNonPositiveConvertAmount = errors.New("domain: convert source amount must be positive")
+	// ErrSelfConversion is returned when a Convert request names the same
+	// account as both the source and the destination.
+	ErrSelfConversion = errors.New("domain: convert from and to account must differ")
+	// ErrSameCurrencyConversion is returned when a Convert request's from and
+	// to accounts share a currency: that is a transfer, not a conversion.
+	ErrSameCurrencyConversion = errors.New("domain: convert from and to account must have different currencies")
 )

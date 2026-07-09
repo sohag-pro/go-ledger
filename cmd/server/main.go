@@ -28,6 +28,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
@@ -230,11 +231,12 @@ func run(logger *slog.Logger) error {
 	// ADR-012, "Per-key rate limiting", and internal/api/api.go).
 	limiter := auth.NewLimiter(cfg.rateLimitRPM)
 	deps := api.Deps{
-		Accounts:     ledger.NewAccountService(repo),
-		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName)),
-		Audit:        ledger.NewAuditService(repo),
-		Auth:         resolver,
-		RateLimiter:  limiter,
+		Accounts: ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
+			ledger.WithFXProvider(fx.NewDBProvider(pool))),
+		Audit:       ledger.NewAuditService(repo),
+		Auth:        resolver,
+		RateLimiter: limiter,
 	}
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
