@@ -99,8 +99,9 @@ A `RateProvider` interface decouples rate origin from the conversion logic:
 
 ```go
 type RateProvider interface {
-    // Rate returns the current MID rate (quote per base), scaled by 1e8.
-    Rate(ctx context.Context, base, quote domain.Currency) (domain.FXQuote, error)
+    // Rate returns the current MID rate (quote per base, in the FXQuote, scaled by
+    // 1e8) and the configured spread in basis points for that pair.
+    Rate(ctx context.Context, base, quote domain.Currency) (domain.FXQuote, int32, error)
 }
 ```
 
