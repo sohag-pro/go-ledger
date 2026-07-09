@@ -12,13 +12,17 @@ services:
       - "4318:4318"   # OTLP/HTTP
       - "4317:4317"   # OTLP/gRPC (unused by default, exposed for convenience)
 
-  # --- Local dev stack (plain `docker compose up`) --------------------------
-  # app + postgres + jaeger + prometheus for local development and manual
-  # exploration. Distinct container names and no profile, so it never collides
-  # with the load-test profile (which you start explicitly and separately).
+  # --- Local dev stack: `docker compose --profile dev up` -------------------
+  # app + postgres + prometheus (jaeger is profile-less, so it joins any run)
+  # for local development and manual exploration. These carry the `dev` profile
+  # so they never start alongside the `load-test` profile. Docker Compose always
+  # starts profile-less services, so if the dev services had no profile they
+  # would boot during `--profile load-test up` too and collide on ports 8080 and
+  # 5432; the `dev` profile keeps the two stacks fully separate.
   dev-postgres:
     image: postgres:16
     container_name: go-ledger-dev-postgres
+    profiles: ["dev"]
     environment:
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: ledger
@@ -34,6 +38,7 @@ services:
   dev-app:
     build: .
     container_name: go-ledger-dev-app
+    profiles: ["dev"]
     depends_on:
       dev-postgres:
         condition: service_healthy
@@ -48,6 +53,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: go-ledger-prometheus
+    profiles: ["dev"]
     depends_on:
       - dev-app
     volumes:

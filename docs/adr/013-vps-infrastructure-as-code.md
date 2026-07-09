@@ -71,10 +71,13 @@ distroless-static adds ~2 MB.
 
 ### 3. The local dev stack is compose
 
-A plain `docker compose up` brings up the full local stack: app, Postgres,
-Jaeger (traces), and Prometheus (scraping the app's existing `/metrics`). The
-separate `load-test` profile, tuned for the multi-tenant audit-chain k6 run, is
-kept as is. This is local-only; nothing here reaches prod.
+`docker compose --profile dev up` brings up the full local stack: app, Postgres,
+Jaeger (traces), and Prometheus (scraping the app's existing `/metrics`). It
+carries a `dev` profile, kept separate from the `load-test` profile (tuned for
+the multi-tenant audit-chain k6 run), because Docker Compose always starts
+profile-less services: without its own profile the dev stack would boot during a
+`--profile load-test` run too and collide on ports. This is local-only; nothing
+here reaches prod.
 
 ### 4. VPS provisioning is codified as an idempotent Ansible playbook
 
