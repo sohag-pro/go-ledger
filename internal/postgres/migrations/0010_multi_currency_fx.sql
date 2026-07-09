@@ -166,6 +166,11 @@ ALTER TABLE transactions ADD COLUMN currency text;
 -- Restore the pre-0010 trigger bodies. assert_posting_currency reads
 -- transactions.currency again, so it must be restored after the column
 -- above is re-added, not before.
+-- NOTE: the re-added transactions.currency is always NULL (FX rows cannot be
+-- backfilled to one currency), so this restored trigger's NEW.currency vs
+-- account comparison is a no-op after a rollback: the currency-integrity guard
+-- stays effectively off until a forward re-migration to 0010. Accepted per
+-- ADR-014 (pre-real-money); do not run this Down on a live multi-currency DB.
 CREATE OR REPLACE FUNCTION assert_posting_currency() RETURNS trigger AS $$
 DECLARE
     account_currency text;

@@ -107,6 +107,8 @@ func Convert(source Money, quote Currency, midE8 int64, spreadBps int32) (Money,
 		return Money{}, 0, ErrConversionDust
 	}
 	// appliedE8 (informational): round_half_even(factor / bpsScale), scaled 1e8.
+	// The ok bool is ignored deliberately: appliedE8 = midE8*(bpsScale-spreadBps)
+	// /bpsScale <= midE8 <= MaxInt64, so it always fits int64 (cannot overflow).
 	appliedE8, _ := bankersDiv(factor, bigBpsScale)
 	out, err := NewMoney(converted, quote)
 	if err != nil {
