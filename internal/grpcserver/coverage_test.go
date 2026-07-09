@@ -193,8 +193,15 @@ func TestGRPCGetTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get transaction: %v", err)
 	}
-	if got.Transaction.Id != post.Transaction.Id || got.Transaction.Currency != "USD" || len(got.Transaction.Postings) != 2 {
+	if got.Transaction.Id != post.Transaction.Id || len(got.Transaction.Postings) != 2 {
 		t.Errorf("get transaction = %+v, want a match for posted %+v", got.Transaction, post.Transaction)
+	}
+	// Transaction has no transaction-level currency field (ADR-014, reworked
+	// the same way as REST): each posting carries its own currency instead.
+	for _, p := range got.Transaction.Postings {
+		if p.Currency != "USD" {
+			t.Errorf("posting currency = %q, want USD", p.Currency)
+		}
 	}
 
 	if _, err := client.GetTransaction(ctx, &ledgerv1.GetTransactionRequest{Id: missingID}); status.Code(err) != codes.NotFound {

@@ -25,6 +25,7 @@ const (
 	LedgerService_GetBalance_FullMethodName          = "/ledger.v1.LedgerService/GetBalance"
 	LedgerService_GetStatement_FullMethodName        = "/ledger.v1.LedgerService/GetStatement"
 	LedgerService_PostTransaction_FullMethodName     = "/ledger.v1.LedgerService/PostTransaction"
+	LedgerService_Convert_FullMethodName             = "/ledger.v1.LedgerService/Convert"
 	LedgerService_GetTransaction_FullMethodName      = "/ledger.v1.LedgerService/GetTransaction"
 	LedgerService_GetTransactionAudit_FullMethodName = "/ledger.v1.LedgerService/GetTransactionAudit"
 	LedgerService_GetAccountAudit_FullMethodName     = "/ledger.v1.LedgerService/GetAccountAudit"
@@ -40,6 +41,7 @@ type LedgerServiceClient interface {
 	GetBalance(ctx context.Context, in *GetBalanceRequest, opts ...grpc.CallOption) (*GetBalanceResponse, error)
 	GetStatement(ctx context.Context, in *GetStatementRequest, opts ...grpc.CallOption) (*GetStatementResponse, error)
 	PostTransaction(ctx context.Context, in *PostTransactionRequest, opts ...grpc.CallOption) (*PostTransactionResponse, error)
+	Convert(ctx context.Context, in *ConvertRequest, opts ...grpc.CallOption) (*ConvertResponse, error)
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error)
 	GetTransactionAudit(ctx context.Context, in *GetTransactionAuditRequest, opts ...grpc.CallOption) (*GetTransactionAuditResponse, error)
 	GetAccountAudit(ctx context.Context, in *GetAccountAuditRequest, opts ...grpc.CallOption) (*GetAccountAuditResponse, error)
@@ -113,6 +115,16 @@ func (c *ledgerServiceClient) PostTransaction(ctx context.Context, in *PostTrans
 	return out, nil
 }
 
+func (c *ledgerServiceClient) Convert(ctx context.Context, in *ConvertRequest, opts ...grpc.CallOption) (*ConvertResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ConvertResponse)
+	err := c.cc.Invoke(ctx, LedgerService_Convert_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *ledgerServiceClient) GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetTransactionResponse)
@@ -153,6 +165,7 @@ type LedgerServiceServer interface {
 	GetBalance(context.Context, *GetBalanceRequest) (*GetBalanceResponse, error)
 	GetStatement(context.Context, *GetStatementRequest) (*GetStatementResponse, error)
 	PostTransaction(context.Context, *PostTransactionRequest) (*PostTransactionResponse, error)
+	Convert(context.Context, *ConvertRequest) (*ConvertResponse, error)
 	GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error)
 	GetTransactionAudit(context.Context, *GetTransactionAuditRequest) (*GetTransactionAuditResponse, error)
 	GetAccountAudit(context.Context, *GetAccountAuditRequest) (*GetAccountAuditResponse, error)
@@ -183,6 +196,9 @@ func (UnimplementedLedgerServiceServer) GetStatement(context.Context, *GetStatem
 }
 func (UnimplementedLedgerServiceServer) PostTransaction(context.Context, *PostTransactionRequest) (*PostTransactionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PostTransaction not implemented")
+}
+func (UnimplementedLedgerServiceServer) Convert(context.Context, *ConvertRequest) (*ConvertResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Convert not implemented")
 }
 func (UnimplementedLedgerServiceServer) GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTransaction not implemented")
@@ -322,6 +338,24 @@ func _LedgerService_PostTransaction_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LedgerService_Convert_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConvertRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LedgerServiceServer).Convert(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LedgerService_Convert_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LedgerServiceServer).Convert(ctx, req.(*ConvertRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LedgerService_GetTransaction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetTransactionRequest)
 	if err := dec(in); err != nil {
@@ -406,6 +440,10 @@ var LedgerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PostTransaction",
 			Handler:    _LedgerService_PostTransaction_Handler,
+		},
+		{
+			MethodName: "Convert",
+			Handler:    _LedgerService_Convert_Handler,
 		},
 		{
 			MethodName: "GetTransaction",

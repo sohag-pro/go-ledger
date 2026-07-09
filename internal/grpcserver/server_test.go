@@ -112,8 +112,10 @@ func authedCtx(ctx context.Context) context.Context {
 var provisionTestAPIKeyOnce sync.Once
 
 // dialClient starts the real gRPC server on a bufconn and returns a connected
-// generated client plus a cleanup func.
-func dialClient(t *testing.T) ledgerv1.LedgerServiceClient {
+// generated client plus a cleanup func. opts is passed through to
+// ledger.NewTransactionService, e.g. ledger.WithFXProvider(...) for tests that
+// exercise Convert (which errors with ledger.ErrNoFXProvider without one).
+func dialClient(t *testing.T, opts ...ledger.ServiceOption) ledgerv1.LedgerServiceClient {
 	t.Helper()
 	if poolErr != nil {
 		t.Skipf("skipping integration test: %v", poolErr)
@@ -131,7 +133,7 @@ func dialClient(t *testing.T) ledgerv1.LedgerServiceClient {
 	}
 	deps := grpcserver.Deps{
 		Accounts:     ledger.NewAccountService(repo),
-		Transactions: ledger.NewTransactionService(repo, nil, nil),
+		Transactions: ledger.NewTransactionService(repo, nil, nil, opts...),
 		Audit:        ledger.NewAuditService(repo),
 		Auth:         auth.NewResolver(repo, time.Minute),
 	}
