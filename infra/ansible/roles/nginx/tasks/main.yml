@@ -1,2 +1,38 @@
 ---
-[]
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: Install the go-ledger vhost
+  ansible.builtin.template:
+    src: go.sohag.pro.conf.j2
+    dest: "/etc/nginx/sites-available/{{ server_name }}"
+    mode: "0644"
+    # Do not clobber the certbot-managed 443 block on re-runs once TLS is set up.
+    force: false
+  notify: Reload nginx
+
+- name: Enable the vhost
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ server_name }}"
+    dest: "/etc/nginx/sites-enabled/{{ server_name }}"
+    state: link
+  notify: Reload nginx
+
+- name: Validate nginx config before any reload
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Flush handlers now so the reload happens before the portfolio check
+  ansible.builtin.meta: flush_handlers
+
+- name: Assert the shared portfolio is still healthy after nginx changes
+  ansible.builtin.uri:
+    url: "{{ portfolio_url }}"
+    status_code: 200
+  register: nginx_portfolio_check
+  retries: 3
+  delay: 2
+  until: nginx_portfolio_check.status == 200
