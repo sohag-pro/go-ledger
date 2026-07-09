@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>go-ledger, a production-grade payment ledger in Go, by Sohag Hasan</title>
-<meta name="description" content="An open-source double-entry payment ledger in Go: atomic posting, idempotency, an immutable audit log, full observability. Built in public over 12 weeks by Sohag Hasan.">
+<meta name="description" content="An open-source double-entry payment ledger in Go: atomic posting, idempotency, an immutable audit log, full observability. Built in public over 14 weeks by Sohag Hasan.">
 <style>
 :root{
   --bg:#16202E;
@@ -408,7 +408,7 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       <div>
         <p class="eyebrow">open source, MIT, Go 1.26</p>
         <h1 id="hero-h">A production-grade payment ledger in <span class="go">Go</span>.</h1>
-        <p class="sub">Double-entry accounting with invariants that are impossible to violate. Built in the open over 12 weeks: atomic posting, idempotency, an immutable audit log, and one trace from HTTP to SQL.</p>
+        <p class="sub">Double-entry accounting with invariants that are impossible to violate. Built in the open over 14 weeks: atomic posting, idempotency, an immutable audit log, and one trace from HTTP to SQL.</p>
         <div class="ctas">
           <a class="btn btn-primary" href="https://github.com/sohag-pro/go-ledger">
             <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
@@ -499,7 +499,7 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
   <!-- proof strip -->
   <div class="proof" role="group" aria-label="Build discipline at a glance">
     <div class="proof-in">
-      <div class="proof-item"><div class="proof-num">9<span class="u"> / </span>12</div><div class="proof-lbl">weeks shipped, on a public 12-week roadmap</div></div>
+      <div class="proof-item"><div class="proof-num">10<span class="u"> / </span>14</div><div class="proof-lbl">weeks shipped, on a public 14-week roadmap</div></div>
       <div class="proof-item"><div class="proof-num">11 <span class="u">ADRs</span></div><div class="proof-lbl">one architecture decision record per significant decision</div></div>
       <div class="proof-item"><div class="proof-num">race <span class="u">+</span> lint</div><div class="proof-lbl">tests run with the race detector, lint green in CI</div></div>
       <div class="proof-item"><div class="proof-num">live <span class="u">on push</span></div><div class="proof-lbl">every push to main deploys to production via CI/CD</div></div>
@@ -561,7 +561,7 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
   <div class="wrap">
     <header class="sec-head rv">
       <p class="sec-no">02 &middot; the plan</p>
-      <h2 id="roadmap-h">Twelve weeks, in public, on schedule.</h2>
+      <h2 id="roadmap-h">Fourteen weeks, in public, on schedule.</h2>
       <p class="sec-sub">The roadmap was published before week one. Every week ships code, a blog post, and the decision records behind it.</p>
     </header>
     <div class="road-cols rv">
@@ -576,14 +576,16 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       <div class="col">
         <div class="week shipped"><span class="wk-no">wk 07</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">gRPC layer</span> <span class="wk-d">over the shared domain core</span></span></div>
         <div class="week shipped"><span class="wk-no">wk 08</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Observability</span> <span class="wk-d">OpenTelemetry traces, logs, metrics</span></span></div>
-        <div class="week current"><span class="wk-no">wk 09</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Testing<span class="wk-tag">current</span></span> <span class="wk-d">unit, property, chaos, load</span></span></div>
-        <div class="week planned"><span class="wk-no">wk 10</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Docker + infrastructure</span> <span class="wk-d">distroless images</span></span></div>
-        <div class="week planned"><span class="wk-no">wk 11</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Live deployment</span> <span class="wk-d">CI/CD to production</span></span></div>
-        <div class="week planned"><span class="wk-no">wk 12</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Launch + retrospective</span> <span class="wk-d">what held up, what didn't</span></span></div>
+        <div class="week shipped"><span class="wk-no">wk 09</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Testing</span> <span class="wk-d">unit, property, chaos, load</span></span></div>
+        <div class="week shipped"><span class="wk-no">wk 10</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Docker + deploy</span> <span class="wk-d">distroless images, live to production</span></span></div>
+        <div class="week current"><span class="wk-no">wk 11</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Multi-currency + FX<span class="wk-tag">current</span></span> <span class="wk-d">per-currency invariant, env-configured rates</span></span></div>
+        <div class="week planned"><span class="wk-no">wk 12</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Nested accounts + reporting</span> <span class="wk-d">rolled-up balances, trial balance</span></span></div>
+        <div class="week planned"><span class="wk-no">wk 13</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Approvals + event stream</span> <span class="wk-d">threshold gate, outbox events</span></span></div>
+        <div class="week planned"><span class="wk-no">wk 14</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Webhooks + launch</span> <span class="wk-d">signed delivery, retrospective</span></span></div>
       </div>
     </div>
     <div class="road-note rv" role="group" aria-label="Discipline proof points">
-      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> 9 of 12 weeks shipped</span>
+      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> 10 of 14 weeks shipped</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> one ADR per significant decision (11 so far)</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> go test -race + lint green in CI</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> live deploy on every push to main</span>
@@ -621,16 +623,16 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       <header class="sec-head">
         <p class="sec-no">04 &middot; the record</p>
         <p class="kicker">Every week, written down.</p>
-        <h2 id="series-h">A 12-week build, documented post by post.</h2>
+        <h2 id="series-h">A 14-week build, documented post by post.</h2>
         <p class="sec-sub">The design decisions, the dead ends, and the reasoning behind every invariant, published the week each one ships. Not a tutorial polished after the fact: the real build, in order, with the trade-offs still visible.</p>
         <a class="btn btn-ghost series-cta" href="https://notes.sohag.pro/series/go-ledger">Read the series &rarr;</a>
       </header>
       <div class="series-rail">
         <div class="sstat">
           <!-- EDIT HERE: weeks shipped (number + matching .on/.live sticks below) -->
-          <div class="sstat-num">9<span class="u"> / </span>12</div>
+          <div class="sstat-num">10<span class="u"> / </span>14</div>
           <div class="sticks" aria-hidden="true">
-            <span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick live"></span><span class="stick"></span><span class="stick"></span><span class="stick"></span>
+            <span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick live"></span><span class="stick"></span><span class="stick"></span><span class="stick"></span>
           </div>
           <div class="sstat-lbl">weeks shipped</div>
         </div>
