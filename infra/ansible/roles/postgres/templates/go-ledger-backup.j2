@@ -1,0 +1,5 @@
+#!/bin/sh
+# Managed by Ansible. Daily gzip pg_dump, keep 14 days.
+ts=$(date +%Y%m%d)
+sudo -u postgres pg_dump {{ pg_database }} | gzip > /var/backups/go-ledger/{{ pg_database }}-$ts.sql.gz
+find /var/backups/go-ledger -name '{{ pg_database }}-*.sql.gz' -mtime +14 -delete

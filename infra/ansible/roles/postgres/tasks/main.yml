@@ -1,2 +1,58 @@
 ---
-[]
+- name: Install PostgreSQL and the psycopg dependency Ansible needs
+  ansible.builtin.apt:
+    name:
+      - postgresql
+      - python3-psycopg2
+    state: present
+    update_cache: true
+
+- name: Ensure PostgreSQL is running
+  ansible.builtin.service:
+    name: postgresql
+    enabled: true
+    state: started
+
+- name: Create the goledger role
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_user:
+    name: "{{ pg_role }}"
+    password: "{{ pg_password }}"
+
+- name: Create the goledger database owned by the role
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_db:
+    name: "{{ pg_database }}"
+    owner: "{{ pg_role }}"
+
+- name: Keep Postgres bound to localhost only
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+    regexp: "^#?listen_addresses"
+    line: "listen_addresses = 'localhost'"
+  notify: Restart postgresql
+
+- name: Tune Postgres memory for the 1GB shared box
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+    regexp: "^#?{{ item.key }}"
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - { key: "shared_buffers", value: "128MB" }
+    - { key: "work_mem", value: "8MB" }
+    - { key: "max_connections", value: "20" }
+  notify: Restart postgresql
+
+- name: Backups directory
+  ansible.builtin.file:
+    path: /var/backups/go-ledger
+    state: directory
+    mode: "0755"
+
+- name: Daily pg_dump backup script
+  ansible.builtin.template:
+    src: go-ledger-backup.j2
+    dest: /etc/cron.daily/go-ledger-backup
+    mode: "0755"
