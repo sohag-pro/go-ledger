@@ -14,16 +14,30 @@
     force: false
   notify: Reload nginx
 
-- name: Enable the vhost
-  ansible.builtin.file:
-    src: "/etc/nginx/sites-available/{{ server_name }}"
-    dest: "/etc/nginx/sites-enabled/{{ server_name }}"
-    state: link
-  notify: Reload nginx
+- name: Enable and validate the vhost, self healing on failure
+  block:
+    - name: Enable the vhost
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/{{ server_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ server_name }}"
+        state: link
+      notify: Reload nginx
 
-- name: Validate nginx config before any reload
-  ansible.builtin.command: nginx -t
-  changed_when: false
+    - name: Validate nginx config before any reload
+      ansible.builtin.command: nginx -t
+      changed_when: false
+  rescue:
+    - name: Remove the broken vhost symlink so nginx's active config stays clean
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-enabled/{{ server_name }}"
+        state: absent
+
+    - name: Fail because the new vhost did not validate
+      ansible.builtin.fail:
+        msg: >-
+          nginx -t failed for {{ server_name }}. The sites-enabled symlink
+          has been removed so the previously working config stays active.
+          Fix the vhost template and re-run the playbook.
 
 - name: Flush handlers now so the reload happens before the portfolio check
   ansible.builtin.meta: flush_handlers

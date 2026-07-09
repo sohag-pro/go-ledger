@@ -80,7 +80,7 @@ kept as is. This is local-only; nothing here reaches prod.
 
 The prose in `server-setup.md` becomes an executable, re-runnable Ansible
 playbook under `infra/ansible/`, split into roles that mirror the runbook: base
-(users, ufw, fail2ban, unattended upgrades), postgres (Postgres 16, role and
+(ufw, fail2ban, unattended upgrades), postgres (Postgres 16, role and
 database, 1 GB memory tuning, pg_dump backup cron), app (`/opt/go-ledger`,
 root-owned env file, deploy user, restricted sudoers), systemd (the hardened
 unit), nginx (the go.sohag.pro vhost with gzip), and tls (certbot).

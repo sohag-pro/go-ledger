@@ -15,6 +15,7 @@ Tracked (public, generic): `playbook.yml`, `roles/`, `ansible.cfg`, the
     cp inventory.example inventory                 # fill in the real host
     cp group_vars/all.example.yml group_vars/all.yml   # fill in real values
     pip install ansible ansible-lint               # or brew install ansible
+    ansible-galaxy collection install -r collections/requirements.yml
 
 ## Run
 
