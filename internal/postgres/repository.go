@@ -183,10 +183,12 @@ func clearingAccountName(currency domain.Currency) string {
 // GetOrCreateClearingAccount returns the tenant's per-currency FX clearing
 // account, creating it (as a Liability, System account) on first use. The
 // underlying query is INSERT ... ON CONFLICT (tenant_id, name) WHERE
-// is_system DO NOTHING, unioned with a fallback SELECT, so two callers racing
-// to create the same tenant's first clearing account for a currency
-// (including two callers in different processes) resolve to the same row
-// rather than creating duplicates or erroring.
+// is_system DO UPDATE (a no-op update, just to force Postgres to return the
+// existing row), so two callers racing to create the same tenant's first
+// clearing account for a currency (including two callers in different
+// processes) resolve to the same row rather than creating duplicates,
+// erroring, or (the DO NOTHING version's bug) both losing the race against
+// each other's snapshot and returning no row at all.
 func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID string, currency domain.Currency) (domain.Account, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {

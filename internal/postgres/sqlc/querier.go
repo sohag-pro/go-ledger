@@ -46,9 +46,23 @@ type Querier interface {
 	// same row instead of creating a duplicate. The ON CONFLICT arbiter is the
 	// partial unique index accounts_system_name_uniq (migration 0010), which only
 	// covers is_system rows, so this can never collide with an ordinary
-	// user-named account. ins does nothing on conflict (no RETURNING row); the
-	// second branch then fetches the row that already existed, guarded by
-	// NOT EXISTS so it only runs when ins produced nothing.
+	// user-named account.
+	//
+	// On conflict this does a no-op DO UPDATE (id set to its own current value)
+	// rather than DO NOTHING. DO NOTHING never RETURNs the conflicting row, which
+	// an earlier version of this query worked around with a CTE plus a fallback
+	// SELECT unioned into the same statement, guarded by NOT EXISTS. That
+	// fallback ran against the single statement's original snapshot: when two
+	// callers raced to create the same tenant's first clearing account for a
+	// currency, the loser blocked on the conflict, and by the time it unblocked
+	// (after the winner committed) its own fallback SELECT could still miss the
+	// now-committed row, since the snapshot predated that commit. Both branches
+	// of the UNION then returned zero rows to the loser, surfacing as "no rows in
+	// result set" under concurrent Converts targeting the same pair. DO UPDATE
+	// instead forces Postgres's own EvalPlanQual re-fetch of the current row
+	// version as part of resolving the conflict, so RETURNING always yields
+	// exactly one row, new or existing, in a single round trip with no second
+	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error

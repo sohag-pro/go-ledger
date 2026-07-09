@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,8 +20,9 @@ import (
 
 // seedConvertRate writes one fx_rates row directly via sqlc, bypassing the
 // fx package's own env-seeding path, exactly the way internal/fx's own tests
-// set up fixtures. fx_rates is global (not tenant-scoped), so every test below
-// uses its own currency pair to avoid the "current rate" resolving to a row a
+// set up fixtures. fx_rates is global (not tenant-scoped), so every test in
+// this PACKAGE (not just this file: see also convert_roundtrip_test.go) uses
+// its own quote currency to avoid the "current rate" resolving to a row a
 // different test appended. Every test in this file converts FROM USD, so base
 // is fixed rather than threaded through as a parameter that never varies.
 func seedConvertRate(t *testing.T, pool *pgxpool.Pool, quote domain.Currency, midE8 int64, spreadBps int32) {
@@ -409,6 +411,21 @@ func TestConvert_RejectsInvalidRequests(t *testing.T) {
 			t.Errorf("cross tenant: err = %v, want ErrAccountNotFound", err)
 		}
 	})
+
+	// Mirrors "cross tenant" above but on the FROM side: an id that was never
+	// created at all, rather than one that belongs to a different tenant.
+	// Cross tenant already covers the to-account lookup failing; this covers
+	// the from-account lookup failing, the branch immediately before it.
+	t.Run("unknown from account", func(t *testing.T) {
+		t.Parallel()
+		tenant := uuid.NewString()
+		seedConvertRate(t, pool, "ZAR", 100_000_000, 0)
+		zar := newConvertAccount(t, repo, tenant, "ZAR")
+		req := ledger.ConvertRequest{FromAccountID: uuid.NewString(), ToAccountID: zar.ID, SourceAmount: 100}
+		if _, _, err := svc.Convert(ctx, tenant, req, nil); !errors.Is(err, domain.ErrAccountNotFound) {
+			t.Errorf("unknown from account: err = %v, want ErrAccountNotFound", err)
+		}
+	})
 }
 
 // TestConvert_NoFXProvider checks the construction-time guard: a
@@ -427,5 +444,96 @@ func TestConvert_NoFXProvider(t *testing.T) {
 	req := ledger.ConvertRequest{FromAccountID: usd.ID, ToAccountID: eur.ID, SourceAmount: 100}
 	if _, _, err := svc.Convert(ctx, tenant, req, nil); !errors.Is(err, ledger.ErrNoFXProvider) {
 		t.Errorf("Convert() without a provider: err = %v, want ErrNoFXProvider", err)
+	}
+}
+
+// TestConvert_NoRateForPair covers the rate-lookup error branch: AUD has no
+// fx_rates row in either direction (no USD/AUD, no AUD/USD), so fx.Provider's
+// db-backed Rate must surface domain.ErrFXRateNotFound rather than Convert
+// panicking or silently defaulting a rate.
+func TestConvert_NoRateForPair(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := newConvertService(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+
+	usd := newConvertAccount(t, repo, tenant, "USD")
+	aud := newConvertAccount(t, repo, tenant, "AUD")
+	req := ledger.ConvertRequest{FromAccountID: usd.ID, ToAccountID: aud.ID, SourceAmount: 100}
+	if _, _, err := svc.Convert(ctx, tenant, req, nil); !errors.Is(err, domain.ErrFXRateNotFound) {
+		t.Errorf("no rate for pair: err = %v, want ErrFXRateNotFound", err)
+	}
+}
+
+// TestConvert_ConcurrentIdempotentHammer fires many concurrent Convert calls
+// at the same tenant with the same idempotency key. The idempotency precheck
+// (GetIdempotencyKey) runs before RunInTx's per-tenant mutex, so more than one
+// goroutine can miss the precheck and proceed toward a real conversion; only
+// one of those wins the DB's unique constraint on (tenant, key), and every
+// other one must observe ErrDuplicateIdempotencyKey inside RunInTx and replay
+// the winner's transaction rather than posting a second conversion. This is
+// the same hammer pattern TestPostIdempotentHammer uses for Post, applied to
+// Convert's separate idempotency and RunInTx wiring.
+func TestConvert_ConcurrentIdempotentHammer(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := newConvertService(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+
+	seedConvertRate(t, pool, "JPY", 150_000_000, 0)
+	usd := newConvertAccount(t, repo, tenant, "USD")
+	jpy := newConvertAccount(t, repo, tenant, "JPY")
+
+	const n = 25
+	req := ledger.ConvertRequest{FromAccountID: usd.ID, ToAccountID: jpy.ID, SourceAmount: 1_000}
+	idem := &domain.Idempotency{Key: "convert-hammer-1"}
+
+	var wg sync.WaitGroup
+	ids := make([]string, n)
+	replays := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			txn, replayed, err := svc.Convert(ctx, tenant, req, idem)
+			if txn != nil {
+				ids[i] = txn.ID
+			}
+			replays[i], errs[i] = replayed, err
+		}(i)
+	}
+	wg.Wait()
+
+	var first string
+	replayCount := 0
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("call %d: %v", i, errs[i])
+		}
+		if first == "" {
+			first = ids[i]
+		} else if ids[i] != first {
+			t.Fatalf("call %d returned id %s, want %s", i, ids[i], first)
+		}
+		if replays[i] {
+			replayCount++
+		}
+	}
+	if replayCount != n-1 {
+		t.Errorf("replay count = %d, want %d (exactly one real conversion)", replayCount, n-1)
+	}
+
+	// Exactly one audit row for the one conversion, even under concurrency.
+	audit, err := repo.ListAuditByTransaction(ctx, tenant, first)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	if len(audit) != 1 {
+		t.Errorf("audit rows = %d, want 1 (no re-conversion under concurrency)", len(audit))
 	}
 }

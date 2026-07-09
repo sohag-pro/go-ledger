@@ -29,7 +29,7 @@ ALTER TABLE postings ADD CONSTRAINT postings_currency_len CHECK (char_length(cur
 
 -- 4. accounts.is_system marks the per-tenant per-currency FX clearing
 --    accounts that the FX flow posts through. The clearing get-or-create is
---    an INSERT ... ON CONFLICT (tenant_id, name) WHERE is_system DO NOTHING,
+--    an INSERT ... ON CONFLICT (tenant_id, name) WHERE is_system DO UPDATE,
 --    so it needs a real conflict target. A partial unique index, rather
 --    than a full UNIQUE on (tenant_id, name), is deliberate: existing user
 --    accounts were never required to have unique names, so a full UNIQUE

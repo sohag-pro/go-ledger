@@ -11,15 +11,21 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
-// TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing is the money-safety
-// proof for FX (Task 10, ADR-014): converting X USD into EUR and immediately
+// TestConvertRoundTrip_USDToNZDToUSD_ReconcilesToClearing is the money-safety
+// proof for FX (Task 10, ADR-014): converting X USD into NZD and immediately
 // back into USD must never make money vanish. Two spreads and a rounding
 // residual do cost the user something on the round trip; this test proves
 // that cost is fully accounted for, not leaked: it decomposes cleanly into
 // the two spreads plus a rounding residual, and the same amount lands, to
 // the minor unit, in the USD FX clearing account. Every currency in the
 // book, clearing accounts included, still nets to zero afterward.
-func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
+//
+// The pair is USD/NZD, not USD/EUR: fx_rates is global, not tenant-scoped
+// (see seedConvertRate), and TestConvert_BalancesPerCurrencyAndRecordsRate in
+// this same package already owns USD/EUR with its own spread. Two parallel
+// tests seeding the same pair would race on CurrentFXRate's "latest
+// effective_at" tiebreak and could each resolve the other's rate.
+func TestConvertRoundTrip_USDToNZDToUSD_ReconcilesToClearing(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
@@ -28,19 +34,19 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 	tenant := uuid.NewString()
 
 	const (
-		base, quote = domain.Currency("USD"), domain.Currency("EUR")
-		midE8       = 92_000_000 // 0.92 EUR per USD
+		base, quote = domain.Currency("USD"), domain.Currency("NZD")
+		midE8       = 92_000_000 // 0.92 NZD per USD
 		spreadBps   = 75         // 0.75%, large enough that spread cost cannot be confused with rounding jitter
 	)
 	seedConvertRate(t, pool, quote, midE8, spreadBps)
 
 	usd := newConvertAccount(t, repo, tenant, base)
-	eur := newConvertAccount(t, repo, tenant, quote)
+	nzd := newConvertAccount(t, repo, tenant, quote)
 
 	const sourceAmount = 1_000_000 // $10,000.00: large enough that neither leg dusts
 
-	// Leg 1: USD -> EUR.
-	fwdReq := ledger.ConvertRequest{FromAccountID: usd.ID, ToAccountID: eur.ID, SourceAmount: sourceAmount}
+	// Leg 1: USD -> NZD.
+	fwdReq := ledger.ConvertRequest{FromAccountID: usd.ID, ToAccountID: nzd.ID, SourceAmount: sourceAmount}
 	fwd, replayed, err := svc.Convert(ctx, tenant, fwdReq, &domain.Idempotency{Key: "roundtrip-fwd"})
 	if err != nil {
 		t.Fatalf("forward Convert() error = %v", err)
@@ -51,12 +57,12 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 	if fwd.FX == nil {
 		t.Fatalf("forward Convert() has no FX detail")
 	}
-	amountEUR := fwd.FX.ConvertedAmount
+	amountNZD := fwd.FX.ConvertedAmount
 	mid1, spread1bps := fwd.FX.MidRateE8, fwd.FX.SpreadBps
 
-	// Leg 2: EUR -> USD, converting the ENTIRE EUR amount just credited, so
-	// the EUR clearing account carries no leftover open position afterward.
-	backReq := ledger.ConvertRequest{FromAccountID: eur.ID, ToAccountID: usd.ID, SourceAmount: amountEUR}
+	// Leg 2: NZD -> USD, converting the ENTIRE NZD amount just credited, so
+	// the NZD clearing account carries no leftover open position afterward.
+	backReq := ledger.ConvertRequest{FromAccountID: nzd.ID, ToAccountID: usd.ID, SourceAmount: amountNZD}
 	back, replayed, err := svc.Convert(ctx, tenant, backReq, &domain.Idempotency{Key: "roundtrip-back"})
 	if err != nil {
 		t.Fatalf("return Convert() error = %v", err)
@@ -97,8 +103,8 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("actualForward: %v", err)
 	}
-	if actualForward.Amount() != amountEUR {
-		t.Fatalf("actualForward = %d, want %d (the service's own converted amount)", actualForward.Amount(), amountEUR)
+	if actualForward.Amount() != amountNZD {
+		t.Fatalf("actualForward = %d, want %d (the service's own converted amount)", actualForward.Amount(), amountNZD)
 	}
 
 	idealReturn, _, err := domain.Convert(idealForward, base, mid2, 0)
@@ -152,27 +158,27 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get clearing USD: %v", err)
 	}
-	clearingEUR, err := repo.GetOrCreateClearingAccount(ctx, tenant, quote)
+	clearingNZD, err := repo.GetOrCreateClearingAccount(ctx, tenant, quote)
 	if err != nil {
-		t.Fatalf("get clearing EUR: %v", err)
+		t.Fatalf("get clearing NZD: %v", err)
 	}
 	clearingUSDBal, err := repo.Balance(ctx, tenant, clearingUSD.ID)
 	if err != nil {
 		t.Fatalf("balance clearing USD: %v", err)
 	}
-	clearingEURBal, err := repo.Balance(ctx, tenant, clearingEUR.ID)
+	clearingNZDBal, err := repo.Balance(ctx, tenant, clearingNZD.ID)
 	if err != nil {
-		t.Fatalf("balance clearing EUR: %v", err)
+		t.Fatalf("balance clearing NZD: %v", err)
 	}
 	if clearingUSDBal.Amount() != totalLoss {
 		t.Errorf("clearing USD balance = %d, want totalLoss %d (nothing vanishes, it all sits in clearing)",
 			clearingUSDBal.Amount(), totalLoss)
 	}
-	// Converting the ENTIRE EUR credit back means leg 2's source amount
-	// exactly matches leg 1's converted amount, so leg 1's open EUR position
-	// is fully closed out by leg 2: no EUR is left stranded in clearing.
-	if !clearingEURBal.IsZero() {
-		t.Errorf("clearing EUR balance = %s, want zero (round trip closes the EUR clearing position)", clearingEURBal)
+	// Converting the ENTIRE NZD credit back means leg 2's source amount
+	// exactly matches leg 1's converted amount, so leg 1's open NZD position
+	// is fully closed out by leg 2: no NZD is left stranded in clearing.
+	if !clearingNZDBal.IsZero() {
+		t.Errorf("clearing NZD balance = %s, want zero (round trip closes the NZD clearing position)", clearingNZDBal)
 	}
 
 	// --- (c) every currency still nets to zero across the whole book ---
@@ -181,7 +187,7 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 		t.Fatalf("ListAccounts: %v", err)
 	}
 	if len(accounts) != 4 {
-		t.Fatalf("tenant accounts = %d, want 4 (usd, eur, and their two clearing accounts)", len(accounts))
+		t.Fatalf("tenant accounts = %d, want 4 (usd, nzd, and their two clearing accounts)", len(accounts))
 	}
 	sums := map[domain.Currency]int64{}
 	for _, a := range accounts {
