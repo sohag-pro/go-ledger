@@ -129,7 +129,16 @@ the reverse is derived. The rule, order-of-operations exactly:
 
 Reducing quote-out is always worse for the customer regardless of direction, so a
 round trip (A to B to A) loses roughly two spreads plus rounding, and that loss is
-exactly what accumulates in the clearing accounts. Both directions are unit
+exactly what accumulates in the clearing accounts.
+
+One provenance subtlety for inverted lookups: the FX snapshot's `mid_rate_e8`
+records the *inverted* mid actually applied, while its `fx_rate_id` points at the
+reverse-direction `fx_rates` row, whose stored `mid_rate_e8` is the *non-inverted*
+value. The conversion stays fully reproducible from the snapshot alone
+(mid + spread + source through the decision-6 formula); the `fx_rate_id` link is
+provenance to the source row, not the applied number. An auditor joining on
+`fx_rate_id` should expect the stored row's mid to be the reciprocal of the applied
+mid for an inverted pair. Both directions are unit
 tested, and the round-trip reconciliation test asserts the clearing position
 equals the expected spread-plus-residual.
 
