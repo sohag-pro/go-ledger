@@ -1,0 +1,6 @@
+# Real host list and secrets never enter the public repo. Only the *.example
+# files are tracked. See ADR-013.
+inventory
+group_vars/all.yml
+*.retry
+vault-pass.txt

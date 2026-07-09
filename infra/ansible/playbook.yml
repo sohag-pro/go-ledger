@@ -1,0 +1,14 @@
+---
+# Reproduces the go-ledger VPS described in docs/ops/server-setup.md.
+# Docker is NOT installed here: prod runs a bare systemd binary (ADR-013).
+# Run in check mode first: ansible-playbook playbook.yml --check --diff
+- name: Provision the go-ledger VPS
+  hosts: ledger
+  become: true
+  roles:
+    - base
+    - postgres
+    - app
+    - systemd
+    - nginx
+    - tls

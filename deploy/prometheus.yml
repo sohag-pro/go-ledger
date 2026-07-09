@@ -1,0 +1,12 @@
+# Local dev scrape config. Targets the app's loopback metrics server, which in
+# the compose network is reachable at go-ledger-dev-app:9090 because the dev app
+# sets METRICS_ADDR=0.0.0.0:9090 (the app default 127.0.0.1:9090 is not
+# reachable across containers).
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: go-ledger
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["go-ledger-dev-app:9090"]

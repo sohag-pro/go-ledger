@@ -1,0 +1,25 @@
+---
+- name: Install certbot and the nginx plugin
+  ansible.builtin.apt:
+    name:
+      - certbot
+      - python3-certbot-nginx
+    state: present
+    update_cache: true
+
+- name: Obtain and install the certificate (idempotent; certbot no-ops if valid)
+  ansible.builtin.command:
+    cmd: >-
+      certbot --nginx -d {{ server_name }}
+      --non-interactive --agree-tos --redirect
+      --keep-until-expiring
+    creates: "/etc/letsencrypt/live/{{ server_name }}/fullchain.pem"
+
+- name: Re-assert the portfolio is healthy after the cert change
+  ansible.builtin.uri:
+    url: "{{ portfolio_url }}"
+    status_code: 200
+  register: tls_portfolio_check
+  retries: 3
+  delay: 2
+  until: tls_portfolio_check.status == 200

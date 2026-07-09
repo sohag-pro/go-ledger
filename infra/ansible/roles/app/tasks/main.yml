@@ -1,0 +1,43 @@
+---
+- name: Create the app system user (no home, no login)
+  ansible.builtin.user:
+    name: "{{ app_user }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Create the deploy user (key-only, receives CI deploys)
+  ansible.builtin.user:
+    name: "{{ deploy_user }}"
+    create_home: true
+    shell: /bin/bash
+
+- name: App directory owned by the deploy user
+  ansible.builtin.file:
+    path: "{{ app_dir }}"
+    state: directory
+    owner: "{{ deploy_user }}"
+    group: "{{ deploy_user }}"
+    mode: "0755"
+
+- name: Env config directory
+  ansible.builtin.file:
+    path: "{{ env_file | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Root-owned env file, readable by the app group
+  ansible.builtin.copy:
+    dest: "{{ env_file }}"
+    content: "PORT=8080\n"
+    owner: root
+    group: "{{ app_user }}"
+    mode: "0640"
+    force: false
+
+- name: Restricted sudoers so deploy can restart only the app
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/go-ledger-deploy
+    mode: "0440"
+    validate: "visudo -cf %s"

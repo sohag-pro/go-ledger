@@ -1,0 +1,21 @@
+# Copy to group_vars/all.yml (gitignored) and fill in real values, or supply the
+# secret ones via ansible-vault. No real secret is ever committed.
+---
+app_user: goledger
+deploy_user: deploy
+app_dir: /opt/go-ledger
+env_file: /etc/go-ledger/env
+app_binary: /opt/go-ledger/go-ledger
+
+pg_version: "16"
+pg_role: goledger
+pg_database: goledger
+# Provide via vault or the real all.yml, never here:
+pg_password: "REPLACE_ME"
+
+server_name: go.sohag.pro
+upstream_addr: "127.0.0.1:8080"
+# The shared portfolio host whose availability the nginx role must not break:
+portfolio_url: "https://sohag.pro/"
+
+default_tenant_id: "00000000-0000-0000-0000-000000000001"

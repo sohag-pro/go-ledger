@@ -1,0 +1,6 @@
+---
+- name: Reload nginx
+  # reload is graceful; restart would drop the portfolio's connections.
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded

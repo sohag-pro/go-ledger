@@ -1,0 +1,3 @@
+# Copy to `inventory` (gitignored) and fill in the real host.
+[ledger]
+ledger-vps ansible_host=REPLACE_WITH_VPS_IP ansible_user=root

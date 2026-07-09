@@ -12,6 +12,49 @@ services:
       - "4318:4318"   # OTLP/HTTP
       - "4317:4317"   # OTLP/gRPC (unused by default, exposed for convenience)
 
+  # --- Local dev stack (plain `docker compose up`) --------------------------
+  # app + postgres + jaeger + prometheus for local development and manual
+  # exploration. Distinct container names and no profile, so it never collides
+  # with the load-test profile (which you start explicitly and separately).
+  dev-postgres:
+    image: postgres:16
+    container_name: go-ledger-dev-postgres
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  dev-app:
+    build: .
+    container_name: go-ledger-dev-app
+    depends_on:
+      dev-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@dev-postgres:5432/ledger?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      METRICS_ADDR: "0.0.0.0:9090"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: go-ledger-prometheus
+    depends_on:
+      - dev-app
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+
   # load-test profile: a full, self-contained stack (postgres + app, jaeger
   # included) for k6/etc. load runs against a real server. Not started by a
   # plain `docker compose up`; bring it up with:
