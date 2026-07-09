@@ -19,7 +19,8 @@ the SQL round-trips, with every log line for that request carrying the same
 
 The build plan flags this as a heavy week with an OpenTelemetry-config rabbit
 hole risk, and says to time-box to eight hours and ship slog-correlation plus
-Prometheus RED if the remote export fights back. Several choices had no obvious
+Prometheus RED (the Rate, Errors, and Duration metrics for each endpoint) if the
+remote export fights back. Several choices had no obvious
 default, and one early instinct (route every metric through OpenTelemetry) turned
 out to be the wrong call for a service that already has metrics tied to alerting
 baselines.
@@ -172,8 +173,8 @@ CI pipeline builds from a checked-out commit, so the revision is populated.
   spans would exhaust the Honeycomb free tier on demo traffic; a parent-based ratio
   plus dropping health and metrics paths keeps the signal and the budget.
 - **`otelslog` log bridge**: deferred. It ships logs over OTLP, a signal this week
-  does not export. A wrapping handler gives the correlation the DoD asks for
-  without a new pipeline.
+  does not export. A wrapping handler gives the correlation the definition of done
+  asks for without a new pipeline.
 - **`otelchi` for route-named HTTP spans**: not adopted. A few lines of chi
   middleware over the already-present `otelhttp` set the route pattern without
   another dependency.
