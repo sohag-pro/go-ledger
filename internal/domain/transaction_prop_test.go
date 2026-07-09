@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -82,6 +83,71 @@ func TestProp_MultiCurrencyPerturbedAlwaysInvalid(t *testing.T) {
 		tx := Transaction{ID: "tx", Postings: postings}
 		if err := tx.Validate(); err == nil {
 			t.Fatalf("perturbed multi-currency transaction (currency %s off by %d) passed Validate, expected failure", cur, delta)
+		}
+	})
+}
+
+// genTwoCurrencyCancelingPerturbation builds a multi-currency transaction from
+// K (K in [2,5]) per-currency-balanced groups, exactly like
+// genMultiCurrencyTransaction, but then perturbs ONE posting in currency
+// curs[0] by +delta and ONE posting in a DIFFERENT currency curs[1] by
+// -delta. The two currencies are drawn without replacement from
+// currencyPool, so they are always distinct.
+//
+// This is the case a currency-blind implementation cannot get right: because
+// +delta and -delta are equal in raw minor units and opposite in sign, the
+// naive sum of every posting's raw amount, ignoring currency entirely, is
+// unchanged by the perturbation and stays exactly zero. A Validate that
+// dumped every posting into one global accumulator (instead of grouping by
+// currency) would therefore wrongly accept this transaction: real money
+// would have vanished from curs[0] and reappeared, unaccounted for, in
+// curs[1]. The real per-currency invariant must reject it, because curs[0]'s
+// own group now sums to +delta and curs[1]'s own group now sums to -delta,
+// each nonzero on its own.
+func genTwoCurrencyCancelingPerturbation(t *rapid.T) ([]Posting, Currency, Currency, int64) {
+	perm := rapid.Permutation(currencyPool).Draw(t, "currencyPerm")
+	k := rapid.IntRange(2, 5).Draw(t, "k")
+	curs := perm[:k]
+
+	delta := rapid.Int64Range(1, 1_000_000).Draw(t, "delta")
+
+	groups := make([][]Posting, k)
+	for i, cur := range curs {
+		groups[i] = genBalancedPostingsForCurrency(t, cur)
+	}
+
+	// Bump one leg of curs[0] by +delta and one leg of curs[1] by -delta:
+	// raw-unit canceling, but each currency's own group is now off.
+	idxA := rapid.IntRange(0, len(groups[0])-1).Draw(t, "idxA")
+	idxB := rapid.IntRange(0, len(groups[1])-1).Draw(t, "idxB")
+	bumpedA, _ := NewMoney(groups[0][idxA].Amount.Amount()+delta, curs[0])
+	groups[0][idxA].Amount = bumpedA
+	bumpedB, _ := NewMoney(groups[1][idxB].Amount.Amount()-delta, curs[1])
+	groups[1][idxB].Amount = bumpedB
+
+	var all []Posting
+	for _, g := range groups {
+		all = append(all, g...)
+	}
+	return rapid.Permutation(all).Draw(t, "shuffle"), curs[0], curs[1], delta
+}
+
+// Property: a transaction perturbed so that two DIFFERENT currencies are each
+// individually unbalanced, by equal and opposite raw-unit deltas, must always
+// be rejected with ErrUnbalanced. This is the case from the Task 10 review: a
+// currency-blind global-sum check (sum every posting's amount regardless of
+// currency; reject only if the grand total is nonzero) would see the two
+// deltas cancel and wrongly accept the transaction, even though real money
+// vanished from one currency and reappeared in another. Grouping by currency,
+// as the real Validate does, is what makes this case fail as it must.
+func TestProp_CrossCurrencyCancelingImbalanceAlwaysInvalid(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		postings, curA, curB, delta := genTwoCurrencyCancelingPerturbation(t)
+		tx := Transaction{ID: "tx", Postings: postings}
+		err := tx.Validate()
+		if !errors.Is(err, ErrUnbalanced) {
+			t.Fatalf("cross-currency canceling imbalance (currency %s off by +%d, currency %s off by -%d) "+
+				"gave err=%v, want ErrUnbalanced", curA, delta, curB, delta, err)
 		}
 	})
 }

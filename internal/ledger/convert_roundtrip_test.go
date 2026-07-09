@@ -70,13 +70,21 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 	finalUSD := back.FX.ConvertedAmount
 	mid2, spread2bps := back.FX.MidRateE8, back.FX.SpreadBps
 
-	// --- (a) the ledger lost exactly the two spreads plus the rounding residual ---
+	// --- (a) decompose the round trip's cost into named, individually checked pieces ---
 	//
 	// Recompute both legs with domain.Convert (the same pure function the
 	// service itself calls) at the ACTUAL rates the service resolved, but
 	// with the spread stripped to zero. That isolates what a pure mid-rate
 	// round trip would have cost (rounding only, no markup) from what each
-	// leg's own spread additionally cost.
+	// leg's own spread additionally cost. residual, spread1USD, and spread2USD
+	// are defined below by telescoping subtraction, so residual + spread1USD +
+	// spread2USD == totalLoss by construction: that arithmetic identity is not
+	// itself a finding, so it is not asserted. What is checked, and does prove
+	// something, is that each named piece is well-behaved on its own: both
+	// spreads are non-negative and the rounding-only residual stays within its
+	// expected one-unit-per-leg bound. Part (b) below is the real conservation
+	// proof: the total loss lands, to the minor unit, in the USD clearing
+	// account.
 	sourceMoney, err := domain.NewMoney(sourceAmount, base)
 	if err != nil {
 		t.Fatalf("NewMoney(source): %v", err)
@@ -120,10 +128,6 @@ func TestConvertRoundTrip_USDToEURToUSD_ReconcilesToClearing(t *testing.T) {
 	spread2USD := idealReturn2.Amount() - actualReturn.Amount()
 	totalLoss := sourceAmount - finalUSD
 
-	if got, want := residual+spread1USD+spread2USD, totalLoss; got != want {
-		t.Errorf("residual(%d) + spread1(%d) + spread2(%d) = %d, want totalLoss %d",
-			residual, spread1USD, spread2USD, got, want)
-	}
 	// domain.Convert never rounds in the customer's favor once a spread is
 	// applied (see its doc comment), so each leg's own spread cost must be
 	// non-negative.
