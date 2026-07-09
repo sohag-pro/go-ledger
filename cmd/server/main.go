@@ -118,6 +118,13 @@ func loadConfig() (config, error) {
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
 	}
+	// Fail fast on a malformed DEFAULT_CURRENCY (for example "usd", "US", or
+	// "DOLLARS") rather than booting successfully and only surfacing the
+	// problem later as per-request 422s plus a silently-repeating seeder log
+	// (seed.Seed also stamps this currency on every seeded account).
+	if err := domain.Currency(cfg.defaultCurrency).Validate(); err != nil {
+		return config{}, fmt.Errorf("DEFAULT_CURRENCY %q is invalid: %w", cfg.defaultCurrency, err)
+	}
 	return cfg, nil
 }
 

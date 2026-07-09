@@ -84,6 +84,49 @@ func TestMaxBodyBytes(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_ValidatesDefaultCurrency proves loadConfig fails fast on a
+// malformed DEFAULT_CURRENCY (ADR-014's "New-account default currency is
+// env-configured" only holds if the configured value is a well-formed code):
+// without this check, a typo like "usd", "US", or "DOLLARS" boots the server
+// successfully and only surfaces as per-request 422s plus a
+// silently-repeating seeder log, instead of a clear boot-time error next to
+// the existing DATABASE_URL check.
+func TestLoadConfig_ValidatesDefaultCurrency(t *testing.T) {
+	tests := []struct {
+		name            string
+		defaultCurrency string
+		wantErr         bool
+	}{
+		{name: "unset falls back to USD", defaultCurrency: "", wantErr: false},
+		{name: "valid three-letter uppercase code", defaultCurrency: "EUR", wantErr: false},
+		{name: "lowercase rejected", defaultCurrency: "usd", wantErr: true},
+		{name: "too short rejected", defaultCurrency: "US", wantErr: true},
+		{name: "not a code rejected", defaultCurrency: "DOLLARS", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			if tt.defaultCurrency == "" {
+				// t.Setenv cannot unset; loadConfig's getenv already treats an
+				// empty string as unset, so setting it to "" here has the same
+				// effect as the variable never being set.
+				t.Setenv("DEFAULT_CURRENCY", "")
+			} else {
+				t.Setenv("DEFAULT_CURRENCY", tt.defaultCurrency)
+			}
+
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Fatalf("loadConfig() with DEFAULT_CURRENCY=%q: got nil error, want an error", tt.defaultCurrency)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("loadConfig() with DEFAULT_CURRENCY=%q: got error %v, want nil", tt.defaultCurrency, err)
+			}
+		})
+	}
+}
+
 // fakeKeyStore is an in-memory api_keys store for the provisioning test. It
 // mirrors the two behaviours provisionAPIKeys depends on from the real
 // postgres repository: a second insert of the same key_hash fails with a
