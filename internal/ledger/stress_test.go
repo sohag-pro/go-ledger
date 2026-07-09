@@ -556,13 +556,13 @@ func TestUnbalancedRejectedByTrigger(t *testing.T) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed; harmless on error path
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO transactions (id, tenant_id, currency) VALUES ($1,$2,'USD')`,
+		`INSERT INTO transactions (id, tenant_id) VALUES ($1,$2)`,
 		txn, tenant); err != nil {
 		t.Fatalf("insert transaction: %v", err)
 	}
 	// A single non-zero posting: the transaction cannot possibly balance.
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4,$5)`,
+		`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, currency) VALUES ($1,$2,$3,$4,$5,'USD')`,
 		posting, tenant, txn, acct, int64(100)); err != nil {
 		t.Fatalf("insert posting: %v", err)
 	}

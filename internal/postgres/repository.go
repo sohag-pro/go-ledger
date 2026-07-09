@@ -145,7 +145,7 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
 	}
-	return accountFromRow(row)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency)
 }
 
 // ListAccounts returns up to limit of the tenant's accounts, ordered by name.
@@ -163,7 +163,7 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	}
 	out := make([]domain.Account, 0, len(rows))
 	for _, row := range rows {
-		acct, err := accountFromRow(row)
+		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
 		if err != nil {
 			return nil, err
 		}
@@ -353,13 +353,14 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 	if err != nil {
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	// A valid transaction has at least one posting in a single shared currency.
-	currency := string(t.Postings[0].Amount.Currency())
-
+	// currency now lives on each posting, not on the transaction (ADR-014): an
+	// FX transaction spans two currencies, so there is no single value to
+	// insert here. The fx_* snapshot columns are all nullable; the domain
+	// model has no FX conversion fields yet, so every insert today writes them
+	// as NULL (a plain, single-currency transaction has no snapshot to keep).
 	if err := tr.q.CreateTransaction(ctx, sqlc.CreateTransactionParams{
 		ID:       txID,
 		TenantID: tid,
-		Currency: currency,
 	}); err != nil {
 		if isUniqueViolation(err) {
 			return domain.ErrDuplicateTransaction
@@ -382,6 +383,7 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 			TransactionID: txID,
 			AccountID:     aid,
 			Amount:        p.Amount.Amount(),
+			Currency:      string(p.Amount.Currency()),
 			Description:   p.Description,
 		}); err != nil {
 			// The currency-integrity trigger rejects a posting into an account
@@ -528,10 +530,12 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: list postings: %w", err)
 	}
-	currency := domain.Currency(row.Currency)
 	out := domain.Transaction{ID: row.ID.String(), Postings: make([]domain.Posting, 0, len(postings))}
 	for _, p := range postings {
-		money, err := domain.NewMoney(p.Amount, currency)
+		// Each posting carries its own currency (ADR-014): an FX transaction has
+		// two currencies in play, so Money is rebuilt per row, never from one
+		// transaction-wide currency.
+		money, err := domain.NewMoney(p.Amount, domain.Currency(p.Currency))
 		if err != nil {
 			return domain.Transaction{}, fmt.Errorf("postgres: build posting money: %w", err)
 		}
@@ -804,15 +808,22 @@ func ptrToInt4(p *int) pgtype.Int4 {
 	return pgtype.Int4{Int32: int32(*p), Valid: true} //nolint:gosec // rate limits are small, application-set values
 }
 
-func accountFromRow(row sqlc.Account) (domain.Account, error) {
-	at, err := domain.ParseAccountType(row.Type)
+// accountFromRow builds a domain.Account from the scalar fields common to every
+// account-shaped row sqlc generates (GetAccountRow, ListAccountsRow, ...). Taking
+// individual fields rather than one sqlc row type is deliberate: sqlc gives each
+// query its own row struct whenever its column list doesn't exactly match every
+// column of the accounts table (which stopped being true once the schema grew
+// columns like is_system that not every query selects), so a single shared
+// struct type would not compile across call sites.
+func accountFromRow(id uuid.UUID, name, accountType, currency string) (domain.Account, error) {
+	at, err := domain.ParseAccountType(accountType)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
 	}
 	return domain.Account{
-		ID:       row.ID.String(),
-		Name:     row.Name,
+		ID:       id.String(),
+		Name:     name,
 		Type:     at,
-		Currency: domain.Currency(row.Currency),
+		Currency: domain.Currency(currency),
 	}, nil
 }

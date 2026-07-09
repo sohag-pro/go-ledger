@@ -20,7 +20,7 @@ func TestAuditLogIsImmutable(t *testing.T) {
 	// Minimal valid rows to satisfy the FKs. Insert postings-free: the balance
 	// trigger is deferred and fires on postings, not on a bare transaction row.
 	mustExec(t, pool, `INSERT INTO accounts (id, tenant_id, name, type, currency) VALUES ($1,$2,'A','asset','USD')`, acct, tenant)
-	mustExec(t, pool, `INSERT INTO transactions (id, tenant_id, currency) VALUES ($1,$2,'USD')`, txn, tenant)
+	mustExec(t, pool, `INSERT INTO transactions (id, tenant_id) VALUES ($1,$2)`, txn, tenant)
 	// actor gets its own placeholder ($4) rather than reusing $2: Postgres cannot
 	// deduce a single type for $2 when it is bound as uuid (tenant_id) and cast to
 	// text (actor) in the same statement.

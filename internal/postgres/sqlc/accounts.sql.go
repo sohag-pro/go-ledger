@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -46,15 +47,89 @@ type GetAccountParams struct {
 	ID       uuid.UUID
 }
 
-func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (Account, error) {
+type GetAccountRow struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	Name      string
+	Type      string
+	Currency  string
+	CreatedAt time.Time
+}
+
+func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error) {
 	row := q.db.QueryRow(ctx, getAccount, arg.TenantID, arg.ID)
-	var i Account
+	var i GetAccountRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
 		&i.Name,
 		&i.Type,
 		&i.Currency,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getOrCreateClearingAccount = `-- name: GetOrCreateClearingAccount :one
+WITH ins AS (
+    INSERT INTO accounts (id, tenant_id, name, type, currency, is_system)
+    VALUES ($1, $2, $3, $4, $5, true)
+    ON CONFLICT (tenant_id, name) WHERE is_system DO NOTHING
+    RETURNING id, tenant_id, name, type, currency, is_system, created_at
+)
+SELECT id, tenant_id, name, type, currency, is_system, created_at FROM ins
+UNION ALL
+SELECT id, tenant_id, name, type, currency, is_system, created_at
+FROM accounts
+WHERE tenant_id = $2 AND name = $3 AND is_system
+  AND NOT EXISTS (SELECT 1 FROM ins)
+LIMIT 1
+`
+
+type GetOrCreateClearingAccountParams struct {
+	ID       uuid.UUID
+	TenantID uuid.UUID
+	Name     string
+	Type     string
+	Currency string
+}
+
+type GetOrCreateClearingAccountRow struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	Name      string
+	Type      string
+	Currency  string
+	IsSystem  bool
+	CreatedAt time.Time
+}
+
+// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
+// created lazily on first use. Keyed by (tenant_id, name): name is the
+// reserved, deterministic "fx.clearing.<CURRENCY>" string the caller builds,
+// so a second call for the same tenant and currency always resolves to the
+// same row instead of creating a duplicate. The ON CONFLICT arbiter is the
+// partial unique index accounts_system_name_uniq (migration 0010), which only
+// covers is_system rows, so this can never collide with an ordinary
+// user-named account. ins does nothing on conflict (no RETURNING row); the
+// second branch then fetches the row that already existed, guarded by
+// NOT EXISTS so it only runs when ins produced nothing.
+func (q *Queries) GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error) {
+	row := q.db.QueryRow(ctx, getOrCreateClearingAccount,
+		arg.ID,
+		arg.TenantID,
+		arg.Name,
+		arg.Type,
+		arg.Currency,
+	)
+	var i GetOrCreateClearingAccountRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Type,
+		&i.Currency,
+		&i.IsSystem,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -73,15 +148,24 @@ type ListAccountsParams struct {
 	Limit    int32
 }
 
-func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]Account, error) {
+type ListAccountsRow struct {
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	Name      string
+	Type      string
+	Currency  string
+	CreatedAt time.Time
+}
+
+func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error) {
 	rows, err := q.db.Query(ctx, listAccounts, arg.TenantID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Account
+	var items []ListAccountsRow
 	for rows.Next() {
-		var i Account
+		var i ListAccountsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
