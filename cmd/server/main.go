@@ -57,9 +57,37 @@ const defaultTenantID = "00000000-0000-0000-0000-000000000001"
 // operator can always tell which build is actually serving.
 var buildRevision = "dev"
 
+// migrateTimeout bounds how long the `migrate` subcommand's database
+// connection and goose run may take (Task 5.6b, audit A4.3), so a hung
+// migration fails the deploy pipeline's pre-swap step instead of hanging the
+// CI job indefinitely.
+const migrateTimeout = 2 * time.Minute
+
+// errDatabaseURLRequired is returned by runMigrateCommand when DATABASE_URL
+// is unset, distinct from run()'s own loadConfig check so `migrate` fails
+// with the same clear message whether or not the server's other env vars
+// are present.
+var errDatabaseURLRequired = errors.New("DATABASE_URL is required")
+
 func main() {
 	logger := slog.New(observability.NewTraceHandler(slog.NewJSONHandler(os.Stdout, nil)))
 	slog.SetDefault(logger)
+
+	// `migrate` is a distinct entry point, not a server flag: the deploy
+	// pipeline invokes `./go-ledger.new migrate` over SSH against the box's
+	// DATABASE_URL BEFORE swapping the new binary into place (Task 5.6b,
+	// audit A4.3), so a schema change lands ahead of the code that needs it
+	// and a failed migration aborts the deploy without ever swapping (see
+	// .github/workflows/deploy.yml and runMigrateCommand's own doc comment).
+	// Every other invocation, including no args at all, falls through to the
+	// normal server path unchanged.
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := runMigrateCommand(os.Args[2:], logger); err != nil {
+			logger.Error("migrate failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(logger); err != nil {
 		logger.Error("server exited with error", "error", err)
@@ -327,9 +355,16 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
-	// Apply migrations before serving. On a single instance this is the simplest
-	// correct option: the binary that needs a column also creates it.
-	if err := runMigrations(cfg.databaseURL, logger); err != nil {
+	// Apply migrations before serving. On a single instance this is the
+	// simplest correct option: the binary that needs a column also creates
+	// it. The deploy pipeline (Task 5.6b, audit A4.3) additionally runs
+	// `./go-ledger migrate` against production BEFORE swapping the new
+	// binary in, so a migration failure aborts the deploy before any new
+	// code runs at all; this on-boot call stays as a second, idempotent
+	// safety net (goose Up on an already-current database is a no-op) for
+	// local dev, docker-compose, and any environment that starts the server
+	// directly without a separate migrate step.
+	if err := runMigrations(ctx, cfg.databaseURL); err != nil {
 		return err
 	}
 
@@ -583,11 +618,16 @@ func run(logger *slog.Logger) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
-// runMigrations applies the embedded goose migrations. goose uses database/sql,
-// so it opens a short-lived handle over the pgx stdlib driver, separate from the
-// app's pgx pool.
-func runMigrations(dsn string, logger *slog.Logger) error {
-	db, err := sql.Open("pgx", dsn)
+// runMigrations applies every pending embedded goose migration to
+// databaseURL, up to the latest version. It is the testable core shared by
+// the on-boot call in run() and the `migrate` subcommand's deploy-pipeline
+// path (runMigrateCommand): goose uses database/sql, so it opens a
+// short-lived handle over the pgx stdlib driver, separate from the app's pgx
+// pool. Re-running it against an already-migrated database is a no-op (goose
+// Up only applies versions not yet recorded as run), so both callers can
+// invoke it without coordinating with each other.
+func runMigrations(ctx context.Context, databaseURL string) error {
+	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return fmt.Errorf("open db for migrations: %w", err)
 	}
@@ -597,11 +637,74 @@ func runMigrations(dsn string, logger *slog.Logger) error {
 	if err := goose.SetDialect("postgres"); err != nil {
 		return fmt.Errorf("set goose dialect: %w", err)
 	}
-	if err := goose.Up(db, "migrations"); err != nil {
+	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
-	logger.Info("migrations applied")
 	return nil
+}
+
+// migrationStatus reports the database's current goose schema version
+// (0 for a database with no migrations applied yet), backing `migrate
+// status`. It never changes the database.
+func migrationStatus(ctx context.Context, databaseURL string) (int64, error) {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return 0, fmt.Errorf("open db for migration status: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	goose.SetBaseFS(postgres.Migrations)
+	if err := goose.SetDialect("postgres"); err != nil {
+		return 0, fmt.Errorf("set goose dialect: %w", err)
+	}
+	version, err := goose.GetDBVersionContext(ctx, db)
+	if err != nil {
+		return 0, fmt.Errorf("get db version: %w", err)
+	}
+	return version, nil
+}
+
+// runMigrateCommand implements the `migrate` subcommand (Task 5.6b, audit
+// A4.3). `migrate` with no further argument (or `migrate up`) applies every
+// pending migration and exits 0, or non-zero with a clear error if
+// DATABASE_URL is unset or unreachable, or a migration fails. `migrate
+// status` reports the current schema version without changing anything,
+// useful to sanity-check a box by hand. This is the exact step the deploy
+// pipeline runs over SSH against the new binary, BEFORE swapping it into
+// place: see .github/workflows/deploy.yml's "Migrate (pre-swap)" step, and
+// docs/ops/server-setup.md for the full migrate-then-swap-then-health-check
+// flow and its rollback.
+func runMigrateCommand(args []string, logger *slog.Logger) error {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return errDatabaseURLRequired
+	}
+
+	sub := "up"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), migrateTimeout)
+	defer cancel()
+
+	switch sub {
+	case "up":
+		if err := runMigrations(ctx, databaseURL); err != nil {
+			return err
+		}
+		logger.Info("migrations applied")
+		return nil
+	case "status":
+		version, err := migrationStatus(ctx, databaseURL)
+		if err != nil {
+			return err
+		}
+		logger.Info("migration status", "version", version)
+		return nil
+	default:
+		return fmt.Errorf("unknown migrate subcommand %q (want %q or %q)", sub, "up", "status")
+	}
 }
 
 // apiKeyStore is the slice of the repository provisionAPIKeys needs: create a

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-swap migration wrapper (Task 5.6b, audit A4.3).
+#
+# The deploy pipeline (.github/workflows/deploy.yml) runs this, over a
+# narrowly scoped sudoers NOPASSWD rule, against the freshly uploaded
+# go-ledger.new BEFORE it is swapped into place: it loads the same env file
+# the go-ledger systemd unit uses (so DATABASE_URL matches production), then
+# execs the new binary's own `migrate` subcommand. A migration failure here
+# exits non-zero, which aborts the deploy job before the swap-and-restart
+# step ever runs, so a bad migration never leaves new code running against
+# an unmigrated database or vice versa.
+#
+# Deliberately installed root-owned outside {{ app_dir }}: {{ app_dir }} is
+# owned by {{ deploy_user }} so CI can upload binaries there, and a wrapper
+# script the deploy user could overwrite would turn this sudoers rule into
+# an unrestricted root-escalation path (replace the script, sudo runs
+# whatever it says) instead of the narrow one it is meant to be.
+set -eu
+set -a
+. {{ env_file }}
+set +a
+exec {{ app_dir }}/go-ledger.new migrate "$@"

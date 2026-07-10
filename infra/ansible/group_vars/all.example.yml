@@ -30,3 +30,12 @@ upstream_addr: "127.0.0.1:8080"
 portfolio_url: "https://sohag.pro/"
 
 default_tenant_id: "00000000-0000-0000-0000-000000000001"
+
+# Off-box journald log shipping via systemd-journal-upload (Task 5.6b, audit
+# A6.3). Supply the real sink via vault or the real all.yml, never here; the
+# receiving endpoint must itself speak the journal-upload/journal-remote wire
+# protocol (see infra/ansible/roles/logship for why that forwarder was
+# chosen and what it costs).
+logship_sink_url: "REPLACE_ME" # e.g. https://journal-remote.example.net:19532/upload
+logship_trusted_cert_file: "" # path to a CA cert on the box, only if the sink uses a private CA; blank uses the system trust store
+journald_system_max_use: "200M" # local retention cap, applied regardless of whether logship_sink_url is provisioned

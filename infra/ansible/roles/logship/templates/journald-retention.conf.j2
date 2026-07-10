@@ -1,0 +1,6 @@
+# Managed by Ansible (infra/ansible/roles/logship). Bounds local journald
+# disk use regardless of whether off-box shipping is configured, so the
+# journal alone can never fill this box's small disk (see
+# docs/ops/server-setup.md, "Disk and memory").
+[Journal]
+SystemMaxUse={{ journald_system_max_use }}

@@ -155,7 +155,14 @@ jobs:
           go-version-file: go.mod
 
       - name: Build linux/amd64 binary
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o go-ledger ./cmd/server
+        # -X main.buildRevision stamps the short commit SHA into the binary
+        # (Task 5.6a, audit A6.1) so /healthz and the build_info metric report
+        # exactly which build is serving in production (Task 5.6b makes the
+        # deployed binary actually carry it, not just the field existing).
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X main.buildRevision=${GITHUB_SHA::7}" \
+            -o go-ledger ./cmd/server
 
       - name: Set up SSH
         run: |
@@ -167,18 +174,65 @@ jobs:
       - name: Upload binary
         run: scp -i ~/.ssh/deploy_key go-ledger "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/go-ledger/go-ledger.new"
 
+      - name: Migrate (pre-swap)
+        # Applies every pending goose migration against production BEFORE the
+        # new binary is swapped in (Task 5.6b, audit A4.3, ADR-017 "Migrations
+        # run in CI before deploy"): schema changes land ahead of the code
+        # that needs them, and a failed migration fails this step, which
+        # stops the job here, so the swap-and-restart step below never runs
+        # and the currently running (old) binary is left untouched. The
+        # go-ledger-migrate wrapper (infra/ansible/roles/app) loads the box's
+        # own /etc/go-ledger/env and execs go-ledger.new migrate; it is
+        # root-owned and reachable only through the narrowly scoped sudoers
+        # rule installed by that role, not by ssh'ing in and running an
+        # arbitrary command as root.
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
+            set -euo pipefail
+            chmod 755 /opt/go-ledger/go-ledger.new
+            sudo /usr/local/sbin/go-ledger-migrate
+          '
+
       - name: Swap binary and restart service
         run: |
           ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
             set -euo pipefail
             cd /opt/go-ledger
-            chmod 755 go-ledger.new
             if [ -f go-ledger ]; then mv go-ledger go-ledger.prev; fi
             mv go-ledger.new go-ledger
             sudo systemctl restart go-ledger
           '
 
-      - name: Health check
+      - name: Health check (rollback on failure)
+        # A bad binary self-heals to the last-known-good one (Task 5.6b,
+        # audit A6.2): if the post-restart health check fails, ssh back in,
+        # restore go-ledger.prev over go-ledger, restart, and re-check health,
+        # then fail the pipeline loudly either way. A rollback does NOT
+        # un-apply the migration that just ran; see docs/ops/server-setup.md
+        # for why migrations must stay backward-compatible with the previous
+        # binary for one release.
         run: |
           sleep 3
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz
+          if curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz; then
+            exit 0
+          fi
+
+          echo "::error::health check failed after deploy; rolling back to the previous binary"
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
+            set -euo pipefail
+            cd /opt/go-ledger
+            if [ ! -f go-ledger.prev ]; then
+              echo "no go-ledger.prev on the box to roll back to" >&2
+              exit 1
+            fi
+            cp go-ledger.prev go-ledger
+            sudo systemctl restart go-ledger
+          '
+
+          sleep 3
+          if curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz; then
+            echo "::error::rolled back to the previous binary after a failed health check; the new build did NOT go live, investigate before retrying the deploy"
+          else
+            echo "::error::rollback restart also failed its health check; the app may be down, investigate immediately"
+          fi
+          exit 1
