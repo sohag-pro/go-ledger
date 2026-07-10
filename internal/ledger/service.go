@@ -188,6 +188,16 @@ func (s *TransactionService) replay(ctx context.Context, tenantID, key string, t
 // detail actually applied: the mid rate, spread, applied rate, source, and
 // effective time, so the audit row is a full, self-contained record of what
 // happened without needing to join back to the transaction row.
+//
+// When t is itself a reversal (t.ReversesTransactionID is set), the snapshot
+// also carries reverses_transaction_id: the id of the original transaction it
+// reverses. Without it, the reversal's audit row names only itself, so an
+// auditor reading the tamper-evident chain in isolation cannot tell what got
+// reversed without joining back to the transactions table, defeating the
+// point of a self-contained snapshot. The field is omitted entirely for
+// ordinary (non-reversal) transactions, so this stays byte-identical to the
+// pre-existing snapshot for the create path and every previously written
+// audit row's hash is unaffected.
 func auditSnapshot(t *domain.Transaction) map[string]any {
 	postings := make([]map[string]any, 0, len(t.Postings))
 	for _, p := range t.Postings {
@@ -201,6 +211,9 @@ func auditSnapshot(t *domain.Transaction) map[string]any {
 	snapshot := map[string]any{
 		"id":       t.ID,
 		"postings": postings,
+	}
+	if t.ReversesTransactionID != nil {
+		snapshot["reverses_transaction_id"] = *t.ReversesTransactionID
 	}
 	if t.FX != nil {
 		snapshot["fx"] = map[string]any{

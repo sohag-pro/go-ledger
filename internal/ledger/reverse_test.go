@@ -383,13 +383,22 @@ func TestReverseTransaction_AuditChainIncludesReversal(t *testing.T) {
 		t.Error("row hash is empty after the chainer ran, want a computed hash")
 	}
 	var snapshot struct {
-		ID string `json:"id"`
+		ID                    string `json:"id"`
+		ReversesTransactionID string `json:"reverses_transaction_id"`
 	}
 	if err := json.Unmarshal(entry.After, &snapshot); err != nil {
 		t.Fatalf("unmarshal audit snapshot: %v", err)
 	}
 	if snapshot.ID != reversal.ID {
 		t.Errorf("audit snapshot id = %q, want the reversal's own id %q", snapshot.ID, reversal.ID)
+	}
+	// The reversal's audit snapshot must be self-contained: it names the
+	// original transaction it reverses, so an auditor reading this row alone
+	// (without joining back to the transactions table) can tell what was
+	// undone.
+	if snapshot.ReversesTransactionID != original.ID {
+		t.Errorf("audit snapshot reverses_transaction_id = %q, want the original transaction's id %q",
+			snapshot.ReversesTransactionID, original.ID)
 	}
 
 	// Verify still walks clean end to end with the reversal's audit row in
