@@ -25,14 +25,25 @@
 -- The chainer later copies occurred_at, unmodified, into audit_log.created_at
 -- (see the chainer's doc comment for why that reproduces today's row_hash
 -- bit for bit).
+--
+-- before/after are json, not jsonb, for exactly the reason migration 0009
+-- converted audit_log's own before/after from jsonb to json: the chainer
+-- hashes before/after's exact bytes as read back from this table, and jsonb
+-- does not guarantee a byte-exact round trip (its output routine reformats
+-- the stored value, for example inserting a space after ':' and ','), so a
+-- value inserted as '{"id":"x"}' would read back as '{"id": "x"}', a
+-- different byte sequence, breaking the hash the moment it passed through
+-- this table. json has no such reformatting: it stores and returns the
+-- exact input text, so the bytes the chainer reads are the exact bytes the
+-- post wrote, unchanged.
 CREATE TABLE audit_outbox (
     id             bigserial   PRIMARY KEY,
     tenant_id      uuid        NOT NULL,
     action         text        NOT NULL,
     transaction_id uuid        NOT NULL REFERENCES transactions(id),
     actor          text        NOT NULL,
-    before         jsonb,
-    after          jsonb       NOT NULL,
+    before         json,
+    after          json        NOT NULL,
     occurred_at    timestamptz NOT NULL DEFAULT now(),
     -- The inserting transaction's id, cast from xid8 (pg_current_xact_id's
     -- return type, PostgreSQL 13+) through text to bigint: there is no direct
