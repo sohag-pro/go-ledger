@@ -37,10 +37,20 @@ SELECT tenant_id, idempotency_key, fingerprint, fingerprint_scheme, transaction_
 FROM idempotency_keys
 WHERE tenant_id = $1 AND idempotency_key = $2 AND expires_at > now();
 
--- name: SweepExpiredIdempotencyKeys :execrows
--- Deletes every idempotency key whose replay window has passed, across all
--- tenants (Task 4.5, audit A1.4): this is what keeps the table from growing
--- forever. Not tenant-scoped and not run inside RunInTx: it is a plain
--- maintenance statement a background goroutine calls on an interval (see
--- cmd/server's idempotency sweeper), not part of any request's unit of work.
-DELETE FROM idempotency_keys WHERE expires_at < now();
+-- name: SweepExpiredIdempotencyKeysBatch :execrows
+-- Deletes up to batch_size idempotency keys whose replay window has passed,
+-- across all tenants (Task 4.5, audit A1.4; batched per the follow-up
+-- review: a plain "DELETE ... WHERE expires_at < now()" has no bound, so a
+-- large backlog could delete an unbounded number of rows in one statement
+-- and contend with live posts). The ctid subquery caps each statement's own
+-- row scan/lock footprint to batch_size rows instead of the whole table.
+-- Not tenant-scoped and not run inside RunInTx: it is a plain maintenance
+-- statement. The Go caller (postgres.Repository.SweepExpiredIdempotencyKeys)
+-- loops this query in batches until a call deletes 0 rows (or a max
+-- iteration guard trips), summing the deleted count for the sweep log line.
+DELETE FROM idempotency_keys
+WHERE ctid IN (
+    SELECT ctid FROM idempotency_keys
+    WHERE expires_at < now()
+    LIMIT sqlc.arg(batch_size)::int
+);

@@ -212,14 +212,17 @@ type Repository interface {
 
 	// SweepExpiredIdempotencyKeys deletes every idempotency_keys row whose
 	// expires_at has passed, across every tenant, and returns how many rows
-	// it deleted (Task 4.5, audit A1.4). It is not scoped to one tenant and
-	// is never called from inside RunInTx: it is a plain maintenance
-	// statement a background goroutine calls on an interval (see
+	// it deleted in total (Task 4.5, audit A1.4). It is not scoped to one
+	// tenant and is never called from inside RunInTx: it is a plain
+	// maintenance statement a background goroutine calls on an interval (see
 	// cmd/server's idempotency sweeper), independent of any request's unit
 	// of work. GetIdempotencyKey already treats an expired row as absent, so
 	// this sweep is purely about reclaiming space, not correctness: a
 	// deployment that never ran it would behave identically from a caller's
-	// point of view, just with an ever-growing table.
+	// point of view, just with an ever-growing table. The implementation
+	// deletes in bounded batches rather than one unbounded statement, so a
+	// large backlog cannot lock and remove an arbitrarily large number of
+	// rows in a single delete that contends with live posts.
 	SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error)
 
 	// GetAPIKeyByHash resolves an unrevoked api_keys row by the SHA-256 hex hash

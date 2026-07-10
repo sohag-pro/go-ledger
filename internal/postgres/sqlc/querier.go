@@ -225,12 +225,17 @@ type Querier interface {
 	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
 	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)
 	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
-	// Deletes every idempotency key whose replay window has passed, across all
-	// tenants (Task 4.5, audit A1.4): this is what keeps the table from growing
-	// forever. Not tenant-scoped and not run inside RunInTx: it is a plain
-	// maintenance statement a background goroutine calls on an interval (see
-	// cmd/server's idempotency sweeper), not part of any request's unit of work.
-	SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error)
+	// Deletes up to batch_size idempotency keys whose replay window has passed,
+	// across all tenants (Task 4.5, audit A1.4; batched per the follow-up
+	// review: a plain "DELETE ... WHERE expires_at < now()" has no bound, so a
+	// large backlog could delete an unbounded number of rows in one statement
+	// and contend with live posts). The ctid subquery caps each statement's own
+	// row scan/lock footprint to batch_size rows instead of the whole table.
+	// Not tenant-scoped and not run inside RunInTx: it is a plain maintenance
+	// statement. The Go caller (postgres.Repository.SweepExpiredIdempotencyKeys)
+	// loops this query in batches until a call deletes 0 rows (or a max
+	// iteration guard trips), summing the deleted count for the sweep log line.
+	SweepExpiredIdempotencyKeysBatch(ctx context.Context, batchSize int32) (int64, error)
 	// Task 2.4b (audit A3.4): each currency's already-posted debit total for
 	// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
 	// up with the same clock that stamped created_at on every posting). Read

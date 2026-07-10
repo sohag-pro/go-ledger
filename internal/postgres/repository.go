@@ -803,17 +803,54 @@ func (r *Repository) CountPendingOutbox(ctx context.Context, tenantID string) (i
 	return int(n), nil
 }
 
+// sweepBatchSize bounds each delete statement the idempotency sweep issues
+// (see SweepExpiredIdempotencyKeys) so a large backlog of expired keys is
+// reclaimed in bounded chunks instead of one unbounded DELETE contending
+// with live posts. A constant rather than an env knob: there is no
+// deployment-shaped reason to tune it, just a sane default.
+const sweepBatchSize = 1000
+
+// sweepMaxIterations bounds how many batches a single
+// SweepExpiredIdempotencyKeys call will issue, so a pathological backlog (or
+// a backlog that keeps growing as fast as it drains) can never turn one
+// sweep tick into an unbounded loop; the remainder is picked up on the next
+// scheduled tick.
+const sweepMaxIterations = 1000
+
 // SweepExpiredIdempotencyKeys deletes every idempotency_keys row whose
 // expires_at has passed, across every tenant, and returns how many rows it
-// deleted (Task 4.5, audit A1.4). It runs directly against the pool, not
-// inside RunInTx: it is a plain maintenance statement, never part of a
-// request's unit of work.
+// deleted in total (Task 4.5, audit A1.4). It runs directly against the
+// pool, not inside RunInTx: it is a plain maintenance statement, never part
+// of a request's unit of work.
+//
+// It deletes in bounded batches of sweepBatchSize rows (a single unbounded
+// DELETE could lock and remove an arbitrarily large number of rows in one
+// statement, contending with live posts under a large backlog) rather than
+// one statement for the whole table. It loops the batched delete until a
+// batch reports 0 rows deleted, up to sweepMaxIterations batches as a safety
+// valve, respecting context cancellation between batches. It is best-effort
+// maintenance: an error from any batch is returned (and logged by the
+// caller) without panicking, and rows already deleted by prior batches in
+// this call stay deleted.
 func (r *Repository) SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error) {
-	n, err := r.q.SweepExpiredIdempotencyKeys(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("postgres: sweep expired idempotency keys: %w", err)
+	var total int64
+	for range sweepMaxIterations {
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("postgres: sweep expired idempotency keys: %w", err)
+		}
+		n, err := r.q.SweepExpiredIdempotencyKeysBatch(ctx, sweepBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("postgres: sweep expired idempotency keys: %w", err)
+		}
+		total += n
+		if n < sweepBatchSize {
+			// Fewer rows than the batch size means this batch drained
+			// everything currently expired; no need to issue another
+			// statement that would just find 0 rows.
+			break
+		}
 	}
-	return n, nil
+	return total, nil
 }
 
 // Balance returns the derived balance of an account in the account's currency.
