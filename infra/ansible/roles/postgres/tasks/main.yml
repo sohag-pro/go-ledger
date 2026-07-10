@@ -93,22 +93,37 @@
     group: postgres
     mode: "0640"
 
-- name: Enable WAL archiving to pgbackrest
+- name: Note whether the offsite pgbackrest repository is provisioned
+  ansible.builtin.set_fact:
+    postgres_pgbackrest_configured: "{{ pgbackrest_s3_endpoint != 'REPLACE_ME' }}"
+
+- name: Set replication GUCs needed for WAL archiving (safe to set regardless)
   ansible.builtin.lineinfile:
     path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
     regexp: "^#?{{ item.key }}"
     line: "{{ item.key }} = {{ item.value }}"
   loop:
     - { key: "wal_level", value: "replica" }
-    - { key: "archive_mode", value: "on" }
-    - { key: "archive_command", value: "'pgbackrest --stanza={{ pgbackrest_stanza }} archive-push %p'" }
-    - { key: "archive_timeout", value: "60" }
     - { key: "max_wal_senders", value: "3" }
   notify: Restart postgresql
 
-- name: Note whether the offsite pgbackrest repository is provisioned
-  ansible.builtin.set_fact:
-    postgres_pgbackrest_configured: "{{ pgbackrest_s3_endpoint != 'REPLACE_ME' }}"
+# archive_mode/archive_command/archive_timeout are gated behind
+# postgres_pgbackrest_configured: turning archiving on with a failing
+# archive_command (host still REPLACE_ME) makes Postgres retry archiving
+# forever and retain unarchived WAL, which can fill the 1GB shared VPS disk
+# (it also hosts the portfolio site). Until the offsite repo is provisioned,
+# leave archive_mode at its safe "off" default.
+- name: Enable WAL archiving to pgbackrest
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+    regexp: "^#?{{ item.key }}"
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - { key: "archive_mode", value: "on" }
+    - { key: "archive_command", value: "'pgbackrest --stanza={{ pgbackrest_stanza }} archive-push %p'" }
+    - { key: "archive_timeout", value: "60" }
+  when: postgres_pgbackrest_configured
+  notify: Restart postgresql
 
 - name: Skip stanza creation until the offsite repository is provisioned
   ansible.builtin.debug:
@@ -120,6 +135,18 @@
   when: not postgres_pgbackrest_configured
 
 - name: Create the pgbackrest stanza (safe to re-run, already-exists is not an error)
+  # NOTE: the guard below treats any occurrence of the substring "already
+  # exists" in stdout/stderr as a benign no-op. That is deliberately loose:
+  # we don't have a confirmed, version-stable pgbackrest wording to
+  # distinguish "stanza already exists and matches" from "stanza already
+  # exists but the pg1-path (or other option) does not match", and pgbackrest
+  # error text has changed across versions. If a genuine mismatch error
+  # happens to also contain the words "already exists" (plausible, since
+  # that class of error is usually phrased as "stanza already exists ... but
+  # does not match"), this guard would currently swallow it as success.
+  # TODO: validate against a live pgbackrest binary (the target version
+  # pinned by the postgres role) before relying on this in production, and
+  # tighten the match to the exact success-only wording once confirmed.
   ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} stanza-create
   become: true
   become_user: postgres
