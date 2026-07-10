@@ -30,12 +30,17 @@ func seedConvertRate(t *testing.T, pool *pgxpool.Pool, quote domain.Currency, mi
 	t.Helper()
 	q := sqlc.New(pool)
 	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
-		Base:        "USD",
-		Quote:       string(quote),
-		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
-		Source:      "test",
-		EffectiveAt: time.Now().UTC(),
+		Base:      "USD",
+		Quote:     string(quote),
+		MidRateE8: midE8,
+		SpreadBps: spreadBps,
+		Source:    "test",
+		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
+		// "effective_at <= now()" gate runs on the database SERVER's clock, so
+		// a timestamp from this test process landing even slightly ahead of
+		// it would make the row transiently invisible right after insert
+		// (Task 2.4's clock-skew fix; see internal/fx/provider_test.go).
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
 	}); err != nil {
 		t.Fatalf("seed fx rate USD/%s: %v", quote, err)
 	}
@@ -54,13 +59,15 @@ func seedTenantConvertRate(t *testing.T, pool *pgxpool.Pool, tenantID string, ba
 	}
 	q := sqlc.New(pool)
 	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
-		TenantID:    pgtype.UUID{Bytes: tid, Valid: true},
-		Base:        string(base),
-		Quote:       string(quote),
-		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
-		Source:      "test-tenant",
-		EffectiveAt: time.Now().UTC(),
+		TenantID:  pgtype.UUID{Bytes: tid, Valid: true},
+		Base:      string(base),
+		Quote:     string(quote),
+		MidRateE8: midE8,
+		SpreadBps: spreadBps,
+		Source:    "test-tenant",
+		// Same past safety margin as seedConvertRate above, and for the same
+		// clock-skew reason (Task 2.4 remediation).
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
 	}); err != nil {
 		t.Fatalf("seed tenant fx rate %s/%s for tenant %s: %v", base, quote, tenantID, err)
 	}

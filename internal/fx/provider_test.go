@@ -114,7 +114,7 @@ func insertRate(t *testing.T, q *sqlc.Queries, base, quote string, midE8 int64, 
 		MidRateE8:   midE8,
 		SpreadBps:   spreadBps,
 		Source:      "test",
-		EffectiveAt: effectiveAt,
+		EffectiveAt: pgtype.Timestamptz{Time: effectiveAt, Valid: true},
 	}); err != nil {
 		t.Fatalf("insert fx rate %s/%s: %v", base, quote, err)
 	}
@@ -136,7 +136,7 @@ func insertTenantRate(t *testing.T, q *sqlc.Queries, tenantID, base, quote strin
 		MidRateE8:   midE8,
 		SpreadBps:   spreadBps,
 		Source:      "test",
-		EffectiveAt: effectiveAt,
+		EffectiveAt: pgtype.Timestamptz{Time: effectiveAt, Valid: true},
 	}); err != nil {
 		t.Fatalf("insert tenant fx rate %s/%s for tenant %s: %v", base, quote, tenantID, err)
 	}
@@ -162,7 +162,7 @@ func TestRate_Direct(t *testing.T) {
 	ctx := context.Background()
 	q := sqlc.New(pool)
 
-	insertRate(t, q, "GBP", "CHF", 115_000_000, 30, time.Now().UTC())
+	insertRate(t, q, "GBP", "CHF", 115_000_000, 30, time.Now().UTC().Add(-2*time.Second))
 
 	// Rate() requires a tenant id even though this pair has no tenant-specific
 	// row: any well-formed id resolves the global default here, since (tenant_id
@@ -194,7 +194,7 @@ func TestRate_Inverse(t *testing.T) {
 	q := sqlc.New(pool)
 
 	const midE8 = 150_000_000 // 1 JPY = 1.5 CAD scaled, an arbitrary fixture rate
-	insertRate(t, q, "JPY", "CAD", midE8, 40, time.Now().UTC())
+	insertRate(t, q, "JPY", "CAD", midE8, 40, time.Now().UTC().Add(-2*time.Second))
 
 	provider := fx.NewDBProvider(pool)
 	quote, spreadBps, err := provider.Rate(ctx, uuid.NewString(), domain.Currency("CAD"), domain.Currency("JPY"))
@@ -242,7 +242,7 @@ func TestCurrentFXRate_TiebreakAndAppend(t *testing.T) {
 	ctx := context.Background()
 	q := sqlc.New(pool)
 
-	effectiveAt := time.Now().UTC()
+	effectiveAt := time.Now().UTC().Add(-2 * time.Second)
 	insertRate(t, q, "AUD", "NOK", 100_000_000, 10, effectiveAt)
 	insertRate(t, q, "AUD", "NOK", 200_000_000, 20, effectiveAt)
 
@@ -290,7 +290,7 @@ func TestRate_TenantOverridesGlobal(t *testing.T) {
 		base  domain.Currency = "SGD"
 		quote domain.Currency = "HKD"
 	)
-	insertRate(t, q, string(base), string(quote), globalMidE8, globalSpread, time.Now().UTC())
+	insertRate(t, q, string(base), string(quote), globalMidE8, globalSpread, time.Now().UTC().Add(-2*time.Second))
 
 	// Before tenant A has a row of its own, both tenants resolve the global
 	// default.
@@ -305,7 +305,7 @@ func TestRate_TenantOverridesGlobal(t *testing.T) {
 		}
 	}
 
-	insertTenantRate(t, q, tenantA, string(base), string(quote), tenantMidE8, tenantSpread, time.Now().UTC())
+	insertTenantRate(t, q, tenantA, string(base), string(quote), tenantMidE8, tenantSpread, time.Now().UTC().Add(-2*time.Second))
 
 	// Tenant A now resolves its own row.
 	gotA, spreadA, err := provider.Rate(ctx, tenantA, base, quote)

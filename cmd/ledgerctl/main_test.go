@@ -256,12 +256,11 @@ func TestParseKeyID(t *testing.T) {
 
 func TestParseRateSetValid(t *testing.T) {
 	t.Parallel()
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	a, err := parseRateSet([]string{
 		"--tenant", "tenant-1", "--base", "usd", "--quote", "eur",
 		"--mid", "0.9200", "--spread-bps", "50",
-	}, now)
+	})
 	if err != nil {
 		t.Fatalf("parseRateSet: %v", err)
 	}
@@ -280,8 +279,11 @@ func TestParseRateSetValid(t *testing.T) {
 	if a.source != defaultRateSource {
 		t.Errorf("source = %q, want default %q", a.source, defaultRateSource)
 	}
-	if !a.effectiveAt.Equal(now) {
-		t.Errorf("effectiveAt = %v, want now (%v) by default", a.effectiveAt, now)
+	// --effective-at omitted: effectiveAt must be nil, not this process's
+	// time.Now(), so the database server's clock stamps the row instead
+	// (Task 2.4 remediation; see rateSetArgs.effectiveAt).
+	if a.effectiveAt != nil {
+		t.Errorf("effectiveAt = %v, want nil (server-stamped) when --effective-at is omitted", a.effectiveAt)
 	}
 }
 
@@ -291,7 +293,7 @@ func TestParseRateSetExplicitSourceAndEffectiveAt(t *testing.T) {
 		"--tenant", "tenant-1", "--base", "USD", "--quote", "BDT",
 		"--mid", "110.50", "--spread-bps", "25",
 		"--source", "negotiated", "--effective-at", "2026-03-01T00:00:00Z",
-	}, time.Now())
+	})
 	if err != nil {
 		t.Fatalf("parseRateSet: %v", err)
 	}
@@ -302,7 +304,7 @@ func TestParseRateSetExplicitSourceAndEffectiveAt(t *testing.T) {
 		t.Errorf("source = %q, want negotiated", a.source)
 	}
 	want := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
-	if !a.effectiveAt.Equal(want) {
+	if a.effectiveAt == nil || !a.effectiveAt.Equal(want) {
 		t.Errorf("effectiveAt = %v, want %v", a.effectiveAt, want)
 	}
 }
@@ -325,7 +327,7 @@ func TestParseRateSetRequiredFlags(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := parseRateSet(tc.args, time.Now()); err == nil {
+			if _, err := parseRateSet(tc.args); err == nil {
 				t.Fatalf("parseRateSet(%v): expected an error", tc.args)
 			}
 		})
@@ -341,7 +343,7 @@ func TestParseRateSetMidNeverFloatParsed(t *testing.T) {
 	t.Parallel()
 	a, err := parseRateSet([]string{
 		"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.123456789",
-	}, time.Now())
+	})
 	if err != nil {
 		t.Fatalf("parseRateSet: %v", err)
 	}

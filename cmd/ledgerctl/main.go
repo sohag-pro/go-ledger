@@ -374,7 +374,16 @@ type rateSetArgs struct {
 	midRateE8   int64
 	spreadBps   int32
 	source      string
-	effectiveAt time.Time
+	// effectiveAt is nil when --effective-at is omitted: "effective
+	// immediately" is a nil value all the way down to the SQL insert, so the
+	// DATABASE SERVER's clock stamps the row (COALESCE(..., now())), never
+	// this CLI process's own time.Now() (Task 2.4 remediation: a CLI host
+	// even slightly ahead of the database server made a just-inserted
+	// "immediate" rate transiently invisible to CurrentFXRate's "effective_at
+	// <= now()" gate, which runs on the server's clock). A non-nil
+	// effectiveAt (--effective-at was given) is passed through unchanged,
+	// including a future timestamp for a genuinely scheduled rate.
+	effectiveAt *time.Time
 }
 
 // parseRateSet parses "rate set"'s flags, exactly like parseKeyIssue does for
@@ -383,9 +392,10 @@ type rateSetArgs struct {
 // the same string-scaling parser internal/fx/seed.go uses for FX_RATES, so a
 // decimal rate never passes through strconv.ParseFloat on its way into
 // mid_rate_e8 (go-ledger's money-safety rule: integer only on the rate
-// path). now is injected so --effective-at's default is testable without
-// real time passing.
-func parseRateSet(args []string, now time.Time) (rateSetArgs, error) {
+// path). Unlike an earlier version of this function, there is no injected
+// "now": the omitted-flag default is nil (server-stamped), not any
+// particular instant, so there is nothing to inject for a test to control.
+func parseRateSet(args []string) (rateSetArgs, error) {
 	fs := flag.NewFlagSet("rate set", flag.ContinueOnError)
 	tenantFlag := fs.String("tenant", "", "tenant id (required)")
 	baseFlag := fs.String("base", "", "base currency, e.g. USD (required)")
@@ -423,13 +433,13 @@ func parseRateSet(args []string, now time.Time) (rateSetArgs, error) {
 		return rateSetArgs{}, domain.ErrInvalidSpread
 	}
 
-	effectiveAt := now
+	var effectiveAt *time.Time
 	if *effectiveAtFlag != "" {
 		t, err := time.Parse(time.RFC3339, *effectiveAtFlag)
 		if err != nil {
 			return rateSetArgs{}, fmt.Errorf("--effective-at: %w", err)
 		}
-		effectiveAt = t
+		effectiveAt = &t
 	}
 
 	return rateSetArgs{
@@ -444,15 +454,23 @@ func parseRateSet(args []string, now time.Time) (rateSetArgs, error) {
 }
 
 func rateSet(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
-	a, err := parseRateSet(args, time.Now())
+	a, err := parseRateSet(args)
 	if err != nil {
 		return err
 	}
 	if err := svc.SetFXRate(ctx, a.tenantID, a.base, a.quote, a.midRateE8, a.spreadBps, a.source, a.effectiveAt); err != nil {
 		return fmt.Errorf("set fx rate: %w", err)
 	}
+	// effective_at is only known here if the operator gave --effective-at
+	// explicitly; the omitted case is stamped by the database server at
+	// insert time (see rateSetArgs.effectiveAt), so this prints "now (server
+	// clock)" rather than guessing a timestamp this process never computed.
+	effectiveAtStr := "now (server clock)"
+	if a.effectiveAt != nil {
+		effectiveAtStr = a.effectiveAt.Format(time.RFC3339)
+	}
 	_, _ = fmt.Fprintf(out, "tenant %s: %s/%s mid_rate_e8=%d spread_bps=%d source=%s effective_at=%s\n",
-		a.tenantID, a.base, a.quote, a.midRateE8, a.spreadBps, a.source, a.effectiveAt.Format(time.RFC3339))
+		a.tenantID, a.base, a.quote, a.midRateE8, a.spreadBps, a.source, effectiveAtStr)
 	return nil
 }
 

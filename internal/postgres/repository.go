@@ -1097,7 +1097,15 @@ func (r *Repository) SetTenantStatus(ctx context.Context, tenantID string, statu
 // use elsewhere in this file: base and quote must each be a valid currency
 // code and must differ, midRateE8 must be positive, and spreadBps must be in
 // [0, 10000).
-func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt time.Time) error {
+//
+// effectiveAt nil leaves the sqlc param unset (pgtype.Timestamptz{Valid:
+// false}), which the InsertFXRate query's COALESCE(sqlc.narg('effective_at'),
+// now()) resolves to the DATABASE SERVER's now(), not this process's clock
+// (see the query's doc comment and domain.Repository.InsertFXRate for why
+// that distinction is a real correctness fix, not a style choice). A non-nil
+// effectiveAt (an explicit, possibly future, scheduled rate) is passed
+// through untouched.
+func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt *time.Time) error {
 	if err := base.Validate(); err != nil {
 		return err
 	}
@@ -1129,6 +1137,11 @@ func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, q
 		pgTenantID = pgtype.UUID{Bytes: tid, Valid: true}
 	}
 
+	var pgEffectiveAt pgtype.Timestamptz
+	if effectiveAt != nil {
+		pgEffectiveAt = pgtype.Timestamptz{Time: *effectiveAt, Valid: true}
+	}
+
 	if _, err := r.q.InsertFXRate(ctx, sqlc.InsertFXRateParams{
 		TenantID:    pgTenantID,
 		Base:        string(base),
@@ -1136,7 +1149,7 @@ func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, q
 		MidRateE8:   midRateE8,
 		SpreadBps:   spreadBps,
 		Source:      source,
-		EffectiveAt: effectiveAt,
+		EffectiveAt: pgEffectiveAt,
 	}); err != nil {
 		return fmt.Errorf("postgres: insert fx rate: %w", err)
 	}

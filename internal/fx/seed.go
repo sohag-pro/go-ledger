@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -36,7 +35,16 @@ const maxSpreadBps = 10_000
 var ErrMalformedFXRate = errors.New("fx: malformed FX_RATES entry")
 
 // Seed parses raw, the FX_RATES environment variable, and inserts one
-// fx_rates row per entry via InsertFXRate, with effective_at set to now().
+// fx_rates row per entry via InsertFXRate, with effective_at left unset so
+// the DATABASE SERVER's now() stamps it (see the InsertFXRate query's
+// COALESCE), not this process's own time.Now(). Seed runs at every process
+// boot on the same path that immediately starts serving CurrentFXRate reads,
+// which also gate on "effective_at <= now()" using the server's clock: had
+// Seed stamped its own clock instead, a boot host even slightly ahead of the
+// database server could make a freshly seeded row transiently invisible
+// right after start (Task 2.4's clock-skew remediation, applied here too
+// since this is the same money-adjacent write path, just automatic rather
+// than operator-invoked).
 //
 // raw is a comma-separated list of "BASE:QUOTE=rate/spreadBps" entries, for
 // example "USD:EUR=0.9200/25,USD:BDT=110.50/50". An empty (or all
@@ -65,7 +73,6 @@ func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 	}
 
 	q := sqlc.New(db)
-	now := time.Now().UTC()
 
 	for _, field := range strings.Split(raw, ",") {
 		field = strings.TrimSpace(field)
@@ -99,12 +106,15 @@ func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 			// TenantID left at its zero value (Valid: false, i.e. NULL): every
 			// row Seed writes is the global default (see the comment on the
 			// CurrentFXRate call above).
-			Base:        e.base,
-			Quote:       e.quote,
-			MidRateE8:   e.midE8,
-			SpreadBps:   e.spreadBps,
-			Source:      envSource,
-			EffectiveAt: now,
+			Base:      e.base,
+			Quote:     e.quote,
+			MidRateE8: e.midE8,
+			SpreadBps: e.spreadBps,
+			Source:    envSource,
+			// EffectiveAt left at its zero value (Valid: false, i.e. NULL):
+			// the query's COALESCE(sqlc.narg('effective_at'), now()) then
+			// stamps the row with the database server's own clock (see the
+			// Seed doc comment above for why that matters).
 		}); err != nil {
 			return fmt.Errorf("fx: seed insert %s/%s: %w", e.base, e.quote, err)
 		}

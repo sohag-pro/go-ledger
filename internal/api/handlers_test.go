@@ -419,7 +419,7 @@ func (f *fakeRepo) SetTenantStatus(_ context.Context, tenantID string, status do
 // in internal/fx and internal/ledger instead, since it depends on
 // CurrentFXRate's SQL, not on repository plumbing this fake stands in for);
 // it exists only so fakeRepo keeps satisfying domain.Repository.
-func (f *fakeRepo) InsertFXRate(_ context.Context, _ *string, _, _ domain.Currency, _ int64, _ int32, _ string, _ time.Time) error {
+func (f *fakeRepo) InsertFXRate(_ context.Context, _ *string, _, _ domain.Currency, _ int64, _ int32, _ string, _ *time.Time) error {
 	return nil
 }
 

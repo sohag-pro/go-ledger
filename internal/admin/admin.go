@@ -208,6 +208,12 @@ func (s *Service) ListKeys(ctx context.Context, tenantID string) ([]domain.APIKe
 // It returns domain.ErrTenantNotFound if tenantID does not exist, and the
 // same validation errors domain.Repository.InsertFXRate documents for a
 // malformed base/quote/midRateE8/spreadBps.
-func (s *Service) SetFXRate(ctx context.Context, tenantID string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt time.Time) error {
+//
+// effectiveAt is nil for "effective immediately": the repository lets the
+// database server's own clock stamp the row rather than defaulting to this
+// process's time.Now() (Task 2.4 remediation; see
+// domain.Repository.InsertFXRate). A non-nil effectiveAt (a scheduled,
+// possibly future rate) is passed through unchanged.
+func (s *Service) SetFXRate(ctx context.Context, tenantID string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt *time.Time) error {
 	return s.repo.InsertFXRate(ctx, &tenantID, base, quote, midRateE8, spreadBps, source, effectiveAt)
 }

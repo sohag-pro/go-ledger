@@ -209,5 +209,16 @@ type Repository interface {
 	// (ErrNonPositiveRate otherwise) and spreadBps must be in [0, 10000)
 	// (ErrInvalidSpread otherwise). It returns ErrTenantNotFound if tenantID
 	// names a tenant that does not exist.
-	InsertFXRate(ctx context.Context, tenantID *string, base, quote Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt time.Time) error
+	//
+	// effectiveAt is nil for the common "effective immediately" case: the
+	// adapter must let the DATABASE SERVER's clock stamp the row (SQL
+	// COALESCE(..., now()), never the caller's own time.Now()), because
+	// CurrentFXRate's "effective_at <= now()" gate also runs on the server's
+	// clock. Stamping with the caller's clock instead is a real clock-skew bug
+	// (Task 2.4 remediation): a caller even slightly ahead of the database
+	// server makes a just-inserted "immediate" rate transiently invisible,
+	// silently falling through to the global default. A non-nil effectiveAt
+	// (an explicit, possibly future, scheduled rate) is still honored exactly
+	// as given.
+	InsertFXRate(ctx context.Context, tenantID *string, base, quote Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt *time.Time) error
 }

@@ -4,8 +4,20 @@
 -- tenant_id NULL makes this the global default rate for the pair; a non-NULL
 -- tenant_id makes it that tenant's own rate (Task 2.4, audit A3.3), resolved
 -- ahead of the global default by CurrentFXRate below.
+--
+-- effective_at is a nullable named param (sqlc.narg): when the caller omits
+-- an explicit effective_at, COALESCE falls through to the DATABASE SERVER's
+-- now(), never the calling process's clock. Stamping an "immediate" rate
+-- with the caller's clock is what caused a real clock-skew bug (Task 2.4
+-- remediation): CurrentFXRate below gates on "effective_at <= now()" using
+-- the server's clock too, so if the caller's clock ran even slightly ahead,
+-- a just-inserted row was transiently invisible and the query silently fell
+-- through to the global default. Passing NULL here (rather than the CLI
+-- host's time.Now()) makes the two clocks the same clock for the common,
+-- unscheduled case; an explicit future effective_at (a scheduled rate) is
+-- unaffected, since the caller still supplies it directly.
 INSERT INTO fx_rates (tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, COALESCE(sqlc.narg('effective_at')::timestamptz, now()))
 RETURNING *;
 
 -- name: CurrentFXRate :one

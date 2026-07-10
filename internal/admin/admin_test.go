@@ -518,8 +518,15 @@ func TestSetFXRateInsertsAResolvableTenantRate(t *testing.T) {
 		t.Fatalf("create other tenant: %v", err)
 	}
 
-	effectiveAt := time.Now().UTC()
-	if err := svc.SetFXRate(ctx, tenant.ID, "USD", "TRY", 3_000_000_00, 120, "manual", effectiveAt); err != nil {
+	// A small past safety margin, not exactly time.Now(): CurrentFXRate gates
+	// on "effective_at <= now()" using the database SERVER's clock, so a
+	// timestamp from this test process landing even slightly ahead of the
+	// server's clock would make the row transiently invisible immediately
+	// after insert (the same clock-skew class of bug Task 2.4 fixed for the
+	// omitted-effective-at case; here the test passes an explicit timestamp,
+	// so the margin is applied here instead).
+	effectiveAt := time.Now().UTC().Add(-2 * time.Second)
+	if err := svc.SetFXRate(ctx, tenant.ID, "USD", "TRY", 3_000_000_00, 120, "manual", &effectiveAt); err != nil {
 		t.Fatalf("SetFXRate: %v", err)
 	}
 
@@ -553,7 +560,7 @@ func TestSetFXRateMissingTenantErrors(t *testing.T) {
 	svc, _ := newTestSvc(t)
 	ctx := context.Background()
 
-	err := svc.SetFXRate(ctx, "00000000-0000-0000-0000-000000000000", "USD", "TRY", 100_000_000, 0, "manual", time.Now())
+	err := svc.SetFXRate(ctx, "00000000-0000-0000-0000-000000000000", "USD", "TRY", 100_000_000, 0, "manual", nil)
 	if !errors.Is(err, domain.ErrTenantNotFound) {
 		t.Errorf("SetFXRate into missing tenant: err = %v, want ErrTenantNotFound", err)
 	}
@@ -588,7 +595,7 @@ func TestSetFXRateValidatesBeforeInsert(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := svc.SetFXRate(ctx, tenant.ID, tc.base, tc.quote, tc.midRateE8, tc.spreadBps, "manual", time.Now())
+			err := svc.SetFXRate(ctx, tenant.ID, tc.base, tc.quote, tc.midRateE8, tc.spreadBps, "manual", nil)
 			if !errors.Is(err, tc.wantErr) {
 				t.Errorf("SetFXRate(%s/%s, mid=%d, spread=%d): err = %v, want %v",
 					tc.base, tc.quote, tc.midRateE8, tc.spreadBps, err, tc.wantErr)
