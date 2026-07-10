@@ -40,6 +40,18 @@ import (
 // transaction, action domain.ActionTransactionReversed (ADR-017): like Post,
 // the tamper-evident audit chain itself is built asynchronously by the
 // background chainer, not inside this call.
+//
+// A reversal posts real money (the negated legs plus the audit row), exactly
+// like Post and Convert, so it goes through the same PrePostHook screening
+// gate those two use (Task 6.1 gap fix, audit A9.1): the fully-built reversal
+// transaction is reviewed synchronously, immediately before RunInTx, so a
+// rejection or an ambiguous hook failure both return here with nothing
+// written, the same fail-closed guarantee Post and Convert give. This only
+// runs for a genuinely NEW reversal: the idempotent "already reversed" path
+// above (existing found via GetReversalOf, and the ErrTransactionAlreadyReversed
+// race-guard branch below) posts nothing new, so it is never re-screened, the
+// same replay exemption reviewPost's own callers already give Post and
+// Convert.
 func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, originalID string) (reversal *domain.Transaction, alreadyReversed bool, err error) {
 	ctx, span := s.tracer.Start(ctx, "ledger.ReverseTransaction",
 		oteltrace.WithAttributes(
@@ -84,6 +96,19 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 	if err := t.Validate(); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "validation failed")
+		return nil, false, err
+	}
+
+	// Screening runs on the fully-built reversal, synchronously, and BEFORE
+	// RunInTx opens any transaction (Task 6.1 gap fix, audit A9.1): a
+	// rejection or an ambiguous hook failure both return here, before a
+	// single row (the reversal's postings or its audit_outbox row) is
+	// written. A reversal moves real money, exactly like Post and Convert, so
+	// a party a screening system would block must not be able to receive
+	// funds through a reversal either.
+	if err := reviewPost(ctx, s.prePostHook, tenantID, &t); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "screening rejected reversal")
 		return nil, false, err
 	}
 
