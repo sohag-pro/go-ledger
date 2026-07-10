@@ -58,6 +58,55 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 // compile-time check that Repository satisfies the domain port.
 var _ domain.Repository = (*Repository)(nil)
 
+// withTenant runs fn against a *sqlc.Queries bound to a dedicated
+// transaction with the RLS GUC app.tenant_id set to tenantID
+// (transaction-local, migration 0024, Task 5.4b, audit A3.5), then commits.
+// It exists because the app's tenant-scoped reads run directly on r.q
+// (bound to the pool), which carries no GUC and therefore no RLS
+// protection: a single bare statement on a pooled connection is its own
+// implicit transaction, so a set_config('app.tenant_id', ..., true) issued
+// as a separate statement would evaporate before the very next query ran.
+// Wrapping both the set_config and the read in one explicit transaction is
+// what makes the GUC actually apply while fn runs.
+//
+// It is also used for the handful of standalone writes that, like the
+// reads above, run outside RunInTx (GetOrCreateClearingAccount,
+// SetAccountStatus, CreateWebhookSubscription, a tenant-specific
+// InsertFXRate): the same "forgotten WHERE/mismatched value" defense in
+// depth RunInTx gives every write inside a domain.Tx applies to these too.
+//
+// The extra per-call transaction (BEGIN, set_config, the query, COMMIT,
+// versus one bare statement on the pool) is an accepted cost of the
+// defense-in-depth: RLS with FORCE is only a backstop if the tenant's GUC
+// is actually set on the connection that runs the query, and that requires
+// a real transaction boundary.
+//
+// Deliberately NOT used for genuinely cross-tenant reads: the audit
+// chainer, the webhook fan-out and delivery worker, the idempotency
+// sweep, and restore-verify's own tenant enumeration all query through
+// their own code paths (or, for the sweep, directly on r.q with no
+// tenantID in scope), never through withTenant, so the GUC stays unset on
+// those connections and the "allow when unset" branch of every policy
+// keeps their cross-tenant access working.
+func (r *Repository) withTenant(ctx context.Context, tenantID string, fn func(q *sqlc.Queries) error) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: begin tenant-scoped call: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return fmt.Errorf("postgres: set tenant guc: %w", err)
+	}
+	if err := fn(sqlc.New(tx)); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit tenant-scoped call: %w", err)
+	}
+	return nil
+}
+
 // CreateAccount assigns an identity if a.ID is empty, validates the account, and
 // inserts it.
 func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *domain.Account) error {
@@ -108,7 +157,12 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	row, err := r.q.GetAccount(ctx, sqlc.GetAccountParams{TenantID: tid, ID: aid})
+	var row sqlc.GetAccountRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetAccount(ctx, sqlc.GetAccountParams{TenantID: tid, ID: aid})
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Account{}, domain.ErrAccountNotFound
 	}
@@ -124,9 +178,14 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	rows, err := r.q.ListAccounts(ctx, sqlc.ListAccountsParams{
-		TenantID: tid,
-		Limit:    int32(limit), //nolint:gosec // limit is bounded by the API layer
+	var rows []sqlc.ListAccountsRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAccounts(ctx, sqlc.ListAccountsParams{
+			TenantID: tid,
+			Limit:    int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list accounts: %w", err)
@@ -158,7 +217,12 @@ func (r *Repository) SetAccountStatus(ctx context.Context, tenantID, id string, 
 	if err != nil {
 		return fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	rows, err := r.q.SetAccountStatus(ctx, sqlc.SetAccountStatusParams{TenantID: tid, ID: aid, Status: string(status)})
+	var rows int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.SetAccountStatus(ctx, sqlc.SetAccountStatusParams{TenantID: tid, ID: aid, Status: string(status)})
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("postgres: set account status: %w", err)
 	}
@@ -194,12 +258,17 @@ func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID st
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: generate clearing account id: %w", err)
 	}
-	row, err := r.q.GetOrCreateClearingAccount(ctx, sqlc.GetOrCreateClearingAccountParams{
-		ID:       id,
-		TenantID: tid,
-		Name:     clearingAccountName(currency),
-		Type:     domain.Liability.String(),
-		Currency: string(currency),
+	var row sqlc.GetOrCreateClearingAccountRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetOrCreateClearingAccount(ctx, sqlc.GetOrCreateClearingAccountParams{
+			ID:       id,
+			TenantID: tid,
+			Name:     clearingAccountName(currency),
+			Type:     domain.Liability.String(),
+			Currency: string(currency),
+		})
+		return err
 	})
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get or create clearing account: %w", err)
@@ -270,6 +339,23 @@ func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(conte
 		tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 		if err != nil {
 			return fmt.Errorf("postgres: begin: %w", err)
+		}
+
+		// Set the RLS GUC (migration 0024, Task 5.4b, audit A3.5)
+		// transaction-local (set_config's third argument, true) so it
+		// disappears when this attempt commits or rolls back rather than
+		// leaking onto whatever request next borrows this pooled
+		// connection. Parameterized, never string-interpolated: tenantID
+		// is untrusted input from the request. Every write this attempt's
+		// fn performs now runs with app.tenant_id set to tenantID, so a
+		// write that ever forgot its own tenant_id filter (an UPDATE or
+		// DELETE missing a WHERE, not just a SELECT) still cannot touch
+		// another tenant's row: the FORCE ROW LEVEL SECURITY policies
+		// restrict both the read side (USING) and the write side (WITH
+		// CHECK) to this one tenant for the rest of the transaction.
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			return fmt.Errorf("postgres: set tenant guc: %w", err)
 		}
 
 		if err := fn(ctx, txRepo{q: r.q.WithTx(tx)}); err != nil {
@@ -658,14 +744,22 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	row, err := r.q.GetTransaction(ctx, sqlc.GetTransactionParams{TenantID: tid, ID: txID})
+	var out domain.Transaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		row, err := q.GetTransaction(ctx, sqlc.GetTransactionParams{TenantID: tid, ID: txID})
+		if err != nil {
+			return err
+		}
+		out, err = transactionFromRow(ctx, q, tid, row)
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Transaction{}, domain.ErrTransactionNotFound
 	}
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: get transaction: %w", err)
 	}
-	return r.transactionFromRow(ctx, tid, row)
+	return out, nil
 }
 
 // GetReversalOf returns the transaction that reverses originalID within
@@ -681,9 +775,17 @@ func (r *Repository) GetReversalOf(ctx context.Context, tenantID, originalID str
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: parse original transaction id: %w", err)
 	}
-	row, err := r.q.GetReversalOf(ctx, sqlc.GetReversalOfParams{
-		TenantID:              tid,
-		ReversesTransactionID: pgtype.UUID{Bytes: origID, Valid: true},
+	var out domain.Transaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		row, err := q.GetReversalOf(ctx, sqlc.GetReversalOfParams{
+			TenantID:              tid,
+			ReversesTransactionID: pgtype.UUID{Bytes: origID, Valid: true},
+		})
+		if err != nil {
+			return err
+		}
+		out, err = transactionFromRow(ctx, q, tid, row)
+		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Transaction{}, domain.ErrTransactionNotFound
@@ -691,7 +793,7 @@ func (r *Repository) GetReversalOf(ctx context.Context, tenantID, originalID str
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: get reversal: %w", err)
 	}
-	return r.transactionFromRow(ctx, tid, row)
+	return out, nil
 }
 
 // transactionFromRow loads tid's postings and assembles the full
@@ -699,8 +801,11 @@ func (r *Repository) GetReversalOf(ctx context.Context, tenantID, originalID str
 // GetTransaction or GetReversalOf: both queries select the identical column
 // set, so the postings fetch and the rest of the assembly (shared with
 // ListTransactions, see assembleTransaction) are not duplicated per query.
-func (r *Repository) transactionFromRow(ctx context.Context, tid uuid.UUID, row sqlc.Transaction) (domain.Transaction, error) {
-	rows, err := r.q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
+// It takes q rather than closing over a Repository so the caller controls
+// which transaction (and therefore which RLS GUC scope, see withTenant)
+// the postings fetch runs in, the same one the row above was fetched in.
+func transactionFromRow(ctx context.Context, q *sqlc.Queries, tid uuid.UUID, row sqlc.Transaction) (domain.Transaction, error) {
+	rows, err := q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
 		TenantID:      tid,
 		TransactionID: row.ID,
 	})
@@ -814,32 +919,38 @@ func (r *Repository) ListTransactions(ctx context.Context, tenantID string, filt
 		reference = pgtype.Text{String: *filter.Reference, Valid: true}
 	}
 
-	rows, err := r.q.ListTransactions(ctx, sqlc.ListTransactionsParams{
-		TenantID:       tid,
-		FromTs:         ptrToTimestamptz(filter.From),
-		ToTs:           ptrToTimestamptz(filter.To),
-		Reference:      reference,
-		AfterCreatedAt: afterTime,
-		AfterID:        afterID,
-		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+	var rows []sqlc.Transaction
+	var postingRows []sqlc.ListPostingsByTransactionIDsRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListTransactions(ctx, sqlc.ListTransactionsParams{
+			TenantID:       tid,
+			FromTs:         ptrToTimestamptz(filter.From),
+			ToTs:           ptrToTimestamptz(filter.To),
+			Reference:      reference,
+			AfterCreatedAt: afterTime,
+			AfterID:        afterID,
+			PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		if err != nil || len(rows) == 0 {
+			return err
+		}
+
+		ids := make([]uuid.UUID, len(rows))
+		for i, row := range rows {
+			ids[i] = row.ID
+		}
+		postingRows, err = q.ListPostingsByTransactionIDs(ctx, sqlc.ListPostingsByTransactionIDsParams{
+			TenantID:       tid,
+			TransactionIds: ids,
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list transactions: %w", err)
 	}
 	if len(rows) == 0 {
 		return nil, nil
-	}
-
-	ids := make([]uuid.UUID, len(rows))
-	for i, row := range rows {
-		ids[i] = row.ID
-	}
-	postingRows, err := r.q.ListPostingsByTransactionIDs(ctx, sqlc.ListPostingsByTransactionIDsParams{
-		TenantID:       tid,
-		TransactionIds: ids,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("postgres: batch list postings: %w", err)
 	}
 	byTransaction := make(map[uuid.UUID][]domain.Posting, len(rows))
 	for _, p := range postingRows {
@@ -867,7 +978,12 @@ func (r *Repository) GetIdempotencyKey(ctx context.Context, tenantID, key string
 	if err != nil {
 		return domain.IdempotencyRecord{}, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	row, err := r.q.GetIdempotencyKey(ctx, sqlc.GetIdempotencyKeyParams{TenantID: tid, IdempotencyKey: key})
+	var row sqlc.GetIdempotencyKeyRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetIdempotencyKey(ctx, sqlc.GetIdempotencyKeyParams{TenantID: tid, IdempotencyKey: key})
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.IdempotencyRecord{}, domain.ErrIdempotencyKeyNotFound
 	}
@@ -892,7 +1008,12 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	rows, err := r.q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{TenantID: tid, TransactionID: txID})
+	var rows []sqlc.ListAuditByTransactionRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{TenantID: tid, TransactionID: txID})
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by transaction: %w", err)
 	}
@@ -943,11 +1064,16 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 		}
 	}
 
-	rows, err := r.q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{
-		TenantID:  tid,
-		AccountID: aid,
-		AfterID:   afterID,
-		PageLimit: int32(limit), //nolint:gosec // limit is bounded by the API layer
+	var rows []sqlc.ListAuditByAccountRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{
+			TenantID:  tid,
+			AccountID: aid,
+			AfterID:   afterID,
+			PageLimit: int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
@@ -977,7 +1103,12 @@ func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	rows, err := r.q.ListAuditForVerify(ctx, tid)
+	var rows []sqlc.ListAuditForVerifyRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditForVerify(ctx, tid)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
 	}
@@ -1006,7 +1137,12 @@ func (r *Repository) CountPendingOutbox(ctx context.Context, tenantID string) (i
 	if err != nil {
 		return 0, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	n, err := r.q.CountPendingOutbox(ctx, tid)
+	var n int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		n, err = q.CountPendingOutbox(ctx, tid)
+		return err
+	})
 	if err != nil {
 		return 0, fmt.Errorf("postgres: count pending outbox: %w", err)
 	}
@@ -1079,7 +1215,12 @@ func (r *Repository) Balance(ctx context.Context, tenantID, accountID string) (d
 	if err != nil {
 		return domain.Money{}, fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	sum, err := r.q.AccountBalance(ctx, sqlc.AccountBalanceParams{TenantID: tid, AccountID: aid})
+	var sum int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		sum, err = q.AccountBalance(ctx, sqlc.AccountBalanceParams{TenantID: tid, AccountID: aid})
+		return err
+	})
 	if err != nil {
 		return domain.Money{}, fmt.Errorf("postgres: account balance: %w", err)
 	}
@@ -1112,12 +1253,17 @@ func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, 
 		}
 	}
 
-	rows, err := r.q.AccountStatement(ctx, sqlc.AccountStatementParams{
-		TenantID:       tid,
-		AccountID:      aid,
-		AfterCreatedAt: afterTime,
-		AfterID:        afterID,
-		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+	var rows []sqlc.AccountStatementRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.AccountStatement(ctx, sqlc.AccountStatementParams{
+			TenantID:       tid,
+			AccountID:      aid,
+			AfterCreatedAt: afterTime,
+			AfterID:        afterID,
+			PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: account statement: %w", err)
@@ -1490,7 +1636,7 @@ func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, q
 		pgEffectiveAt = pgtype.Timestamptz{Time: *effectiveAt, Valid: true}
 	}
 
-	if _, err := r.q.InsertFXRate(ctx, sqlc.InsertFXRateParams{
+	params := sqlc.InsertFXRateParams{
 		TenantID:    pgTenantID,
 		Base:        string(base),
 		Quote:       string(quote),
@@ -1498,7 +1644,25 @@ func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, q
 		SpreadBps:   spreadBps,
 		Source:      source,
 		EffectiveAt: pgEffectiveAt,
-	}); err != nil {
+	}
+	// A tenant-specific rate is inserted with the GUC set to that tenant
+	// (fx_rates's RLS policy, migration 0024, still allows it: WITH CHECK
+	// is "tenant_id IS NULL OR <matches the GUC>", and this row's tenant_id
+	// equals the GUC). A global rate (tenantID nil, tenant_id column left
+	// NULL) has no tenant to scope the GUC to; its WITH CHECK passes
+	// unconditionally via the "tenant_id IS NULL" branch regardless, so it
+	// is inserted directly on the pool, same as before this migration.
+	if tenantID != nil {
+		err := r.withTenant(ctx, *tenantID, func(q *sqlc.Queries) error {
+			_, err := q.InsertFXRate(ctx, params)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("postgres: insert fx rate: %w", err)
+		}
+		return nil
+	}
+	if _, err := r.q.InsertFXRate(ctx, params); err != nil {
 		return fmt.Errorf("postgres: insert fx rate: %w", err)
 	}
 	return nil
@@ -1608,13 +1772,16 @@ func (r *Repository) CreateWebhookSubscription(ctx context.Context, sub *domain.
 	if eventTypes == nil {
 		eventTypes = []string{}
 	}
-	if err := r.q.InsertWebhookSubscription(ctx, sqlc.InsertWebhookSubscriptionParams{
-		ID:         id,
-		TenantID:   tid,
-		Url:        sub.URL,
-		Secret:     secret,
-		EventTypes: eventTypes,
-	}); err != nil {
+	err = r.withTenant(ctx, sub.TenantID, func(q *sqlc.Queries) error {
+		return q.InsertWebhookSubscription(ctx, sqlc.InsertWebhookSubscriptionParams{
+			ID:         id,
+			TenantID:   tid,
+			Url:        sub.URL,
+			Secret:     secret,
+			EventTypes: eventTypes,
+		})
+	})
+	if err != nil {
 		return fmt.Errorf("postgres: insert webhook subscription: %w", err)
 	}
 	sub.Active = true
@@ -1629,7 +1796,12 @@ func (r *Repository) ListWebhookSubscriptionsByTenant(ctx context.Context, tenan
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	rows, err := r.q.ListWebhookSubscriptionsByTenant(ctx, tid)
+	var rows []sqlc.ListWebhookSubscriptionsByTenantRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListWebhookSubscriptionsByTenant(ctx, tid)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list webhook subscriptions by tenant: %w", err)
 	}
