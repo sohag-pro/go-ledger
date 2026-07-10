@@ -31,6 +31,15 @@ func toHumaErr(err error) error {
 	if errors.As(err, &tenantErr) {
 		return huma.Error403Forbidden(tenantErr.Reason())
 	}
+	// A *domain.PolicyViolationError (Task 2.4b, audit A3.4) is checked via
+	// errors.As, like TenantNotActiveError above, so its Error() message
+	// (naming the exact rule, currency, and amount/limit) reaches the client
+	// instead of a generic "policy violation" the switch below would give a
+	// bare errors.Is(err, domain.ErrPolicyViolation) match.
+	var policyErr *domain.PolicyViolationError
+	if errors.As(err, &policyErr) {
+		return huma.Error422UnprocessableEntity(policyErr.Error())
+	}
 
 	switch {
 	case err == nil:
@@ -43,6 +52,8 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("invalid tenant name or status")
 	case errors.Is(err, admin.ErrInvalidScopes):
 		return huma.Error422UnprocessableEntity("at least one valid scope (read, post, admin) is required")
+	case errors.Is(err, domain.ErrInvalidTenantPolicy):
+		return huma.Error422UnprocessableEntity("invalid tenant policy: amounts must be non-negative and allowed_currencies must be well-formed three-letter codes")
 	case errors.Is(err, domain.ErrAccountNotFound):
 		return huma.Error404NotFound("account not found")
 	case errors.Is(err, domain.ErrTransactionNotFound):

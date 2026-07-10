@@ -101,4 +101,17 @@ var (
 	// codes.PermissionDenied (gRPC): the credential itself is valid, it just
 	// lacks the scope the operation needs.
 	ErrInsufficientScope = errors.New("domain: insufficient scope")
+	// ErrPolicyViolation is the sentinel matched via errors.Is for any
+	// *PolicyViolationError, regardless of which TenantPolicy rule (max
+	// transaction amount, daily volume, currency allowlist) tripped it (Task
+	// 2.4b, audit A3.4). A transport layer maps it to 422 Unprocessable
+	// Entity (REST) or codes.FailedPrecondition (gRPC): the request is
+	// otherwise well-formed, it just violates a guardrail its tenant
+	// configured.
+	ErrPolicyViolation = errors.New("domain: tenant policy violation")
+	// ErrInvalidTenantPolicy is returned when a TenantPolicy fails
+	// TenantPolicy.Validate: a negative amount limit, or an
+	// AllowedCurrencies entry that is not a well-formed three-letter
+	// currency code.
+	ErrInvalidTenantPolicy = errors.New("domain: invalid tenant policy")
 )

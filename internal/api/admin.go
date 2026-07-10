@@ -49,6 +49,21 @@ type SetTenantStatusInput struct {
 	}
 }
 
+// SetTenantPolicyInput is the set-tenant-policy request (Task 2.4b, audit
+// A3.4): a path id plus the full policy in the body. Every field is
+// optional; an omitted field is 0/empty, meaning "no limit" for that
+// guardrail (see domain.TenantPolicy). This call always writes the FULL
+// policy the body describes, not a partial merge: omitting a field clears
+// (unlimits) that guardrail rather than leaving a previous value in place.
+type SetTenantPolicyInput struct {
+	ID   string `path:"id" format:"uuid" doc:"Tenant id"`
+	Body struct {
+		MaxTransactionAmount int64    `json:"max_transaction_amount,omitempty" doc:"Max per-currency debit total for a single transaction, in minor units. 0 (or omitted) means unlimited."`
+		DailyVolumeLimit     int64    `json:"daily_volume_limit,omitempty" doc:"Max per-currency cumulative debit total for the current day, in minor units. 0 (or omitted) means unlimited."`
+		AllowedCurrencies    []string `json:"allowed_currencies,omitempty" doc:"Currencies this tenant may post in. Empty (or omitted) means every currency is allowed."`
+	}
+}
+
 // EmptyOutput is the huma output for admin operations that report success
 // with no response body, just a 204 No Content status.
 type EmptyOutput struct{}
@@ -211,6 +226,28 @@ func registerAdmin(api huma.API, deps Deps) {
 		Security:      bearerSecurity,
 	}, func(ctx context.Context, in *SetTenantStatusInput) (*EmptyOutput, error) {
 		if err := deps.Admin.SetTenantStatus(ctx, in.ID, domain.TenantStatus(in.Body.Status)); err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &EmptyOutput{}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "set-tenant-policy",
+		Method:        http.MethodPost,
+		Path:          "/v1/admin/tenants/{id}/policy",
+		Summary:       "Set a tenant's posting guardrails",
+		Description:   "Sets the tenant's optional per-currency guardrails (Task 2.4b): a max transaction amount, a daily volume cap, and a currency allowlist. Writes the full policy the body describes; an omitted field clears (unlimits) that guardrail rather than leaving a previous value in place.",
+		Tags:          []string{"admin"},
+		DefaultStatus: http.StatusNoContent,
+		MaxBodyBytes:  MaxRequestBodyBytes,
+		Security:      bearerSecurity,
+	}, func(ctx context.Context, in *SetTenantPolicyInput) (*EmptyOutput, error) {
+		policy := domain.TenantPolicy{
+			MaxTransactionAmount: in.Body.MaxTransactionAmount,
+			DailyVolumeLimit:     in.Body.DailyVolumeLimit,
+			AllowedCurrencies:    in.Body.AllowedCurrencies,
+		}
+		if err := deps.Admin.SetTenantPolicy(ctx, in.ID, policy); err != nil {
 			return nil, toHumaErr(err)
 		}
 		return &EmptyOutput{}, nil

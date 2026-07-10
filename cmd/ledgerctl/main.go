@@ -17,8 +17,16 @@
 // "rate set" (Task 2.4, audit A3.3) is the operator path for a tenant's own
 // FX rate and spread: it appends a tenant-scoped fx_rates row, resolved
 // ahead of the global default (see internal/fx.Provider.Rate). There is no
-// REST equivalent yet; per-tenant rate policy (limits, an allowlist of
-// pairs) is a separate, later piece of work.
+// REST equivalent yet.
+//
+// "tenant policy" (Task 2.4b, audit A3.4) sets a tenant's optional posting
+// guardrails (a max transaction amount, a daily volume cap, a currency
+// allowlist, each enforced per currency), the same policy the REST
+// POST /v1/admin/tenants/{id}/policy endpoint sets. Every flag is optional
+// and this command always writes the FULL policy the flags describe: an
+// omitted flag clears (unlimits) that guardrail rather than leaving a
+// previous value in place, so reapplying an existing limit means passing it
+// again explicitly.
 package main
 
 import (
@@ -82,6 +90,7 @@ var commands = map[string]map[string]handler{
 		"create": tenantCreate,
 		"list":   tenantList,
 		"status": tenantStatus,
+		"policy": tenantPolicySet,
 	},
 	"key": {
 		"issue":  keyIssue,
@@ -100,6 +109,7 @@ const usage = `usage: ledgerctl <resource> <action> [flags]
   tenant create --name NAME
   tenant list
   tenant status --id ID --status active|suspended|closed
+  tenant policy --tenant ID [--max-amount N] [--daily-limit N] [--currencies USD,EUR]
 
   key issue --tenant ID --name NAME --scopes read,post[,admin] [--expires-in DURATION]
   key rotate --id KEYID
@@ -215,6 +225,63 @@ func tenantStatus(ctx context.Context, svc *admin.Service, out *os.File, args []
 		return fmt.Errorf("set tenant status: %w", err)
 	}
 	_, _ = fmt.Fprintf(out, "tenant %s is now %s\n", id, status)
+	return nil
+}
+
+// parseTenantPolicy parses "tenant policy"'s flags into a domain.TenantPolicy
+// (Task 2.4b, audit A3.4). Every flag is optional: an omitted flag is its
+// zero value (0 for the two amount flags, empty for --currencies), which
+// domain.TenantPolicy already treats as "no limit" for that guardrail. This
+// command always sets the FULL policy from the flags given on this
+// invocation, never merging with whatever was there before: an omitted flag
+// CLEARS that guardrail rather than leaving a previous value in place. An
+// operator who wants to keep an existing limit must pass it again explicitly
+// (a plain SetTenantPolicy write, not a read-modify-write, mirrors the REST
+// endpoint's own documented behavior; see internal/api/admin.go's
+// SetTenantPolicyInput).
+func parseTenantPolicy(args []string) (tenantID string, policy domain.TenantPolicy, err error) {
+	fs := flag.NewFlagSet("tenant policy", flag.ContinueOnError)
+	tenantFlag := fs.String("tenant", "", "tenant id (required)")
+	maxAmountFlag := fs.Int64("max-amount", 0, "max per-currency debit total for a single transaction, in minor units (0 = unlimited, and clears any existing limit)")
+	dailyLimitFlag := fs.Int64("daily-limit", 0, "max per-currency cumulative debit total for the day, in minor units (0 = unlimited, and clears any existing limit)")
+	currenciesFlag := fs.String("currencies", "", "comma-separated allowed currencies, e.g. USD,EUR (omitted = every currency allowed, and clears any existing allowlist)")
+	if err := fs.Parse(args); err != nil {
+		return "", domain.TenantPolicy{}, err
+	}
+	if *tenantFlag == "" {
+		return "", domain.TenantPolicy{}, errors.New("--tenant is required")
+	}
+	var currencies []string
+	if *currenciesFlag != "" {
+		for _, c := range strings.Split(*currenciesFlag, ",") {
+			c = strings.ToUpper(strings.TrimSpace(c))
+			if c == "" {
+				continue
+			}
+			currencies = append(currencies, c)
+		}
+	}
+	return *tenantFlag, domain.TenantPolicy{
+		MaxTransactionAmount: *maxAmountFlag,
+		DailyVolumeLimit:     *dailyLimitFlag,
+		AllowedCurrencies:    currencies,
+	}, nil
+}
+
+func tenantPolicySet(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
+	tenantID, policy, err := parseTenantPolicy(args)
+	if err != nil {
+		return err
+	}
+	if err := svc.SetTenantPolicy(ctx, tenantID, policy); err != nil {
+		return fmt.Errorf("set tenant policy: %w", err)
+	}
+	currencies := "any"
+	if len(policy.AllowedCurrencies) > 0 {
+		currencies = strings.Join(policy.AllowedCurrencies, ",")
+	}
+	_, _ = fmt.Fprintf(out, "tenant %s policy: max_amount=%d daily_limit=%d currencies=%s\n",
+		tenantID, policy.MaxTransactionAmount, policy.DailyVolumeLimit, currencies)
 	return nil
 }
 

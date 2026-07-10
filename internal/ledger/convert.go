@@ -180,7 +180,25 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, err
 	}
 
+	// Resolved BEFORE RunInTx, on its own connection, never from inside
+	// RunInTx's closure: see enforceTenantPolicy's doc comment in policy.go
+	// for the connection-pool deadlock a second in-tx Repository call would
+	// risk under a small pool.
+	policy, err := tenantPolicy(ctx, s.repo, tenantID)
+	if err != nil {
+		span.RecordError(err)
+		return nil, false, err
+	}
+
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
+		// Policy is checked over the FULL set of legs Convert built above
+		// (source debit, both clearing legs, destination credit), so the
+		// converted destination amount counts toward the destination
+		// currency's max-transaction and daily-volume totals exactly like an
+		// ordinary post would (Task 2.4b, audit A3.4).
+		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
+			return err
+		}
 		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {
 			return err
 		}

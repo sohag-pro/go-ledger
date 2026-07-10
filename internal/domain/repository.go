@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -45,6 +46,19 @@ type Tx interface {
 
 	// AppendAudit writes one audit row within the surrounding transaction.
 	AppendAudit(ctx context.Context, tenantID string, e AuditEntry) error
+
+	// TenantDailyDebits returns the tenant's already-posted per-currency
+	// debit total for "today" (created_at >= date_trunc('day', now()) on the
+	// DATABASE SERVER's clock), within the surrounding transaction (Task
+	// 2.4b, audit A3.4). It is the daily-volume policy's race-safe read:
+	// called from inside RunInTx, under the per-tenant in-process
+	// serialization (ADR-012), so two concurrent posts for the same tenant
+	// can never both read the same total and both post believing they are
+	// under the cap. The returned map is keyed by currency code; a currency
+	// with no posted debits today is simply absent, never a zero-valued
+	// entry, so a caller should treat a missing key as 0 (see
+	// CheckTransactionPolicy).
+	TenantDailyDebits(ctx context.Context, tenantID string) (map[string]int64, error)
 }
 
 // Repository is the persistence port for the ledger. The domain owns this
@@ -221,4 +235,13 @@ type Repository interface {
 	// (an explicit, possibly future, scheduled rate) is still honored exactly
 	// as given.
 	InsertFXRate(ctx context.Context, tenantID *string, base, quote Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt *time.Time) error
+
+	// SetTenantSettings overwrites the tenants.settings jsonb column for
+	// tenantID with the given raw JSON document (Task 2.4b, audit A3.4). It
+	// is a whole-document replace, not a merge: the only writer today
+	// (admin.Service.SetTenantPolicy) always builds the full TenantSettings
+	// document from the policy given, so there is nothing else in the
+	// column yet worth preserving. It returns ErrTenantNotFound if tenantID
+	// has no row.
+	SetTenantSettings(ctx context.Context, tenantID string, settings json.RawMessage) error
 }

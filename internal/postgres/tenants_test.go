@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -169,5 +170,75 @@ func TestListTenants(t *testing.T) {
 	}
 	if len(limited) != 1 {
 		t.Errorf("ListTenants(1) returned %d rows, want 1", len(limited))
+	}
+}
+
+// TestSetTenantSettings proves the settings jsonb column round-trips through
+// SetTenantSettings/GetTenant (Task 2.4b, audit A3.4), and that a second
+// write fully replaces the first (whole-document replace, not a merge).
+func TestSetTenantSettings(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+
+	id := uuid.NewString()
+	if err := repo.CreateTenant(ctx, id, "settings test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	first := json.RawMessage(`{"policy":{"max_transaction_amount":100}}`)
+	if err := repo.SetTenantSettings(ctx, id, first); err != nil {
+		t.Fatalf("SetTenantSettings: %v", err)
+	}
+	got, err := repo.GetTenant(ctx, id)
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	settings, err := domain.ParseTenantSettings(got.Settings)
+	if err != nil {
+		t.Fatalf("ParseTenantSettings: %v", err)
+	}
+	if settings.Policy.MaxTransactionAmount != 100 {
+		t.Errorf("MaxTransactionAmount = %d, want 100", settings.Policy.MaxTransactionAmount)
+	}
+
+	// A second write replaces the first entirely.
+	second := json.RawMessage(`{"policy":{"daily_volume_limit":500,"allowed_currencies":["USD"]}}`)
+	if err := repo.SetTenantSettings(ctx, id, second); err != nil {
+		t.Fatalf("SetTenantSettings (second write): %v", err)
+	}
+	got, err = repo.GetTenant(ctx, id)
+	if err != nil {
+		t.Fatalf("GetTenant (after second write): %v", err)
+	}
+	settings, err = domain.ParseTenantSettings(got.Settings)
+	if err != nil {
+		t.Fatalf("ParseTenantSettings (after second write): %v", err)
+	}
+	if settings.Policy.MaxTransactionAmount != 0 {
+		t.Errorf("MaxTransactionAmount after replace = %d, want 0 (cleared)", settings.Policy.MaxTransactionAmount)
+	}
+	if settings.Policy.DailyVolumeLimit != 500 {
+		t.Errorf("DailyVolumeLimit = %d, want 500", settings.Policy.DailyVolumeLimit)
+	}
+	if len(settings.Policy.AllowedCurrencies) != 1 || settings.Policy.AllowedCurrencies[0] != "USD" {
+		t.Errorf("AllowedCurrencies = %v, want [USD]", settings.Policy.AllowedCurrencies)
+	}
+}
+
+// TestSetTenantSettingsNotFound proves SetTenantSettings fails closed with
+// domain.ErrTenantNotFound for an id with no tenant row, rather than
+// silently no-op'ing (an UPDATE matching zero rows is not an error at the
+// SQL level), the same pattern TestSetTenantStatusNotFound covers for
+// SetTenantStatus above.
+func TestSetTenantSettingsNotFound(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	err := repo.SetTenantSettings(context.Background(), uuid.NewString(), json.RawMessage(`{}`))
+	if !errors.Is(err, domain.ErrTenantNotFound) {
+		t.Errorf("got %v, want ErrTenantNotFound", err)
 	}
 }

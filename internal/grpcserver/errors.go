@@ -19,6 +19,17 @@ import (
 // InvalidArgument, an exhausted serialization conflict is Unavailable, and
 // anything unrecognized is Internal without leaking internals.
 func toStatus(err error) error {
+	// A *domain.PolicyViolationError (Task 2.4b, audit A3.4) is checked via
+	// errors.As, before the switch below, so its Error() message (naming the
+	// exact rule, currency, and amount/limit) reaches the client instead of
+	// a generic message. It maps to FailedPrecondition, not InvalidArgument:
+	// the request itself is well-formed, it just fails a guardrail its
+	// tenant configured, which is exactly what FailedPrecondition means.
+	var policyErr *domain.PolicyViolationError
+	if errors.As(err, &policyErr) {
+		return status.Error(codes.FailedPrecondition, policyErr.Error())
+	}
+
 	switch {
 	case err == nil:
 		return nil

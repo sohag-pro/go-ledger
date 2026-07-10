@@ -465,6 +465,25 @@ components:
         - account_id
         - amount
       type: object
+    SetTenantPolicyInputBody:
+      additionalProperties: false
+      properties:
+        allowed_currencies:
+          description: Currencies this tenant may post in. Empty (or omitted) means every currency is allowed.
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        daily_volume_limit:
+          description: Max per-currency cumulative debit total for the current day, in minor units. 0 (or omitted) means unlimited.
+          format: int64
+          type: integer
+        max_transaction_amount:
+          description: Max per-currency debit total for a single transaction, in minor units. 0 (or omitted) means unlimited.
+          format: int64
+          type: integer
+      type: object
     SetTenantStatusInputBody:
       additionalProperties: false
       properties:
@@ -1006,6 +1025,39 @@ paths:
       security:
         - bearerAuth: []
       summary: Create a tenant
+      tags:
+        - admin
+  /v1/admin/tenants/{id}/policy:
+    post:
+      description: "Sets the tenant's optional per-currency guardrails (Task 2.4b): a max transaction amount, a daily volume cap, and a currency allowlist. Writes the full policy the body describes; an omitted field clears (unlimits) that guardrail rather than leaving a previous value in place."
+      operationId: set-tenant-policy
+      parameters:
+        - description: Tenant id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Tenant id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetTenantPolicyInputBody"
+        required: true
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Set a tenant's posting guardrails
       tags:
         - admin
   /v1/admin/tenants/{id}/status:

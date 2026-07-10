@@ -32,6 +32,7 @@ func TestToStatus(t *testing.T) {
 		{"description too long", domain.ErrDescriptionTooLong, codes.InvalidArgument},
 		{"overflow", domain.ErrOverflow, codes.InvalidArgument},
 		{"write conflict", domain.ErrConflict, codes.Unavailable},
+		{"policy violation", &domain.PolicyViolationError{Rule: domain.PolicyRuleMaxTransactionAmount, Currency: "USD", Amount: 100, Limit: 50}, codes.FailedPrecondition},
 		{"unknown", errors.New("boom"), codes.Internal},
 	}
 	for _, tc := range cases {

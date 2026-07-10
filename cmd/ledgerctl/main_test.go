@@ -20,6 +20,7 @@ func TestResolveHandlerKnownSubcommands(t *testing.T) {
 		{"tenant", "create"},
 		{"tenant", "list"},
 		{"tenant", "status"},
+		{"tenant", "policy"},
 		{"key", "issue"},
 		{"key", "rotate"},
 		{"key", "revoke"},
@@ -366,5 +367,61 @@ func TestJoinAndFormatHelpers(t *testing.T) {
 	when := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	if got := formatExpiry(&when); got != when.Format(time.RFC3339) {
 		t.Errorf("formatExpiry = %q, want %q", got, when.Format(time.RFC3339))
+	}
+}
+
+// TestParseTenantPolicyValid proves parseTenantPolicy (Task 2.4b, audit
+// A3.4) reads every flag into the matching domain.TenantPolicy field, and
+// upper-cases a lowercase --currencies entry the same way parseRateSet
+// upper-cases --base/--quote.
+func TestParseTenantPolicyValid(t *testing.T) {
+	t.Parallel()
+	tenantID, policy, err := parseTenantPolicy([]string{
+		"--tenant", "tenant-1", "--max-amount", "50000", "--daily-limit", "200000", "--currencies", "usd, eur",
+	})
+	if err != nil {
+		t.Fatalf("parseTenantPolicy: %v", err)
+	}
+	if tenantID != "tenant-1" {
+		t.Errorf("tenantID = %q, want tenant-1", tenantID)
+	}
+	if policy.MaxTransactionAmount != 50000 {
+		t.Errorf("MaxTransactionAmount = %d, want 50000", policy.MaxTransactionAmount)
+	}
+	if policy.DailyVolumeLimit != 200000 {
+		t.Errorf("DailyVolumeLimit = %d, want 200000", policy.DailyVolumeLimit)
+	}
+	if len(policy.AllowedCurrencies) != 2 || policy.AllowedCurrencies[0] != "USD" || policy.AllowedCurrencies[1] != "EUR" {
+		t.Errorf("AllowedCurrencies = %v, want [USD EUR] (upper-cased, trimmed)", policy.AllowedCurrencies)
+	}
+}
+
+// TestParseTenantPolicyOmittedFlagsAreUnlimited proves every flag but
+// --tenant is genuinely optional, and that omitting one yields the
+// unlimited zero value for that guardrail (0, or a nil AllowedCurrencies),
+// not an error and not some other default.
+func TestParseTenantPolicyOmittedFlagsAreUnlimited(t *testing.T) {
+	t.Parallel()
+	_, policy, err := parseTenantPolicy([]string{"--tenant", "tenant-1"})
+	if err != nil {
+		t.Fatalf("parseTenantPolicy: %v", err)
+	}
+	if policy.MaxTransactionAmount != 0 {
+		t.Errorf("MaxTransactionAmount = %d, want 0 (unlimited)", policy.MaxTransactionAmount)
+	}
+	if policy.DailyVolumeLimit != 0 {
+		t.Errorf("DailyVolumeLimit = %d, want 0 (unlimited)", policy.DailyVolumeLimit)
+	}
+	if len(policy.AllowedCurrencies) != 0 {
+		t.Errorf("AllowedCurrencies = %v, want empty (every currency allowed)", policy.AllowedCurrencies)
+	}
+}
+
+// TestParseTenantPolicyMissingTenant proves --tenant is the one required
+// flag.
+func TestParseTenantPolicyMissingTenant(t *testing.T) {
+	t.Parallel()
+	if _, _, err := parseTenantPolicy([]string{"--max-amount", "100"}); err == nil {
+		t.Fatal("parseTenantPolicy with no --tenant: expected an error")
 	}
 }

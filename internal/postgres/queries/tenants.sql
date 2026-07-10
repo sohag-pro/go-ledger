@@ -9,3 +9,8 @@ SELECT id, name, status, settings, created_at FROM tenants ORDER BY created_at, 
 
 -- name: SetTenantStatus :execrows
 UPDATE tenants SET status = $2 WHERE id = $1;
+
+-- name: SetTenantSettings :execrows
+-- Task 2.4b (audit A3.4): a whole-document replace of the settings jsonb
+-- column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
+UPDATE tenants SET settings = $2 WHERE id = $1;

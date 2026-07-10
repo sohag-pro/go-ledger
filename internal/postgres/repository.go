@@ -563,6 +563,27 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	return nil
 }
 
+// TenantDailyDebits returns the tenant's per-currency debit total for today,
+// within the surrounding transaction (Task 2.4b, audit A3.4). See
+// domain.Tx.TenantDailyDebits for the race-safety this depends on: RunInTx's
+// per-tenant in-process lock (ADR-012) is what makes this read consistent
+// with the write that follows it in the same call.
+func (tr txRepo) TenantDailyDebits(ctx context.Context, tenantID string) (map[string]int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := tr.q.TenantDailyDebits(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: tenant daily debits: %w", err)
+	}
+	out := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		out[row.Currency] = row.Total
+	}
+	return out, nil
+}
+
 // GetTransaction returns the transaction and its postings, or
 // domain.ErrTransactionNotFound if absent.
 func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
@@ -1079,6 +1100,25 @@ func (r *Repository) SetTenantStatus(ctx context.Context, tenantID string, statu
 	rows, err := r.q.SetTenantStatus(ctx, sqlc.SetTenantStatusParams{ID: tid, Status: string(status)})
 	if err != nil {
 		return fmt.Errorf("postgres: set tenant status: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrTenantNotFound
+	}
+	return nil
+}
+
+// SetTenantSettings overwrites the tenant's settings jsonb column with
+// settings (Task 2.4b, audit A3.4): a whole-document replace, not a merge
+// (see domain.Repository.SetTenantSettings). It returns
+// domain.ErrTenantNotFound if no tenant matches id.
+func (r *Repository) SetTenantSettings(ctx context.Context, tenantID string, settings json.RawMessage) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.SetTenantSettings(ctx, sqlc.SetTenantSettingsParams{ID: tid, Settings: settings})
+	if err != nil {
+		return fmt.Errorf("postgres: set tenant settings: %w", err)
 	}
 	if rows == 0 {
 		return domain.ErrTenantNotFound

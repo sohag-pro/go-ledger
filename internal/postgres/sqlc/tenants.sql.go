@@ -72,6 +72,25 @@ func (q *Queries) ListTenants(ctx context.Context, limit int32) ([]Tenant, error
 	return items, nil
 }
 
+const setTenantSettings = `-- name: SetTenantSettings :execrows
+UPDATE tenants SET settings = $2 WHERE id = $1
+`
+
+type SetTenantSettingsParams struct {
+	ID       uuid.UUID
+	Settings []byte
+}
+
+// Task 2.4b (audit A3.4): a whole-document replace of the settings jsonb
+// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
+func (q *Queries) SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTenantSettings, arg.ID, arg.Settings)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setTenantStatus = `-- name: SetTenantStatus :execrows
 UPDATE tenants SET status = $2 WHERE id = $1
 `

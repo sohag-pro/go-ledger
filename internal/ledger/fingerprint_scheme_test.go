@@ -60,6 +60,19 @@ func (f *fakeSchemeRepo) GetTransaction(_ context.Context, _, _ string) (domain.
 	return domain.Transaction{}, nil
 }
 
+// GetTenant reports domain.ErrTenantNotFound (Task 2.4b, audit A3.4): Post
+// and Convert both resolve the tenant's TenantPolicy via GetTenant BEFORE
+// ever calling RunInTx (see internal/ledger/policy.go's tenantPolicy), so
+// every test in this file now exercises that call as ordinary, expected
+// traffic, not the "unexpectedly touched the repository further" case the
+// nil embed's panic exists to catch. ErrTenantNotFound resolves to the
+// zero-value policy (no guardrails), which is exactly right: none of these
+// tests care about tenant policy, only about the fingerprint-scheme replay
+// path below.
+func (f *fakeSchemeRepo) GetTenant(_ context.Context, _ string) (domain.Tenant, error) {
+	return domain.Tenant{}, domain.ErrTenantNotFound
+}
+
 func mkFingerprintTxn() *domain.Transaction {
 	d, _ := domain.NewMoney(100, "USD")
 	c, _ := domain.NewMoney(-100, "USD")

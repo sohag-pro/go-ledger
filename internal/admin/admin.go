@@ -13,6 +13,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -216,4 +217,31 @@ func (s *Service) ListKeys(ctx context.Context, tenantID string) ([]domain.APIKe
 // possibly future rate) is passed through unchanged.
 func (s *Service) SetFXRate(ctx context.Context, tenantID string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt *time.Time) error {
 	return s.repo.InsertFXRate(ctx, &tenantID, base, quote, midRateE8, spreadBps, source, effectiveAt)
+}
+
+// SetTenantPolicy writes policy into tenantID's tenants.settings jsonb
+// column as {"policy": {...}} (Task 2.4b, audit A3.4), replacing whatever
+// was there before: the settings document holds nothing else yet, so a
+// whole-document write is the same thing as an update, without needing a
+// read-modify-write.
+//
+// policy is validated first (TenantPolicy.Validate: no negative limit, every
+// AllowedCurrencies entry a well-formed three-letter code), the same
+// defense-in-depth style validateScopes and requireActiveTenant apply
+// elsewhere in this file, so a malformed policy is rejected with
+// domain.ErrInvalidTenantPolicy before anything is written. It returns
+// domain.ErrTenantNotFound if tenantID has no row.
+//
+// Unlike IssueKey, this does not require the tenant to be active: an
+// operator may want to configure guardrails ahead of, or during, a status
+// change, exactly like SetFXRate above.
+func (s *Service) SetTenantPolicy(ctx context.Context, tenantID string, policy domain.TenantPolicy) error {
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(domain.TenantSettings{Policy: policy})
+	if err != nil {
+		return fmt.Errorf("admin: marshal tenant policy: %w", err)
+	}
+	return s.repo.SetTenantSettings(ctx, tenantID, raw)
 }

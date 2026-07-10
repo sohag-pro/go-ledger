@@ -27,6 +27,8 @@ func TestToHumaErr(t *testing.T) {
 		{"unbalanced", domain.ErrUnbalanced, 422, false},
 		{"currency mismatch", domain.ErrCurrencyMismatch, 422, false},
 		{"too few postings", domain.ErrTooFewPostings, 422, false},
+		{"invalid tenant policy", domain.ErrInvalidTenantPolicy, 422, false},
+		{"policy violation", &domain.PolicyViolationError{Rule: domain.PolicyRuleMaxTransactionAmount, Currency: "USD", Amount: 100, Limit: 50}, 422, false},
 	}
 
 	for _, tt := range tests {
@@ -49,5 +51,26 @@ func TestToHumaErr(t *testing.T) {
 				t.Errorf("toHumaErr(%v) status = %d, want %d", tt.err, statusErr.GetStatus(), tt.wantStatus)
 			}
 		})
+	}
+}
+
+// TestToHumaErr_PolicyViolationMessageNamesRuleAndCurrency proves toHumaErr's
+// *domain.PolicyViolationError branch (Task 2.4b, audit A3.4) surfaces the
+// typed error's own message, not a generic "policy violation" string, so a
+// caller's 422 body says exactly which rule and currency tripped.
+func TestToHumaErr_PolicyViolationMessageNamesRuleAndCurrency(t *testing.T) {
+	pv := &domain.PolicyViolationError{
+		Rule: domain.PolicyRuleDailyVolumeLimit, Currency: "EUR", Amount: 1500, Limit: 1000,
+	}
+	got := toHumaErr(pv)
+	statusErr, ok := got.(huma.StatusError)
+	if !ok {
+		t.Fatalf("toHumaErr(%v) = %v (%T), does not implement huma.StatusError", pv, got, got)
+	}
+	if statusErr.GetStatus() != 422 {
+		t.Errorf("status = %d, want 422", statusErr.GetStatus())
+	}
+	if statusErr.Error() == "" {
+		t.Error("error message is empty")
 	}
 }

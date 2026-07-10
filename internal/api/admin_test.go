@@ -329,3 +329,78 @@ func TestAdminIssueKeyInvalidScopesIs422(t *testing.T) {
 		t.Errorf("issue key with empty scopes: status = %d, want 422 (%s)", rec.Code, rec.Body.String())
 	}
 }
+
+// TestAdminSetTenantPolicy is the REST surface for Task 2.4b (audit A3.4): an
+// admin-scoped POST to /v1/admin/tenants/{id}/policy writes the tenant's
+// guardrails, a malformed body is rejected with 422 before anything is
+// written, and a non-admin key is rejected with 403 before the handler body
+// runs at all (the same scope gate every other /v1/admin/ route already has).
+func TestAdminSetTenantPolicy(t *testing.T) {
+	repo := newAdminTestRouter(t)
+	r := newAPIRouter(repo)
+
+	createRec := doAs(t, r, adminKeyPlaintext, http.MethodPost, "/v1/admin/tenants", map[string]string{"name": "policy rest test"})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create tenant: status = %d, want 201 (%s)", createRec.Code, createRec.Body.String())
+	}
+	var created TenantBody
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created tenant: %v", err)
+	}
+
+	policyBody := map[string]any{
+		"max_transaction_amount": 50000,
+		"daily_volume_limit":     200000,
+		"allowed_currencies":     []string{"USD", "EUR"},
+	}
+	setRec := doAs(t, r, adminKeyPlaintext, http.MethodPost, "/v1/admin/tenants/"+created.ID+"/policy", policyBody)
+	if setRec.Code != http.StatusNoContent {
+		t.Fatalf("set tenant policy: status = %d, want 204 (%s)", setRec.Code, setRec.Body.String())
+	}
+
+	// The write landed in the tenant's settings jsonb, decodable the same
+	// way the ledger's enforcement path reads it back.
+	stored, err := repo.GetTenant(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetTenant after set-tenant-policy: %v", err)
+	}
+	settings, err := domain.ParseTenantSettings(stored.Settings)
+	if err != nil {
+		t.Fatalf("ParseTenantSettings: %v", err)
+	}
+	if settings.Policy.MaxTransactionAmount != 50000 {
+		t.Errorf("MaxTransactionAmount = %d, want 50000", settings.Policy.MaxTransactionAmount)
+	}
+	if settings.Policy.DailyVolumeLimit != 200000 {
+		t.Errorf("DailyVolumeLimit = %d, want 200000", settings.Policy.DailyVolumeLimit)
+	}
+	if len(settings.Policy.AllowedCurrencies) != 2 {
+		t.Errorf("AllowedCurrencies = %v, want [USD EUR]", settings.Policy.AllowedCurrencies)
+	}
+
+	// A malformed policy (negative amount) is rejected with 422, and does not
+	// overwrite the good policy set above.
+	badRec := doAs(t, r, adminKeyPlaintext, http.MethodPost, "/v1/admin/tenants/"+created.ID+"/policy",
+		map[string]any{"max_transaction_amount": -1})
+	if badRec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("negative amount: status = %d, want 422 (%s)", badRec.Code, badRec.Body.String())
+	}
+	stillGood, err := repo.GetTenant(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetTenant after rejected policy: %v", err)
+	}
+	stillSettings, err := domain.ParseTenantSettings(stillGood.Settings)
+	if err != nil {
+		t.Fatalf("ParseTenantSettings after rejected policy: %v", err)
+	}
+	if stillSettings.Policy.MaxTransactionAmount != 50000 {
+		t.Errorf("policy was overwritten by a rejected request: MaxTransactionAmount = %d, want 50000", stillSettings.Policy.MaxTransactionAmount)
+	}
+
+	// A non-admin (post-only) key is rejected with 403, before the handler
+	// body (and thus admin.Service.SetTenantPolicy) ever runs.
+	forbiddenRec := doAs(t, r, postOnlyKeyPlaintext, http.MethodPost, "/v1/admin/tenants/"+created.ID+"/policy", policyBody)
+	if forbiddenRec.Code != http.StatusForbidden {
+		t.Errorf("non-admin key: status = %d, want 403 (%s)", forbiddenRec.Code, forbiddenRec.Body.String())
+	}
+}

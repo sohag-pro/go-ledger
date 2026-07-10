@@ -136,7 +136,21 @@ type Querier interface {
 	// affected (not zero), so the admin service can tell "no such key" (0 rows)
 	// from "already revoked" (1 row, unchanged) without a separate lookup.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// Task 2.4b (audit A3.4): a whole-document replace of the settings jsonb
+	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
+	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)
 	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
+	// Task 2.4b (audit A3.4): each currency's already-posted debit total for
+	// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
+	// up with the same clock that stamped created_at on every posting). Read
+	// from inside the caller's SERIALIZABLE RunInTx body, under the per-tenant
+	// in-process serialization (ADR-012), so a daily-volume policy check is race
+	// free: two concurrent posts for the same tenant can never both read this
+	// same total and both post believing they are under the cap. Only positive
+	// amounts (debits, ADR-002) are summed: a transaction's credits are the
+	// mirror image of its debits within each currency (the balance invariant),
+	// so counting only debits avoids double-counting the same movement.
+	TenantDailyDebits(ctx context.Context, tenantID uuid.UUID) ([]TenantDailyDebitsRow, error)
 	// Updates last_used_at for a single key by id. Called best-effort and
 	// throttled from the auth resolver (Task 2.2): not every request, so this is
 	// not a write on the hot path of every authenticated call.

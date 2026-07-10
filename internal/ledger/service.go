@@ -65,6 +65,10 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 // original transaction instead of writing a new one (returning replayed=true). A
 // key reused with a different request body returns domain.ErrIdempotencyConflict.
 // Every real post also writes one append-only audit row in the same transaction.
+// Before any of that, t's postings are checked against tenantID's optional
+// TenantPolicy guardrails (Task 2.4b, audit A3.4: max transaction amount, daily
+// volume, currency allowlist); a tripped guardrail returns a
+// *domain.PolicyViolationError.
 func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction, idem *domain.Idempotency) (replayed bool, err error) {
 	ctx, span := s.tracer.Start(ctx, "ledger.PostTransaction",
 		oteltrace.WithAttributes(
@@ -82,9 +86,22 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		return false, err
 	}
 
+	// Resolved BEFORE RunInTx, on its own connection, never from inside
+	// RunInTx's closure: see enforceTenantPolicy's doc comment for the
+	// connection-pool deadlock a second in-tx Repository call would risk
+	// under a small pool.
+	policy, err := tenantPolicy(ctx, s.repo, tenantID)
+	if err != nil {
+		span.RecordError(err)
+		return false, err
+	}
+
 	fingerprint := t.Fingerprint()
 	start := time.Now()
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
+		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
+			return err
+		}
 		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {
 			return err
 		}

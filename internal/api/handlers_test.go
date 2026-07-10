@@ -414,6 +414,43 @@ func (f *fakeRepo) SetTenantStatus(_ context.Context, tenantID string, status do
 	return nil
 }
 
+// SetTenantSettings overwrites the fake tenant's Settings field (Task 2.4b,
+// audit A3.4), the same whole-document replace the real repository does. It
+// returns domain.ErrTenantNotFound if tenantID has no row, matching the real
+// adapter's execrows-zero case.
+func (f *fakeRepo) SetTenantSettings(_ context.Context, tenantID string, settings json.RawMessage) error {
+	t, ok := f.tenants[tenantID]
+	if !ok {
+		return domain.ErrTenantNotFound
+	}
+	t.Settings = settings
+	f.tenants[tenantID] = t
+	return nil
+}
+
+// TenantDailyDebits is a minimal in-memory stand-in (Task 2.4b, audit A3.4):
+// it sums every posting's positive (debit) amount ever recorded, grouped by
+// the currency of the account it posted against, with no "today" filtering.
+// No handler test in this package sets a tenant policy with a
+// DailyVolumeLimit, so this is never exercised for its date semantics; real
+// day-boundary correctness is covered by the Postgres-backed integration
+// tests in internal/ledger instead (this fake has no server clock to filter
+// against, only a synthetic per-posting counter, see f.clock).
+func (f *fakeRepo) TenantDailyDebits(_ context.Context, _ string) (map[string]int64, error) {
+	out := make(map[string]int64)
+	for _, p := range f.postings {
+		if p.amount <= 0 {
+			continue
+		}
+		a, ok := f.accounts[p.accountID]
+		if !ok {
+			continue
+		}
+		out[string(a.Currency)] += p.amount
+	}
+	return out, nil
+}
+
 // InsertFXRate is not exercised by any handler test in this package (Task
 // 2.4's per-tenant resolution is covered by real-Postgres integration tests
 // in internal/fx and internal/ledger instead, since it depends on

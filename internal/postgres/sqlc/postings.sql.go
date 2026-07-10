@@ -184,3 +184,47 @@ func (q *Queries) ListPostingsByTransaction(ctx context.Context, arg ListPosting
 	}
 	return items, nil
 }
+
+const tenantDailyDebits = `-- name: TenantDailyDebits :many
+SELECT currency, SUM(amount)::bigint AS total
+FROM postings
+WHERE tenant_id = $1
+  AND amount > 0
+  AND created_at >= date_trunc('day', now())
+GROUP BY currency
+`
+
+type TenantDailyDebitsRow struct {
+	Currency string
+	Total    int64
+}
+
+// Task 2.4b (audit A3.4): each currency's already-posted debit total for
+// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
+// up with the same clock that stamped created_at on every posting). Read
+// from inside the caller's SERIALIZABLE RunInTx body, under the per-tenant
+// in-process serialization (ADR-012), so a daily-volume policy check is race
+// free: two concurrent posts for the same tenant can never both read this
+// same total and both post believing they are under the cap. Only positive
+// amounts (debits, ADR-002) are summed: a transaction's credits are the
+// mirror image of its debits within each currency (the balance invariant),
+// so counting only debits avoids double-counting the same movement.
+func (q *Queries) TenantDailyDebits(ctx context.Context, tenantID uuid.UUID) ([]TenantDailyDebitsRow, error) {
+	rows, err := q.db.Query(ctx, tenantDailyDebits, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TenantDailyDebitsRow
+	for rows.Next() {
+		var i TenantDailyDebitsRow
+		if err := rows.Scan(&i.Currency, &i.Total); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

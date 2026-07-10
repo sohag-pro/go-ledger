@@ -20,6 +20,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/fx"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
@@ -601,5 +602,160 @@ func TestSetFXRateValidatesBeforeInsert(t *testing.T) {
 					tc.base, tc.quote, tc.midRateE8, tc.spreadBps, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestSetTenantPolicyRoundTrip proves ledgerctl "tenant policy"'s underlying
+// path (Task 2.4b, audit A3.4): SetTenantPolicy must not just write without
+// error, GetTenant must read back exactly the policy that was set, decoded
+// through the same domain.ParseTenantSettings the ledger's enforcement path
+// uses.
+func TestSetTenantPolicyRoundTrip(t *testing.T) {
+	t.Parallel()
+	svc, repo := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "policy test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	policy := domain.TenantPolicy{
+		MaxTransactionAmount: 500_00,
+		DailyVolumeLimit:     2_000_00,
+		AllowedCurrencies:    []string{"USD", "EUR"},
+	}
+	if err := svc.SetTenantPolicy(ctx, tenant.ID, policy); err != nil {
+		t.Fatalf("SetTenantPolicy: %v", err)
+	}
+
+	got, err := repo.GetTenant(ctx, tenant.ID)
+	if err != nil {
+		t.Fatalf("GetTenant: %v", err)
+	}
+	settings, err := domain.ParseTenantSettings(got.Settings)
+	if err != nil {
+		t.Fatalf("ParseTenantSettings: %v", err)
+	}
+	if settings.Policy.MaxTransactionAmount != policy.MaxTransactionAmount {
+		t.Errorf("MaxTransactionAmount = %d, want %d", settings.Policy.MaxTransactionAmount, policy.MaxTransactionAmount)
+	}
+	if settings.Policy.DailyVolumeLimit != policy.DailyVolumeLimit {
+		t.Errorf("DailyVolumeLimit = %d, want %d", settings.Policy.DailyVolumeLimit, policy.DailyVolumeLimit)
+	}
+	if len(settings.Policy.AllowedCurrencies) != 2 {
+		t.Fatalf("AllowedCurrencies = %v, want [USD EUR]", settings.Policy.AllowedCurrencies)
+	}
+
+	// Setting a second, DIFFERENT policy overwrites the first (whole-document
+	// replace, not a merge, per SetTenantPolicy's doc comment).
+	if err := svc.SetTenantPolicy(ctx, tenant.ID, domain.TenantPolicy{MaxTransactionAmount: 1}); err != nil {
+		t.Fatalf("SetTenantPolicy (overwrite): %v", err)
+	}
+	got, err = repo.GetTenant(ctx, tenant.ID)
+	if err != nil {
+		t.Fatalf("GetTenant (after overwrite): %v", err)
+	}
+	settings, err = domain.ParseTenantSettings(got.Settings)
+	if err != nil {
+		t.Fatalf("ParseTenantSettings (after overwrite): %v", err)
+	}
+	if settings.Policy.MaxTransactionAmount != 1 || settings.Policy.DailyVolumeLimit != 0 || len(settings.Policy.AllowedCurrencies) != 0 {
+		t.Errorf("policy after overwrite = %+v, want only MaxTransactionAmount=1", settings.Policy)
+	}
+}
+
+// TestSetTenantPolicyMissingTenantErrors proves SetTenantPolicy fails closed
+// with domain.ErrTenantNotFound for a tenant id that does not exist, rather
+// than silently no-op'ing (SetTenantSettings's execrows is 0, which the
+// repository maps to ErrTenantNotFound, the same pattern SetTenantStatus and
+// SetFXRate already use).
+func TestSetTenantPolicyMissingTenantErrors(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	err := svc.SetTenantPolicy(ctx, "00000000-0000-0000-0000-000000000000", domain.TenantPolicy{MaxTransactionAmount: 100})
+	if !errors.Is(err, domain.ErrTenantNotFound) {
+		t.Errorf("SetTenantPolicy on missing tenant: err = %v, want ErrTenantNotFound", err)
+	}
+}
+
+// TestSetTenantPolicyValidatesBeforeWrite proves SetTenantPolicy rejects a
+// malformed policy (a negative limit, or a currency that is not a
+// well-formed three-letter code) before ever writing anything, the same
+// defense-in-depth style TestSetFXRateValidatesBeforeInsert covers for
+// SetFXRate above.
+func TestSetTenantPolicyValidatesBeforeWrite(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "policy validation test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		policy domain.TenantPolicy
+	}{
+		{"negative max transaction amount", domain.TenantPolicy{MaxTransactionAmount: -1}},
+		{"negative daily volume limit", domain.TenantPolicy{DailyVolumeLimit: -1}},
+		{"malformed currency code", domain.TenantPolicy{AllowedCurrencies: []string{"usd"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := svc.SetTenantPolicy(ctx, tenant.ID, tc.policy)
+			if !errors.Is(err, domain.ErrInvalidTenantPolicy) {
+				t.Errorf("SetTenantPolicy(%+v): err = %v, want ErrInvalidTenantPolicy", tc.policy, err)
+			}
+		})
+	}
+}
+
+// TestSetTenantPolicyThenPostRespectsIt is the full admin-to-ledger path
+// (Task 2.4b, audit A3.4): a policy set through admin.Service.SetTenantPolicy
+// is enforced the very next time that tenant posts through
+// ledger.TransactionService.Post, over the same repository, with no
+// intervening step. This is the "an operator sets a policy, then a post
+// respects it" case the task brief calls out explicitly.
+func TestSetTenantPolicyThenPostRespectsIt(t *testing.T) {
+	t.Parallel()
+	svc, repo := newTestSvc(t)
+	txSvc := ledger.NewTransactionService(repo, nil, nil)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "policy enforcement test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if err := svc.SetTenantPolicy(ctx, tenant.ID, domain.TenantPolicy{MaxTransactionAmount: 100}); err != nil {
+		t.Fatalf("SetTenantPolicy: %v", err)
+	}
+
+	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
+	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
+	if err := repo.CreateAccount(ctx, tenant.ID, debit); err != nil {
+		t.Fatalf("create debit account: %v", err)
+	}
+	if err := repo.CreateAccount(ctx, tenant.ID, credit); err != nil {
+		t.Fatalf("create credit account: %v", err)
+	}
+
+	d, _ := domain.NewMoney(101, "USD")
+	c, _ := domain.NewMoney(-101, "USD")
+	over := &domain.Transaction{Postings: []domain.Posting{
+		{AccountID: debit.ID, Amount: d},
+		{AccountID: credit.ID, Amount: c},
+	}}
+	_, err = txSvc.Post(ctx, tenant.ID, over, nil)
+	var pv *domain.PolicyViolationError
+	if !errors.As(err, &pv) {
+		t.Fatalf("post over the just-set policy cap: err = %v, want *domain.PolicyViolationError", err)
+	}
+	if pv.Rule != domain.PolicyRuleMaxTransactionAmount {
+		t.Errorf("PolicyViolationError.Rule = %s, want %s", pv.Rule, domain.PolicyRuleMaxTransactionAmount)
 	}
 }
