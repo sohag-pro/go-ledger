@@ -636,6 +636,15 @@ components:
       required:
         - status
       type: object
+    ShredTenantPIIInputBody:
+      additionalProperties: false
+      properties:
+        confirm:
+          description: "Must be true. This operation is irreversible: it permanently destroys the tenant's PII encryption key, and every posting description ever encrypted under it becomes permanently unreadable."
+          type: boolean
+      required:
+        - confirm
+      type: object
     StatementEntryBody:
       additionalProperties: false
       properties:
@@ -1305,6 +1314,39 @@ paths:
       security:
         - bearerAuth: []
       summary: Set a tenant's posting guardrails
+      tags:
+        - admin
+  /v1/admin/tenants/{id}/shred-pii:
+    post:
+      description: "Crypto-shredding (Task 6.2): destroys the tenant's Data Encryption Key. Every posting description ever encrypted under it becomes permanently unreadable (a later read returns a redacted marker, not an error); money data (accounts, transactions, amounts, balances) and the tamper-evident audit hash chain are completely untouched and remain verifiable. THIS CANNOT BE UNDONE: there is no way to recover an erased description, by anyone, once this call succeeds. Requires confirm: true in the body. Idempotent: calling it again for an already-shredded tenant succeeds with no effect."
+      operationId: shred-tenant-pii
+      parameters:
+        - description: Tenant id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Tenant id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ShredTenantPIIInputBody"
+        required: true
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Irreversibly erase a tenant's PII encryption key
       tags:
         - admin
   /v1/admin/tenants/{id}/status:

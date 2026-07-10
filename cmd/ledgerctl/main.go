@@ -87,10 +87,11 @@ type handler func(ctx context.Context, svc *admin.Service, out *os.File, args []
 // DATABASE_URL or database dependency at all.
 var commands = map[string]map[string]handler{
 	"tenant": {
-		"create": tenantCreate,
-		"list":   tenantList,
-		"status": tenantStatus,
-		"policy": tenantPolicySet,
+		"create":    tenantCreate,
+		"list":      tenantList,
+		"status":    tenantStatus,
+		"policy":    tenantPolicySet,
+		"shred-pii": tenantShredPII,
 	},
 	"key": {
 		"issue":  keyIssue,
@@ -115,6 +116,7 @@ const usage = `usage: ledgerctl <resource> <action> [flags]
   tenant list
   tenant status --id ID --status active|suspended|closed
   tenant policy --tenant ID [--max-amount N] [--daily-limit N] [--currencies USD,EUR]
+  tenant shred-pii --tenant ID --yes    (IRREVERSIBLE: destroys the tenant's PII encryption key)
 
   key issue --tenant ID --name NAME --scopes read,post[,admin] [--expires-in DURATION]
   key rotate --id KEYID
@@ -291,6 +293,41 @@ func tenantPolicySet(ctx context.Context, svc *admin.Service, out *os.File, args
 	}
 	_, _ = fmt.Fprintf(out, "tenant %s policy: max_amount=%d daily_limit=%d currencies=%s\n",
 		tenantID, policy.MaxTransactionAmount, policy.DailyVolumeLimit, currencies)
+	return nil
+}
+
+// parseTenantShredPII parses "tenant shred-pii"'s flags: --tenant and the
+// required --yes confirmation flag (Task 6.2, audit A9.3). Unlike every other
+// tenant subcommand, a missing confirmation fails closed here, before svc is
+// ever called: this operation is irreversible (see
+// admin.Service.ShredTenantPII's own doc comment), so requiring an explicit
+// --yes is the CLI's own belt-and-suspenders on top of the REST endpoint's
+// own required confirm: true body field.
+func parseTenantShredPII(args []string) (tenantID string, err error) {
+	fs := flag.NewFlagSet("tenant shred-pii", flag.ContinueOnError)
+	tenantFlag := fs.String("tenant", "", "tenant id (required)")
+	yesFlag := fs.Bool("yes", false, "required: confirms this IRREVERSIBLE operation")
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+	if *tenantFlag == "" {
+		return "", errors.New("--tenant is required")
+	}
+	if !*yesFlag {
+		return "", errors.New("--yes is required: this operation is IRREVERSIBLE, it permanently destroys the tenant's PII encryption key")
+	}
+	return *tenantFlag, nil
+}
+
+func tenantShredPII(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
+	tenantID, err := parseTenantShredPII(args)
+	if err != nil {
+		return err
+	}
+	if err := svc.ShredTenantPII(ctx, tenantID); err != nil {
+		return fmt.Errorf("shred tenant pii: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, "tenant %s: PII encryption key destroyed (IRREVERSIBLE). Every posting description ever encrypted for this tenant is now permanently unreadable.\n", tenantID)
 	return nil
 }
 

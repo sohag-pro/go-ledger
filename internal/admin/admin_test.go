@@ -885,3 +885,58 @@ func TestDeleteWebhookSubscriptionDeactivatesAndErrorsOnUnknownID(t *testing.T) 
 		t.Errorf("delete unknown webhook subscription: err = %v, want ErrWebhookSubscriptionNotFound", err)
 	}
 }
+
+// TestShredTenantPIILeavesATombstoneAndIsIdempotent proves
+// admin.Service.ShredTenantPII (Task 6.2, audit A9.3) leaves a permanent
+// shredded marker even for a tenant that never encrypted anything yet (no
+// crypto_keys row at all before the call), and that calling it again is a
+// no-op success, not an error, that never moves the original erasure
+// timestamp. This is the operator-surface-level proof; the money-critical
+// "Verify still returns Valid after a shred" proof lives in
+// internal/ledger's own integration tests, where a real cipher and a posted
+// transaction are both in play.
+func TestShredTenantPIILeavesATombstoneAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+	svc, repo := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "shred pii test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	// No crypto_keys row exists yet: GetWrappedDEK reports found=false.
+	if _, _, found, err := repo.GetWrappedDEK(ctx, tenant.ID); err != nil {
+		t.Fatalf("GetWrappedDEK before shred: %v", err)
+	} else if found {
+		t.Fatal("GetWrappedDEK before shred: found = true, want false (no key created yet)")
+	}
+
+	if err := svc.ShredTenantPII(ctx, tenant.ID); err != nil {
+		t.Fatalf("ShredTenantPII: %v", err)
+	}
+
+	// A permanent tombstone now exists, even though nothing was ever
+	// encrypted: a later Encrypt for this tenant must see it as shredded,
+	// never silently mint a fresh, live key.
+	_, shredded, found, err := repo.GetWrappedDEK(ctx, tenant.ID)
+	if err != nil {
+		t.Fatalf("GetWrappedDEK after shred: %v", err)
+	}
+	if !found || !shredded {
+		t.Errorf("GetWrappedDEK after shred: found=%v shredded=%v, want found=true shredded=true", found, shredded)
+	}
+
+	// GetOrCreateWrappedDEK (what Encrypt calls internally) must also report
+	// shredded, never revive the tenant with a fresh DEK.
+	if _, shredded, err := repo.GetOrCreateWrappedDEK(ctx, tenant.ID, []byte("candidate")); err != nil {
+		t.Fatalf("GetOrCreateWrappedDEK after shred: %v", err)
+	} else if !shredded {
+		t.Error("GetOrCreateWrappedDEK after shred: shredded = false, want true (must not revive a shredded tenant)")
+	}
+
+	// Idempotent: shredding again succeeds with no error.
+	if err := svc.ShredTenantPII(ctx, tenant.ID); err != nil {
+		t.Fatalf("ShredTenantPII (second call): %v", err)
+	}
+}

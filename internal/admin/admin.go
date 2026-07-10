@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -278,6 +279,45 @@ func (s *Service) CreateWebhookSubscription(ctx context.Context, tenantID, url s
 // carries no field capable of holding one.
 func (s *Service) ListWebhookSubscriptions(ctx context.Context, tenantID string) ([]domain.WebhookSubscription, error) {
 	return s.repo.ListWebhookSubscriptionsByTenant(ctx, tenantID)
+}
+
+// ShredTenantPII irreversibly destroys tenantID's PII encryption key (Task
+// 6.2, audit A9.3): the crypto-shredding operation behind
+// POST /v1/admin/tenants/{id}/shred-pii and `ledgerctl tenant shred-pii`.
+// Every posting description that tenant ever had encrypted
+// (internal/crypto.Cipher, wired in only when LEDGER_MASTER_KEY is set)
+// becomes permanently unreadable: a later read decrypts to
+// crypto.RedactedMarker instead of erroring. Money data (accounts,
+// transactions, postings' amounts, balances) and the tamper-evident audit
+// hash chain (ADR-012) are completely untouched: crypto_keys is a separate
+// table from every one of those, and the chain hashes the exact ciphertext
+// bytes already stored in audit_log.after, never decrypts them, so it
+// verifies identically before and after this call.
+//
+// This is a direct, thin pass-through to
+// domain.Repository.ShredTenantCryptoKey, the same "no separate persistence
+// dependency" shape every other method in this file follows: it does not
+// require tenantID to exist or be active first (unlike IssueKey), mirroring
+// SetFXRate/SetTenantPolicy/CreateWebhookSubscription's own reasoning, an
+// operator may be shredding PII as part of, or ahead of, closing a tenant
+// entirely. It is idempotent: calling it again for an already-shredded
+// tenant is a no-op success, not an error, and never moves the original
+// erasure timestamp (see ShredTenantCryptoKey's own doc comment).
+//
+// THIS IS IRREVERSIBLE. There is no undo: once a tenant's key is destroyed,
+// none of its encrypted descriptions can ever be recovered, by anyone,
+// including this codebase's own operators. See
+// docs/ops/retention-and-erasure.md.
+func (s *Service) ShredTenantPII(ctx context.Context, tenantID string) error {
+	if err := s.repo.ShredTenantCryptoKey(ctx, tenantID); err != nil {
+		return err
+	}
+	// Logged as a distinct, irreversible ops event (never plaintext, never a
+	// key: there is neither to log here, only the fact that this tenant's
+	// key no longer exists), regardless of which surface called this
+	// (REST or ledgerctl): this is the one choke point both go through.
+	slog.WarnContext(ctx, "tenant pii crypto-shredded", "tenant_id", tenantID)
+	return nil
 }
 
 // DeleteWebhookSubscription deactivates the subscription identified by id

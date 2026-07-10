@@ -21,6 +21,7 @@ func TestResolveHandlerKnownSubcommands(t *testing.T) {
 		{"tenant", "list"},
 		{"tenant", "status"},
 		{"tenant", "policy"},
+		{"tenant", "shred-pii"},
 		{"key", "issue"},
 		{"key", "rotate"},
 		{"key", "revoke"},
@@ -492,5 +493,36 @@ func TestParseWebhookAddRequiredFlags(t *testing.T) {
 				t.Fatalf("parseWebhookAdd(%v): expected an error", tc.args)
 			}
 		})
+	}
+}
+
+// --- tenant shred-pii (Task 6.2, audit A9.3): --yes is a hard requirement,
+// checked before any database round trip, since this operation is
+// irreversible. ---
+
+func TestParseTenantShredPIIRequiresYes(t *testing.T) {
+	t.Parallel()
+	_, err := parseTenantShredPII([]string{"--tenant", "tenant-1"})
+	if err == nil {
+		t.Fatal("parseTenantShredPII without --yes: expected an error")
+	}
+}
+
+func TestParseTenantShredPIIRequiresTenant(t *testing.T) {
+	t.Parallel()
+	_, err := parseTenantShredPII([]string{"--yes"})
+	if err == nil {
+		t.Fatal("parseTenantShredPII without --tenant: expected an error")
+	}
+}
+
+func TestParseTenantShredPIIValid(t *testing.T) {
+	t.Parallel()
+	tenantID, err := parseTenantShredPII([]string{"--tenant", "tenant-1", "--yes"})
+	if err != nil {
+		t.Fatalf("parseTenantShredPII: %v", err)
+	}
+	if tenantID != "tenant-1" {
+		t.Errorf("tenantID = %q, want tenant-1", tenantID)
 	}
 }

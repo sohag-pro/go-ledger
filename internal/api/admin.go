@@ -68,6 +68,21 @@ type SetTenantPolicyInput struct {
 // with no response body, just a 204 No Content status.
 type EmptyOutput struct{}
 
+// ShredTenantPIIInput is the shred-pii request: a path id plus a required
+// confirmation flag (Task 6.2, audit A9.3). Confirm must be exactly true:
+// omitting it (the zero value, false) fails closed with a 400 rather than
+// silently proceeding, since this call is irreversible (see
+// admin.Service.ShredTenantPII's own doc comment). There is deliberately no
+// way to pass this as a query parameter or header instead: a body field
+// forces a caller to construct the request deliberately, not accidentally
+// via a copy-pasted URL.
+type ShredTenantPIIInput struct {
+	ID   string `path:"id" format:"uuid" doc:"Tenant id"`
+	Body struct {
+		Confirm bool `json:"confirm" doc:"Must be true. This operation is irreversible: it permanently destroys the tenant's PII encryption key, and every posting description ever encrypted under it becomes permanently unreadable."`
+	}
+}
+
 // KeyBody is the JSON shape of an api key in the list-keys response. It
 // never carries the plaintext: that is never stored anywhere to return, only
 // shown once, at issue or rotate time, in IssuedKeyBody below.
@@ -335,6 +350,30 @@ func registerAdmin(api huma.API, deps Deps) {
 			AllowedCurrencies:    in.Body.AllowedCurrencies,
 		}
 		if err := deps.Admin.SetTenantPolicy(ctx, in.ID, policy); err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &EmptyOutput{}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "shred-tenant-pii",
+		Method:      http.MethodPost,
+		Path:        "/v1/admin/tenants/{id}/shred-pii",
+		Summary:     "Irreversibly erase a tenant's PII encryption key",
+		Description: "Crypto-shredding (Task 6.2): destroys the tenant's Data Encryption Key. Every posting description ever " +
+			"encrypted under it becomes permanently unreadable (a later read returns a redacted marker, not an error); money data " +
+			"(accounts, transactions, amounts, balances) and the tamper-evident audit hash chain are completely untouched and remain " +
+			"verifiable. THIS CANNOT BE UNDONE: there is no way to recover an erased description, by anyone, once this call succeeds. " +
+			"Requires confirm: true in the body. Idempotent: calling it again for an already-shredded tenant succeeds with no effect.",
+		Tags:          []string{"admin"},
+		DefaultStatus: http.StatusNoContent,
+		MaxBodyBytes:  MaxRequestBodyBytes,
+		Security:      bearerSecurity,
+	}, func(ctx context.Context, in *ShredTenantPIIInput) (*EmptyOutput, error) {
+		if !in.Body.Confirm {
+			return nil, huma.Error400BadRequest("confirm must be true: this operation is irreversible")
+		}
+		if err := deps.Admin.ShredTenantPII(ctx, in.ID); err != nil {
 			return nil, toHumaErr(err)
 		}
 		return &EmptyOutput{}, nil
