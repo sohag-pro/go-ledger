@@ -355,15 +355,22 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
-	// Apply migrations before serving. On a single instance this is the
-	// simplest correct option: the binary that needs a column also creates
-	// it. The deploy pipeline (Task 5.6b, audit A4.3) additionally runs
-	// `./go-ledger migrate` against production BEFORE swapping the new
-	// binary in, so a migration failure aborts the deploy before any new
-	// code runs at all; this on-boot call stays as a second, idempotent
-	// safety net (goose Up on an already-current database is a no-op) for
-	// local dev, docker-compose, and any environment that starts the server
-	// directly without a separate migrate step.
+	// Apply migrations before serving. On a single instance (ADR-013; this
+	// deployment) this is the simplest correct option: the binary that
+	// needs a column also creates it. Its safety depends on that
+	// single-instance shape, NOT on goose providing any lock: the legacy
+	// goose.UpContext called below takes no advisory lock or other
+	// cross-process serialization (that only exists via goose.NewProvider
+	// with a SessionLocker, which this code does not use), so two instances
+	// racing this call could race each other. The deploy pipeline (Task
+	// 5.6b, audit A4.3) additionally runs `./go-ledger migrate` against
+	// production BEFORE swapping the new binary in, so a migration failure
+	// aborts the deploy before any new code runs at all; this on-boot call
+	// stays as a second, idempotent safety net (goose Up on an
+	// already-current database is a no-op) for local dev, docker-compose,
+	// and any environment that starts the server directly without a
+	// separate migrate step. See docs/ops/server-setup.md for what to
+	// revisit if this project ever goes multi-instance.
 	if err := runMigrations(ctx, cfg.databaseURL); err != nil {
 		return err
 	}

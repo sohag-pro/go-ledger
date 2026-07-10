@@ -182,15 +182,21 @@ jobs:
         # stops the job here, so the swap-and-restart step below never runs
         # and the currently running (old) binary is left untouched. The
         # go-ledger-migrate wrapper (infra/ansible/roles/app) loads the box's
-        # own /etc/go-ledger/env and execs go-ledger.new migrate; it is
-        # root-owned and reachable only through the narrowly scoped sudoers
-        # rule installed by that role, not by ssh'ing in and running an
-        # arbitrary command as root.
+        # own /etc/go-ledger/env and execs go-ledger.new migrate; the script
+        # itself is root-owned (so `deploy` cannot tamper with it) and
+        # reachable only through the narrowly scoped sudoers rule installed
+        # by that role, but that rule's Runas_Spec is `(goledger)`, not
+        # `(root)`: sudo runs the wrapper, and go-ledger.new migrate under
+        # it, as the sandboxed goledger app user, never as root. That caps a
+        # leaked DEPLOY_SSH_KEY at "run arbitrary code as the app user"
+        # (same ceiling the running service already has), not root RCE,
+        # even though go-ledger.new itself lives under deploy's own
+        # ownership and is overwritten by this same pipeline every push.
         run: |
           ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
             set -euo pipefail
             chmod 755 /opt/go-ledger/go-ledger.new
-            sudo /usr/local/sbin/go-ledger-migrate
+            sudo -u goledger /usr/local/sbin/go-ledger-migrate
           '
 
       - name: Swap binary and restart service
@@ -218,7 +224,15 @@ jobs:
           fi
 
           echo "::error::health check failed after deploy; rolling back to the previous binary"
-          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
+          # This step's shell runs with -e (the GitHub Actions run: default),
+          # so a naive `ssh ... || exit 1` right after it would still let -e
+          # kill the script the instant the ssh command below returns
+          # non-zero (e.g. no go-ledger.prev, or the restart itself failing),
+          # skipping every diagnostic below and leaving the log silent about
+          # which failure actually happened. Guarding the ssh call as the
+          # condition of an `if` neutralizes -e for just this command, so the
+          # explicit ::error:: message and exit 1 always run instead.
+          if ! ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
             set -euo pipefail
             cd /opt/go-ledger
             if [ ! -f go-ledger.prev ]; then
@@ -227,7 +241,10 @@ jobs:
             fi
             cp go-ledger.prev go-ledger
             sudo systemctl restart go-ledger
-          '
+          '; then
+            echo "::error::rollback itself failed (no go-ledger.prev on the box, or the restart command failed); the app is likely still down on the bad build, investigate immediately"
+            exit 1
+          fi
 
           sleep 3
           if curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz; then

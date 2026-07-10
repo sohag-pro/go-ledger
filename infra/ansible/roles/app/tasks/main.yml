@@ -43,7 +43,7 @@
     group: root
     mode: "0755"
 
-- name: Restricted sudoers so deploy can restart the app and run the migrate wrapper
+- name: Restricted sudoers so deploy can restart the app as root and run the migrate wrapper as the app user, not root
   ansible.builtin.template:
     src: sudoers.j2
     dest: /etc/sudoers.d/go-ledger-deploy

@@ -13,8 +13,20 @@
 # Deliberately installed root-owned outside {{ app_dir }}: {{ app_dir }} is
 # owned by {{ deploy_user }} so CI can upload binaries there, and a wrapper
 # script the deploy user could overwrite would turn this sudoers rule into
-# an unrestricted root-escalation path (replace the script, sudo runs
-# whatever it says) instead of the narrow one it is meant to be.
+# an unrestricted escalation path (replace the script, sudo runs whatever it
+# says) instead of the narrow one it is meant to be. Root ownership of THIS
+# script only protects it from being tampered with by {{ deploy_user }}; it
+# does not mean the migrate it runs should execute as root.
+#
+# Runs as {{ app_user }}, not root: the sudoers Runas_Spec is
+# `({{ app_user }})`, so sudo executes this whole script, and everything it
+# execs, as {{ app_user }}, the same sandboxed system user the systemd unit
+# runs the service as. go-ledger.new lives in {{ app_dir }}, which
+# {{ deploy_user }} fully owns and CI overwrites on every push, so running
+# migrate as root would let a leaked deploy key run arbitrary code as root;
+# running it as {{ app_user }} caps that blast radius at what the service
+# already has. {{ env_file }} is root:{{ app_user }} 0640, so {{ app_user }}
+# can read DATABASE_URL from it without needing root.
 set -eu
 set -a
 . {{ env_file }}
