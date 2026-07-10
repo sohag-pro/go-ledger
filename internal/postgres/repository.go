@@ -1086,6 +1086,63 @@ func (r *Repository) SetTenantStatus(ctx context.Context, tenantID string, statu
 	return nil
 }
 
+// InsertFXRate appends a new fx_rates row (Task 2.4, audit A3.3). tenantID
+// nil inserts the global default rate (tenant_id NULL); a non-nil tenantID
+// inserts that tenant's own rate, after confirming the tenant exists (a
+// clean domain.ErrTenantNotFound rather than a raw foreign-key-violation
+// error from the fx_rates_tenant_id_fkey constraint).
+//
+// Validation mirrors the fx_rates CHECK constraints and runs before any
+// write, the same defense-in-depth style CreateAccount and CreateTransaction
+// use elsewhere in this file: base and quote must each be a valid currency
+// code and must differ, midRateE8 must be positive, and spreadBps must be in
+// [0, 10000).
+func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt time.Time) error {
+	if err := base.Validate(); err != nil {
+		return err
+	}
+	if err := quote.Validate(); err != nil {
+		return err
+	}
+	if base == quote {
+		return domain.ErrSameCurrencyRate
+	}
+	if midRateE8 <= 0 {
+		return domain.ErrNonPositiveRate
+	}
+	if spreadBps < 0 || spreadBps >= 10_000 {
+		return domain.ErrInvalidSpread
+	}
+
+	var pgTenantID pgtype.UUID
+	if tenantID != nil {
+		tid, err := uuid.Parse(*tenantID)
+		if err != nil {
+			return fmt.Errorf("postgres: parse tenant id: %w", err)
+		}
+		if _, err := r.q.GetTenant(ctx, tid); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrTenantNotFound
+			}
+			return fmt.Errorf("postgres: check tenant exists: %w", err)
+		}
+		pgTenantID = pgtype.UUID{Bytes: tid, Valid: true}
+	}
+
+	if _, err := r.q.InsertFXRate(ctx, sqlc.InsertFXRateParams{
+		TenantID:    pgTenantID,
+		Base:        string(base),
+		Quote:       string(quote),
+		MidRateE8:   midRateE8,
+		SpreadBps:   spreadBps,
+		Source:      source,
+		EffectiveAt: effectiveAt,
+	}); err != nil {
+		return fmt.Errorf("postgres: insert fx rate: %w", err)
+	}
+	return nil
+}
+
 // tenantFromRow converts a sqlc Tenant row to a domain.Tenant.
 func tenantFromRow(row sqlc.Tenant) domain.Tenant {
 	return domain.Tenant{

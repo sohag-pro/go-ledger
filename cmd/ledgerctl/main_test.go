@@ -24,6 +24,7 @@ func TestResolveHandlerKnownSubcommands(t *testing.T) {
 		{"key", "rotate"},
 		{"key", "revoke"},
 		{"key", "list"},
+		{"rate", "set"},
 	}
 	for _, tc := range cases {
 		h, err := resolveHandler(tc.resource, tc.action)
@@ -248,6 +249,104 @@ func TestParseKeyID(t *testing.T) {
 
 	if _, err := parseKeyID("key rotate", nil); err == nil {
 		t.Fatal("expected an error for a missing --id")
+	}
+}
+
+// --- rate set: pure flag-parsing, no database or service involved. ---
+
+func TestParseRateSetValid(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	a, err := parseRateSet([]string{
+		"--tenant", "tenant-1", "--base", "usd", "--quote", "eur",
+		"--mid", "0.9200", "--spread-bps", "50",
+	}, now)
+	if err != nil {
+		t.Fatalf("parseRateSet: %v", err)
+	}
+	if a.tenantID != "tenant-1" {
+		t.Errorf("tenantID = %q, want tenant-1", a.tenantID)
+	}
+	if a.base != "USD" || a.quote != "EUR" {
+		t.Errorf("base/quote = %s/%s, want USD/EUR (lowercase input upper-cased)", a.base, a.quote)
+	}
+	if a.midRateE8 != 92_000_000 {
+		t.Errorf("midRateE8 = %d, want 92000000 (0.9200 scaled by 1e8, no ParseFloat)", a.midRateE8)
+	}
+	if a.spreadBps != 50 {
+		t.Errorf("spreadBps = %d, want 50", a.spreadBps)
+	}
+	if a.source != defaultRateSource {
+		t.Errorf("source = %q, want default %q", a.source, defaultRateSource)
+	}
+	if !a.effectiveAt.Equal(now) {
+		t.Errorf("effectiveAt = %v, want now (%v) by default", a.effectiveAt, now)
+	}
+}
+
+func TestParseRateSetExplicitSourceAndEffectiveAt(t *testing.T) {
+	t.Parallel()
+	a, err := parseRateSet([]string{
+		"--tenant", "tenant-1", "--base", "USD", "--quote", "BDT",
+		"--mid", "110.50", "--spread-bps", "25",
+		"--source", "negotiated", "--effective-at", "2026-03-01T00:00:00Z",
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("parseRateSet: %v", err)
+	}
+	if a.midRateE8 != 11_050_000_000 {
+		t.Errorf("midRateE8 = %d, want 11050000000 (110.50 scaled by 1e8)", a.midRateE8)
+	}
+	if a.source != "negotiated" {
+		t.Errorf("source = %q, want negotiated", a.source)
+	}
+	want := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	if !a.effectiveAt.Equal(want) {
+		t.Errorf("effectiveAt = %v, want %v", a.effectiveAt, want)
+	}
+}
+
+func TestParseRateSetRequiredFlags(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing tenant", []string{"--base", "USD", "--quote", "EUR", "--mid", "0.92"}},
+		{"missing base", []string{"--tenant", "t", "--quote", "EUR", "--mid", "0.92"}},
+		{"missing quote", []string{"--tenant", "t", "--base", "USD", "--mid", "0.92"}},
+		{"missing mid", []string{"--tenant", "t", "--base", "USD", "--quote", "EUR"}},
+		{"invalid base", []string{"--tenant", "t", "--base", "US", "--quote", "EUR", "--mid", "0.92"}},
+		{"same base and quote", []string{"--tenant", "t", "--base", "USD", "--quote", "USD", "--mid", "0.92"}},
+		{"spread out of range", []string{"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.92", "--spread-bps", "10000"}},
+		{"negative spread", []string{"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.92", "--spread-bps", "-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseRateSet(tc.args, time.Now()); err == nil {
+				t.Fatalf("parseRateSet(%v): expected an error", tc.args)
+			}
+		})
+	}
+}
+
+// TestParseRateSetMidNeverFloatParsed proves --mid goes through fx.ParseRateE8
+// (integer scaling), not strconv.ParseFloat: a rate with more fractional
+// digits than domain.RateScale can hold is truncated, never rounded, exactly
+// the guarantee fx.ParseRateE8 documents, which a float64 parse-and-round
+// would not give.
+func TestParseRateSetMidNeverFloatParsed(t *testing.T) {
+	t.Parallel()
+	a, err := parseRateSet([]string{
+		"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.123456789",
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("parseRateSet: %v", err)
+	}
+	if a.midRateE8 != 12_345_678 {
+		t.Errorf("midRateE8 = %d, want 12345678 (truncated to 8 fractional digits, not rounded)", a.midRateE8)
 	}
 }
 

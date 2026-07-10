@@ -198,4 +198,16 @@ type Repository interface {
 	// if status is not one of TenantStatus.Valid()'s three values, or
 	// ErrTenantNotFound if no tenant matches tenantID.
 	SetTenantStatus(ctx context.Context, tenantID string, status TenantStatus) error
+
+	// InsertFXRate appends a new fx_rates row (Task 2.4, audit A3.3): fx_rates
+	// stays append-only, so this is always a plain INSERT, never an update to
+	// an existing row. tenantID nil makes the row the global default rate for
+	// the pair; tenantID naming a tenant makes it that tenant's own rate,
+	// resolved ahead of the global default (see fx.Provider.Rate and the
+	// CurrentFXRate query, migration 0014). base and quote must be distinct,
+	// valid three-letter currency codes; midRateE8 must be positive
+	// (ErrNonPositiveRate otherwise) and spreadBps must be in [0, 10000)
+	// (ErrInvalidSpread otherwise). It returns ErrTenantNotFound if tenantID
+	// names a tenant that does not exist.
+	InsertFXRate(ctx context.Context, tenantID *string, base, quote Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt time.Time) error
 }

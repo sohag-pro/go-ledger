@@ -60,6 +60,9 @@ var (
 	// ErrFXRateNotFound is returned when no fx_rates row exists for a currency
 	// pair, in either direction, at or before the requested time.
 	ErrFXRateNotFound = errors.New("domain: fx rate not found")
+	// ErrSameCurrencyRate is returned when an fx_rates row is inserted with
+	// the same base and quote currency: a currency has no rate against itself.
+	ErrSameCurrencyRate = errors.New("domain: fx rate base and quote must differ")
 	// ErrNonPositiveConvertAmount is returned when a Convert request's source
 	// amount is zero or negative. Zero would silently pass the conversion's
 	// dust guard (a zero source converts to a zero result, and dust is only

@@ -56,6 +56,7 @@ type FxRate struct {
 	Source      string
 	EffectiveAt time.Time
 	CreatedAt   time.Time
+	TenantID    pgtype.UUID
 }
 
 type IdempotencyKey struct {

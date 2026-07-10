@@ -414,6 +414,15 @@ func (f *fakeRepo) SetTenantStatus(_ context.Context, tenantID string, status do
 	return nil
 }
 
+// InsertFXRate is not exercised by any handler test in this package (Task
+// 2.4's per-tenant resolution is covered by real-Postgres integration tests
+// in internal/fx and internal/ledger instead, since it depends on
+// CurrentFXRate's SQL, not on repository plumbing this fake stands in for);
+// it exists only so fakeRepo keeps satisfying domain.Repository.
+func (f *fakeRepo) InsertFXRate(_ context.Context, _ *string, _, _ domain.Currency, _ int64, _ int32, _ string, _ time.Time) error {
+	return nil
+}
+
 var _ domain.Repository = (*fakeRepo)(nil)
 
 // fakeFXProvider is a fixed-rate fx.Provider for handler tests: it stands in
@@ -426,7 +435,7 @@ type fakeFXProvider struct {
 	err       error
 }
 
-func (f *fakeFXProvider) Rate(_ context.Context, _, _ domain.Currency) (domain.FXQuote, int32, error) {
+func (f *fakeFXProvider) Rate(_ context.Context, _ string, _, _ domain.Currency) (domain.FXQuote, int32, error) {
 	if f.err != nil {
 		return domain.FXQuote{}, 0, f.err
 	}

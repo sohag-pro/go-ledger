@@ -113,7 +113,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, domain.ErrSameCurrencyConversion
 	}
 
-	quote, spreadBps, err := s.fxProvider.Rate(ctx, from.Currency, to.Currency)
+	quote, spreadBps, err := s.fxProvider.Rate(ctx, tenantID, from.Currency, to.Currency)
 	if err != nil {
 		span.RecordError(err)
 		return nil, false, err

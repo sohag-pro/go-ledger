@@ -19,6 +19,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
@@ -495,5 +496,103 @@ func TestCreateTenantAndSetStatusRoundTrip(t *testing.T) {
 
 	if err := svc.SetTenantStatus(ctx, tenant.ID, domain.TenantSuspended); err != nil {
 		t.Fatalf("suspend tenant: %v", err)
+	}
+}
+
+// TestSetFXRateInsertsAResolvableTenantRate is ledgerctl "rate set"'s
+// underlying path (Task 2.4, audit A3.3): SetFXRate must not just insert a
+// row without error, it must insert a row that fx.Provider.Rate actually
+// resolves ahead of the global default for that tenant, and that a different
+// tenant, with no row of its own, does not see.
+func TestSetFXRateInsertsAResolvableTenantRate(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "fx rate test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	otherTenant, err := svc.CreateTenant(ctx, "fx rate test tenant (no rate of its own)")
+	if err != nil {
+		t.Fatalf("create other tenant: %v", err)
+	}
+
+	effectiveAt := time.Now().UTC()
+	if err := svc.SetFXRate(ctx, tenant.ID, "USD", "TRY", 3_000_000_00, 120, "manual", effectiveAt); err != nil {
+		t.Fatalf("SetFXRate: %v", err)
+	}
+
+	provider := fx.NewDBProvider(sharedPool)
+	quote, spreadBps, err := provider.Rate(ctx, tenant.ID, "USD", "TRY")
+	if err != nil {
+		t.Fatalf("Rate(tenant) error = %v", err)
+	}
+	if quote.MidRateE8 != 3_000_000_00 || spreadBps != 120 {
+		t.Errorf("Rate(tenant) = {mid: %d, spread: %d}, want {mid: 300000000, spread: 120} (the row SetFXRate inserted)",
+			quote.MidRateE8, spreadBps)
+	}
+	if quote.Source != "manual" {
+		t.Errorf("Rate(tenant).Source = %q, want manual", quote.Source)
+	}
+
+	// A different tenant, with no USD/TRY row of its own, must NOT resolve
+	// the row SetFXRate just inserted for tenant: it has no global default
+	// for this pair either, so it must fail with ErrFXRateNotFound.
+	_, _, err = provider.Rate(ctx, otherTenant.ID, "USD", "TRY")
+	if !errors.Is(err, domain.ErrFXRateNotFound) {
+		t.Errorf("Rate(otherTenant) = %v, want ErrFXRateNotFound (tenant-scoped rate must not leak to another tenant)", err)
+	}
+}
+
+// TestSetFXRateMissingTenantErrors proves SetFXRate fails closed with
+// domain.ErrTenantNotFound for a tenant id that does not exist, rather than
+// surfacing a raw foreign-key-violation error from the database.
+func TestSetFXRateMissingTenantErrors(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	err := svc.SetFXRate(ctx, "00000000-0000-0000-0000-000000000000", "USD", "TRY", 100_000_000, 0, "manual", time.Now())
+	if !errors.Is(err, domain.ErrTenantNotFound) {
+		t.Errorf("SetFXRate into missing tenant: err = %v, want ErrTenantNotFound", err)
+	}
+}
+
+// TestSetFXRateValidatesBeforeInsert proves SetFXRate rejects a malformed
+// rate or spread the same way internal/fx.Seed rejects a malformed FX_RATES
+// entry: before ever touching the database, using the domain errors the
+// fx_rates CHECK constraints mirror.
+func TestSetFXRateValidatesBeforeInsert(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "fx rate validation test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		base      domain.Currency
+		quote     domain.Currency
+		midRateE8 int64
+		spreadBps int32
+		wantErr   error
+	}{
+		{"same currency", "USD", "USD", 100_000_000, 0, domain.ErrSameCurrencyRate},
+		{"non-positive rate", "USD", "TRY", 0, 0, domain.ErrNonPositiveRate},
+		{"spread too wide", "USD", "TRY", 100_000_000, 10_000, domain.ErrInvalidSpread},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := svc.SetFXRate(ctx, tenant.ID, tc.base, tc.quote, tc.midRateE8, tc.spreadBps, "manual", time.Now())
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("SetFXRate(%s/%s, mid=%d, spread=%d): err = %v, want %v",
+					tc.base, tc.quote, tc.midRateE8, tc.spreadBps, err, tc.wantErr)
+			}
+		})
 	}
 }

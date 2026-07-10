@@ -19,7 +19,7 @@ type unreachableFXProvider struct {
 	called bool
 }
 
-func (p *unreachableFXProvider) Rate(_ context.Context, _, _ domain.Currency) (domain.FXQuote, int32, error) {
+func (p *unreachableFXProvider) Rate(_ context.Context, _ string, _, _ domain.Currency) (domain.FXQuote, int32, error) {
 	p.called = true
 	return domain.FXQuote{}, 0, nil
 }

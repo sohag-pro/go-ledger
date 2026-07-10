@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver for goose
 	"github.com/pressly/goose/v3"
@@ -118,6 +120,40 @@ func insertRate(t *testing.T, q *sqlc.Queries, base, quote string, midE8 int64, 
 	}
 }
 
+// insertTenantRate writes one tenant-scoped fx_rates row directly via sqlc
+// (Task 2.4, audit A3.3): tenantID must be an existing tenants.id (see
+// newTestTenant), since fx_rates.tenant_id carries a foreign key.
+func insertTenantRate(t *testing.T, q *sqlc.Queries, tenantID, base, quote string, midE8 int64, spreadBps int32, effectiveAt time.Time) {
+	t.Helper()
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		t.Fatalf("parse tenant id %q: %v", tenantID, err)
+	}
+	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
+		TenantID:    pgtype.UUID{Bytes: tid, Valid: true},
+		Base:        base,
+		Quote:       quote,
+		MidRateE8:   midE8,
+		SpreadBps:   spreadBps,
+		Source:      "test",
+		EffectiveAt: effectiveAt,
+	}); err != nil {
+		t.Fatalf("insert tenant fx rate %s/%s for tenant %s: %v", base, quote, tenantID, err)
+	}
+}
+
+// newTestTenant creates and returns a fresh tenant id, so a tenant-scoped
+// fx_rates row (fx_rates.tenant_id references tenants.id) has a real row to
+// point at.
+func newTestTenant(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	id := uuid.NewString()
+	if err := postgres.NewRepository(pool).CreateTenant(context.Background(), id, "fx provider test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	return id
+}
+
 // TestRate_Direct covers the plain case: the pair is stored exactly as
 // requested, so Rate returns its mid and spread unchanged.
 func TestRate_Direct(t *testing.T) {
@@ -128,8 +164,12 @@ func TestRate_Direct(t *testing.T) {
 
 	insertRate(t, q, "GBP", "CHF", 115_000_000, 30, time.Now().UTC())
 
+	// Rate() requires a tenant id even though this pair has no tenant-specific
+	// row: any well-formed id resolves the global default here, since (tenant_id
+	// = $1 OR tenant_id IS NULL) always matches a NULL row (see TestRate_TenantOverridesGlobal
+	// for the case where a tenant-specific row actually wins).
 	provider := fx.NewDBProvider(pool)
-	quote, spreadBps, err := provider.Rate(ctx, domain.Currency("GBP"), domain.Currency("CHF"))
+	quote, spreadBps, err := provider.Rate(ctx, uuid.NewString(), domain.Currency("GBP"), domain.Currency("CHF"))
 	if err != nil {
 		t.Fatalf("Rate() error = %v", err)
 	}
@@ -157,7 +197,7 @@ func TestRate_Inverse(t *testing.T) {
 	insertRate(t, q, "JPY", "CAD", midE8, 40, time.Now().UTC())
 
 	provider := fx.NewDBProvider(pool)
-	quote, spreadBps, err := provider.Rate(ctx, domain.Currency("CAD"), domain.Currency("JPY"))
+	quote, spreadBps, err := provider.Rate(ctx, uuid.NewString(), domain.Currency("CAD"), domain.Currency("JPY"))
 	if err != nil {
 		t.Fatalf("Rate() error = %v", err)
 	}
@@ -181,7 +221,7 @@ func TestRate_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	provider := fx.NewDBProvider(pool)
-	_, _, err := provider.Rate(ctx, domain.Currency("NZD"), domain.Currency("SEK"))
+	_, _, err := provider.Rate(ctx, uuid.NewString(), domain.Currency("NZD"), domain.Currency("SEK"))
 	if !errors.Is(err, domain.ErrFXRateNotFound) {
 		t.Fatalf("Rate() error = %v, want domain.ErrFXRateNotFound", err)
 	}
@@ -222,5 +262,90 @@ func TestCurrentFXRate_TiebreakAndAppend(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("fx_rates row count for AUD/NOK = %d, want 2 (append, never overwrite)", count)
+	}
+}
+
+// TestRate_TenantOverridesGlobal is the discriminating test for Task 2.4
+// (audit A3.3): with only a global SGD/HKD row, both tenants resolve it; once
+// tenant A gets its own SGD/HKD row with a different mid and spread, tenant A
+// resolves its own row while tenant B still resolves the global one, and the
+// inverse pair (HKD/SGD) honors the same per-tenant preference.
+func TestRate_TenantOverridesGlobal(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	q := sqlc.New(pool)
+	provider := fx.NewDBProvider(pool)
+
+	tenantA := newTestTenant(t, pool)
+	tenantB := newTestTenant(t, pool)
+
+	const (
+		globalMidE8  = 55_000_000
+		globalSpread = 20
+		tenantMidE8  = 60_000_000
+		tenantSpread = 75
+	)
+	const (
+		base  domain.Currency = "SGD"
+		quote domain.Currency = "HKD"
+	)
+	insertRate(t, q, string(base), string(quote), globalMidE8, globalSpread, time.Now().UTC())
+
+	// Before tenant A has a row of its own, both tenants resolve the global
+	// default.
+	for _, tenant := range []string{tenantA, tenantB} {
+		got, spreadBps, err := provider.Rate(ctx, tenant, base, quote)
+		if err != nil {
+			t.Fatalf("Rate(%s) error = %v", tenant, err)
+		}
+		if got.MidRateE8 != globalMidE8 || spreadBps != globalSpread {
+			t.Errorf("Rate(%s) = {mid: %d, spread: %d}, want the global row {mid: %d, spread: %d}",
+				tenant, got.MidRateE8, spreadBps, globalMidE8, globalSpread)
+		}
+	}
+
+	insertTenantRate(t, q, tenantA, string(base), string(quote), tenantMidE8, tenantSpread, time.Now().UTC())
+
+	// Tenant A now resolves its own row.
+	gotA, spreadA, err := provider.Rate(ctx, tenantA, base, quote)
+	if err != nil {
+		t.Fatalf("Rate(tenantA) error = %v", err)
+	}
+	if gotA.MidRateE8 != tenantMidE8 || spreadA != tenantSpread {
+		t.Errorf("Rate(tenantA) = {mid: %d, spread: %d}, want the tenant row {mid: %d, spread: %d}",
+			gotA.MidRateE8, spreadA, tenantMidE8, tenantSpread)
+	}
+
+	// Tenant B, with no row of its own, still resolves the global default.
+	gotB, spreadB, err := provider.Rate(ctx, tenantB, base, quote)
+	if err != nil {
+		t.Fatalf("Rate(tenantB) error = %v", err)
+	}
+	if gotB.MidRateE8 != globalMidE8 || spreadB != globalSpread {
+		t.Errorf("Rate(tenantB) = {mid: %d, spread: %d}, want the global row {mid: %d, spread: %d}",
+			gotB.MidRateE8, spreadB, globalMidE8, globalSpread)
+	}
+
+	// The inverse pair (HKD/SGD) must honor the same per-tenant preference:
+	// tenant A inverts its own row, tenant B inverts the global one.
+	wantInvertedA := (domain.RateScale * domain.RateScale) / int64(tenantMidE8)
+	invA, invSpreadA, err := provider.Rate(ctx, tenantA, quote, base)
+	if err != nil {
+		t.Fatalf("Rate(tenantA, inverse) error = %v", err)
+	}
+	if invA.MidRateE8 != wantInvertedA || invSpreadA != tenantSpread {
+		t.Errorf("Rate(tenantA, inverse) = {mid: %d, spread: %d}, want {mid: %d, spread: %d} (inverted tenant row)",
+			invA.MidRateE8, invSpreadA, wantInvertedA, tenantSpread)
+	}
+
+	wantInvertedGlobal := (domain.RateScale * domain.RateScale) / int64(globalMidE8)
+	invB, invSpreadB, err := provider.Rate(ctx, tenantB, quote, base)
+	if err != nil {
+		t.Fatalf("Rate(tenantB, inverse) error = %v", err)
+	}
+	if invB.MidRateE8 != wantInvertedGlobal || invSpreadB != globalSpread {
+		t.Errorf("Rate(tenantB, inverse) = {mid: %d, spread: %d}, want {mid: %d, spread: %d} (inverted global row)",
+			invB.MidRateE8, invSpreadB, wantInvertedGlobal, globalSpread)
 	}
 }

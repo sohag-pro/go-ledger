@@ -199,3 +199,15 @@ func (s *Service) RevokeKey(ctx context.Context, keyID string) error {
 func (s *Service) ListKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error) {
 	return s.repo.ListAPIKeysByTenant(ctx, tenantID)
 }
+
+// SetFXRate appends a tenant-scoped fx_rates row for tenantID (Task 2.4,
+// audit A3.3), so that tenant's own rate and spread for (base, quote) is
+// resolved ahead of the global default (see fx.Provider.Rate). Unlike
+// IssueKey, this does not require tenantID to be active: an operator may
+// want to configure a rate for a tenant before or during a status change.
+// It returns domain.ErrTenantNotFound if tenantID does not exist, and the
+// same validation errors domain.Repository.InsertFXRate documents for a
+// malformed base/quote/midRateE8/spreadBps.
+func (s *Service) SetFXRate(ctx context.Context, tenantID string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt time.Time) error {
+	return s.repo.InsertFXRate(ctx, &tenantID, base, quote, midRateE8, spreadBps, source, effectiveAt)
+}

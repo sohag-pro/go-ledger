@@ -13,6 +13,12 @@
 // once, deliberately: it is never logged (this package never touches
 // log/slog, unlike the rest of this codebase) and never stored anywhere,
 // only its hash is.
+//
+// "rate set" (Task 2.4, audit A3.3) is the operator path for a tenant's own
+// FX rate and spread: it appends a tenant-scoped fx_rates row, resolved
+// ahead of the global default (see internal/fx.Provider.Rate). There is no
+// REST equivalent yet; per-tenant rate policy (limits, an allowlist of
+// pairs) is a separate, later piece of work.
 package main
 
 import (
@@ -28,6 +34,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
@@ -82,6 +89,9 @@ var commands = map[string]map[string]handler{
 		"revoke": keyRevoke,
 		"list":   keyList,
 	},
+	"rate": {
+		"set": rateSet,
+	},
 }
 
 // usage is printed on a missing or unrecognized subcommand.
@@ -95,6 +105,8 @@ const usage = `usage: ledgerctl <resource> <action> [flags]
   key rotate --id KEYID
   key revoke --id KEYID
   key list --tenant ID
+
+  rate set --tenant ID --base BASE --quote QUOTE --mid RATE [--spread-bps BPS] [--source SOURCE] [--effective-at RFC3339]
 
 DATABASE_URL must be set.`
 
@@ -343,6 +355,104 @@ func keyList(ctx context.Context, svc *admin.Service, out *os.File, args []strin
 		}
 		_, _ = fmt.Fprintf(out, "%s\t%s\t%s\tscopes=%s\texpires=%s\n", k.ID, status, k.Name, joinScopes(k.Scopes), expires)
 	}
+	return nil
+}
+
+// --- rate subcommands ---
+
+// defaultRateSource is the fx_rates.source value a "rate set" call writes
+// when --source is omitted, distinguishing an operator's manual tenant rate
+// from the "env" source internal/fx.Seed writes for the global default.
+const defaultRateSource = "manual"
+
+// rateSetArgs is the parsed, validated result of "rate set"'s flags, kept
+// separate from parseRateSet's flag.FlagSet plumbing so rateSet's own body
+// stays a plain call into svc.SetFXRate.
+type rateSetArgs struct {
+	tenantID    string
+	base, quote domain.Currency
+	midRateE8   int64
+	spreadBps   int32
+	source      string
+	effectiveAt time.Time
+}
+
+// parseRateSet parses "rate set"'s flags, exactly like parseKeyIssue does for
+// "key issue": every check that does not need a database round trip runs
+// here, before rateSet ever calls svc. --mid is parsed with fx.ParseRateE8,
+// the same string-scaling parser internal/fx/seed.go uses for FX_RATES, so a
+// decimal rate never passes through strconv.ParseFloat on its way into
+// mid_rate_e8 (go-ledger's money-safety rule: integer only on the rate
+// path). now is injected so --effective-at's default is testable without
+// real time passing.
+func parseRateSet(args []string, now time.Time) (rateSetArgs, error) {
+	fs := flag.NewFlagSet("rate set", flag.ContinueOnError)
+	tenantFlag := fs.String("tenant", "", "tenant id (required)")
+	baseFlag := fs.String("base", "", "base currency, e.g. USD (required)")
+	quoteFlag := fs.String("quote", "", "quote currency, e.g. EUR (required)")
+	midFlag := fs.String("mid", "", "mid rate as a plain decimal, e.g. 0.9200 (required)")
+	spreadFlag := fs.Int("spread-bps", 0, "spread in basis points, 0-9999 (default 0)")
+	sourceFlag := fs.String("source", defaultRateSource, "provenance recorded on the row (default manual)")
+	effectiveAtFlag := fs.String("effective-at", "", "RFC3339 timestamp (default now)")
+	if err := fs.Parse(args); err != nil {
+		return rateSetArgs{}, err
+	}
+
+	if *tenantFlag == "" {
+		return rateSetArgs{}, errors.New("--tenant is required")
+	}
+	base := domain.Currency(strings.ToUpper(strings.TrimSpace(*baseFlag)))
+	if err := base.Validate(); err != nil {
+		return rateSetArgs{}, fmt.Errorf("--base: %w", err)
+	}
+	quote := domain.Currency(strings.ToUpper(strings.TrimSpace(*quoteFlag)))
+	if err := quote.Validate(); err != nil {
+		return rateSetArgs{}, fmt.Errorf("--quote: %w", err)
+	}
+	if base == quote {
+		return rateSetArgs{}, domain.ErrSameCurrencyRate
+	}
+	if *midFlag == "" {
+		return rateSetArgs{}, errors.New("--mid is required")
+	}
+	midRateE8, err := fx.ParseRateE8(*midFlag)
+	if err != nil {
+		return rateSetArgs{}, fmt.Errorf("--mid: %w", err)
+	}
+	if *spreadFlag < 0 || *spreadFlag >= 10_000 {
+		return rateSetArgs{}, domain.ErrInvalidSpread
+	}
+
+	effectiveAt := now
+	if *effectiveAtFlag != "" {
+		t, err := time.Parse(time.RFC3339, *effectiveAtFlag)
+		if err != nil {
+			return rateSetArgs{}, fmt.Errorf("--effective-at: %w", err)
+		}
+		effectiveAt = t
+	}
+
+	return rateSetArgs{
+		tenantID:    *tenantFlag,
+		base:        base,
+		quote:       quote,
+		midRateE8:   midRateE8,
+		spreadBps:   int32(*spreadFlag), //nolint:gosec // bounded to [0, 10000) just above
+		source:      *sourceFlag,
+		effectiveAt: effectiveAt,
+	}, nil
+}
+
+func rateSet(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
+	a, err := parseRateSet(args, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := svc.SetFXRate(ctx, a.tenantID, a.base, a.quote, a.midRateE8, a.spreadBps, a.source, a.effectiveAt); err != nil {
+		return fmt.Errorf("set fx rate: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, "tenant %s: %s/%s mid_rate_e8=%d spread_bps=%d source=%s effective_at=%s\n",
+		a.tenantID, a.base, a.quote, a.midRateE8, a.spreadBps, a.source, a.effectiveAt.Format(time.RFC3339))
 	return nil
 }
 
