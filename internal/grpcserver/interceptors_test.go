@@ -45,7 +45,17 @@ const testPlaintextKey = "glk_interceptor-test-key" //nolint:gosec // test fixtu
 
 func newTestResolver() *auth.Resolver {
 	lookup := &fakeLookup{keys: map[string]domain.APIKey{
-		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test"},
+		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: domain.TenantActive},
+	}}
+	return auth.NewResolver(lookup, time.Minute)
+}
+
+// newTestResolverWithStatus is newTestResolver but for a key whose tenant
+// carries status, so tests can exercise the suspended/closed gate
+// (Task 2.1, ADR-015).
+func newTestResolverWithStatus(status domain.TenantStatus) *auth.Resolver {
+	lookup := &fakeLookup{keys: map[string]domain.APIKey{
+		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: status},
 	}}
 	return auth.NewResolver(lookup, time.Minute)
 }
@@ -160,6 +170,35 @@ func TestAuthInterceptorInjectsTenantAndKeyForValidKey(t *testing.T) {
 	}
 	if seenKey.ID != "key-1" {
 		t.Errorf("key id = %q, want key-1", seenKey.ID)
+	}
+}
+
+// TestAuthInterceptorRejectsSuspendedOrClosedTenantAsPermissionDenied proves a
+// valid key whose tenant is suspended or closed is rejected with
+// codes.PermissionDenied, not codes.Unauthenticated: the credential itself is
+// fine, only the tenant is gated (Task 2.1, ADR-015).
+func TestAuthInterceptorRejectsSuspendedOrClosedTenantAsPermissionDenied(t *testing.T) {
+	tenantStatuses := []domain.TenantStatus{domain.TenantSuspended, domain.TenantClosed}
+	for _, tenantStatus := range tenantStatuses {
+		t.Run(string(tenantStatus), func(t *testing.T) {
+			called := false
+			handler := func(_ context.Context, _ any) (any, error) {
+				called = true
+				return nil, nil
+			}
+			interceptor := authUnaryInterceptor(newTestResolverWithStatus(tenantStatus), discardLogger())
+			ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
+			_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("code = %v, want PermissionDenied", status.Code(err))
+			}
+			if err.Error() == "" || !strings.Contains(err.Error(), string(tenantStatus)) {
+				t.Errorf("error = %v, want it to name the status %q", err, tenantStatus)
+			}
+			if called {
+				t.Error("handler should not run for a suspended or closed tenant")
+			}
+		})
 	}
 }
 

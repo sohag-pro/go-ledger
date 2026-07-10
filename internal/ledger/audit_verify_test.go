@@ -41,6 +41,9 @@ func TestAuditService_Verify_ValidChain(t *testing.T) {
 	audits := ledger.NewAuditService(repo)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "audit verify test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -90,6 +93,9 @@ func TestAuditService_Verify_DetectsTamper(t *testing.T) {
 	audits := ledger.NewAuditService(repo)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "audit verify test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}

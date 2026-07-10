@@ -187,6 +187,9 @@ func TestChaosMidTransactionCutRollsBack(t *testing.T) {
 	}
 	seedRepo := postgres.NewRepository(seedPool)
 	tenant := uuid.NewString()
+	if err := seedRepo.CreateTenant(ctx, tenant, "chaos test tenant"); err != nil {
+		t.Fatalf("chaos test: create tenant: %v", err)
+	}
 
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -291,6 +294,9 @@ func TestChaosAmbiguousCommitReplayIsIdempotent(t *testing.T) {
 	}
 	seedRepo := postgres.NewRepository(seedPool)
 	tenant := uuid.NewString()
+	if err := seedRepo.CreateTenant(ctx, tenant, "chaos test tenant"); err != nil {
+		t.Fatalf("chaos test: create tenant: %v", err)
+	}
 
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}

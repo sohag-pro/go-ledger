@@ -54,6 +54,9 @@ func TestGet_ReturnsPostedTransaction(t *testing.T) {
 	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "service coverage test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -133,6 +136,9 @@ func TestAccountService_CreateGetListBalanceStatement(t *testing.T) {
 	txns := ledger.NewTransactionService(repo, discardLogger(), nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "service coverage test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -211,6 +217,9 @@ func TestAuditService_ByTransactionAndByAccount(t *testing.T) {
 	audits := ledger.NewAuditService(repo)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "service coverage test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}

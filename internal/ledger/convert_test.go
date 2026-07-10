@@ -40,11 +40,20 @@ func seedConvertRate(t *testing.T, pool *pgxpool.Pool, quote domain.Currency, mi
 	}
 }
 
-// newConvertAccount creates and returns an account of the given currency.
+// newConvertAccount creates and returns an account of the given currency. It
+// ensures tenant's own row exists first (accounts_tenant_fk, migration 0011):
+// every test in this file calls this for a freshly generated tenant id with
+// no tenant row of its own, and a caller that creates more than one account
+// for the same tenant is unaffected (ErrTenantAlreadyExists on the second
+// call is swallowed).
 func newConvertAccount(t *testing.T, repo *postgres.Repository, tenant string, currency domain.Currency) domain.Account {
 	t.Helper()
+	ctx := context.Background()
+	if err := repo.CreateTenant(ctx, tenant, "convert test tenant"); err != nil && !errors.Is(err, domain.ErrTenantAlreadyExists) {
+		t.Fatalf("create tenant: %v", err)
+	}
 	a := &domain.Account{Name: "acct-" + uuid.NewString(), Type: domain.Asset, Currency: currency}
-	if err := repo.CreateAccount(context.Background(), tenant, a); err != nil {
+	if err := repo.CreateAccount(ctx, tenant, a); err != nil {
 		t.Fatalf("create %s account: %v", currency, err)
 	}
 	return *a

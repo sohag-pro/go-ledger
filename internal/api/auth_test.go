@@ -215,6 +215,12 @@ func TestV1CrossTenantIsolation_Postgres(t *testing.T) {
 	const plaintextB = "glk_cross-tenant-test-key-b"
 
 	ctx := context.Background()
+	if err := repo.CreateTenant(ctx, tenantA, "tenant A"); err != nil {
+		t.Fatalf("create tenant A: %v", err)
+	}
+	if err := repo.CreateTenant(ctx, tenantB, "tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
 	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenantA, Name: "tenant A"}, domain.HashAPIKey(plaintextA)); err != nil {
 		t.Fatalf("insert tenant A key: %v", err)
 	}
@@ -323,6 +329,12 @@ func TestConvertCrossTenantIsolation_Postgres(t *testing.T) {
 	const plaintextA = "glk_convert-cross-tenant-test-key-a"
 	const plaintextB = "glk_convert-cross-tenant-test-key-b"
 
+	if err := repo.CreateTenant(ctx, tenantA, "tenant A"); err != nil {
+		t.Fatalf("create tenant A: %v", err)
+	}
+	if err := repo.CreateTenant(ctx, tenantB, "tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
 	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenantA, Name: "tenant A"}, domain.HashAPIKey(plaintextA)); err != nil {
 		t.Fatalf("insert tenant A key: %v", err)
 	}

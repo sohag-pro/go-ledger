@@ -123,6 +123,9 @@ func dialClient(t *testing.T, opts ...ledger.ServiceOption) ledgerv1.LedgerServi
 	repo := postgres.NewRepository(sharedPool)
 	var provisionErr error
 	provisionTestAPIKeyOnce.Do(func() {
+		if provisionErr = repo.CreateTenant(context.Background(), testTenant, "grpc server test tenant"); provisionErr != nil {
+			return
+		}
 		provisionErr = repo.InsertAPIKey(context.Background(),
 			domain.APIKey{TenantID: testTenant, Name: "grpc server test key"},
 			domain.HashAPIKey(testAPIKeyPlaintext),

@@ -129,10 +129,19 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 
 // insertAPIKey writes one api_keys row for tenant directly (the seeder itself
 // never touches this table; only the app's provisioning path and this test
-// setup do).
+// setup do). It ensures tenant's own row exists first (api_keys_tenant_fk,
+// migration 0011): the "only the demo key: proceeds" case below calls this
+// before Seed ever runs for that tenant, so Seed's own tenant upsert has not
+// happened yet.
 func insertAPIKey(t *testing.T, pool *pgxpool.Pool, tenant, keyHash string) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(),
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, 'test tenant') ON CONFLICT (id) DO NOTHING`,
+		tenant); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
 		`INSERT INTO api_keys (id, tenant_id, name, key_hash) VALUES ($1, $2, $3, $4)`,
 		uuid.NewString(), tenant, "test-key", keyHash); err != nil {
 		t.Fatalf("insert api key: %v", err)

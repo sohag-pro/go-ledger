@@ -158,6 +158,9 @@ func TestCreateTransactionDuplicateID(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "duplicate txn id tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	a := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	b := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -202,6 +205,9 @@ func TestCreateTransactionUnbalancedViaRunInTx(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "unbalanced runintx tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	a := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, tenant, a); err != nil {
@@ -251,6 +257,9 @@ func TestCreateTransactionPostingAccountMissing(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "missing posting account tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	existing := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, tenant, existing); err != nil {

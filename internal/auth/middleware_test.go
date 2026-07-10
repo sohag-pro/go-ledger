@@ -119,7 +119,7 @@ func TestHumaMiddleware_ValidKeyInjectsTenantAndCallsNext(t *testing.T) {
 	t.Parallel()
 
 	const plaintext = "glk_middleware-test-key"
-	key := domain.APIKey{ID: "key-1", TenantID: "tenant-xyz", Name: "test key"}
+	key := domain.APIKey{ID: "key-1", TenantID: "tenant-xyz", Name: "test key", TenantStatus: domain.TenantActive}
 	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
 	mux, _ := newTestAPI(t, resolver)
 
@@ -140,6 +140,54 @@ func TestHumaMiddleware_ValidKeyInjectsTenantAndCallsNext(t *testing.T) {
 	}
 	if out.Tenant != key.TenantID {
 		t.Errorf("tenant seen by handler = %q, want %q", out.Tenant, key.TenantID)
+	}
+}
+
+// TestHumaMiddleware_SuspendedOrClosedTenantIs403 proves a valid key whose
+// tenant is suspended or closed is rejected with 403 Forbidden, not 401: the
+// credential itself is fine, only the tenant is gated (Task 2.1, ADR-015).
+// The response names the reason, unlike the deliberately-generic 401 body.
+func TestHumaMiddleware_SuspendedOrClosedTenantIs403(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status domain.TenantStatus
+	}{
+		{"suspended", domain.TenantSuspended},
+		{"closed", domain.TenantClosed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			plaintext := "glk_middleware-test-key-" + tt.name
+			key := domain.APIKey{ID: "key-" + tt.name, TenantID: "tenant-" + tt.name, Name: "test key", TenantStatus: tt.status}
+			resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
+			mux, _ := newTestAPI(t, resolver)
+
+			req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+			req.Header.Set(authHeader, "Bearer "+plaintext)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body.String())
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body not JSON: %v (%q)", err, rec.Body.String())
+			}
+			if body["status"] != float64(403) || body["title"] != "Forbidden" {
+				t.Errorf("body = %v, want status 403 title Forbidden", body)
+			}
+			wantDetail := "tenant is " + string(tt.status)
+			if body["detail"] != wantDetail {
+				t.Errorf("body detail = %v, want %q", body["detail"], wantDetail)
+			}
+		})
 	}
 }
 
@@ -198,7 +246,7 @@ func TestMiddleware_NetHTTPFallback(t *testing.T) {
 	t.Parallel()
 
 	const plaintext = "glk_nethttp-test-key"
-	key := domain.APIKey{ID: "key-2", TenantID: "tenant-abc", Name: "test key"}
+	key := domain.APIKey{ID: "key-2", TenantID: "tenant-abc", Name: "test key", TenantStatus: domain.TenantActive}
 	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
 
 	var sawTenant string
@@ -230,6 +278,36 @@ func TestMiddleware_NetHTTPFallback(t *testing.T) {
 		}
 		if sawTenant != key.TenantID {
 			t.Errorf("tenant seen by handler = %q, want %q", sawTenant, key.TenantID)
+		}
+	})
+
+	t.Run("suspended tenant is 403 naming the reason", func(t *testing.T) {
+		const suspendedPlaintext = "glk_nethttp-suspended-key"
+		suspendedKey := domain.APIKey{ID: "key-3", TenantID: "tenant-susp", Name: "test key", TenantStatus: domain.TenantSuspended}
+		suspendedResolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(suspendedPlaintext): suspendedKey}), time.Minute)
+		called := false
+		suspendedHandler := Middleware(suspendedResolver, discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+		req.Header.Set(authHeader, "Bearer "+suspendedPlaintext)
+		rec := httptest.NewRecorder()
+		suspendedHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body.String())
+		}
+		if called {
+			t.Error("handler should not run for a suspended tenant")
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("body not JSON: %v (%q)", err, rec.Body.String())
+		}
+		if body["detail"] != "tenant is suspended" {
+			t.Errorf("body detail = %v, want %q", body["detail"], "tenant is suspended")
 		}
 	})
 }

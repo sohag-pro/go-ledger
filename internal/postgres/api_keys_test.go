@@ -20,6 +20,9 @@ func TestAPIKeyInsertAndResolve(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "api key test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	rpm := 120
 	cases := []struct {
@@ -64,6 +67,9 @@ func TestAPIKeyInsertAndResolve(t *testing.T) {
 			if got.ID == "" {
 				t.Error("expected generated id, got empty")
 			}
+			if got.TenantStatus != domain.TenantActive {
+				t.Errorf("TenantStatus = %q, want %q (GetAPIKeyByHash joins tenants, Task 2.1)", got.TenantStatus, domain.TenantActive)
+			}
 			switch {
 			case tc.key.RateLimitRPM == nil:
 				if got.RateLimitRPM != nil {
@@ -87,6 +93,9 @@ func TestAPIKeyRevokedNotFound(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "revoked key test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	_, hash, err := domain.GenerateAPIKey()
 	if err != nil {

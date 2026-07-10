@@ -30,6 +30,9 @@ func TestPostIdempotentHammer(t *testing.T) {
 	svc := ledger.NewTransactionService(repo, nil, nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "idempotency test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -94,6 +97,9 @@ func TestPostIdempotentConflict(t *testing.T) {
 	svc := ledger.NewTransactionService(repo, nil, nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "idempotency test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}

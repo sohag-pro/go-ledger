@@ -161,6 +161,9 @@ func TestPostConcurrentStress(t *testing.T) {
 	idsByTenant := make([][]string, tenantCount)
 	for tn := range tenants {
 		tenants[tn] = uuid.NewString()
+		if err := repo.CreateTenant(ctx, tenants[tn], "stress test tenant"); err != nil {
+			t.Fatalf("create tenant %d: %v", tn, err)
+		}
 		ids := make([]string, accountsPerTenant)
 		for i := range ids {
 			a := &domain.Account{Name: "acct", Type: domain.Asset, Currency: "USD"}
@@ -277,6 +280,9 @@ func TestPostConcurrentStressSingleTenant(t *testing.T) {
 	ctx := context.Background()
 
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "stress test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 	ids := make([]string, accounts)
 	for i := range ids {
 		a := &domain.Account{Name: "acct", Type: domain.Asset, Currency: "USD"}
@@ -400,6 +406,9 @@ func TestPostNoCrossTenantStarvation(t *testing.T) {
 
 	setupTenant := func(accounts int) (string, []string) {
 		tenant := uuid.NewString()
+		if err := repo.CreateTenant(ctx, tenant, "stress test tenant"); err != nil {
+			t.Fatalf("create tenant: %v", err)
+		}
 		ids := make([]string, accounts)
 		for i := range ids {
 			a := &domain.Account{Name: "acct", Type: domain.Asset, Currency: "USD"}
@@ -542,6 +551,12 @@ func TestUnbalancedRejectedByTrigger(t *testing.T) {
 	txn := uuid.New()
 	posting := uuid.New()
 
+	// tenants first: accounts_tenant_fk (migration 0011) requires the tenant
+	// row to exist before an account can reference it.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, 'test tenant')`, tenant); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
 	// Seed an account so the posting's foreign key holds.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO accounts (id, tenant_id, name, type, currency) VALUES ($1,$2,'a','asset','USD')`,

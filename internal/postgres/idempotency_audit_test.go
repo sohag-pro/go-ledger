@@ -12,10 +12,18 @@ import (
 )
 
 // seedTxn creates two accounts and posts one balanced transaction, returning the
-// transaction id and the two account ids.
+// transaction id and the two account ids. It ensures tenant's own row exists
+// first (accounts_tenant_fk, migration 0011): most callers pass a freshly
+// generated id with no tenant row of its own, and a caller that already
+// created one (e.g. to seed a second transaction for the same tenant) is
+// unaffected, since CreateTenant is only ever a no-op the second time here
+// (IsUniqueViolationError is swallowed).
 func seedTxn(t *testing.T, repo *postgres.Repository, tenant string) (txnID, debit, credit string) { //nolint:unparam // credit is part of the helper's shape for future callers even though no test currently reads it
 	t.Helper()
 	ctx := context.Background()
+	if err := repo.CreateTenant(ctx, tenant, "test tenant"); err != nil && !errors.Is(err, domain.ErrTenantAlreadyExists) {
+		t.Fatalf("create tenant: %v", err)
+	}
 	d := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	c := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, tenant, d); err != nil {

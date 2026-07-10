@@ -121,6 +121,9 @@ func TestHappyPath(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "happy path tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, tenant, cash); err != nil {
@@ -199,6 +202,9 @@ func TestTenantIsolation(t *testing.T) {
 	ctx := context.Background()
 
 	owner := uuid.NewString()
+	if err := repo.CreateTenant(ctx, owner, "owner tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 	acct := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, owner, acct); err != nil {
 		t.Fatalf("create account: %v", err)
@@ -224,6 +230,12 @@ func TestCurrencyMismatchRejectedByTrigger(t *testing.T) {
 	txn := uuid.New()
 	posting := uuid.New()
 
+	// tenants first: accounts_tenant_fk (migration 0011) requires the tenant
+	// row to exist before an account can reference it.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, 'test tenant')`, tenant); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
 	// Account holds EUR; the posting claims USD.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO accounts (id, tenant_id, name, type, currency) VALUES ($1,$2,'a','asset','EUR')`,
@@ -250,6 +262,9 @@ func TestListAccounts(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "list accounts tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	for _, name := range []string{"Revenue", "Cash"} {
 		a := &domain.Account{Name: name, Type: domain.Asset, Currency: "USD"}
@@ -280,6 +295,9 @@ func TestAccountStatement(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "account statement tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	other := &domain.Account{Name: "Other", Type: domain.Asset, Currency: "USD"}
@@ -342,6 +360,9 @@ func TestPostCrossCurrencyReturnsMismatch(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "cross currency tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	usd := &domain.Account{Name: "USD acct", Type: domain.Asset, Currency: "USD"}
 	eur := &domain.Account{Name: "EUR acct", Type: domain.Asset, Currency: "EUR"}

@@ -302,6 +302,9 @@ func TestGRPCConvertCrossTenantIsolation(t *testing.T) {
 	seedFXRate(t, "PLN", 100_000_000, 0)
 
 	tenantB := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenantB, "tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
 	plnB := &domain.Account{Name: "Tenant B PLN", Type: domain.Asset, Currency: "PLN"}
 	if err := repo.CreateAccount(ctx, tenantB, plnB); err != nil {
 		t.Fatalf("create tenant B account: %v", err)

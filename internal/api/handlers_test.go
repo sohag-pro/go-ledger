@@ -41,6 +41,7 @@ type fakeRepo struct {
 	idem     map[string]domain.IdempotencyRecord // key -> record
 	audit    []domain.AuditEntry
 	apiKeys  map[string]domain.APIKey // key_hash -> resolved key
+	tenants  map[string]domain.Tenant // tenant id -> tenant row
 }
 
 type postingRec struct {
@@ -55,6 +56,7 @@ func newFakeRepo() *fakeRepo {
 		txns:     map[string]domain.Transaction{},
 		idem:     map[string]domain.IdempotencyRecord{},
 		apiKeys:  map[string]domain.APIKey{},
+		tenants:  map[string]domain.Tenant{},
 	}
 }
 
@@ -280,10 +282,22 @@ func (f *fakeRepo) RunInTx(ctx context.Context, _ string, fn func(context.Contex
 	return fn(ctx, f)
 }
 
+// GetAPIKeyByHash mirrors the real repository's join to tenants: the
+// returned key's TenantStatus reflects the tenant's current row in f.tenants
+// so a test can flip a tenant to suspended/closed with SetTenantStatus and
+// see it take effect the next time the key resolves. A key whose tenant was
+// never explicitly created (most existing tests, which predate tenants)
+// defaults to active, matching the common case of a key issued against a
+// tenant that exists and is active.
 func (f *fakeRepo) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
 	k, ok := f.apiKeys[hash]
 	if !ok {
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if t, ok := f.tenants[k.TenantID]; ok {
+		k.TenantStatus = t.Status
+	} else {
+		k.TenantStatus = domain.TenantActive
 	}
 	return k, nil
 }
@@ -293,6 +307,46 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 		k.ID = uuid.NewString()
 	}
 	f.apiKeys[keyHash] = k
+	return nil
+}
+
+func (f *fakeRepo) CreateTenant(_ context.Context, tenantID, name string) error {
+	if _, exists := f.tenants[tenantID]; exists {
+		return domain.ErrTenantAlreadyExists
+	}
+	f.tenants[tenantID] = domain.Tenant{ID: tenantID, Name: name, Status: domain.TenantActive, CreatedAt: time.Now()}
+	return nil
+}
+
+func (f *fakeRepo) GetTenant(_ context.Context, tenantID string) (domain.Tenant, error) {
+	t, ok := f.tenants[tenantID]
+	if !ok {
+		return domain.Tenant{}, domain.ErrTenantNotFound
+	}
+	return t, nil
+}
+
+func (f *fakeRepo) ListTenants(_ context.Context, limit int) ([]domain.Tenant, error) {
+	out := make([]domain.Tenant, 0, len(f.tenants))
+	for _, t := range f.tenants {
+		if len(out) == limit {
+			break
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) SetTenantStatus(_ context.Context, tenantID string, status domain.TenantStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidTenant
+	}
+	t, ok := f.tenants[tenantID]
+	if !ok {
+		return domain.ErrTenantNotFound
+	}
+	t.Status = status
+	f.tenants[tenantID] = t
 	return nil
 }
 

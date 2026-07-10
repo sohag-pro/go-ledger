@@ -40,10 +40,21 @@ func (f *fakeLookup) callCount() int {
 	return int(atomic.LoadInt32(&f.calls))
 }
 
+// setKey replaces the stored key for hash, simulating a tenant's status
+// changing between one lookup and the next (e.g. an operator suspending a
+// tenant): the fake's caller is expected to have already advanced r.now past
+// the cached entry's TTL, since a real database update only becomes visible
+// to Resolve on its next fetch, never mid-TTL.
+func (f *fakeLookup) setKey(hash string, k domain.APIKey) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keys[hash] = k
+}
+
 const testPlaintext = "glk_test-key-plaintext"
 
 func testKey() (domain.APIKey, string) {
-	key := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "test key"}
+	key := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "test key", TenantStatus: domain.TenantActive}
 	return key, testPlaintext
 }
 
@@ -230,9 +241,10 @@ func TestResolve_ConcurrentSameAndDifferentTokens(t *testing.T) {
 		p := fmt.Sprintf("glk_concurrent-key-%d", i)
 		plaintexts[i] = p
 		keys[domain.HashAPIKey(p)] = domain.APIKey{
-			ID:       fmt.Sprintf("key-%d", i),
-			TenantID: fmt.Sprintf("tenant-%d", i),
-			Name:     fmt.Sprintf("key %d", i),
+			ID:           fmt.Sprintf("key-%d", i),
+			TenantID:     fmt.Sprintf("tenant-%d", i),
+			Name:         fmt.Sprintf("key %d", i),
+			TenantStatus: domain.TenantActive,
 		}
 	}
 	lookup := newFakeLookup(keys)
@@ -265,5 +277,135 @@ func TestResolve_ConcurrentSameAndDifferentTokens(t *testing.T) {
 
 	for err := range errCh {
 		t.Error(err)
+	}
+}
+
+// --- Tenant status gating (Task 2.1, ADR-015). ---
+
+// TestResolve_ActiveTenantPasses proves the ordinary case is unaffected: a
+// key whose tenant is active resolves exactly as before.
+func TestResolve_ActiveTenantPasses(t *testing.T) {
+	t.Parallel()
+
+	key, plaintext := testKey() // TenantStatus: domain.TenantActive
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key})
+	r := NewResolver(lookup, time.Minute)
+
+	got, err := r.Resolve(context.Background(), "Bearer "+plaintext)
+	if err != nil {
+		t.Fatalf("Resolve error = %v, want nil", err)
+	}
+	if got != key {
+		t.Fatalf("Resolve = %+v, want %+v", got, key)
+	}
+}
+
+// TestResolve_SuspendedAndClosedTenantsAreRejected proves a valid key whose
+// tenant is suspended or closed is rejected with a *domain.TenantNotActiveError
+// (matched via errors.Is(err, domain.ErrTenantNotActive)), not ErrUnauthorized:
+// the credential itself is fine, only the tenant is gated, and the error names
+// the exact status so a transport layer can put it in a 403 / PermissionDenied
+// response.
+func TestResolve_SuspendedAndClosedTenantsAreRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status domain.TenantStatus
+	}{
+		{"suspended", domain.TenantSuspended},
+		{"closed", domain.TenantClosed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			key := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "test key", TenantStatus: tt.status}
+			lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(testPlaintext): key})
+			r := NewResolver(lookup, time.Minute)
+
+			_, err := r.Resolve(context.Background(), "Bearer "+testPlaintext)
+			if err == nil {
+				t.Fatal("Resolve error = nil, want a TenantNotActiveError")
+			}
+			if errors.Is(err, ErrUnauthorized) {
+				t.Errorf("Resolve error = %v, want a TenantNotActiveError, not ErrUnauthorized (the key is valid)", err)
+			}
+			if !errors.Is(err, domain.ErrTenantNotActive) {
+				t.Fatalf("Resolve error = %v, want it to match domain.ErrTenantNotActive", err)
+			}
+			var tenantErr *domain.TenantNotActiveError
+			if !errors.As(err, &tenantErr) {
+				t.Fatalf("Resolve error = %v (%T), want a *domain.TenantNotActiveError", err, err)
+			}
+			if tenantErr.Status != tt.status {
+				t.Errorf("TenantNotActiveError.Status = %q, want %q", tenantErr.Status, tt.status)
+			}
+			wantReason := "tenant is " + string(tt.status)
+			if got := tenantErr.Reason(); got != wantReason {
+				t.Errorf("Reason() = %q, want %q", got, wantReason)
+			}
+		})
+	}
+}
+
+// TestResolve_SuspensionIsPickedUpWithinOneTTL proves the cache does not let a
+// suspended tenant's key keep working past its cache entry's TTL: gating is
+// folded into the same cache entry as the key, so it is checked on a cache hit
+// (not just a fresh lookup), and a tenant suspended after the entry was cached
+// is rejected the next time the entry expires and is refetched.
+func TestResolve_SuspensionIsPickedUpWithinOneTTL(t *testing.T) {
+	t.Parallel()
+
+	activeKey := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "test key", TenantStatus: domain.TenantActive}
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(testPlaintext): activeKey})
+	r := NewResolver(lookup, time.Second)
+
+	current := time.Now()
+	r.now = func() time.Time { return current }
+
+	if _, err := r.Resolve(context.Background(), testPlaintext); err != nil {
+		t.Fatalf("first Resolve (active) error = %v, want nil", err)
+	}
+	if got := lookup.callCount(); got != 1 {
+		t.Fatalf("lookup call count after first Resolve = %d, want 1", got)
+	}
+
+	// The tenant is suspended in the backing store, but the cache entry has
+	// not expired yet: Resolve must still see the pre-suspension cached
+	// entry, exactly like the key-only cache-hit behavior this gating sits on
+	// top of.
+	suspendedKey := activeKey
+	suspendedKey.TenantStatus = domain.TenantSuspended
+	lookup.setKey(domain.HashAPIKey(testPlaintext), suspendedKey)
+
+	if _, err := r.Resolve(context.Background(), testPlaintext); err != nil {
+		t.Fatalf("second Resolve (still cached, pre-suspension) error = %v, want nil", err)
+	}
+	if got := lookup.callCount(); got != 1 {
+		t.Fatalf("lookup call count while still cached = %d, want 1 (no refetch yet)", got)
+	}
+
+	// Advance past the TTL: the next Resolve refetches and must now see the
+	// suspension.
+	current = current.Add(2 * time.Second)
+
+	_, err := r.Resolve(context.Background(), testPlaintext)
+	if !errors.Is(err, domain.ErrTenantNotActive) {
+		t.Fatalf("Resolve after TTL expiry (suspended) error = %v, want a TenantNotActiveError", err)
+	}
+	if got := lookup.callCount(); got != 2 {
+		t.Fatalf("lookup call count after TTL expiry = %d, want 2 (expired entry should refetch)", got)
+	}
+
+	// And the rejection itself is also cached: a third call within the new
+	// TTL window must not hit the database again.
+	_, err = r.Resolve(context.Background(), testPlaintext)
+	if !errors.Is(err, domain.ErrTenantNotActive) {
+		t.Fatalf("third Resolve (still within post-suspension TTL) error = %v, want a TenantNotActiveError", err)
+	}
+	if got := lookup.callCount(); got != 2 {
+		t.Fatalf("lookup call count for cached suspended entry = %d, want 2 (no extra refetch)", got)
 	}
 }

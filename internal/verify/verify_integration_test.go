@@ -128,6 +128,10 @@ func postTxn(t *testing.T, pool *pgxpool.Pool, tenant string) string {
 	accounts := ledger.NewAccountService(repo)
 	txns := ledger.NewTransactionService(repo, nil, nil)
 
+	if err := repo.CreateTenant(ctx, tenant, "verify test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
 	if err := accounts.Create(ctx, tenant, cash); err != nil {

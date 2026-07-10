@@ -207,16 +207,27 @@ func TestLoadConfig_SafeByDefault(t *testing.T) {
 }
 
 // fakeKeyStore is an in-memory api_keys store for the provisioning test. It
-// mirrors the two behaviours provisionAPIKeys depends on from the real
-// postgres repository: a second insert of the same key_hash fails with a
-// Postgres unique-violation (23505) rather than overwriting, and a stored key
-// resolves back by hash so the resolver can find it.
+// mirrors the behaviours provisionAPIKeys depends on from the real postgres
+// repository: a second insert of the same key_hash fails with a Postgres
+// unique-violation (23505) rather than overwriting, a second CreateTenant for
+// the same id fails with domain.ErrTenantAlreadyExists rather than
+// overwriting, and a stored key resolves back by hash so the resolver can
+// find it.
 type fakeKeyStore struct {
-	byHash map[string]domain.APIKey
+	byHash  map[string]domain.APIKey
+	tenants map[string]bool
 }
 
 func newFakeKeyStore() *fakeKeyStore {
-	return &fakeKeyStore{byHash: map[string]domain.APIKey{}}
+	return &fakeKeyStore{byHash: map[string]domain.APIKey{}, tenants: map[string]bool{}}
+}
+
+func (s *fakeKeyStore) CreateTenant(_ context.Context, tenantID, _ string) error {
+	if s.tenants[tenantID] {
+		return domain.ErrTenantAlreadyExists
+	}
+	s.tenants[tenantID] = true
+	return nil
 }
 
 func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash string) error {
@@ -232,10 +243,18 @@ func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash 
 	return nil
 }
 
+// GetAPIKeyByHash defaults an unset TenantStatus to active: this fake has no
+// tenants table of its own, and every key provisionAPIKeys inserts here
+// stands for a tenant that exists and is active (the case these tests cover;
+// tenant status gating itself is tested in internal/auth against a fake that
+// tracks status explicitly).
 func (s *fakeKeyStore) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
 	k, ok := s.byHash[hash]
 	if !ok {
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if k.TenantStatus == "" {
+		k.TenantStatus = domain.TenantActive
 	}
 	return k, nil
 }
