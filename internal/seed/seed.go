@@ -181,9 +181,12 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 		return fmt.Errorf("seed: enable audit purge: %w", err)
 	}
 
-	// Reset: idempotency_keys and audit_log reference transactions, so clear them
-	// first, then postings and transactions before accounts.
-	for _, table := range []string{"idempotency_keys", "audit_log", "postings", "transactions", "accounts"} {
+	// Reset: idempotency_keys, audit_log, and audit_outbox (ADR-017) all
+	// reference transactions, so clear them first, then postings and
+	// transactions before accounts. audit_outbox is not append-only guarded
+	// (no immutability trigger; it holds no chain data, just pending
+	// events), so it needs no purge GUC, unlike audit_log above.
+	for _, table := range []string{"idempotency_keys", "audit_log", "audit_outbox", "postings", "transactions", "accounts"} {
 		if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE tenant_id = $1", tid); err != nil {
 			return fmt.Errorf("seed: clear %s: %w", table, err)
 		}
