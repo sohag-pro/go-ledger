@@ -37,6 +37,26 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
+// insertLegacyAuditRow inserts one audit_log row directly, bypassing the
+// chainer entirely: it stands in for a row some earlier chainer session
+// (possibly on a different host) already produced, with the given id and
+// prev/row hash, leaving chain_seq to its column DEFAULT (so it is assigned
+// in true insertion order, exactly as the real chainer's InsertAuditLog
+// does) and outbox_id NULL (this row is not tied to any outbox row the test
+// chainer might later try to process). It fails the test on any error.
+func insertLegacyAuditRow(t *testing.T, pool *pgxpool.Pool, id uuid.UUID, tenant, txnID string, createdAt time.Time, prevHash, rowHash string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash)
+		VALUES ($1, $2, $3, $4, $5, NULL, '{}', $6, $7, $8)`,
+		id, uuid.MustParse(tenant), domain.ActionTransactionCreated, uuid.MustParse(txnID), tenant,
+		createdAt, prevHash, rowHash,
+	); err != nil {
+		t.Fatalf("insert legacy audit_log row %s: %v", id, err)
+	}
+}
+
 var (
 	sharedPool *pgxpool.Pool
 	sharedDSN  string
@@ -690,4 +710,335 @@ func TestChainer_ReuseAuditEntryJSONRoundTrip(t *testing.T) {
 	if string(rows[0].After) != string(after) {
 		t.Errorf("after = %q, want %q (byte-exact round trip)", rows[0].After, after)
 	}
+}
+
+// TestChainer_ChainSeqOrderingImmuneToOutOfOrderUUIDv7Ids proves IMPORTANT 2
+// (ADR-017, migration 0016): the chain's linearization key is chain_seq, a
+// plain DB-assigned ascending sequence, not audit_log.id (a UUIDv7). UUIDv7
+// is monotonic only within the ONE process that minted it: across a leader
+// failover to a different host with clock skew, a new leader can mint an id
+// LOWER than the current head, and ORDER BY id would then see a fork that
+// never actually happened.
+//
+// This test fabricates exactly that: three pre-existing audit_log rows,
+// inserted directly (standing in for rows a prior chainer session already
+// produced), with ids DELIBERATELY scrambled relative to chain order (their
+// ids are neither ascending nor descending in the order they were actually
+// chained) but chain_seq, left to its column DEFAULT, correctly reflecting
+// true insertion order (exactly what the real chainer's InsertAuditLog
+// always produces, since chain_seq is never supplied by the caller). It then
+// runs the real chainer on one more, ordinary outbox row and confirms
+// GetLastAuditHash (used inside chainOne to resolve the tenant's head)
+// extends off the row with the highest chain_seq, not the row with the
+// lexicographically greatest id, and that the resulting four-row chain
+// verifies end to end walking chain_seq order (ListAuditForVerify).
+func TestChainer_ChainSeqOrderingImmuneToOutOfOrderUUIDv7Ids(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	auditSvc := ledger.NewAuditService(repo)
+	ctx := context.Background()
+
+	tenant, debit, credit := seedTenant(t, repo)
+
+	// A transaction row for the three legacy audit_log rows to reference
+	// (audit_log.transaction_id is a foreign key); inserted directly, with no
+	// outbox row, so the chainer never touches it.
+	legacyTxnID := uuid.NewString()
+	if _, err := pool.Exec(ctx, `INSERT INTO transactions (id, tenant_id) VALUES ($1, $2)`,
+		legacyTxnID, uuid.MustParse(tenant),
+	); err != nil {
+		t.Fatalf("seed legacy transaction: %v", err)
+	}
+
+	// Ids deliberately out of chain order: idHigh (lexicographically
+	// greatest) is chained FIRST, idLow (lexicographically least) SECOND,
+	// idMid (lexicographically between the two) THIRD. Neither ascending nor
+	// descending id order matches this chain order; only chain_seq
+	// (assigned 1, 2, 3 in this exact insertion order via the column
+	// DEFAULT) does.
+	idHigh := uuid.MustParse("ffffffff-0000-7000-8000-000000000001")
+	idLow := uuid.MustParse("00000000-0000-7000-8000-000000000002")
+	idMid := uuid.MustParse("77777777-0000-7000-8000-000000000003")
+
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
+
+	entry1 := domain.AuditEntry{
+		ID: idHigh.String(), Action: domain.ActionTransactionCreated, TransactionID: legacyTxnID,
+		Actor: tenant, After: []byte("{}"), CreatedAt: createdAt,
+	}
+	hash1 := domain.ComputeAuditRowHash(tenant, entry1, domain.AuditGenesisHash)
+	insertLegacyAuditRow(t, pool, idHigh, tenant, legacyTxnID, createdAt, domain.AuditGenesisHash, hash1)
+
+	entry2 := entry1
+	entry2.ID = idLow.String()
+	hash2 := domain.ComputeAuditRowHash(tenant, entry2, hash1)
+	insertLegacyAuditRow(t, pool, idLow, tenant, legacyTxnID, createdAt, hash1, hash2)
+
+	entry3 := entry1
+	entry3.ID = idMid.String()
+	hash3 := domain.ComputeAuditRowHash(tenant, entry3, hash2)
+	insertLegacyAuditRow(t, pool, idMid, tenant, legacyTxnID, createdAt, hash2, hash3)
+
+	// Sanity check: id-descending order (the OLD, buggy GetLastAuditHash)
+	// would have picked idHigh's row (chained FIRST, chain_seq 1) as the
+	// "latest" hash, not idMid's row (chained LAST, chain_seq 3, the true
+	// head). If this assertion ever fails, the scrambling above stopped
+	// being scrambled and the test would no longer prove anything.
+	if idHigh.String() <= idMid.String() || idMid.String() <= idLow.String() {
+		t.Fatalf("test setup bug: ids are not scrambled as intended (idHigh=%s idMid=%s idLow=%s)", idHigh, idMid, idLow)
+	}
+
+	// One ordinary new event, posted and chained the normal way. Its
+	// prev_hash must be hash3 (the row with the highest chain_seq), proving
+	// GetLastAuditHash resolved the true head and not the row with the
+	// greatest id (hash1's row).
+	txnID := post(t, svc, tenant, debit, credit, 555)
+	chainer := audit.NewChainer(pool, discardLogger(), time.Millisecond, 500)
+	drainUntilEmpty(t, chainer, repo, tenant)
+
+	rows, err := repo.ListAuditForVerify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("list audit for verify: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("audit rows = %d, want 4", len(rows))
+	}
+	// ListAuditForVerify orders by chain_seq: the true chain order, not id
+	// order (which would put idLow, idMid, idHigh, then the new row, in that
+	// scrambled sequence instead).
+	wantIDOrder := []string{idHigh.String(), idLow.String(), idMid.String()}
+	for i, want := range wantIDOrder {
+		if rows[i].ID != want {
+			t.Fatalf("row %d id = %s, want %s (chain_seq order, not id order)", i, rows[i].ID, want)
+		}
+	}
+	newRow := rows[3]
+	if newRow.TransactionID != txnID {
+		t.Fatalf("row 3 transaction id = %s, want the newly posted transaction %s", newRow.TransactionID, txnID)
+	}
+	if newRow.PrevHash != hash3 {
+		t.Fatalf("new row's prev_hash = %q, want %q (the true head, chain_seq 3), not %q (idHigh's hash, the wrong head an id-ordered read would pick)",
+			newRow.PrevHash, hash3, hash1)
+	}
+
+	result, err := auditSvc.Verify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("chain invalid: checked=%d first_break=%s", result.Checked, result.FirstBreakID)
+	}
+	if result.Checked != 4 {
+		t.Fatalf("checked = %d, want 4", result.Checked)
+	}
+}
+
+// TestChainer_DuplicateOutboxIDBackstop proves MINOR 3 (ADR-017, migration
+// 0016): if audit_log already has a row claiming a given audit_outbox row's
+// id (simulating some other writer having already legitimately chained it,
+// the scenario the outbox_id UNIQUE constraint exists to catch), a further
+// attempt by this chainer to chain that same outbox row must fail the insert
+// with a unique violation that chainOne treats as a graceful no-op: it marks
+// the outbox row processed (so it is not retried forever), evicts any cached
+// hash for the tenant, and does not error or produce a second, forking,
+// audit_log row.
+func TestChainer_DuplicateOutboxIDBackstop(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	ctx := context.Background()
+
+	tenant, debit, credit := seedTenant(t, repo)
+	txnID := post(t, svc, tenant, debit, credit, 999)
+
+	var outboxID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM audit_outbox WHERE transaction_id = $1`, uuid.MustParse(txnID),
+	).Scan(&outboxID); err != nil {
+		t.Fatalf("read outbox id: %v", err)
+	}
+
+	// Simulate a legitimate winner already having chained this exact outbox
+	// row: insert an audit_log row claiming outboxID directly, standing in
+	// for another writer (or an earlier, overlapping leader) that processed
+	// it first. The row's own hash values are irrelevant to this test; only
+	// its outbox_id matters.
+	winnerID, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("new v7: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id)
+		VALUES ($1, $2, $3, $4, $5, NULL, '{}', now(), '', 'winner-hash', $6)`,
+		winnerID, uuid.MustParse(tenant), domain.ActionTransactionCreated, uuid.MustParse(txnID), tenant, outboxID,
+	); err != nil {
+		t.Fatalf("seed winner audit_log row: %v", err)
+	}
+
+	chainer := audit.NewChainer(pool, discardLogger(), time.Millisecond, 500)
+	if _, err := chainer.DrainOnce(ctx); err != nil {
+		t.Fatalf("drain with a pre-existing outbox_id must not error: %v", err)
+	}
+
+	var processedAt sql.NullTime
+	if err := pool.QueryRow(ctx, `SELECT processed_at FROM audit_outbox WHERE id = $1`, outboxID).Scan(&processedAt); err != nil {
+		t.Fatalf("read outbox processed_at: %v", err)
+	}
+	if !processedAt.Valid {
+		t.Error("outbox row was not marked processed by the duplicate-chain backstop")
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE outbox_id = $1`, outboxID).Scan(&count); err != nil {
+		t.Fatalf("count audit_log rows for outbox id: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit_log rows claiming outbox_id %d = %d, want 1 (no duplicate/fork)", outboxID, count)
+	}
+
+	pending, err := repo.CountPendingOutbox(ctx, tenant)
+	if err != nil {
+		t.Fatalf("count pending outbox: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("pending after backstop = %d, want 0", pending)
+	}
+}
+
+// killApplicationBackend terminates every Postgres backend whose
+// application_name matches appName, via adminPool (a separate connection
+// from the one being killed), failing the test if none was found. This is
+// how TestChainer_LeaderLockLoss_ReleasesLeadershipAndReContends simulates a
+// lost leader-lock session: from the app's point of view, this is
+// indistinguishable from a Postgres restart, a failover, or an operator's
+// own pg_terminate_backend, and Postgres releases that backend's
+// session-level advisory locks as part of tearing it down.
+func killApplicationBackend(t *testing.T, adminPool *pgxpool.Pool, appName string) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := adminPool.Query(ctx,
+		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1`, appName)
+	if err != nil {
+		t.Fatalf("terminate backend(s) for application_name %q: %v", appName, err)
+	}
+	defer rows.Close()
+	killed := 0
+	for rows.Next() {
+		var ok bool
+		if err := rows.Scan(&ok); err != nil {
+			t.Fatalf("scan pg_terminate_backend result: %v", err)
+		}
+		killed++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate pg_terminate_backend results: %v", err)
+	}
+	if killed == 0 {
+		t.Fatalf("no backend found with application_name %q to terminate", appName)
+	}
+}
+
+// TestChainer_LeaderLockLoss_ReleasesLeadershipAndReContends proves CRITICAL
+// 1 (ADR-017): if the leader's lock SESSION is lost (a Postgres restart, a
+// failover, or an operator's pg_terminate_backend), the leader must notice
+// on its very next drain query and stop leading, rather than keep draining
+// on some other, healthy connection while a second instance also acquires
+// the now-free lock and drains concurrently, forking the chain.
+//
+// Mechanics: chainer A gets its own dedicated pool, tagged with a
+// distinctive application_name so every backend it opens can be singled out
+// in pg_stat_activity and killed directly, with enough headroom (MaxConns)
+// that a chainer draining through a second, separate pool connection (the
+// pre-fix bug: drain queries acquired from c.pool independently of the
+// connection the advisory lock lived on) is never starved for a connection
+// and would have every opportunity to keep working. What proves CRITICAL 1
+// is that every drain query for A's leadership term is pinned to the SAME
+// already-acquired connection object the lock lives on, not re-acquired from
+// the pool per query: once that object's underlying session is gone, every
+// further query on it fails immediately, with no fallback to some other
+// healthy connection in the pool.
+//
+// A leads first, alone, with a long (3s) retry interval, so that once it
+// loses the lock it will not race back for it quickly. Chainer B starts only
+// after A is confirmed to be leading (it drained a pre-seeded row), with a
+// short (20ms) interval, so it is overwhelmingly likely to win the
+// re-contend race the instant Postgres frees the lock. More events are then
+// posted and must still get fully chained, by whichever instance is
+// actually leading, with the resulting chain showing no fork: that is only
+// possible if A genuinely stopped draining the moment its lock session died.
+func TestChainer_LeaderLockLoss_ReleasesLeadershipAndReContends(t *testing.T) {
+	newTestPool(t) // skips cleanly (not fails) when no Docker daemon is reachable.
+	ctx := context.Background()
+
+	const appName = "chainer-a-lockloss-test"
+	cfg, err := pgxpool.ParseConfig(sharedDSN)
+	if err != nil {
+		t.Fatalf("parse pool config for chainer A: %v", err)
+	}
+	cfg.MaxConns = 5
+	cfg.ConnConfig.RuntimeParams["application_name"] = appName
+	poolA, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("new pool A: %v", err)
+	}
+	t.Cleanup(poolA.Close)
+
+	poolB := newPool(t, 10)
+	repo := postgres.NewRepository(poolB)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	auditSvc := ledger.NewAuditService(repo)
+
+	tenant, debit, credit := seedTenant(t, repo)
+	post(t, svc, tenant, debit, credit, 111) // one row for A to prove it actually leads and drains.
+
+	const aInterval = time.Second
+	chainerA := audit.NewChainer(poolA, discardLogger(), aInterval, 50)
+	ctxA, cancelA := context.WithCancel(ctx)
+	doneA := make(chan struct{})
+	go func() { defer close(doneA); chainerA.Run(ctxA) }()
+	t.Cleanup(func() { cancelA(); <-doneA })
+
+	// Confirm A actually became leader and did real drain work on its lock
+	// connection, not merely that its goroutine is running.
+	waitForPendingZero(t, repo, tenant)
+
+	// Kill A's one and only backend connection outright: this is what a
+	// Postgres restart, a failover, or pg_terminate_backend looks like from
+	// the app's point of view.
+	killApplicationBackend(t, sharedPool, appName)
+
+	chainerB := audit.NewChainer(poolB, discardLogger(), 10*time.Millisecond, 50)
+	ctxB, cancelB := context.WithCancel(ctx)
+	doneB := make(chan struct{})
+	go func() { defer close(doneB); chainerB.Run(ctxB) }()
+	t.Cleanup(func() { cancelB(); <-doneB })
+
+	// Trickle these posts out over a span comfortably longer than aInterval
+	// (rather than firing them all at once): a buggy chainer A, unaware its
+	// lock session died, ticks again on its own schedule (every aInterval)
+	// and would otherwise only get a chance to race chainer B for a set of
+	// rows if some are still genuinely unprocessed at that moment. Spreading
+	// the posts out gives every one of A's post-kill ticks a real,
+	// overlapping window of pending work to (wrongly) act on if it is still
+	// silently "leading".
+	const more = 40
+	for i := 0; i < more; i++ {
+		post(t, svc, tenant, debit, credit, int64(2_000+i))
+		time.Sleep(aInterval / 10)
+	}
+	waitForPendingZero(t, repo, tenant)
+
+	result, err := auditSvc.Verify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("chain invalid after leader lock loss: checked=%d first_break=%s (a fork would surface here)",
+			result.Checked, result.FirstBreakID)
+	}
+	if result.Checked != 1+more {
+		t.Fatalf("checked = %d, want %d", result.Checked, 1+more)
+	}
+	assertNoFork(t, repo, tenant, 1+more)
 }
