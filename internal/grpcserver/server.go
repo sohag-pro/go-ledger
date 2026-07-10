@@ -102,8 +102,17 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 
 // --- translation helpers ---
 
+// toProtoAccount translates a domain.Account to its protobuf shape. MinBalance
+// (Task 5.5, audit A1.5) is left at its zero value (0) when unset: proto3 has
+// no distinct "absent" for a scalar int64, so a gRPC caller cannot tell "no
+// floor" apart from "floor of exactly zero" the way the REST API's nullable
+// min_balance can (see the proto's own doc comment on Account.min_balance).
 func toProtoAccount(a domain.Account) *ledgerv1.Account {
-	return &ledgerv1.Account{Id: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency)}
+	pa := &ledgerv1.Account{Id: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency), Status: string(a.Status)}
+	if a.MinBalance != nil {
+		pa.MinBalance = *a.MinBalance
+	}
+	return pa
 }
 
 // toProtoTransaction translates a domain.Transaction to its protobuf shape.
@@ -175,13 +184,18 @@ func toProtoAuditEntry(e domain.AuditEntry) *ledgerv1.AuditEntry {
 
 // --- handlers ---
 
-// CreateAccount creates an account for the calling tenant.
+// CreateAccount creates an account for the calling tenant. min_balance (Task
+// 5.5, audit A1.5) is optional: 0 means no floor was requested, mirroring
+// toProtoAccount's own doc comment on the same ambiguity.
 func (s *Server) CreateAccount(ctx context.Context, req *ledgerv1.CreateAccountRequest) (*ledgerv1.CreateAccountResponse, error) {
 	at, err := domain.ParseAccountType(req.Type)
 	if err != nil {
 		return nil, toStatus(err)
 	}
 	acct := &domain.Account{Name: req.Name, Type: at, Currency: domain.Currency(req.Currency)}
+	if req.MinBalance != 0 {
+		acct.MinBalance = &req.MinBalance
+	}
 	if err := s.accounts.Create(ctx, tenantFrom(ctx), acct); err != nil {
 		return nil, toStatus(err)
 	}
@@ -195,6 +209,17 @@ func (s *Server) GetAccount(ctx context.Context, req *ledgerv1.GetAccountRequest
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.GetAccountResponse{Account: toProtoAccount(acct)}, nil
+}
+
+// SetAccountStatus freezes, closes, or reactivates an account for the
+// calling tenant (Task 5.5, audit A1.5), mirroring POST
+// /v1/accounts/{id}/status, and returns the updated account.
+func (s *Server) SetAccountStatus(ctx context.Context, req *ledgerv1.SetAccountStatusRequest) (*ledgerv1.SetAccountStatusResponse, error) {
+	acct, err := s.accounts.SetStatus(ctx, tenantFrom(ctx), req.Id, domain.AccountStatus(req.Status))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &ledgerv1.SetAccountStatusResponse{Account: toProtoAccount(acct)}, nil
 }
 
 // ListAccounts lists accounts for the calling tenant, most recent first.

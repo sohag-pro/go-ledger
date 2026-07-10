@@ -14,10 +14,21 @@ import (
 
 // TestPost_UnknownAccountsFailsAndLeavesNothingPersisted exercises the "genuine
 // failure" branch of Post: idem is nil so the duplicate-key replay path never
-// runs, and the posting insert fails on the foreign key check because neither
-// account was ever created. That is a real, non-conflict persistence failure,
-// distinct from both an idempotency conflict and a serialization conflict, and
-// the whole write must roll back.
+// runs, and neither account posted to was ever created. That is a real,
+// non-conflict persistence failure, distinct from both an idempotency
+// conflict and a serialization conflict, and the whole write must roll back.
+//
+// Since Task 5.5 (audit A1.5), this is caught by enforceAccountConstraints
+// (domain.CheckAccountPostingConstraints), which runs BEFORE
+// tx.CreateTransaction and surfaces a clean domain.ErrAccountNotFound for any
+// posting whose account has no matching domain.AccountPostingState entry,
+// rather than letting the insert reach Postgres and fail on the
+// accounts_tenant_id_fkey-shaped foreign key check the way it used to (a raw,
+// wrapped Postgres error, not a domain sentinel). One consequence: because
+// CreateTransaction is never reached, it never assigns txn.ID either, so
+// there is no id to look up afterward; txn.ID staying empty is itself proof
+// nothing was persisted (CreateTransaction is the only thing that ever
+// assigns it).
 func TestPost_UnknownAccountsFailsAndLeavesNothingPersisted(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -28,8 +39,8 @@ func TestPost_UnknownAccountsFailsAndLeavesNothingPersisted(t *testing.T) {
 
 	txn := mkTxn(t, uuid.NewString(), uuid.NewString())
 	replayed, err := svc.Post(ctx, tenant, txn, nil)
-	if err == nil {
-		t.Fatal("expected an error posting against nonexistent accounts")
+	if !errors.Is(err, domain.ErrAccountNotFound) {
+		t.Fatalf("Post() error = %v, want ErrAccountNotFound", err)
 	}
 	if replayed {
 		t.Error("replayed = true, want false on a genuine failure")
@@ -38,9 +49,10 @@ func TestPost_UnknownAccountsFailsAndLeavesNothingPersisted(t *testing.T) {
 		t.Errorf("got a conflict-shaped error %v, want a plain persistence failure", err)
 	}
 
-	// The write rolled back: nothing was persisted under this id.
-	if _, err := svc.Get(ctx, tenant, txn.ID); !errors.Is(err, domain.ErrTransactionNotFound) {
-		t.Fatalf("get after failed post: got %v, want ErrTransactionNotFound", err)
+	// The write rolled back: CreateTransaction, the only thing that ever
+	// assigns txn.ID, was never reached.
+	if txn.ID != "" {
+		t.Errorf("txn.ID = %q, want empty (CreateTransaction must never have run)", txn.ID)
 	}
 }
 

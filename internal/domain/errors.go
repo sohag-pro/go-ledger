@@ -20,7 +20,9 @@ var (
 	ErrTooFewPostings = errors.New("domain: transaction needs at least two postings")
 	// ErrInvalidAccountType is returned when an AccountType is out of range.
 	ErrInvalidAccountType = errors.New("domain: invalid account type")
-	// ErrInvalidAccount is returned when an Account is missing required fields.
+	// ErrInvalidAccount is returned when an Account is missing required
+	// fields, or carries a Status outside AccountStatus.Valid() (Task 5.5,
+	// audit A1.5), the same dual role ErrInvalidTenant plays for Tenant.
 	ErrInvalidAccount = errors.New("domain: invalid account")
 	// ErrInvalidPosting is returned when a posting is missing an account id.
 	ErrInvalidPosting = errors.New("domain: invalid posting")
@@ -152,4 +154,18 @@ var (
 	// ErrWebhookSubscriptionNotFound is returned when no webhook_subscriptions
 	// row matches the given id.
 	ErrWebhookSubscriptionNotFound = errors.New("domain: webhook subscription not found")
+	// ErrAccountNotActive is the sentinel matched via errors.Is for any
+	// *AccountNotActiveError, regardless of which status (frozen or closed)
+	// caused it (Task 5.5, audit A1.5). A transport layer maps it to 422
+	// Unprocessable Entity (REST) or codes.FailedPrecondition (gRPC): the
+	// request is otherwise well-formed, it just touches an account that is
+	// not currently postable.
+	ErrAccountNotActive = errors.New("domain: account not active")
+	// ErrMinBalanceBreach is the sentinel matched via errors.Is for any
+	// *MinBalanceBreachError (Task 5.5, audit A1.5). A transport layer maps
+	// it to 422 Unprocessable Entity (REST) or codes.FailedPrecondition
+	// (gRPC), the same class as ErrAccountNotActive: the request is
+	// otherwise well-formed, it just would take an account below its
+	// configured floor.
+	ErrMinBalanceBreach = errors.New("domain: posting would breach account minimum balance")
 )

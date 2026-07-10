@@ -85,6 +85,88 @@ func TestGRPCAccountLifecycle(t *testing.T) {
 	}
 }
 
+// TestGRPCAccountStatusAndMinBalance covers Task 5.5 (audit A1.5) over
+// gRPC: a fresh account defaults to status "active" with min_balance 0 (no
+// floor, the documented gRPC convention: see toProtoAccount's doc comment);
+// creating with an explicit min_balance round-trips it; SetAccountStatus
+// freezes the account, which then blocks a PostTransaction with
+// FailedPrecondition, and reactivating un-blocks it; SetAccountStatus on an
+// unknown account id is NotFound.
+func TestGRPCAccountStatusAndMinBalance(t *testing.T) {
+	client := dialClient(t)
+	ctx := authedCtx(context.Background())
+
+	plain, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Status Coverage Cash", Type: "asset", Currency: "USD"})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if plain.Account.Status != "active" {
+		t.Errorf("status = %q, want %q", plain.Account.Status, "active")
+	}
+	if plain.Account.MinBalance != 0 {
+		t.Errorf("min_balance = %d, want 0 (no floor)", plain.Account.MinBalance)
+	}
+
+	withFloor, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Status Coverage Checking", Type: "asset", Currency: "USD", MinBalance: -50000})
+	if err != nil {
+		t.Fatalf("create account with min_balance: %v", err)
+	}
+	if withFloor.Account.MinBalance != -50000 {
+		t.Errorf("min_balance = %d, want -50000", withFloor.Account.MinBalance)
+	}
+
+	rev, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Status Coverage Revenue", Type: "income", Currency: "USD"})
+	if err != nil {
+		t.Fatalf("create revenue account: %v", err)
+	}
+
+	frozen, err := client.SetAccountStatus(ctx, &ledgerv1.SetAccountStatusRequest{Id: plain.Account.Id, Status: "frozen"})
+	if err != nil {
+		t.Fatalf("set account status frozen: %v", err)
+	}
+	if frozen.Account.Status != "frozen" {
+		t.Errorf("response status = %q, want %q", frozen.Account.Status, "frozen")
+	}
+
+	postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "grpc-frozen-account-post")
+	_, err = client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
+		Currency: "USD",
+		Postings: []*ledgerv1.Posting{
+			{AccountId: plain.Account.Id, Amount: 10000},
+			{AccountId: rev.Account.Id, Amount: -10000},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("post into frozen account code = %v, want FailedPrecondition", status.Code(err))
+	}
+
+	got, err := client.GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: plain.Account.Id})
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if got.Account.Status != "frozen" {
+		t.Errorf("GetAccount status = %q, want %q", got.Account.Status, "frozen")
+	}
+
+	if _, err := client.SetAccountStatus(ctx, &ledgerv1.SetAccountStatusRequest{Id: plain.Account.Id, Status: "active"}); err != nil {
+		t.Fatalf("reactivate: %v", err)
+	}
+	reactivatedCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "grpc-reactivated-account-post")
+	if _, err := client.PostTransaction(reactivatedCtx, &ledgerv1.PostTransactionRequest{
+		Currency: "USD",
+		Postings: []*ledgerv1.Posting{
+			{AccountId: plain.Account.Id, Amount: 10000},
+			{AccountId: rev.Account.Id, Amount: -10000},
+		},
+	}); err != nil {
+		t.Fatalf("post into reactivated account: %v", err)
+	}
+
+	if _, err := client.SetAccountStatus(ctx, &ledgerv1.SetAccountStatusRequest{Id: missingID, Status: "closed"}); status.Code(err) != codes.NotFound {
+		t.Errorf("set status on missing account code = %v, want NotFound", status.Code(err))
+	}
+}
+
 func TestGRPCCreateAccountInvalidType(t *testing.T) {
 	client := dialClient(t)
 	_, err := client.CreateAccount(authedCtx(context.Background()), &ledgerv1.CreateAccountRequest{Name: "Bad Type", Type: "not-a-type", Currency: "USD"})

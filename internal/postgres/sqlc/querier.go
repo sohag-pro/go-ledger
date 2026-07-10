@@ -14,12 +14,42 @@ import (
 
 type Querier interface {
 	AccountBalance(ctx context.Context, arg AccountBalanceParams) (int64, error)
+	// Task 5.5, audit A1.5: each named account's derived balance, read inside
+	// the caller's SERIALIZABLE RunInTx body so it is consistent with the
+	// CreateTransaction write that follows in the same transaction: two
+	// concurrent posts that would each individually keep an account above its
+	// floor, but together breach it, are a genuine read-write antidependency
+	// SERIALIZABLE detects and aborts one of. Called ONLY for accounts that
+	// AccountStatusFlags reported as having a MinBalance configured (see
+	// AccountStatusFlags's own doc comment for why this query is kept separate
+	// and only run when actually needed). The LEFT JOIN (rather than a subquery
+	// per account) means an account with no postings yet still returns one row,
+	// with balance COALESCEd to 0.
+	AccountBalances(ctx context.Context, arg AccountBalancesParams) ([]AccountBalancesRow, error)
 	// Postings affecting an account, newest first, each with the running balance as
 	// of that posting. The running balance is a window SUM over the account's full
 	// posting history (the CTE); the keyset filter and limit then return one page.
 	// after_created_at / after_id are the keyset position: pass a far-future
 	// timestamp and the max uuid for the first page.
 	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
+	// Task 5.5, audit A1.5: each named account's current status, min_balance,
+	// and is_system flag ONLY (no balance), read inside the caller's
+	// SERIALIZABLE RunInTx body (see domain.Tx.AccountPostingStates). This is
+	// deliberately split from AccountBalances below: this query touches only the
+	// accounts table, which nothing in the posting path ever writes to (a post
+	// inserts into transactions/postings/audit_outbox/idempotency_keys, never
+	// accounts), so it can never be the read side of a SERIALIZABLE read-write
+	// antidependency against a concurrent post. That is exactly what a combined
+	// query joining postings would risk: reading every historical posting for a
+	// hot account inside the same transaction as a concurrent INSERT into that
+	// account's postings is precisely the kind of broad read-write overlap
+	// SERIALIZABLE flags, and doing it unconditionally on every single post
+	// (unlike the opt-in TenantDailyDebits check) reintroduced, under many-way
+	// single-tenant concurrency onto a handful of accounts, the same class of
+	// retry storm ADR-017 removed the audit chain read to get rid of (see
+	// TestPostConcurrentStressSingleTenant). AccountBalances is now only ever
+	// called for the subset of accounts that actually have a MinBalance set.
+	AccountStatusFlags(ctx context.Context, arg AccountStatusFlagsParams) ([]AccountStatusFlagsRow, error)
 	// The oldest transaction id still in flight, cast the same way audit_outbox.txid
 	// is (xid8 has no direct cast to bigint). A row whose txid is strictly below
 	// this watermark is guaranteed committed and safe to chain (ADR-017,
@@ -29,6 +59,11 @@ type Querier interface {
 	// alongside the chained head (ADR-017 section 5), so a caller can see whether
 	// the chain is current or behind.
 	CountPendingOutbox(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// min_balance (Task 5.5, audit A1.5) is nullable: sqlc.narg leaves it unset
+	// (NULL) when the caller passes no value, matching "no floor configured",
+	// every account's behavior before this column existed. status is NOT
+	// inserted explicitly: the column default ('active', migration 0022)
+	// applies, the same way CreateTenant leaves status to the column default.
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTenant(ctx context.Context, arg CreateTenantParams) error
@@ -318,6 +353,10 @@ type Querier interface {
 	// stable because txid is not reused and id is a bigserial tiebreaker for the
 	// (rare) case of equal txid.
 	ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error)
+	// Task 5.5, audit A1.5: freezes, closes, or reactivates one account. Scoped
+	// to tenant_id like every other write here, so a caller can never flip a
+	// status on another tenant's account by id alone.
+	SetAccountStatus(ctx context.Context, arg SetAccountStatusParams) (int64, error)
 	// Task 2.4b (audit A3.4): a whole-document replace of the settings jsonb
 	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
 	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)

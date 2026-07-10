@@ -16,20 +16,45 @@ type AccountBody struct {
 	Name     string `json:"name"`
 	Type     string `json:"type" doc:"One of: asset, liability, equity, income, expense"`
 	Currency string `json:"currency" doc:"ISO 4217 code, e.g. USD"`
+	// Status is the account's lifecycle gate (Task 5.5, audit A1.5): active,
+	// frozen, or closed. See POST /v1/accounts/{id}/status to change it.
+	Status string `json:"status" doc:"One of: active, frozen, closed"`
+	// MinBalance is the optional floor enforced on this account's derived
+	// balance, in minor units (Task 5.5, audit A1.5). null means no floor.
+	MinBalance *int64 `json:"min_balance,omitempty" doc:"Optional minimum balance floor, in minor units. Omitted when unset."`
 }
 
 func toAccountBody(a domain.Account) AccountBody {
-	return AccountBody{ID: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency)}
+	return AccountBody{
+		ID:         a.ID,
+		Name:       a.Name,
+		Type:       a.Type.String(),
+		Currency:   string(a.Currency),
+		Status:     string(a.Status),
+		MinBalance: a.MinBalance,
+	}
 }
 
 // CreateAccountInput is the create-account request body. Currency is
 // optional (omitempty): when the caller omits it, the server stamps the
-// deployment's configured DEFAULT_CURRENCY instead (ADR-014).
+// deployment's configured DEFAULT_CURRENCY instead (ADR-014). MinBalance is
+// also optional (Task 5.5, audit A1.5): every account is created active, so
+// there is no status field here (see POST /v1/accounts/{id}/status).
 type CreateAccountInput struct {
 	Body struct {
-		Name     string `json:"name" minLength:"1" maxLength:"200" doc:"Human-readable account name"`
-		Type     string `json:"type" enum:"asset,liability,equity,income,expense" doc:"Fundamental account class"`
-		Currency string `json:"currency,omitempty" pattern:"^[A-Z]{3}$" doc:"ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted."`
+		Name       string `json:"name" minLength:"1" maxLength:"200" doc:"Human-readable account name"`
+		Type       string `json:"type" enum:"asset,liability,equity,income,expense" doc:"Fundamental account class"`
+		Currency   string `json:"currency,omitempty" pattern:"^[A-Z]{3}$" doc:"ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted."`
+		MinBalance *int64 `json:"min_balance,omitempty" doc:"Optional minimum balance floor, in minor units. Omit for no floor."`
+	}
+}
+
+// SetAccountStatusInput is the set-account-status request: a path id plus
+// the new status (Task 5.5, audit A1.5).
+type SetAccountStatusInput struct {
+	ID   string `path:"id" format:"uuid" doc:"Account id"`
+	Body struct {
+		Status string `json:"status" enum:"active,frozen,closed" doc:"New account status"`
 	}
 }
 
@@ -110,7 +135,7 @@ func registerAccounts(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
-		acct := &domain.Account{Name: in.Body.Name, Type: at, Currency: domain.Currency(in.Body.Currency)}
+		acct := &domain.Account{Name: in.Body.Name, Type: at, Currency: domain.Currency(in.Body.Currency), MinBalance: in.Body.MinBalance}
 		if err := deps.Accounts.Create(ctx, tenant, acct); err != nil {
 			return nil, toHumaErr(err)
 		}
@@ -154,6 +179,26 @@ func registerAccounts(api huma.API, deps Deps) {
 			return nil, err
 		}
 		acct, err := deps.Accounts.Get(ctx, tenant, in.ID)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &AccountOutput{Body: toAccountBody(acct)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID:  "set-account-status",
+		Method:       http.MethodPost,
+		Path:         "/v1/accounts/{id}/status",
+		Summary:      "Freeze, close, or reactivate an account",
+		Tags:         []string{"accounts"},
+		MaxBodyBytes: MaxRequestBodyBytes,
+		Security:     bearerSecurity,
+	}, func(ctx context.Context, in *SetAccountStatusInput) (*AccountOutput, error) {
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		acct, err := deps.Accounts.SetStatus(ctx, tenant, in.ID, domain.AccountStatus(in.Body.Status))
 		if err != nil {
 			return nil, toHumaErr(err)
 		}

@@ -213,6 +213,16 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
 			return err
 		}
+		// Checked over the same full four-leg set enforceTenantPolicy just
+		// checked (Task 5.5, audit A1.5): the two clearing legs are System
+		// accounts, so CheckAccountPostingConstraints exempts them from both
+		// checks (a clearing account must be free to run negative), while
+		// the from/to accounts are checked exactly like an ordinary post's
+		// legs. A frozen or closed from/to account, or one this convert
+		// would take below its floor, rolls the whole conversion back.
+		if err := enforceAccountConstraints(ctx, tx, tenantID, t.Postings); err != nil {
+			return err
+		}
 		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {
 			return err
 		}

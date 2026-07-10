@@ -105,6 +105,32 @@ type Tx interface {
 	// absent, never a zero-valued entry, so a caller should treat a missing
 	// key as 0 (see CheckTransactionPolicy).
 	TenantDailyDebits(ctx context.Context, tenantID string) (map[string]int64, error)
+
+	// AccountPostingStates returns, for each of accountIDs, its current
+	// Status, MinBalance, System flag, and derived Balance, within the
+	// surrounding transaction (Task 5.5, audit A1.5). Called from inside
+	// RunInTx's SERIALIZABLE transaction, the same way TenantDailyDebits is:
+	// two concurrent postings that would each individually keep an account
+	// above its floor, but together breach it, are a genuine read-write
+	// antidependency SERIALIZABLE can detect and abort one of. An account id
+	// with no matching row is simply absent from the returned map (mirroring
+	// TenantDailyDebits's "missing key means zero" convention, though here a
+	// caller should treat a missing entry as ErrAccountNotFound: see
+	// CheckAccountPostingConstraints), never a zero-valued entry.
+	//
+	// Balance is only ever meaningfully populated for a non-system account
+	// that actually has MinBalance set: the adapter is expected to read the
+	// account's status/min_balance/is_system metadata unconditionally (a
+	// read confined to the accounts table, which nothing in the posting path
+	// writes to, so it carries no extra SERIALIZABLE conflict risk), but to
+	// defer the Balance read (which DOES touch the postings table, and so
+	// CAN conflict with a concurrent post to the same account) to only that
+	// subset, exactly like TenantDailyDebits already defers its own read to
+	// only when a DailyVolumeLimit is actually configured. Running that
+	// second read unconditionally reintroduced, under many-way single-tenant
+	// concurrency onto a handful of accounts, the same class of retry storm
+	// ADR-017 removed the audit chain read to get rid of.
+	AccountPostingStates(ctx context.Context, tenantID string, accountIDs []string) (map[string]AccountPostingState, error)
 }
 
 // Repository is the persistence port for the ledger. The domain owns this
@@ -124,6 +150,14 @@ type Repository interface {
 	// GetAccount returns the account with the given id within the tenant, or
 	// ErrAccountNotFound if none exists.
 	GetAccount(ctx context.Context, tenantID, id string) (Account, error)
+
+	// SetAccountStatus updates the account's lifecycle Status (Task 5.5,
+	// audit A1.5): the operator or tenant action that freezes, closes, or
+	// reactivates one account (distinct from SetTenantStatus, which gates
+	// every account of a tenant at once). It returns ErrInvalidAccount if
+	// status is not one of AccountStatus.Valid()'s three values, or
+	// ErrAccountNotFound if no account matches id within tenantID.
+	SetAccountStatus(ctx context.Context, tenantID, id string, status AccountStatus) error
 
 	// ListAccounts returns up to limit of the tenant's accounts, ordered by name.
 	// Accounts are a small bounded set, so this is a simple capped list rather

@@ -72,6 +72,15 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 		}
 		a.ID = id.String()
 	}
+	// status is not accepted at creation (Task 5.5, audit A1.5): every
+	// account is created active, the column default; freezing or closing one
+	// afterward goes through SetAccountStatus. Stamping it here too (rather
+	// than leaving a.Status "") is just so the *domain.Account this call
+	// hands back to its caller already reflects "active" without a round
+	// trip through GetAccount, mirroring how a.ID is assigned above.
+	if a.Status == "" {
+		a.Status = domain.AccountActive
+	}
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -80,11 +89,12 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 		return fmt.Errorf("postgres: parse account id: %w", err)
 	}
 	return r.q.CreateAccount(ctx, sqlc.CreateAccountParams{
-		ID:       aid,
-		TenantID: tid,
-		Name:     a.Name,
-		Type:     a.Type.String(),
-		Currency: string(a.Currency),
+		ID:         aid,
+		TenantID:   tid,
+		Name:       a.Name,
+		Type:       a.Type.String(),
+		Currency:   string(a.Currency),
+		MinBalance: ptrToInt8(a.MinBalance),
 	})
 }
 
@@ -105,7 +115,7 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
 	}
-	return accountFromRow(row.ID, row.Name, row.Type, row.Currency)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem)
 }
 
 // ListAccounts returns up to limit of the tenant's accounts, ordered by name.
@@ -123,13 +133,39 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	}
 	out := make([]domain.Account, 0, len(rows))
 	for _, row := range rows {
-		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
+		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, acct)
 	}
 	return out, nil
+}
+
+// SetAccountStatus updates the account's status (Task 5.5, audit A1.5). It
+// returns domain.ErrInvalidAccount if status is not one of
+// AccountStatus.Valid()'s three values, or domain.ErrAccountNotFound if no
+// account matches id within tenantID.
+func (r *Repository) SetAccountStatus(ctx context.Context, tenantID, id string, status domain.AccountStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidAccount
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	rows, err := r.q.SetAccountStatus(ctx, sqlc.SetAccountStatusParams{TenantID: tid, ID: aid, Status: string(status)})
+	if err != nil {
+		return fmt.Errorf("postgres: set account status: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrAccountNotFound
+	}
+	return nil
 }
 
 // clearingAccountName is the reserved, deterministic name of a tenant's FX
@@ -168,12 +204,7 @@ func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID st
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get or create clearing account: %w", err)
 	}
-	acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
-	if err != nil {
-		return domain.Account{}, err
-	}
-	acct.System = row.IsSystem
-	return acct, nil
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem)
 }
 
 // CreateTransaction validates t and writes the transaction and all its postings
@@ -533,6 +564,85 @@ func (tr txRepo) TenantDailyDebits(ctx context.Context, tenantID string) (map[st
 	out := make(map[string]int64, len(rows))
 	for _, row := range rows {
 		out[row.Currency] = row.Total
+	}
+	return out, nil
+}
+
+// AccountPostingStates returns each of accountIDs's current status,
+// min_balance, is_system flag, and derived balance, within the surrounding
+// transaction (Task 5.5, audit A1.5). See domain.Tx.AccountPostingStates for
+// the race-safety this depends on: read under the same SERIALIZABLE
+// transaction CreateTransaction writes into right after, the same pattern
+// TenantDailyDebits above already uses for the daily-volume policy check. An
+// empty accountIDs returns an empty map without a round trip: ANY($2::uuid[])
+// against an empty slice is well-defined SQL (it matches nothing), but a
+// transaction can never touch zero accounts (Transaction.Validate requires
+// at least two postings), so this is defense against a caller bug, not a
+// real code path.
+func (tr txRepo) AccountPostingStates(ctx context.Context, tenantID string, accountIDs []string) (map[string]domain.AccountPostingState, error) {
+	if len(accountIDs) == 0 {
+		return map[string]domain.AccountPostingState{}, nil
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	ids := make([]uuid.UUID, len(accountIDs))
+	for i, id := range accountIDs {
+		aid, err := uuid.Parse(id)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: parse account id: %w", err)
+		}
+		ids[i] = aid
+	}
+
+	// Phase 1: status, min_balance, is_system for every touched account.
+	// This is the ONLY query that runs unconditionally on every post; see
+	// AccountStatusFlags's own doc comment for why it is kept to the
+	// accounts table alone.
+	flagRows, err := tr.q.AccountStatusFlags(ctx, sqlc.AccountStatusFlagsParams{TenantID: tid, AccountIds: ids})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: account status flags: %w", err)
+	}
+	out := make(map[string]domain.AccountPostingState, len(flagRows))
+	var needBalance []uuid.UUID
+	for _, row := range flagRows {
+		state := domain.AccountPostingState{
+			AccountID: row.ID.String(),
+			Status:    domain.AccountStatus(row.Status),
+			IsSystem:  row.IsSystem,
+		}
+		if row.MinBalance.Valid {
+			v := row.MinBalance.Int64
+			state.MinBalance = &v
+			// A system account is exempt from the min_balance check
+			// (domain.CheckAccountPostingConstraints), so its balance is
+			// never inspected: skip the second, postings-touching query for
+			// it even if a min_balance somehow ended up set on its row (the
+			// public API never lets a caller set one, but this keeps the
+			// exemption unconditional rather than "true only because nobody
+			// configures this").
+			if !row.IsSystem {
+				needBalance = append(needBalance, row.ID)
+			}
+		}
+		out[state.AccountID] = state
+	}
+
+	// Phase 2: derived balance, ONLY for accounts that actually have a
+	// MinBalance configured (see AccountBalances's own doc comment for why
+	// this read is not run unconditionally like phase 1 is).
+	if len(needBalance) > 0 {
+		balRows, err := tr.q.AccountBalances(ctx, sqlc.AccountBalancesParams{TenantID: tid, AccountIds: needBalance})
+		if err != nil {
+			return nil, fmt.Errorf("postgres: account balances: %w", err)
+		}
+		for _, row := range balRows {
+			id := row.ID.String()
+			state := out[id]
+			state.Balance = row.Balance
+			out[id] = state
+		}
 	}
 	return out, nil
 }
@@ -1423,6 +1533,16 @@ func ptrToInt4(p *int) pgtype.Int4 {
 	return pgtype.Int4{Int32: int32(*p), Valid: true} //nolint:gosec // rate limits are small, application-set values
 }
 
+// ptrToInt8 converts *int64 to a nullable Postgres int8, NULL when p is nil.
+// Used for accounts.min_balance (Task 5.5, audit A1.5): nil means "no floor
+// configured", the same meaning NULL carries in the column.
+func ptrToInt8(p *int64) pgtype.Int8 {
+	if p == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *p, Valid: true}
+}
+
 // accountFromRow builds a domain.Account from the scalar fields common to every
 // account-shaped row sqlc generates (GetAccountRow, ListAccountsRow, ...). Taking
 // individual fields rather than one sqlc row type is deliberate: sqlc gives each
@@ -1430,17 +1550,28 @@ func ptrToInt4(p *int) pgtype.Int4 {
 // column of the accounts table (which stopped being true once the schema grew
 // columns like is_system that not every query selects), so a single shared
 // struct type would not compile across call sites.
-func accountFromRow(id uuid.UUID, name, accountType, currency string) (domain.Account, error) {
+//
+// status, minBalance, and isSystem are Task 5.5 (audit A1.5) additions: every
+// query that selects them (GetAccount, ListAccounts, GetOrCreateClearingAccount)
+// passes its own row's values through unchanged.
+func accountFromRow(id uuid.UUID, name, accountType, currency, status string, minBalance pgtype.Int8, isSystem bool) (domain.Account, error) {
 	at, err := domain.ParseAccountType(accountType)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
 	}
-	return domain.Account{
+	a := domain.Account{
 		ID:       id.String(),
 		Name:     name,
 		Type:     at,
 		Currency: domain.Currency(currency),
-	}, nil
+		Status:   domain.AccountStatus(status),
+		System:   isSystem,
+	}
+	if minBalance.Valid {
+		v := minBalance.Int64
+		a.MinBalance = &v
+	}
+	return a, nil
 }
 
 // CreateWebhookSubscription assigns an identity if sub.ID is empty and

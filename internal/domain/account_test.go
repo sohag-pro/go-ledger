@@ -99,3 +99,222 @@ func TestAccountValidate(t *testing.T) {
 		})
 	}
 }
+
+// TestAccountStatusValid covers Task 5.5 (audit A1.5): the three defined
+// statuses are valid, the zero value and any unrecognized string are not.
+func TestAccountStatusValid(t *testing.T) {
+	valid := []AccountStatus{AccountActive, AccountFrozen, AccountClosed}
+	for _, s := range valid {
+		if !s.Valid() {
+			t.Errorf("Valid(%q) = false, want true", s)
+		}
+	}
+	invalid := []AccountStatus{"", "bogus", "ACTIVE", "suspended"}
+	for _, s := range invalid {
+		if s.Valid() {
+			t.Errorf("Valid(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestAccountValidateStatus covers Account.Validate's Status handling (Task
+// 5.5, audit A1.5): an empty Status is treated as "unset" (valid, not an
+// error, see Account.Status's doc comment), a recognized Status is valid,
+// and an unrecognized Status is ErrInvalidAccount.
+func TestAccountValidateStatus(t *testing.T) {
+	base := Account{ID: "acc_1", Name: "Cash", Type: Asset, Currency: "USD"}
+	tests := []struct {
+		name    string
+		status  AccountStatus
+		wantErr error
+	}{
+		{"unset", "", nil},
+		{"active", AccountActive, nil},
+		{"frozen", AccountFrozen, nil},
+		{"closed", AccountClosed, nil},
+		{"bogus", AccountStatus("bogus"), ErrInvalidAccount},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := base
+			a.Status = tt.status
+			if err := a.Validate(); !errors.Is(err, tt.wantErr) {
+				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// mustPosting is defined in tenant_test.go and reused here.
+
+// TestCheckAccountPostingConstraints covers Task 5.5 (audit A1.5)'s pure
+// domain check in isolation, independent of any storage adapter: frozen and
+// closed non-system accounts are rejected, active ones pass; a min_balance
+// breach is rejected, staying at or above it passes, and an account with no
+// min_balance is unconstrained; a system account is exempt from both checks
+// even when frozen or breaching what would otherwise be its floor; and an
+// account id in postings with no matching states entry is ErrAccountNotFound.
+func TestCheckAccountPostingConstraints(t *testing.T) {
+	floor := int64(-1000)
+	tests := []struct {
+		name     string
+		states   map[string]AccountPostingState
+		postings []Posting
+		wantErr  error
+	}{
+		{
+			name: "active posts",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountActive},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: nil,
+		},
+		{
+			name: "unset status treated as active",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: ""},
+				"b": {AccountID: "b", Status: ""},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: nil,
+		},
+		{
+			name: "frozen rejected",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountFrozen},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: ErrAccountNotActive,
+		},
+		{
+			name: "closed rejected",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountClosed},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: ErrAccountNotActive,
+		},
+		{
+			name: "min balance breach rejected",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountActive, MinBalance: &floor, Balance: -600},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				// -600 (current) + -500 (this posting) = -1100, below -1000.
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: ErrMinBalanceBreach,
+		},
+		{
+			name: "min balance held exactly passes",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountActive, MinBalance: &floor, Balance: -600},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				// -600 + -400 = -1000, exactly at the floor.
+				mustPosting(t, "a", -400, "USD"),
+				mustPosting(t, "b", 400, "USD"),
+			},
+			wantErr: nil,
+		},
+		{
+			name: "no min balance unconstrained",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountActive, Balance: -1_000_000},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: nil,
+		},
+		{
+			name: "system account exempt from frozen status",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountFrozen, IsSystem: true},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: nil,
+		},
+		{
+			name: "system account exempt from min balance",
+			states: map[string]AccountPostingState{
+				"a": {AccountID: "a", Status: AccountActive, IsSystem: true, MinBalance: &floor, Balance: -1_000_000},
+				"b": {AccountID: "b", Status: AccountActive},
+			},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: nil,
+		},
+		{
+			name:   "missing state entry is account not found",
+			states: map[string]AccountPostingState{"b": {AccountID: "b", Status: AccountActive}},
+			postings: []Posting{
+				mustPosting(t, "a", -500, "USD"),
+				mustPosting(t, "b", 500, "USD"),
+			},
+			wantErr: ErrAccountNotFound,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckAccountPostingConstraints(tt.states, tt.postings)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("CheckAccountPostingConstraints() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestAccountNotActiveErrorMessage covers the caller-facing message names
+// the account and its exact status (Task 5.5, audit A1.5).
+func TestAccountNotActiveErrorMessage(t *testing.T) {
+	err := &AccountNotActiveError{AccountID: "acc_1", Status: AccountFrozen}
+	if !errors.Is(err, ErrAccountNotActive) {
+		t.Errorf("errors.Is(err, ErrAccountNotActive) = false, want true")
+	}
+	const want = "domain: account acc_1 is frozen"
+	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+// TestMinBalanceBreachErrorMessage covers the caller-facing message names
+// the account, the balance the posting would have produced, and the floor
+// it breaches (Task 5.5, audit A1.5).
+func TestMinBalanceBreachErrorMessage(t *testing.T) {
+	err := &MinBalanceBreachError{AccountID: "acc_1", MinBalance: -1000, NewBalance: -1100}
+	if !errors.Is(err, ErrMinBalanceBreach) {
+		t.Errorf("errors.Is(err, ErrMinBalanceBreach) = false, want true")
+	}
+	const want = "domain: posting would take account acc_1 to -1100, below its minimum balance -1000"
+	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}

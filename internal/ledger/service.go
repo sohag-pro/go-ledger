@@ -93,7 +93,11 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 // Before any of that, t's postings are checked against tenantID's optional
 // TenantPolicy guardrails (Task 2.4b, audit A3.4: max transaction amount, daily
 // volume, currency allowlist); a tripped guardrail returns a
-// *domain.PolicyViolationError.
+// *domain.PolicyViolationError. Postings are also checked against each
+// touched (non-system) account's status and optional minimum balance (Task
+// 5.5, audit A1.5): a frozen or closed account returns a
+// *domain.AccountNotActiveError, and a posting that would breach an
+// account's floor returns a *domain.MinBalanceBreachError.
 func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction, idem *domain.Idempotency) (replayed bool, err error) {
 	ctx, span := s.tracer.Start(ctx, "ledger.PostTransaction",
 		oteltrace.WithAttributes(
@@ -176,6 +180,9 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 	start := time.Now()
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
+			return err
+		}
+		if err := enforceAccountConstraints(ctx, tx, tenantID, t.Postings); err != nil {
 			return err
 		}
 		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {

@@ -32,6 +32,19 @@ func toStatus(err error) error {
 	if errors.As(err, &policyErr) {
 		return status.Error(codes.FailedPrecondition, policyErr.Error())
 	}
+	// *domain.AccountNotActiveError and *domain.MinBalanceBreachError (Task
+	// 5.5, audit A1.5) are checked the same way, before the switch below:
+	// both map to FailedPrecondition, the same class as a tripped
+	// TenantPolicy guardrail, and each carries a message naming the exact
+	// account and status/floor involved.
+	var accountNotActiveErr *domain.AccountNotActiveError
+	if errors.As(err, &accountNotActiveErr) {
+		return status.Error(codes.FailedPrecondition, accountNotActiveErr.Error())
+	}
+	var minBalanceErr *domain.MinBalanceBreachError
+	if errors.As(err, &minBalanceErr) {
+		return status.Error(codes.FailedPrecondition, minBalanceErr.Error())
+	}
 
 	switch {
 	case err == nil:

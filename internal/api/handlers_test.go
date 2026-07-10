@@ -92,6 +92,13 @@ func (f *fakeRepo) CreateAccount(_ context.Context, _ string, a *domain.Account)
 	if a.ID == "" {
 		a.ID = uuid.NewString()
 	}
+	// Mirrors the real repository (Task 5.5, audit A1.5): every account is
+	// created active, the column default, so a caller reading the account
+	// straight back off this call (rather than through a later GetAccount)
+	// sees "active" too.
+	if a.Status == "" {
+		a.Status = domain.AccountActive
+	}
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -115,6 +122,51 @@ func (f *fakeRepo) ListAccounts(_ context.Context, _ string, limit int) ([]domai
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	if len(out) > limit {
 		out = out[:limit]
+	}
+	return out, nil
+}
+
+// SetAccountStatus mirrors the real repository (Task 5.5, audit A1.5):
+// domain.ErrInvalidAccount for an unrecognized status, domain.ErrAccountNotFound
+// for an unknown id.
+func (f *fakeRepo) SetAccountStatus(_ context.Context, _, id string, status domain.AccountStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidAccount
+	}
+	a, ok := f.accounts[id]
+	if !ok {
+		return domain.ErrAccountNotFound
+	}
+	a.Status = status
+	f.accounts[id] = a
+	return nil
+}
+
+// AccountPostingStates mirrors the real repository's tx-scoped read (Task
+// 5.5, audit A1.5), summing f.postings the same way Balance above does. An
+// account id with no matching fixture is simply absent from the returned
+// map, mirroring the real query and letting
+// domain.CheckAccountPostingConstraints report ErrAccountNotFound for it.
+func (f *fakeRepo) AccountPostingStates(_ context.Context, _ string, accountIDs []string) (map[string]domain.AccountPostingState, error) {
+	out := make(map[string]domain.AccountPostingState, len(accountIDs))
+	for _, id := range accountIDs {
+		a, ok := f.accounts[id]
+		if !ok {
+			continue
+		}
+		var sum int64
+		for _, p := range f.postings {
+			if p.accountID == id {
+				sum += p.amount
+			}
+		}
+		out[id] = domain.AccountPostingState{
+			AccountID:  id,
+			Status:     a.Status,
+			MinBalance: a.MinBalance,
+			IsSystem:   a.System,
+			Balance:    sum,
+		}
 	}
 	return out, nil
 }
@@ -828,6 +880,119 @@ func TestCreateAccount(t *testing.T) {
 			map[string]string{"name": "X", "type": "asset", "currency": "usd"})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422", rec.Code)
+		}
+	})
+
+	// Task 5.5, audit A1.5: a fresh account with no min_balance surfaces
+	// status "active" and an omitted min_balance field.
+	t.Run("defaults active with no min_balance", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]string{"name": "No Floor", "type": "asset", "currency": "USD"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Status != "active" {
+			t.Errorf("status = %q, want %q", out.Status, "active")
+		}
+		if out.MinBalance != nil {
+			t.Errorf("min_balance = %v, want nil", out.MinBalance)
+		}
+	})
+
+	// Task 5.5, audit A1.5: min_balance is optional at creation and, when
+	// given, round-trips on the create response.
+	t.Run("create with min_balance 201", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]any{"name": "Checking", "type": "asset", "currency": "USD", "min_balance": -50000})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Status != "active" {
+			t.Errorf("status = %q, want %q", out.Status, "active")
+		}
+		if out.MinBalance == nil || *out.MinBalance != -50000 {
+			t.Errorf("min_balance = %v, want -50000", out.MinBalance)
+		}
+	})
+}
+
+// TestSetAccountStatusEndpoint covers POST /v1/accounts/{id}/status (Task
+// 5.5, audit A1.5): freezing an account via the endpoint blocks a
+// subsequent post, reactivating it un-blocks one, the updated account
+// (with its new status) is returned in the response body, an invalid
+// status value is 422, and an unknown account id is 404.
+func TestSetAccountStatusEndpoint(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	rev := createAccount(t, r, "Revenue", "income")
+
+	t.Run("freeze blocks a post", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+cash+"/status",
+			map[string]string{"status": "frozen"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Status != "frozen" {
+			t.Errorf("response status = %q, want %q", out.Status, "frozen")
+		}
+
+		postRec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10000},
+				{"account_id": rev, "amount": -10000},
+			},
+		}, map[string]string{"Idempotency-Key": "frozen-account-post"})
+		if postRec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("post into frozen account: status %d, want 422 (%s)", postRec.Code, postRec.Body.String())
+		}
+
+		getRec := do(t, r, http.MethodGet, "/v1/accounts/"+cash, nil)
+		var got AccountBody
+		_ = json.Unmarshal(getRec.Body.Bytes(), &got)
+		if got.Status != "frozen" {
+			t.Errorf("GetAccount status = %q, want %q", got.Status, "frozen")
+		}
+	})
+
+	t.Run("reactivate un-blocks a post", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+cash+"/status",
+			map[string]string{"status": "active"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+
+		postRec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10000},
+				{"account_id": rev, "amount": -10000},
+			},
+		}, map[string]string{"Idempotency-Key": "reactivated-account-post"})
+		if postRec.Code != http.StatusCreated {
+			t.Fatalf("post into reactivated account: status %d, want 201 (%s)", postRec.Code, postRec.Body.String())
+		}
+	})
+
+	t.Run("invalid status 422", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+cash+"/status",
+			map[string]string{"status": "bogus"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("unknown account 404", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+uuid.NewString()+"/status",
+			map[string]string{"status": "closed"})
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status %d, want 404 (%s)", rec.Code, rec.Body.String())
 		}
 	})
 }

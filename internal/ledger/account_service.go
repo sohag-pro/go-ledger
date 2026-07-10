@@ -54,6 +54,22 @@ func (s *AccountService) Get(ctx context.Context, tenantID, id string) (domain.A
 	return s.repo.GetAccount(ctx, tenantID, id)
 }
 
+// SetStatus updates an account's lifecycle status (Task 5.5, audit A1.5:
+// freeze, close, or reactivate one account) and returns the updated
+// account. It returns domain.ErrInvalidAccount if status is not one of
+// domain.AccountStatus.Valid()'s three values, or domain.ErrAccountNotFound
+// if no account matches id. The new status takes effect for the NEXT
+// posting attempt: it is read fresh, inside that posting's own SERIALIZABLE
+// transaction (see internal/ledger's enforceAccountConstraints), never
+// cached, so there is no window where a just-frozen account's in-flight
+// posting is missed.
+func (s *AccountService) SetStatus(ctx context.Context, tenantID, id string, status domain.AccountStatus) (domain.Account, error) {
+	if err := s.repo.SetAccountStatus(ctx, tenantID, id, status); err != nil {
+		return domain.Account{}, err
+	}
+	return s.repo.GetAccount(ctx, tenantID, id)
+}
+
 // List returns up to limit of the tenant's accounts, ordered by name.
 func (s *AccountService) List(ctx context.Context, tenantID string, limit int) ([]domain.Account, error) {
 	return s.repo.ListAccounts(ctx, tenantID, limit)

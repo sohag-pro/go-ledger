@@ -27,7 +27,14 @@ components:
         id:
           description: Account id (UUID)
           type: string
+        min_balance:
+          description: Optional minimum balance floor, in minor units. Omitted when unset.
+          format: int64
+          type: integer
         name:
+          type: string
+        status:
+          description: "One of: active, frozen, closed"
           type: string
         type:
           description: "One of: asset, liability, equity, income, expense"
@@ -37,6 +44,7 @@ components:
         - name
         - type
         - currency
+        - status
       type: object
     AccountsOutputBody:
       additionalProperties: false
@@ -140,6 +148,10 @@ components:
           description: ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted.
           pattern: ^[A-Z]{3}$
           type: string
+        min_balance:
+          description: Optional minimum balance floor, in minor units. Omit for no floor.
+          format: int64
+          type: integer
         name:
           description: Human-readable account name
           maxLength: 200
@@ -530,6 +542,19 @@ components:
       required:
         - account_id
         - amount
+      type: object
+    SetAccountStatusInputBody:
+      additionalProperties: false
+      properties:
+        status:
+          description: New account status
+          enum:
+            - active
+            - frozen
+            - closed
+          type: string
+      required:
+        - status
       type: object
     SetTenantPolicyInputBody:
       additionalProperties: false
@@ -992,6 +1017,42 @@ paths:
       security:
         - bearerAuth: []
       summary: List an account's postings with running balance
+      tags:
+        - accounts
+  /v1/accounts/{id}/status:
+    post:
+      operationId: set-account-status
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAccountStatusInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Freeze, close, or reactivate an account
       tags:
         - accounts
   /v1/admin/keys:

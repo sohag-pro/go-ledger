@@ -38,6 +38,7 @@ const ledgerServiceMethodPrefix = "/ledger.v1.LedgerService/"
 var grpcMethodScopes = map[string]domain.Scope{
 	ledgerServiceMethodPrefix + "CreateAccount":       domain.ScopePost,
 	ledgerServiceMethodPrefix + "GetAccount":          domain.ScopeRead,
+	ledgerServiceMethodPrefix + "SetAccountStatus":    domain.ScopePost,
 	ledgerServiceMethodPrefix + "ListAccounts":        domain.ScopeRead,
 	ledgerServiceMethodPrefix + "GetBalance":          domain.ScopeRead,
 	ledgerServiceMethodPrefix + "GetStatement":        domain.ScopeRead,

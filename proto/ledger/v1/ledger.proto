@@ -37,17 +37,29 @@ message Transaction {
   string effective_at = 6;
 }
 
+// status and min_balance are Task 5.5 (audit A1.5) additions: status is one
+// of active, frozen, or closed; min_balance is the optional floor enforced
+// on the account's derived balance, in minor units. min_balance is 0 when
+// unset (proto3 has no distinct "absent" for a scalar int64), matching a
+// literal 0 floor; a caller that needs to tell "no floor" apart from "floor
+// of exactly zero" should use the REST API, whose min_balance is a JSON
+// null-able field.
 message Account {
   string id = 1;
   string name = 2;
   string type = 3; // asset, liability, equity, income, or expense
   string currency = 4;
+  string status = 5;
+  int64 min_balance = 6;
 }
 
+// min_balance (Task 5.5, audit A1.5) is optional: 0 means no floor was
+// requested, the same convention Account.min_balance above documents.
 message CreateAccountRequest {
   string name = 1;
   string type = 2;
   string currency = 3;
+  int64 min_balance = 4;
 }
 message CreateAccountResponse {
   Account account = 1;
@@ -57,6 +69,16 @@ message GetAccountRequest {
   string id = 1;
 }
 message GetAccountResponse {
+  Account account = 1;
+}
+
+// SetAccountStatusRequest freezes, closes, or reactivates one account (Task
+// 5.5, audit A1.5), mirroring POST /v1/accounts/{id}/status.
+message SetAccountStatusRequest {
+  string id = 1;
+  string status = 2; // one of: active, frozen, closed
+}
+message SetAccountStatusResponse {
   Account account = 1;
 }
 
@@ -213,6 +235,7 @@ message ConvertResponse {
 service LedgerService {
   rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
   rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  rpc SetAccountStatus(SetAccountStatusRequest) returns (SetAccountStatusResponse);
   rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
   rpc GetStatement(GetStatementRequest) returns (GetStatementResponse);

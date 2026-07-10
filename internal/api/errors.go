@@ -59,6 +59,20 @@ func toHumaErr(err error) error {
 	if errors.As(err, &policyErr) {
 		return huma.Error422UnprocessableEntity(policyErr.Error())
 	}
+	// *domain.AccountNotActiveError and *domain.MinBalanceBreachError (Task
+	// 5.5, audit A1.5) are checked the same way, before the switch below, so
+	// each names the exact account and status/floor involved instead of a
+	// generic bare errors.Is match. Both map to 422, the same class as a
+	// tripped TenantPolicy guardrail: the request is otherwise well-formed,
+	// it just fails a constraint the touched account carries.
+	var accountNotActiveErr *domain.AccountNotActiveError
+	if errors.As(err, &accountNotActiveErr) {
+		return huma.Error422UnprocessableEntity(accountNotActiveErr.Error())
+	}
+	var minBalanceErr *domain.MinBalanceBreachError
+	if errors.As(err, &minBalanceErr) {
+		return huma.Error422UnprocessableEntity(minBalanceErr.Error())
+	}
 
 	switch {
 	case err == nil:
