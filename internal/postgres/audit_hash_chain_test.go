@@ -10,15 +10,18 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
-// appendAudit writes one audit row for txnID under tenant, inside its own
-// RunInTx, mirroring how the ledger service calls AppendAudit alongside
-// CreateTransaction. Callers that need the row's hashes should read it back
-// via ListAuditForVerify.
+// appendAudit writes one audit_outbox row for txnID under tenant, inside its
+// own RunInTx, mirroring how the ledger service calls AppendAuditOutbox
+// alongside CreateTransaction, then drains the chainer so the resulting
+// audit_log row exists by the time this returns (ADR-017: chaining is
+// asynchronous, but these tests want to assert on audit_log immediately, the
+// same way they did when AppendAudit chained synchronously). Callers that
+// need the row's hashes should read it back via ListAuditForVerify.
 func appendAudit(t *testing.T, repo *postgres.Repository, tenant, txnID string) {
 	t.Helper()
 	ctx := context.Background()
 	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, tenant, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, tenant, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         tenant,
@@ -26,8 +29,9 @@ func appendAudit(t *testing.T, repo *postgres.Repository, tenant, txnID string) 
 		})
 	})
 	if err != nil {
-		t.Fatalf("append audit for %s: %v", txnID, err)
+		t.Fatalf("append audit outbox for %s: %v", txnID, err)
 	}
+	drainChainer(t, newTestPool(t), tenant)
 }
 
 // TestAuditHashChainBuildsAcrossTransactions posts two transactions for one

@@ -119,8 +119,13 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 }
 
 // postTxn posts one balanced two-leg transaction for tenant through the real
-// account and transaction services, so it creates both a well-formed posting
-// pair and a real, hash-chained audit row, exactly as production would.
+// account and transaction services, so it creates a well-formed posting
+// pair, exactly as production would, then drains the chainer so a real,
+// hash-chained audit_log row exists by the time this returns (ADR-017: Post
+// only writes an audit_outbox row; the chain itself is built asynchronously,
+// but every caller of postTxn wants a real chained row to examine or verify
+// against, the same way they could read one immediately under the old
+// synchronous design).
 func postTxn(t *testing.T, pool *pgxpool.Pool, tenant string) string {
 	t.Helper()
 	ctx := context.Background()
@@ -156,6 +161,7 @@ func postTxn(t *testing.T, pool *pgxpool.Pool, tenant string) string {
 	if _, err := txns.Post(ctx, tenant, txn, nil); err != nil {
 		t.Fatalf("post transaction: %v", err)
 	}
+	drainChainer(t, pool, tenant)
 	return txn.ID
 }
 

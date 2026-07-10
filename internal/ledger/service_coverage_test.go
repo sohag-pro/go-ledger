@@ -234,6 +234,9 @@ func TestAuditService_ByTransactionAndByAccount(t *testing.T) {
 	if _, err := txns.Post(ctx, tenant, txn, nil); err != nil {
 		t.Fatalf("post: %v", err)
 	}
+	// Post only writes an audit_outbox row (ADR-017); drain the chainer so
+	// there is an audit_log row to read back.
+	drainChainer(t, pool, tenant)
 
 	rows, err := audits.ByTransaction(ctx, tenant, txn.ID)
 	if err != nil {

@@ -231,6 +231,9 @@ func TestGRPCGetTransactionAudit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
+	// PostTransaction only writes an audit_outbox row (ADR-017); drain the
+	// chainer so there is an audit_log row to read back.
+	drainChainer(t, sharedPool, testTenant)
 
 	resp, err := client.GetTransactionAudit(ctx, &ledgerv1.GetTransactionAuditRequest{TransactionId: post.Transaction.Id})
 	if err != nil {
@@ -334,6 +337,9 @@ func TestGRPCGetAccountAuditPaginatesAndValidatesCursor(t *testing.T) {
 			t.Fatalf("post %d: %v", i, err)
 		}
 	}
+	// PostTransaction only writes an audit_outbox row (ADR-017); drain the
+	// chainer so there are audit_log rows to page through.
+	drainChainer(t, sharedPool, testTenant)
 
 	page1, err := client.GetAccountAudit(ctx, &ledgerv1.GetAccountAuditRequest{AccountId: cash.Account.Id, Limit: 1})
 	if err != nil {

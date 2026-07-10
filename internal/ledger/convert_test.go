@@ -242,6 +242,10 @@ func TestConvert_BalancesPerCurrencyAndRecordsRate(t *testing.T) {
 		t.Errorf("clearing EUR balance = %d, want %d", eurBal.Amount(), -wantConverted.Amount())
 	}
 
+	// Convert only writes an audit_outbox row (ADR-017); drain the chainer
+	// so there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
+
 	// The audit row must record per-posting currency and the rate detail, not
 	// one top-level currency stamped from postings[0] (the pre-Task-6 shape).
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, txn.ID)
@@ -334,6 +338,10 @@ func TestConvert_IdempotentRetryReplaysDespiteRateMove(t *testing.T) {
 	if second.FX == nil || second.FX.MidRateE8 != 80_000_000 {
 		t.Errorf("retry FX.MidRateE8 = %+v, want the ORIGINAL 80000000, not the moved rate", second.FX)
 	}
+
+	// Convert only writes an audit_outbox row (ADR-017); drain the chainer
+	// so there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
 
 	// Exactly one transaction, one audit row: the retry did not re-convert.
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, first.ID)
@@ -656,6 +664,10 @@ func TestConvert_ConcurrentIdempotentHammer(t *testing.T) {
 	if replayCount != n-1 {
 		t.Errorf("replay count = %d, want %d (exactly one real conversion)", replayCount, n-1)
 	}
+
+	// Convert only writes an audit_outbox row (ADR-017); drain the chainer
+	// so there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
 
 	// Exactly one audit row for the one conversion, even under concurrency.
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, first)

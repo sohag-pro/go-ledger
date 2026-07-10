@@ -80,6 +80,10 @@ func TestPostIdempotentHammer(t *testing.T) {
 		t.Errorf("replay count = %d, want %d", replayCount, n-1)
 	}
 
+	// Post only writes an audit_outbox row (ADR-017); drain the chainer so
+	// there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
+
 	// Exactly one audit row for the one transaction.
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, first)
 	if err != nil {

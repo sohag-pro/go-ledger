@@ -324,10 +324,11 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	})
 }
 
-// TestAppendAuditEdges drives AppendAudit's malformed-id and generic-error
-// branches: a bad tenant id, a bad transaction id, and a well-formed but
-// nonexistent transaction id (a foreign-key violation).
-func TestAppendAuditEdges(t *testing.T) {
+// TestAppendAuditOutboxEdges drives AppendAuditOutbox's malformed-id and
+// generic-error branches: a bad tenant id, a bad transaction id, and a
+// well-formed but nonexistent transaction id (a foreign-key violation:
+// audit_outbox.transaction_id references transactions(id), migration 0015).
+func TestAppendAuditOutboxEdges(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
@@ -336,7 +337,7 @@ func TestAppendAuditEdges(t *testing.T) {
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.AppendAudit(ctx, "not-a-uuid", domain.AuditEntry{
+			return tx.AppendAuditOutbox(ctx, "not-a-uuid", domain.AuditEvent{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: uuid.NewString(),
 				Actor:         "actor",
@@ -351,7 +352,7 @@ func TestAppendAuditEdges(t *testing.T) {
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.AppendAudit(ctx, uuid.NewString(), domain.AuditEntry{
+			return tx.AppendAuditOutbox(ctx, uuid.NewString(), domain.AuditEvent{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: "not-a-uuid",
 				Actor:         "actor",
@@ -366,7 +367,7 @@ func TestAppendAuditEdges(t *testing.T) {
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.AppendAudit(ctx, uuid.NewString(), domain.AuditEntry{
+			return tx.AppendAuditOutbox(ctx, uuid.NewString(), domain.AuditEvent{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: uuid.NewString(),
 				Actor:         "actor",

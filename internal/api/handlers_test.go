@@ -143,13 +143,24 @@ func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, 
 	return nil
 }
 
-func (f *fakeRepo) AppendAudit(_ context.Context, tenantID string, e domain.AuditEntry) error {
-	if e.ID == "" {
-		e.ID = uuid.NewString()
-	}
+// AppendAuditOutbox mirrors the real chainer's job synchronously, right here
+// at write time: handler tests exercise HTTP wiring, not the async chaining
+// gap ADR-017 introduces, so this fake builds the chain immediately instead
+// of modeling an outbox + a separate drain step. CountPendingOutbox below
+// always reports 0 to match: as far as this fake is concerned, nothing is
+// ever pending.
+func (f *fakeRepo) AppendAuditOutbox(_ context.Context, tenantID string, ev domain.AuditEvent) error {
 	f.clock++
-	e.CreatedAt = time.Unix(f.clock, 0).UTC()
-	// Mirror the real repository's chain extension: prev is the last row's
+	e := domain.AuditEntry{
+		ID:            uuid.NewString(),
+		Action:        ev.Action,
+		TransactionID: ev.TransactionID,
+		Actor:         ev.Actor,
+		Before:        ev.Before,
+		After:         ev.After,
+		CreatedAt:     time.Unix(f.clock, 0).UTC(),
+	}
+	// Mirror the real chainer's chain extension: prev is the last row's
 	// RowHash (genesis if this is the first row appended by this fake repo).
 	prev := domain.AuditGenesisHash
 	if len(f.audit) > 0 {
@@ -159,6 +170,12 @@ func (f *fakeRepo) AppendAudit(_ context.Context, tenantID string, e domain.Audi
 	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prev)
 	f.audit = append(f.audit, e)
 	return nil
+}
+
+// CountPendingOutbox always reports 0: this fake chains synchronously (see
+// AppendAuditOutbox), so nothing is ever pending.
+func (f *fakeRepo) CountPendingOutbox(_ context.Context, _ string) (int, error) {
+	return 0, nil
 }
 
 // ListAuditForVerify returns every audit row this fake repo holds, oldest

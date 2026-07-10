@@ -430,11 +430,13 @@ func TestChaosAmbiguousCommitReplayIsIdempotent(t *testing.T) {
 		t.Fatalf("transaction rows for %s after replay = %d, want 1", txn.ID, txnCountAfterReplay)
 	}
 
-	// The atomicity guard: TransactionService.Post writes the transaction, the
-	// idempotency key, and the audit row inside one RunInTx call, so they
-	// commit together or not at all (see internal/postgres/repository.go,
-	// Repository.RunInTx and TransactionService.Post). Confirm both sides are
-	// present and agree, not just that a replay happened to work.
+	// The atomicity guard: TransactionService.Post writes the transaction,
+	// the idempotency key, and the audit_outbox row (ADR-017; the audit_log
+	// row itself is built later, asynchronously, by the chainer) inside one
+	// RunInTx call, so they commit together or not at all (see
+	// internal/postgres/repository.go, Repository.RunInTx and
+	// TransactionService.Post). Confirm both sides are present and agree,
+	// not just that a replay happened to work.
 	rec, err := verifyRepo.GetIdempotencyKey(ctx, tenant, idem.Key)
 	if err != nil {
 		t.Fatalf("chaos test: get idempotency key: %v", err)

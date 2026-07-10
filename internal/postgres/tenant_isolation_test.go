@@ -48,7 +48,7 @@ func TestListAuditByTransactionTenantIsolation(t *testing.T) {
 	txnID, _, _ := seedTxn(t, repo, owner)
 
 	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, owner, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, owner, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         owner,
@@ -58,6 +58,7 @@ func TestListAuditByTransactionTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append audit: %v", err)
 	}
+	drainChainer(t, pool, owner)
 
 	other := uuid.NewString()
 	got, err := repo.ListAuditByTransaction(ctx, other, txnID)
@@ -83,7 +84,7 @@ func TestListAuditByAccountTenantIsolation(t *testing.T) {
 	txnID, debit, _ := seedTxn(t, repo, owner)
 
 	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, owner, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, owner, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         owner,
@@ -93,6 +94,7 @@ func TestListAuditByAccountTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append audit: %v", err)
 	}
+	drainChainer(t, pool, owner)
 
 	other := uuid.NewString()
 	got, err := repo.ListAuditByAccount(ctx, other, debit, nil, 50)

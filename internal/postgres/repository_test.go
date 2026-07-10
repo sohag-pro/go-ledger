@@ -434,15 +434,13 @@ func TestRunInTxExhaustionReturnsConflict(t *testing.T) {
 	}
 }
 
-// TestRunInTxDifferentTenantsRunConcurrently proves the per-tenant in-process
-// mutex (added to stop the audit-chain serialization storm, see RunInTx's doc
-// comment) only ever serializes calls for the SAME tenant. Tenant A's call
-// holds its mutex (and an open transaction) for a deliberate pause; tenant
-// B's call, started while A's is still running, must complete long before
-// that pause elapses. If different tenants shared a mutex, B would block
-// behind A and take at least as long as the pause. Unlike a hashed lock key,
-// a mutex keyed by the exact tenant id string has no collision risk to guard
-// against.
+// TestRunInTxDifferentTenantsRunConcurrently proves two different tenants'
+// RunInTx calls never wait on each other. Before ADR-017, RunInTx also held
+// an in-process per-tenant mutex (for the audit chain read the post used to
+// do), and this test proved that mutex was scoped per tenant, not global;
+// now that the mutex is gone entirely, this is unconditionally true, but the
+// property is still worth a regression test: a future change must not
+// reintroduce any cross-tenant serialization on the posting path.
 func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
@@ -459,8 +457,8 @@ func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
 			return nil
 		})
 	}()
-	// Give tenant A's goroutine a head start so it is holding its lock (and an
-	// open transaction) by the time tenant B's call below starts.
+	// Give tenant A's goroutine a head start so it is holding its
+	// transaction open by the time tenant B's call below starts.
 	time.Sleep(50 * time.Millisecond)
 
 	start := time.Now()
@@ -473,67 +471,53 @@ func TestRunInTxDifferentTenantsRunConcurrently(t *testing.T) {
 	}
 	if elapsed >= pause {
 		t.Fatalf("tenant B's RunInTx took %s, at least as long as tenant A's %s pause: "+
-			"it appears to have waited on tenant A's mutex", elapsed, pause)
+			"it appears to have waited on tenant A somehow", elapsed, pause)
 	}
 	wg.Wait()
 }
 
-// TestRunInTxCancelledWaiterReturnsPromptly is the regression test for the
-// context-cancellation fix to the per-tenant keyed mutex (see keyedMutex.lock
-// in internal/postgres/repository.go). Before the fix, a caller parked
-// waiting for another same-tenant RunInTx to release the mutex was not
-// cancellable: it blocked on a plain sync.Mutex until its turn regardless of
-// its own context. Under sustained same-tenant overload with client
-// timeouts, that piles up parked goroutines that can never give up.
-//
-// Goroutine A holds the tenant's lock for a long pause via a slow fn.
-// Goroutine B starts a RunInTx for the same tenant with a context cancelled
-// shortly after B begins waiting. B must return promptly with a context
-// error, well before A's pause elapses, and its fn must never run: B never
-// got the lock, so it never had a transaction to run fn in.
-func TestRunInTxCancelledWaiterReturnsPromptly(t *testing.T) {
+// TestRunInTxSameTenantRunsConcurrently is the regression test for ADR-017's
+// mutex removal: two RunInTx calls for the SAME tenant, started at (almost)
+// the same time, must not wait on each other either. Before ADR-017, RunInTx
+// held an in-process per-tenant mutex for exactly this case (same-tenant
+// calls used to serialize one at a time, on purpose, to protect the
+// now-removed synchronous audit chain read). With the chain read gone from
+// the posting transaction, there is nothing left for same-tenant calls to
+// serialize on beyond whatever SERIALIZABLE itself would detect; two
+// deliberately non-conflicting same-tenant transactions (each just sleeps,
+// touching no rows) should run essentially in parallel, not back to back.
+func TestRunInTxSameTenantRunsConcurrently(t *testing.T) {
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
 
-	const pause = 2 * time.Second
+	const pause = 300 * time.Millisecond
 	tenant := uuid.NewString()
 
-	holding := make(chan struct{})
-	var wgA sync.WaitGroup
-	wgA.Add(1)
-	go func() {
-		defer wgA.Done()
-		_ = repo.RunInTx(context.Background(), tenant, func(_ context.Context, _ domain.Tx) error {
-			close(holding)
-			time.Sleep(pause)
-			return nil
-		})
-	}()
-	<-holding // goroutine A now holds tenant's lock and will for ~pause.
-
-	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, cancel) // cancel while B is still waiting for the lock.
-
-	bRan := false
 	start := time.Now()
-	err := repo.RunInTx(ctx, tenant, func(_ context.Context, _ domain.Tx) error {
-		bRan = true
-		return nil
-	})
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := repo.RunInTx(context.Background(), tenant, func(_ context.Context, _ domain.Tx) error {
+				time.Sleep(pause)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("RunInTx failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 	elapsed := time.Since(start)
 
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
+	// If the two calls had serialized (the old mutex behavior), this would
+	// take at least 2*pause. Comfortably under that (1.5x) proves they ran
+	// concurrently, not one after the other.
+	if limit := pause * 3 / 2; elapsed >= limit {
+		t.Fatalf("two same-tenant RunInTx calls took %s, at or above %s (1.5x the %s pause each sleeps): "+
+			"they appear to have serialized instead of running concurrently", elapsed, limit, pause)
 	}
-	if bRan {
-		t.Error("fn ran even though the waiter never acquired the tenant lock")
-	}
-	if elapsed >= pause {
-		t.Fatalf("cancelled waiter took %s, at least as long as the %s pause holding the lock: "+
-			"it did not return promptly on cancellation", elapsed, pause)
-	}
-
-	wgA.Wait()
 }
 
 // TestRunInTxNonRetryablePropagates checks that an ordinary error is returned

@@ -91,7 +91,7 @@ func TestAuditAppendAndQuery(t *testing.T) {
 	txnID, debit, _ := seedTxn(t, repo, tenant)
 
 	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, tenant, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, tenant, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         tenant,
@@ -101,6 +101,7 @@ func TestAuditAppendAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append audit: %v", err)
 	}
+	drainChainer(t, pool, tenant)
 
 	byTxn, err := repo.ListAuditByTransaction(ctx, tenant, txnID)
 	if err != nil {
