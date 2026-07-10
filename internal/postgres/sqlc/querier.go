@@ -48,7 +48,7 @@ type Querier interface {
 	// it up separately via GetTenant.
 	GetAPIKeyByID(ctx context.Context, id uuid.UUID) (GetAPIKeyByIDRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
-	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
+	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (GetIdempotencyKeyRow, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
 	// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
 	// caller treats that as the chain's genesis (domain.AuditGenesisHash).

@@ -87,7 +87,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		rec, err := s.repo.GetIdempotencyKey(ctx, tenantID, idem.Key)
 		switch {
 		case err == nil:
-			return s.convertReplay(ctx, tenantID, idem.Key, fingerprint, rec)
+			return s.convertReplay(ctx, tenantID, idem.Key, req, rec)
 		case errors.Is(err, domain.ErrIdempotencyKeyNotFound):
 			// No existing key: proceed with a real conversion.
 		default:
@@ -185,7 +185,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 			return err
 		}
 		if idem != nil {
-			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, t.ID); err != nil {
+			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID); err != nil {
 				return err
 			}
 		}
@@ -211,7 +211,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 				span.RecordError(err)
 				return nil, false, err
 			}
-			return s.convertReplay(ctx, tenantID, idem.Key, fingerprint, rec)
+			return s.convertReplay(ctx, tenantID, idem.Key, req, rec)
 		}
 		span.RecordError(runErr)
 		span.SetStatus(codes.Error, "convert failed")
@@ -225,12 +225,20 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 	return t, false, nil
 }
 
-// convertReplay resolves a hit against the convert idempotency key: if the
-// stored fingerprint matches the request's, it loads and returns the
-// previously posted transaction with replayed=true; if the key was reused for
-// a different request, it returns domain.ErrIdempotencyConflict.
-func (s *TransactionService) convertReplay(ctx context.Context, tenantID, key, fingerprint string, rec domain.IdempotencyRecord) (*domain.Transaction, bool, error) {
-	if rec.Fingerprint != fingerprint {
+// convertReplay resolves a hit against the convert idempotency key: it
+// recomputes req's fingerprint under the SCHEME THE STORED RECORD CARRIES
+// (rec.Scheme), not necessarily the scheme this binary currently writes, so a
+// fingerprint-scheme change never false-conflicts a key stored under an older
+// scheme (Task 2.3, audit A1.6; see TransactionService.replay in service.go
+// for the Post-side counterpart). If that recomputation matches the stored
+// fingerprint, it loads and returns the previously posted transaction with
+// replayed=true; if the key was reused for a different request, it returns
+// domain.ErrIdempotencyConflict. If rec.Scheme is unknown to this binary, it
+// fails closed with ErrIdempotencyConflict rather than replay a transaction
+// it cannot verify the body of.
+func (s *TransactionService) convertReplay(ctx context.Context, tenantID, key string, req ConvertRequest, rec domain.IdempotencyRecord) (*domain.Transaction, bool, error) {
+	expected, ok := domain.ConvertFingerprint(rec.Scheme, req.FromAccountID, req.ToAccountID, req.SourceAmount)
+	if !ok || rec.Fingerprint != expected {
 		metrics.IdempotencyConflicts.Inc()
 		return nil, false, domain.ErrIdempotencyConflict
 	}

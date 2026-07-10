@@ -52,7 +52,7 @@ func TestIdempotencyKeyInsertAndDuplicate(t *testing.T) {
 
 	// First insert of the key succeeds inside a Tx.
 	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
-		return tx.InsertIdempotencyKey(ctx, tenant, "key-1", "fp-1", txnID)
+		return tx.InsertIdempotencyKey(ctx, tenant, "key-1", "fp-1", "v1", txnID)
 	})
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
@@ -60,19 +60,20 @@ func TestIdempotencyKeyInsertAndDuplicate(t *testing.T) {
 
 	// Second insert of the same key returns ErrDuplicateIdempotencyKey.
 	err = repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
-		return tx.InsertIdempotencyKey(ctx, tenant, "key-1", "fp-1", txnID)
+		return tx.InsertIdempotencyKey(ctx, tenant, "key-1", "fp-1", "v1", txnID)
 	})
 	if !errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
 		t.Fatalf("duplicate insert: got %v, want ErrDuplicateIdempotencyKey", err)
 	}
 
-	// The stored record round-trips.
+	// The stored record round-trips, including the scheme it was written
+	// under (Task 2.3, audit A1.6).
 	rec, err := repo.GetIdempotencyKey(ctx, tenant, "key-1")
 	if err != nil {
 		t.Fatalf("get key: %v", err)
 	}
-	if rec.Fingerprint != "fp-1" || rec.TransactionID != txnID {
-		t.Errorf("record = %+v, want fingerprint fp-1 and txn %s", rec, txnID)
+	if rec.Fingerprint != "fp-1" || rec.TransactionID != txnID || rec.Scheme != "v1" {
+		t.Errorf("record = %+v, want fingerprint fp-1, scheme v1, and txn %s", rec, txnID)
 	}
 
 	// A missing key is a typed not-found.

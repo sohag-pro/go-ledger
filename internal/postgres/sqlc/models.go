@@ -59,11 +59,12 @@ type FxRate struct {
 }
 
 type IdempotencyKey struct {
-	TenantID       uuid.UUID
-	IdempotencyKey string
-	Fingerprint    string
-	TransactionID  uuid.UUID
-	CreatedAt      time.Time
+	TenantID          uuid.UUID
+	IdempotencyKey    string
+	Fingerprint       string
+	TransactionID     uuid.UUID
+	CreatedAt         time.Time
+	FingerprintScheme string
 }
 
 type Posting struct {

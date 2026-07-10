@@ -89,7 +89,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 			return err
 		}
 		if idem != nil {
-			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, t.ID); err != nil {
+			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID); err != nil {
 				return err
 			}
 		}
@@ -108,7 +108,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 
 	if runErr != nil {
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
-			return s.replay(ctx, tenantID, idem.Key, fingerprint, t)
+			return s.replay(ctx, tenantID, idem.Key, t)
 		}
 		span.RecordError(runErr)
 		span.SetStatus(codes.Error, "post failed")
@@ -124,15 +124,24 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 	return false, nil
 }
 
-// replay resolves a duplicate idempotency key: if the stored fingerprint matches,
-// it loads the original transaction into t and reports a replay; if not, the key
-// was reused with a different body and it returns ErrIdempotencyConflict.
-func (s *TransactionService) replay(ctx context.Context, tenantID, key, fingerprint string, t *domain.Transaction) (bool, error) {
+// replay resolves a duplicate idempotency key: it recomputes t's fingerprint
+// under the SCHEME THE STORED RECORD CARRIES (rec.Scheme), not necessarily
+// the scheme this binary currently writes (domain.CurrentFingerprintScheme),
+// so a fingerprint-scheme change never false-conflicts a key stored under an
+// older scheme (Task 2.3, audit A1.6). If that recomputation matches the
+// stored fingerprint, it loads the original transaction into t and reports a
+// replay; if not, the key was reused with a different body and it returns
+// ErrIdempotencyConflict. If rec.Scheme is not one this binary knows how to
+// compute (for example a key written by a newer binary, then read by this
+// one after a downgrade), it fails closed with ErrIdempotencyConflict rather
+// than risk replaying a transaction it cannot verify the body of.
+func (s *TransactionService) replay(ctx context.Context, tenantID, key string, t *domain.Transaction) (bool, error) {
 	rec, err := s.repo.GetIdempotencyKey(ctx, tenantID, key)
 	if err != nil {
 		return false, err
 	}
-	if rec.Fingerprint != fingerprint {
+	expected, ok := domain.TransactionFingerprint(rec.Scheme, *t)
+	if !ok || rec.Fingerprint != expected {
 		metrics.IdempotencyConflicts.Inc()
 		return false, domain.ErrIdempotencyConflict
 	}

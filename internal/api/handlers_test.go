@@ -135,11 +135,11 @@ func (f *fakeRepo) GetOrCreateClearingAccount(_ context.Context, _ string, curre
 	return a, nil
 }
 
-func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, transactionID string) error {
+func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, scheme, transactionID string) error {
 	if _, ok := f.idem[key]; ok {
 		return domain.ErrDuplicateIdempotencyKey
 	}
-	f.idem[key] = domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, TransactionID: transactionID}
+	f.idem[key] = domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, Scheme: scheme, TransactionID: transactionID}
 	return nil
 }
 

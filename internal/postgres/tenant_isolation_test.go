@@ -24,7 +24,7 @@ func TestIdempotencyKeyTenantIsolation(t *testing.T) {
 	txnID, _, _ := seedTxn(t, repo, owner)
 
 	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
-		return tx.InsertIdempotencyKey(ctx, owner, "shared-key", "fp-1", txnID)
+		return tx.InsertIdempotencyKey(ctx, owner, "shared-key", "fp-1", "v1", txnID)
 	})
 	if err != nil {
 		t.Fatalf("insert idempotency key: %v", err)

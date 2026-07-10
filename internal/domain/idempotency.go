@@ -12,5 +12,6 @@ type Idempotency struct {
 type IdempotencyRecord struct {
 	Key           string
 	Fingerprint   string
+	Scheme        string
 	TransactionID string
 }

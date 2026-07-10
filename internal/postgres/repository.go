@@ -453,7 +453,11 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 // InsertIdempotencyKey records the key inside the surrounding transaction. A
 // primary-key collision means the key already exists: it is mapped to
 // ErrDuplicateIdempotencyKey so the service can replay the original response.
-func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, transactionID string) error {
+// scheme is stored alongside fingerprint (see domain.CurrentFingerprintScheme)
+// so a future fingerprint-scheme change can recompute this row's fingerprint
+// under the scheme that produced it instead of the scheme current at replay
+// time.
+func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -463,10 +467,11 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
 	if err := tr.q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
-		TenantID:       tid,
-		IdempotencyKey: key,
-		Fingerprint:    fingerprint,
-		TransactionID:  txID,
+		TenantID:          tid,
+		IdempotencyKey:    key,
+		Fingerprint:       fingerprint,
+		FingerprintScheme: scheme,
+		TransactionID:     txID,
 	}); err != nil {
 		if pgConstraint(err) == "idempotency_keys_pkey" {
 			return domain.ErrDuplicateIdempotencyKey
@@ -633,6 +638,7 @@ func (r *Repository) GetIdempotencyKey(ctx context.Context, tenantID, key string
 	return domain.IdempotencyRecord{
 		Key:           row.IdempotencyKey,
 		Fingerprint:   row.Fingerprint,
+		Scheme:        row.FingerprintScheme,
 		TransactionID: row.TransactionID.String(),
 	}, nil
 }

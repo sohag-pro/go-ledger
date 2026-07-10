@@ -36,10 +36,12 @@ type Tx interface {
 	// assigned and written back to t.
 	CreateTransaction(ctx context.Context, tenantID string, t *Transaction) error
 
-	// InsertIdempotencyKey records key with the request fingerprint and the
-	// transaction it produced, within the surrounding transaction. It returns
-	// ErrDuplicateIdempotencyKey if (tenantID, key) already exists.
-	InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, transactionID string) error
+	// InsertIdempotencyKey records key with the request fingerprint, the
+	// scheme that fingerprint was computed under (see
+	// CurrentFingerprintScheme), and the transaction it produced, within the
+	// surrounding transaction. It returns ErrDuplicateIdempotencyKey if
+	// (tenantID, key) already exists.
+	InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string) error
 
 	// AppendAudit writes one audit row within the surrounding transaction.
 	AppendAudit(ctx context.Context, tenantID string, e AuditEntry) error
@@ -88,8 +90,9 @@ type Repository interface {
 	// permanent, often nonzero, open position, unlike a user account.
 	GetOrCreateClearingAccount(ctx context.Context, tenantID string, currency Currency) (Account, error)
 
-	// GetIdempotencyKey returns the stored record for (tenantID, key), or
-	// ErrIdempotencyKeyNotFound if none exists.
+	// GetIdempotencyKey returns the stored record for (tenantID, key),
+	// including the fingerprint scheme it was stored under (IdempotencyRecord.
+	// Scheme), or ErrIdempotencyKeyNotFound if none exists.
 	GetIdempotencyKey(ctx context.Context, tenantID, key string) (IdempotencyRecord, error)
 
 	// ListAuditByTransaction returns the audit rows for a transaction, oldest

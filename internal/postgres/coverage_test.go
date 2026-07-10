@@ -293,7 +293,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", uuid.NewString())
+			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", "v1", uuid.NewString())
 		})
 		if err == nil {
 			t.Fatal("expected error, got nil")
@@ -303,7 +303,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "not-a-uuid")
+			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", "not-a-uuid")
 		})
 		if err == nil {
 			t.Fatal("expected error, got nil")
@@ -313,7 +313,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", uuid.NewString())
+			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", uuid.NewString())
 		})
 		if err == nil {
 			t.Fatal("expected a foreign-key error, got nil")

@@ -74,3 +74,44 @@ func writeField(h hash.Hash, b []byte) {
 	h.Write(n[:])
 	h.Write(b)
 }
+
+// CurrentFingerprintScheme names the fingerprint scheme this binary writes
+// for every new idempotency key (Task 2.3, audit A1.6). It is stored
+// alongside the fingerprint itself (idempotency_keys.fingerprint_scheme,
+// migration 0013), so a stored key always carries the scheme that produced
+// it.
+//
+// Bump this constant, and add a case to TransactionFingerprint and
+// ConvertFingerprint for the new scheme, whenever the fingerprint's content
+// or framing changes. Keep the old scheme's case computing the old
+// (byte-identical) output: a key stored under "v1" must keep comparing
+// against a "v1" recomputation forever, even after "v2" becomes current.
+// This is what makes a fingerprint change non-breaking: old stored keys
+// recompute under the scheme that produced them instead of false-conflicting
+// against a new scheme's output.
+const CurrentFingerprintScheme = "v1"
+
+// TransactionFingerprint computes t's fingerprint under the named scheme. ok
+// is false if scheme is not one this binary knows how to compute (for
+// example a key written by a newer binary, then read by this one after a
+// downgrade); the caller must treat that as fail-closed, never as a match.
+func TransactionFingerprint(scheme string, t Transaction) (fp string, ok bool) {
+	switch scheme {
+	case "v1":
+		return t.Fingerprint(), true
+	default:
+		return "", false
+	}
+}
+
+// ConvertFingerprint computes a convert request's fingerprint under the
+// named scheme. ok is false for a scheme this binary does not know how to
+// compute; see TransactionFingerprint.
+func ConvertFingerprint(scheme, fromAccountID, toAccountID string, sourceAmount int64) (fp string, ok bool) {
+	switch scheme {
+	case "v1":
+		return ConvertRequestFingerprint(fromAccountID, toAccountID, sourceAmount), true
+	default:
+		return "", false
+	}
+}

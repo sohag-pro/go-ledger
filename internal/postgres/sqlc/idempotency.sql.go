@@ -7,12 +7,13 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 const getIdempotencyKey = `-- name: GetIdempotencyKey :one
-SELECT tenant_id, idempotency_key, fingerprint, transaction_id, created_at
+SELECT tenant_id, idempotency_key, fingerprint, fingerprint_scheme, transaction_id, created_at
 FROM idempotency_keys
 WHERE tenant_id = $1 AND idempotency_key = $2
 `
@@ -22,13 +23,23 @@ type GetIdempotencyKeyParams struct {
 	IdempotencyKey string
 }
 
-func (q *Queries) GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error) {
+type GetIdempotencyKeyRow struct {
+	TenantID          uuid.UUID
+	IdempotencyKey    string
+	Fingerprint       string
+	FingerprintScheme string
+	TransactionID     uuid.UUID
+	CreatedAt         time.Time
+}
+
+func (q *Queries) GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (GetIdempotencyKeyRow, error) {
 	row := q.db.QueryRow(ctx, getIdempotencyKey, arg.TenantID, arg.IdempotencyKey)
-	var i IdempotencyKey
+	var i GetIdempotencyKeyRow
 	err := row.Scan(
 		&i.TenantID,
 		&i.IdempotencyKey,
 		&i.Fingerprint,
+		&i.FingerprintScheme,
 		&i.TransactionID,
 		&i.CreatedAt,
 	)
@@ -36,15 +47,16 @@ func (q *Queries) GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyPa
 }
 
 const insertIdempotencyKey = `-- name: InsertIdempotencyKey :exec
-INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, transaction_id)
-VALUES ($1, $2, $3, $4)
+INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, fingerprint_scheme, transaction_id)
+VALUES ($1, $2, $3, $4, $5)
 `
 
 type InsertIdempotencyKeyParams struct {
-	TenantID       uuid.UUID
-	IdempotencyKey string
-	Fingerprint    string
-	TransactionID  uuid.UUID
+	TenantID          uuid.UUID
+	IdempotencyKey    string
+	Fingerprint       string
+	FingerprintScheme string
+	TransactionID     uuid.UUID
 }
 
 func (q *Queries) InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error {
@@ -52,6 +64,7 @@ func (q *Queries) InsertIdempotencyKey(ctx context.Context, arg InsertIdempotenc
 		arg.TenantID,
 		arg.IdempotencyKey,
 		arg.Fingerprint,
+		arg.FingerprintScheme,
 		arg.TransactionID,
 	)
 	return err
