@@ -25,6 +25,11 @@ var (
 	poolErr    error
 )
 
+// testDemoKeyHash stands in for domain.HashAPIKey(cfg.demoAPIKey) in tests
+// that do not care about the actual demo key value, only that Seed is given
+// some hash to compare a tenant's api_keys rows against.
+const testDemoKeyHash = "test-demo-key-hash-not-a-real-hash"
+
 func TestMain(m *testing.M) {
 	os.Exit(runWithContainer(m))
 }
@@ -105,7 +110,7 @@ func TestSeed(t *testing.T) {
 	tenant := uuid.New()
 	now := time.Now()
 
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -144,7 +149,7 @@ func TestSeed(t *testing.T) {
 
 	// Re-seeding resets rather than appends: the transaction count is stable.
 	before := countTxns(t, pool, tenant)
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("re-seed: %v", err)
 	}
 	if after := countTxns(t, pool, tenant); after != before {
@@ -166,7 +171,7 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 	tenant := uuid.New()
 	now := time.Now()
 
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -190,7 +195,7 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 
 	// Re-seeding must clear both, even though audit_log rejects DELETE outside
 	// the seeder's gated transaction.
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("re-seed over idempotency and audit rows: %v", err)
 	}
 

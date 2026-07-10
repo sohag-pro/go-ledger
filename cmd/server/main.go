@@ -85,6 +85,7 @@ type config struct {
 	defaultTenant   string
 	env             string
 	serviceName     string
+	demoMode        bool
 	seedEnabled     bool
 	seedInterval    time.Duration
 	demoAPIKey      string
@@ -105,7 +106,8 @@ func loadConfig() (config, error) {
 		defaultTenant:   getenv("DEFAULT_TENANT_ID", defaultTenantID),
 		env:             getenv("APP_ENV", "development"),
 		serviceName:     getenv("OTEL_SERVICE_NAME", "go-ledger"),
-		seedEnabled:     getenvBool("SEED_ENABLED", true),
+		demoMode:        getenvBool("DEMO_MODE", false),
+		seedEnabled:     getenvBool("SEED_ENABLED", false),
 		seedInterval:    getenvDuration("SEED_INTERVAL", 4*time.Hour),
 		demoAPIKey:      getenv("DEMO_API_KEY", defaultDemoAPIKey),
 		loadTestKey:     getenv("LOAD_TEST_API_KEY", ""),
@@ -124,6 +126,19 @@ func loadConfig() (config, error) {
 	// (seed.Seed also stamps this currency on every seeded account).
 	if err := domain.Currency(cfg.defaultCurrency).Validate(); err != nil {
 		return config{}, fmt.Errorf("DEFAULT_CURRENCY %q is invalid: %w", cfg.defaultCurrency, err)
+	}
+	// Safe-by-default deployment (ADR-015): a plain deployment must be
+	// production-safe without an operator having to remember to turn
+	// demo-shaped defaults off. These two checks only fire when APP_ENV is
+	// exactly "production", so go.sohag.pro (which keeps DEMO_MODE=true and
+	// does not set APP_ENV=production) is unaffected.
+	if cfg.env == "production" {
+		if cfg.demoMode {
+			return config{}, errors.New("DEMO_MODE must not be enabled when APP_ENV=production")
+		}
+		if cfg.demoAPIKey == defaultDemoAPIKey {
+			return config{}, errors.New("refusing to boot in production with the published public demo api key; set DEMO_API_KEY to a real value")
+		}
 	}
 	return cfg, nil
 }
@@ -260,11 +275,12 @@ func run(logger *slog.Logger) error {
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
 	// interval, so the public demo always has fresh, realistic data. Stops on
-	// shutdown.
-	if cfg.seedEnabled {
+	// shutdown. Gated on both DEMO_MODE and SEED_ENABLED (ADR-015,
+	// "Safe-by-default deployment"): a plain deployment runs neither.
+	if cfg.demoMode && cfg.seedEnabled {
 		seedCtx, cancelSeed := context.WithCancel(context.Background())
 		defer cancelSeed()
-		go runSeeder(seedCtx, logger, pool, cfg.defaultTenant, cfg.defaultCurrency, cfg.seedInterval)
+		go runSeeder(seedCtx, logger, pool, cfg.defaultTenant, cfg.defaultCurrency, cfg.seedInterval, domain.HashAPIKey(cfg.demoAPIKey))
 	}
 
 	router := chi.NewRouter()
@@ -396,24 +412,29 @@ type apiKeyStore interface {
 	InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error
 }
 
-// provisionAPIKeys provisions the public demo key, and when LOAD_TEST_API_KEY
-// is set both the single-tenant load-test key (kept for backward compat) and
-// a set of LOAD_TEST_TENANTS high-limit keys spread across distinct tenants,
-// idempotently. It hashes each plaintext and inserts one row per key; a
-// unique-violation on key_hash (the row already exists from a previous boot)
-// is treated as success, so this is safe to run on every startup and after
-// the four-hour demo wipe (which never touches api_keys). The key plaintext
-// is never logged, only the fact that a key is active (ADR-012).
+// provisionAPIKeys provisions the public demo key when DEMO_MODE is on (ADR-015,
+// "Safe-by-default deployment": demo behavior is opt-in, so a plain deployment
+// with DEMO_MODE unset provisions and logs nothing about a demo key), and when
+// LOAD_TEST_API_KEY is set both the single-tenant load-test key (kept for
+// backward compat) and a set of LOAD_TEST_TENANTS high-limit keys spread
+// across distinct tenants, idempotently. It hashes each plaintext and inserts
+// one row per key; a unique-violation on key_hash (the row already exists
+// from a previous boot) is treated as success, so this is safe to run on
+// every startup and after the four-hour demo wipe (which never touches
+// api_keys). The key plaintext is never logged, only the fact that a key is
+// active (ADR-012).
 func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger *slog.Logger) error {
-	demoRPM := demoAPIKeyRateLimitRPM
-	if err := provisionKey(ctx, store, domain.APIKey{
-		TenantID:     cfg.defaultTenant,
-		Name:         "demo",
-		RateLimitRPM: &demoRPM,
-	}, cfg.demoAPIKey); err != nil {
-		return fmt.Errorf("provision demo api key: %w", err)
+	if cfg.demoMode {
+		demoRPM := demoAPIKeyRateLimitRPM
+		if err := provisionKey(ctx, store, domain.APIKey{
+			TenantID:     cfg.defaultTenant,
+			Name:         "demo",
+			RateLimitRPM: &demoRPM,
+		}, cfg.demoAPIKey); err != nil {
+			return fmt.Errorf("provision demo api key: %w", err)
+		}
+		logger.Info("demo api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", demoRPM)
 	}
-	logger.Info("demo api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", demoRPM)
 
 	if cfg.loadTestKey == "" {
 		return nil
@@ -466,10 +487,12 @@ func provisionKey(ctx context.Context, store apiKeyStore, k domain.APIKey, plain
 // ctx is cancelled. A failed seed is logged and the loop continues. currency
 // is stamped on every seeded account and posting (ADR-014): it is the same
 // DEFAULT_CURRENCY used as the fallback for a caller-created account.
-func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant, currency string, interval time.Duration) {
+// demoKeyHash is passed through to seed.Seed, which refuses to reset tenant
+// if it holds any api key other than the demo one (ADR-015).
+func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant, currency string, interval time.Duration, demoKeyHash string) {
 	doSeed := func() {
 		start := time.Now()
-		if err := seed.Seed(ctx, pool, tenant, time.Now(), currency); err != nil {
+		if err := seed.Seed(ctx, pool, tenant, time.Now(), currency, demoKeyHash); err != nil {
 			logger.Error("demo seed failed", "error", err)
 			return
 		}
