@@ -2,6 +2,8 @@ package api
 
 import (
 	"errors"
+	"net/http"
+	"strconv"
 
 	"github.com/danielgtaylor/huma/v2"
 
@@ -9,10 +11,21 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/domain"
 )
 
+// conflictRetryAfterSeconds is the fixed Retry-After value (in seconds) sent
+// with the retry-exhausted 503 for domain.ErrConflict. Unlike the 429 rate
+// limiter's Retry-After (internal/auth/ratelimit.go's retryAfterSeconds),
+// which computes its value from the limiter's actual refill rate, a write
+// conflict has nothing comparable to compute from: the per-tenant
+// serialization that produced it is expected to clear well within a second, so
+// a small fixed value gives an honest, cheap-to-retry hint without implying a
+// precision the server cannot back up.
+const conflictRetryAfterSeconds = 1
+
 // toHumaErr maps a domain error to a huma status error, which huma renders as an
 // RFC 7807 application/problem+json response. Validation and invariant failures
 // are client errors (422), missing resources are 404, a duplicate id is 409, a
-// transient write conflict is 503, and anything unrecognized is a 500 that does
+// transient write conflict is 503 (with a Retry-After header, conflictRetryAfterSeconds
+// below, so a client knows to back off), and anything unrecognized is a 500 that does
 // not leak internals. FX conversion failures (bad rate, bad spread, dust, no
 // rate for the pair, self or same-currency conversion, non-positive source
 // amount) are all client errors too, so they map to 422 like the other
@@ -77,7 +90,10 @@ func toHumaErr(err error) error {
 	case errors.Is(err, domain.ErrIdempotencyConflict):
 		return huma.Error409Conflict("idempotency key was reused with a different request body")
 	case errors.Is(err, domain.ErrConflict):
-		return huma.Error503ServiceUnavailable("write conflict, please retry")
+		return huma.ErrorWithHeaders(
+			huma.Error503ServiceUnavailable("write conflict, please retry"),
+			http.Header{"Retry-After": []string{strconv.Itoa(conflictRetryAfterSeconds)}},
+		)
 	case errors.Is(err, domain.ErrUnbalanced):
 		return huma.Error422UnprocessableEntity("transaction postings must sum to zero")
 	case errors.Is(err, domain.ErrCurrencyMismatch):

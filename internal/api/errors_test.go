@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -43,14 +44,37 @@ func TestToHumaErr(t *testing.T) {
 			if got == nil {
 				t.Fatalf("toHumaErr(%v) = nil, want status %d", tt.err, tt.wantStatus)
 			}
-			statusErr, ok := got.(huma.StatusError)
-			if !ok {
+			// errors.As, not a direct type assertion: domain.ErrConflict's mapping
+			// wraps its huma.StatusError with huma.ErrorWithHeaders (Retry-After,
+			// see TestToHumaErr_ConflictHasRetryAfter below), so the returned error
+			// itself is a *huma.errWithHeaders, not a huma.StatusError directly.
+			// huma's own runtime dispatch unwraps the exact same way (huma.go's
+			// operation handler does errors.As(err, &se) to find the status), so
+			// this is what actually reaches the client, not a test-only nuance.
+			var statusErr huma.StatusError
+			if !errors.As(got, &statusErr) {
 				t.Fatalf("toHumaErr(%v) = %v (%T), does not implement huma.StatusError", tt.err, got, got)
 			}
 			if statusErr.GetStatus() != tt.wantStatus {
 				t.Errorf("toHumaErr(%v) status = %d, want %d", tt.err, statusErr.GetStatus(), tt.wantStatus)
 			}
 		})
+	}
+}
+
+// TestToHumaErr_ConflictHasRetryAfter proves the retry-exhausted 503
+// (domain.ErrConflict) carries a Retry-After header, mirroring how the 429
+// rate-limit response already sets one (internal/auth/ratelimit.go), so a
+// client backing off a transient write conflict knows how long to wait
+// before retrying instead of hammering the server in a tight loop.
+func TestToHumaErr_ConflictHasRetryAfter(t *testing.T) {
+	got := toHumaErr(domain.ErrConflict)
+	headersErr, ok := got.(huma.HeadersError)
+	if !ok {
+		t.Fatalf("toHumaErr(ErrConflict) = %v (%T), does not implement huma.HeadersError", got, got)
+	}
+	if retryAfter := headersErr.GetHeaders().Get("Retry-After"); retryAfter != "1" {
+		t.Errorf("Retry-After = %q, want %q", retryAfter, "1")
 	}
 }
 
