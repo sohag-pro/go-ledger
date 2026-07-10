@@ -406,10 +406,16 @@ func runMigrations(dsn string, logger *slog.Logger) error {
 	return nil
 }
 
-// apiKeyStore is the slice of the repository provisionAPIKeys needs: insert a
-// key row by hash. The postgres repository satisfies it; a test uses a fake.
+// apiKeyStore is the slice of the repository provisionAPIKeys needs: create a
+// tenant row and insert a key row by hash. The postgres repository satisfies
+// it; a test uses a fake. CreateTenant is needed because api_keys_tenant_fk
+// (migration 0011, Task 2.1) requires the tenant to already exist: on a fresh
+// deployment, the demo and load-test tenant ids have never been backfilled by
+// anything, so provisionKey below must create each one before the key that
+// names it.
 type apiKeyStore interface {
 	InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error
+	CreateTenant(ctx context.Context, tenantID, name string) error
 }
 
 // provisionAPIKeys provisions the public demo key when DEMO_MODE is on (ADR-015,
@@ -472,10 +478,16 @@ func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger
 	return nil
 }
 
-// provisionKey inserts one key row for the given plaintext, idempotently: a
-// unique-violation (a row with this key_hash already exists) is swallowed as
-// success. It never logs or returns the plaintext.
+// provisionKey ensures k's tenant exists, then inserts one key row for the
+// given plaintext, idempotently: a tenant that already exists
+// (domain.ErrTenantAlreadyExists) and a key_hash that already exists (a
+// unique-violation) are both swallowed as success. It never logs or returns
+// the plaintext.
 func provisionKey(ctx context.Context, store apiKeyStore, k domain.APIKey, plaintext string) error {
+	tenantName := "provisioned-" + k.TenantID
+	if err := store.CreateTenant(ctx, k.TenantID, tenantName); err != nil && !errors.Is(err, domain.ErrTenantAlreadyExists) {
+		return fmt.Errorf("create tenant %s: %w", k.TenantID, err)
+	}
 	err := store.InsertAPIKey(ctx, k, domain.HashAPIKey(plaintext))
 	if err != nil && !postgres.IsUniqueViolationError(err) {
 		return err

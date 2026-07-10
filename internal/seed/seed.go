@@ -147,6 +147,19 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
 
+	// Ensure the tenant row exists before writing any tenant-owned data:
+	// accounts_tenant_fk and transactions_tenant_fk (migration 0011, Task 2.1)
+	// require it. ON CONFLICT DO NOTHING: a tenant already provisioned via
+	// cmd/server's provisionAPIKeys (which runs before the seeder starts) is
+	// left exactly as it is, including any name or status an operator may
+	// already have set; only a tenant that has never been provisioned gets a
+	// placeholder row here.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+		tid, "demo-"+tenantID[:8]); err != nil {
+		return fmt.Errorf("seed: ensure tenant row: %w", err)
+	}
+
 	// Refuse to touch a tenant that holds any api key other than the demo key,
 	// before any destructive statement runs. A misconfigured DEFAULT_TENANT_ID
 	// pointed at a live tenant must never lose data to a periodic demo reset.
