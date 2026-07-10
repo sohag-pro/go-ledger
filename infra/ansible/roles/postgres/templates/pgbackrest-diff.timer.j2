@@ -1,0 +1,11 @@
+# Managed by Ansible (ADR-016). Daily differential backup, 02:30 local time
+# (after the weekly full backup's window on Sundays).
+[Unit]
+Description=Daily pgBackRest differential backup for go-ledger
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

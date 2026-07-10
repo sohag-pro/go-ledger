@@ -1,0 +1,11 @@
+# Managed by Ansible (ADR-016). Daily differential backup, triggered by
+# pgbackrest-diff.timer.
+[Unit]
+Description=pgBackRest differential backup for the go-ledger stanza
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/usr/bin/pgbackrest --stanza={{ pgbackrest_stanza }} --type=diff backup

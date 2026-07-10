@@ -13,6 +13,17 @@ pg_database: goledger
 # Provide via vault or the real all.yml, never here:
 pg_password: "REPLACE_ME"
 
+# pgBackRest offsite durability (ADR-016). Supply the secret values via
+# ansible-vault or the real all.yml, never commit them.
+pgbackrest_stanza: go-ledger
+pgbackrest_s3_endpoint: "REPLACE_ME" # e.g. s3.us-west-002.backblazeb2.com
+pgbackrest_s3_bucket: "REPLACE_ME"
+pgbackrest_s3_region: "REPLACE_ME"
+pgbackrest_s3_key: "REPLACE_ME"
+pgbackrest_s3_key_secret: "REPLACE_ME"
+pgbackrest_cipher_pass: "REPLACE_ME" # losing this makes the repo unrecoverable
+pgbackrest_retention_full: 2
+
 server_name: go.sohag.pro
 upstream_addr: "127.0.0.1:8080"
 # The shared portfolio host whose availability the nginx role must not break:

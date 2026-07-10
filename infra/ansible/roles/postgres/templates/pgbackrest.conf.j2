@@ -1,0 +1,24 @@
+# Managed by Ansible (ADR-016). pgBackRest repository configuration: continuous
+# WAL archiving plus full/differential base backups shipped to an encrypted,
+# offsite S3-compatible bucket. This is the disaster recovery path, not the
+# same-box pg_dump (see go-ledger-backup.j2).
+[global]
+repo1-type=s3
+repo1-s3-endpoint={{ pgbackrest_s3_endpoint }}
+repo1-s3-bucket={{ pgbackrest_s3_bucket }}
+repo1-s3-region={{ pgbackrest_s3_region }}
+repo1-s3-key={{ pgbackrest_s3_key }}
+repo1-s3-key-secret={{ pgbackrest_s3_key_secret }}
+repo1-path=/go-ledger
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass={{ pgbackrest_cipher_pass }}
+repo1-retention-full={{ pgbackrest_retention_full | default(2) }}
+archive-async=y
+spool-path=/var/spool/pgbackrest
+process-max=2
+log-level-console=info
+log-level-file=detail
+
+[{{ pgbackrest_stanza }}]
+pg1-path=/var/lib/postgresql/{{ pg_version }}/main
+pg1-port=5432

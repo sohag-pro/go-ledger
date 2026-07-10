@@ -1,5 +1,9 @@
 #!/bin/sh
 # Managed by Ansible. Daily gzip pg_dump, keep 14 days.
+# This is a convenience logical dump for quick same-box restores and
+# inspection only. It is NOT the disaster recovery path: that is the
+# pgBackRest offsite, encrypted, point-in-time-recoverable repository
+# (ADR-016). See docs/ops/server-setup.md for the restore runbook.
 umask 077
 ts=$(date +%Y%m%d)
 sudo -u postgres pg_dump {{ pg_database }} | gzip > /var/backups/go-ledger/{{ pg_database }}-$ts.sql.gz

@@ -1,5 +1,8 @@
 ---
 - name: Restart postgresql
+  # A reload is not enough for archive_mode or wal_level (ADR-016): both are
+  # postmaster-startup settings, so a full restart is required whenever the
+  # memory tuning or the pgbackrest WAL archiving settings change.
   ansible.builtin.service:
     name: postgresql
     state: restarted

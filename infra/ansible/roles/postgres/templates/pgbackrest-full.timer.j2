@@ -1,0 +1,10 @@
+# Managed by Ansible (ADR-016). Weekly full backup, Sunday 02:00 local time.
+[Unit]
+Description=Weekly pgBackRest full backup for go-ledger
+
+[Timer]
+OnCalendar=Sun *-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
