@@ -33,6 +33,12 @@ components:
           type: integer
         name:
           type: string
+        party_reference:
+          description: Optional external customer/party id, for linking to an external KYC system. Omitted when unset.
+          type: string
+        party_type:
+          description: Optional free-text party classification, e.g. individual or business. Omitted when unset.
+          type: string
         status:
           description: "One of: active, frozen, closed"
           type: string
@@ -184,6 +190,14 @@ components:
           description: Human-readable account name
           maxLength: 200
           minLength: 1
+          type: string
+        party_reference:
+          description: Optional external customer/party id (KYC linkage). Omit if not linked to an external party system.
+          maxLength: 256
+          type: string
+        party_type:
+          description: Optional free-text party classification, e.g. individual or business.
+          maxLength: 256
           type: string
         type:
           description: Fundamental account class

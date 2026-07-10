@@ -9,6 +9,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 // conflictRetryAfterSeconds is the fixed Retry-After value (in seconds) sent
@@ -73,6 +74,20 @@ func toHumaErr(err error) error {
 	if errors.As(err, &minBalanceErr) {
 		return huma.Error422UnprocessableEntity(minBalanceErr.Error())
 	}
+	// *ledger.ScreeningRejectedError (Task 6.1, audit A9.1) is checked the
+	// same way: an external screening/compliance hook explicitly vetoed the
+	// post. Like the errors above, this is a well-formed request that just
+	// fails a check, so it maps to 422 with the hook's own reason. It is
+	// checked BEFORE errors.Is(err, ledger.ErrScreeningUnavailable) below:
+	// ScreeningRejectedError also wraps ledger.ErrScreeningRejected, a
+	// distinct sentinel from ErrScreeningUnavailable, so the two can never
+	// both match the same error and this ordering is purely for readability
+	// (matching the errors.As-then-switch layout the rest of this function
+	// already uses).
+	var screeningRejectedErr *ledger.ScreeningRejectedError
+	if errors.As(err, &screeningRejectedErr) {
+		return huma.Error422UnprocessableEntity(screeningRejectedErr.Error())
+	}
 
 	switch {
 	case err == nil:
@@ -106,6 +121,17 @@ func toHumaErr(err error) error {
 	case errors.Is(err, domain.ErrConflict):
 		return huma.ErrorWithHeaders(
 			huma.Error503ServiceUnavailable("write conflict, please retry"),
+			http.Header{"Retry-After": []string{strconv.Itoa(conflictRetryAfterSeconds)}},
+		)
+	// ledger.ErrScreeningUnavailable (Task 6.1, audit A9.1) is an AMBIGUOUS
+	// screening failure (a timeout, a dropped connection, anything that is
+	// not an explicit veto): fail closed, the post is rejected, but unlike a
+	// definite veto (ScreeningRejectedError above) the caller is told this
+	// is likely transient and worth retrying, the same class of 503 as a
+	// write-conflict retry-exhaustion.
+	case errors.Is(err, ledger.ErrScreeningUnavailable):
+		return huma.ErrorWithHeaders(
+			huma.Error503ServiceUnavailable("screening system unavailable, please retry"),
 			http.Header{"Retry-After": []string{strconv.Itoa(conflictRetryAfterSeconds)}},
 		)
 	case errors.Is(err, domain.ErrUnbalanced):

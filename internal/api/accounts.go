@@ -22,16 +22,24 @@ type AccountBody struct {
 	// MinBalance is the optional floor enforced on this account's derived
 	// balance, in minor units (Task 5.5, audit A1.5). null means no floor.
 	MinBalance *int64 `json:"min_balance,omitempty" doc:"Optional minimum balance floor, in minor units. Omitted when unset."`
+	// PartyReference and PartyType are optional linkage metadata for an
+	// external KYC/party system (Task 6.1, audit A9.1). Both are omitted
+	// when unset; this package does not validate them beyond a length cap,
+	// the actual party/KYC system is external.
+	PartyReference *string `json:"party_reference,omitempty" doc:"Optional external customer/party id, for linking to an external KYC system. Omitted when unset."`
+	PartyType      *string `json:"party_type,omitempty" doc:"Optional free-text party classification, e.g. individual or business. Omitted when unset."`
 }
 
 func toAccountBody(a domain.Account) AccountBody {
 	return AccountBody{
-		ID:         a.ID,
-		Name:       a.Name,
-		Type:       a.Type.String(),
-		Currency:   string(a.Currency),
-		Status:     string(a.Status),
-		MinBalance: a.MinBalance,
+		ID:             a.ID,
+		Name:           a.Name,
+		Type:           a.Type.String(),
+		Currency:       string(a.Currency),
+		Status:         string(a.Status),
+		MinBalance:     a.MinBalance,
+		PartyReference: a.PartyReference,
+		PartyType:      a.PartyType,
 	}
 }
 
@@ -46,6 +54,13 @@ type CreateAccountInput struct {
 		Type       string `json:"type" enum:"asset,liability,equity,income,expense" doc:"Fundamental account class"`
 		Currency   string `json:"currency,omitempty" pattern:"^[A-Z]{3}$" doc:"ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted."`
 		MinBalance *int64 `json:"min_balance,omitempty" doc:"Optional minimum balance floor, in minor units. Omit for no floor."`
+		// PartyReference and PartyType (Task 6.1, audit A9.1) are optional
+		// linkage metadata for an external KYC/party system: an id and a
+		// free-text classification (e.g. "individual", "business"). Neither
+		// is validated beyond a length cap; the party/KYC system itself is
+		// external and out of scope for this service.
+		PartyReference *string `json:"party_reference,omitempty" maxLength:"256" doc:"Optional external customer/party id (KYC linkage). Omit if not linked to an external party system."`
+		PartyType      *string `json:"party_type,omitempty" maxLength:"256" doc:"Optional free-text party classification, e.g. individual or business."`
 	}
 }
 
@@ -135,7 +150,14 @@ func registerAccounts(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
-		acct := &domain.Account{Name: in.Body.Name, Type: at, Currency: domain.Currency(in.Body.Currency), MinBalance: in.Body.MinBalance}
+		acct := &domain.Account{
+			Name:           in.Body.Name,
+			Type:           at,
+			Currency:       domain.Currency(in.Body.Currency),
+			MinBalance:     in.Body.MinBalance,
+			PartyReference: in.Body.PartyReference,
+			PartyType:      in.Body.PartyType,
+		}
 		if err := deps.Accounts.Create(ctx, tenant, acct); err != nil {
 			return nil, toHumaErr(err)
 		}

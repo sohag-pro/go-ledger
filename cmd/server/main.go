@@ -422,7 +422,15 @@ func run(logger *slog.Logger) error {
 		Accounts: ledger.NewAccountService(repo, ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency))),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
 			ledger.WithFXProvider(fx.NewDBProvider(pool)),
-			ledger.WithIdempotencyTTL(cfg.idempotencyTTL)),
+			ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
+			// PrePostHook (Task 6.1, audit A9.1) is scaffolding for an external
+			// compliance/screening integration: wired explicitly to
+			// NoopPrePostHook here, the same default TransactionService falls
+			// back to on its own, so this deployment allows every transaction
+			// exactly as it did before this hook existed. A real screening
+			// integration replaces this one line with its own PrePostHook
+			// implementation; nothing else in the posting path needs to change.
+			ledger.WithPrePostHook(ledger.NoopPrePostHook{})),
 		Audit:            ledger.NewAuditService(repo),
 		Admin:            admin.NewService(repo),
 		Auth:             resolver,

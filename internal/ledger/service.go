@@ -36,6 +36,7 @@ type TransactionService struct {
 	tracer         oteltrace.Tracer
 	fxProvider     fx.Provider
 	idempotencyTTL time.Duration
+	prePostHook    PrePostHook
 }
 
 // ServiceOption configures optional TransactionService dependencies that most
@@ -64,6 +65,16 @@ func WithIdempotencyTTL(ttl time.Duration) ServiceOption {
 	}
 }
 
+// WithPrePostHook sets the PrePostHook Post and Convert call synchronously,
+// before either ever writes anything, to let an external screening or
+// transaction-monitoring system veto the transaction (Task 6.1, audit
+// A9.1). A TransactionService constructed without this option uses
+// NoopPrePostHook, which allows every transaction: default behavior is
+// unchanged for every existing caller and test that never wires one in.
+func WithPrePostHook(h PrePostHook) ServiceOption {
+	return func(s *TransactionService) { s.prePostHook = h }
+}
+
 // NewTransactionService returns a TransactionService backed by repo. If log is
 // nil the default slog logger is used; if tracer is nil the global tracer is used.
 func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer oteltrace.Tracer, opts ...ServiceOption) *TransactionService {
@@ -73,7 +84,7 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 	if tracer == nil {
 		tracer = otel.Tracer("github.com/sohag-pro/go-ledger/internal/ledger")
 	}
-	s := &TransactionService{repo: repo, log: log, tracer: tracer, idempotencyTTL: DefaultIdempotencyTTL}
+	s := &TransactionService{repo: repo, log: log, tracer: tracer, idempotencyTTL: DefaultIdempotencyTTL, prePostHook: NoopPrePostHook{}}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -98,6 +109,14 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 // 5.5, audit A1.5): a frozen or closed account returns a
 // *domain.AccountNotActiveError, and a posting that would breach an
 // account's floor returns a *domain.MinBalanceBreachError.
+//
+// Immediately before RunInTx (Task 6.1, audit A9.1), and only for a genuine
+// new post, never for a replay (see the idempotency precheck above this
+// call): the configured PrePostHook gets one synchronous chance to veto t.
+// A rejection (ErrScreeningRejected) or an ambiguous hook failure
+// (ErrScreeningUnavailable) both return here, before RunInTx ever opens a
+// transaction, so nothing is written for either outcome; see PrePostHook's
+// own doc comment for the fail-closed distinction between the two.
 func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction, idem *domain.Idempotency) (replayed bool, err error) {
 	ctx, span := s.tracer.Start(ctx, "ledger.PostTransaction",
 		oteltrace.WithAttributes(
@@ -175,6 +194,19 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 			span.RecordError(err)
 			return false, err
 		}
+	}
+
+	// Screening runs here, synchronously, and BEFORE RunInTx opens any
+	// transaction (Task 6.1, audit A9.1): a rejection or an ambiguous hook
+	// failure both return before a single row is written. This intentionally
+	// happens after the idempotency precheck above (a replay returns before
+	// reaching here), so an already-approved, already-posted transaction is
+	// never re-screened on retry; only a genuinely new post is.
+	if err := reviewPost(ctx, s.prePostHook, tenantID, t); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "screening rejected post")
+		metrics.PostDuration.WithLabelValues("rejected").Observe(0)
+		return false, err
 	}
 
 	start := time.Now()

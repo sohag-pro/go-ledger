@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -138,6 +139,42 @@ func TestAccountValidateStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a := base
 			a.Status = tt.status
+			if err := a.Validate(); !errors.Is(err, tt.wantErr) {
+				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestAccountValidatePartyFields covers Task 6.1 (audit A9.1): PartyReference
+// and PartyType are both optional (nil is valid, the default), any value up
+// to their length cap is valid, and exceeding either cap is rejected with a
+// distinct sentinel per field.
+func TestAccountValidatePartyFields(t *testing.T) {
+	base := Account{ID: "acc_1", Name: "Cash", Type: Asset, Currency: "USD"}
+	ptr := func(s string) *string { return &s }
+	atCap := strings.Repeat("a", MaxPartyReferenceLen)
+	overCap := strings.Repeat("a", MaxPartyReferenceLen+1)
+
+	tests := []struct {
+		name           string
+		partyReference *string
+		partyType      *string
+		wantErr        error
+	}{
+		{"both unset", nil, nil, nil},
+		{"party reference set, no type", ptr("cust-123"), nil, nil},
+		{"both set", ptr("cust-123"), ptr("individual"), nil},
+		{"party reference at cap", ptr(atCap), nil, nil},
+		{"party reference over cap", ptr(overCap), nil, ErrPartyReferenceTooLong},
+		{"party type at cap", nil, ptr(atCap), nil},
+		{"party type over cap", nil, ptr(overCap), ErrPartyTypeTooLong},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := base
+			a.PartyReference = tt.partyReference
+			a.PartyType = tt.partyType
 			if err := a.Validate(); !errors.Is(err, tt.wantErr) {
 				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
 			}

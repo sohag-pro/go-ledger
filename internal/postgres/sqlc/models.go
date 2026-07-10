@@ -12,15 +12,17 @@ import (
 )
 
 type Account struct {
-	ID         uuid.UUID
-	TenantID   uuid.UUID
-	Name       string
-	Type       string
-	Currency   string
-	CreatedAt  time.Time
-	IsSystem   bool
-	Status     string
-	MinBalance pgtype.Int8
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	CreatedAt      time.Time
+	IsSystem       bool
+	Status         string
+	MinBalance     pgtype.Int8
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
 }
 
 type ApiKey struct {

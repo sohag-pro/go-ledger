@@ -204,6 +204,20 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, err
 	}
 
+	// Screening runs on the fully-built four-leg transaction, synchronously,
+	// and BEFORE RunInTx opens any transaction (Task 6.1, audit A9.1): a
+	// rejection or an ambiguous hook failure both return here, before a
+	// single row (including the FX snapshot and any lazily-created clearing
+	// account row inserted above) is committed. This happens after the
+	// idempotency precheck near the top of this function, so a convert that
+	// is just replaying an already-approved, already-posted request is never
+	// re-screened.
+	if err := reviewPost(ctx, s.prePostHook, tenantID, t); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "screening rejected post")
+		return nil, false, err
+	}
+
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		// Policy is checked over the FULL set of legs Convert built above
 		// (source debit, both clearing legs, destination credit), so the

@@ -2,6 +2,16 @@ package domain
 
 import "fmt"
 
+// MaxPartyReferenceLen and MaxPartyTypeLen bound Account.PartyReference and
+// Account.PartyType (Task 6.1, audit A9.1): the same 256-character ceiling
+// MaxPostingDescriptionLen and MaxTransactionReferenceLen already use for a
+// free-form, client-supplied identifier. There is nothing special about the
+// number itself, just an established sane cap.
+const (
+	MaxPartyReferenceLen = 256
+	MaxPartyTypeLen      = 256
+)
+
 // AccountType is one of the five fundamental account classes in double-entry
 // accounting. The zero value is intentionally invalid so an uninitialized
 // AccountType fails Validate rather than masquerading as a real type.
@@ -112,6 +122,22 @@ type Account struct {
 	// existed). A negative value is a legitimate overdraft allowance, not an
 	// error: see migration 0022's doc comment.
 	MinBalance *int64
+	// PartyReference is an optional external customer/party id (Task 6.1,
+	// audit A9.1): linkage metadata so an external KYC/customer system can
+	// tie this account back to a party record it owns. nil means no linkage
+	// was supplied, the default, and behaves exactly as every account did
+	// before this field existed. This package does not validate the id
+	// against anything: the party/KYC system is external and out of scope,
+	// so beyond the length cap (MaxPartyReferenceLen) this is opaque,
+	// free-form text.
+	PartyReference *string
+	// PartyType is an optional free-text classification of the linked party
+	// (Task 6.1, audit A9.1), for example "individual" or "business". nil
+	// means unset. Like PartyReference this is linkage metadata only: no
+	// enum is enforced here (a real KYC system's taxonomy is external and
+	// may not match a fixed set this package would have to keep in sync
+	// with), beyond the length cap (MaxPartyTypeLen).
+	PartyType *string
 }
 
 // IsSystem reports whether the account is a system account (for example an
@@ -123,7 +149,10 @@ func (a Account) IsSystem() bool {
 // Validate checks that the account has an id and name, a defined type, a
 // well-formed currency, and (when set) a recognized Status. An empty Status
 // is valid: see Account.Status's doc comment for why "unset" is not the same
-// as "invalid" for this field.
+// as "invalid" for this field. PartyReference and PartyType (Task 6.1, audit
+// A9.1) are checked only against their length caps: they are opaque linkage
+// metadata for an external KYC/party system, so there is no format or
+// taxonomy for this package to enforce beyond that.
 func (a Account) Validate() error {
 	if a.ID == "" || a.Name == "" {
 		return ErrInvalidAccount
@@ -133,6 +162,12 @@ func (a Account) Validate() error {
 	}
 	if a.Status != "" && !a.Status.Valid() {
 		return ErrInvalidAccount
+	}
+	if a.PartyReference != nil && len(*a.PartyReference) > MaxPartyReferenceLen {
+		return ErrPartyReferenceTooLong
+	}
+	if a.PartyType != nil && len(*a.PartyType) > MaxPartyTypeLen {
+		return ErrPartyTypeTooLong
 	}
 	return a.Currency.Validate()
 }

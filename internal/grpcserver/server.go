@@ -161,10 +161,19 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 // no distinct "absent" for a scalar int64, so a gRPC caller cannot tell "no
 // floor" apart from "floor of exactly zero" the way the REST API's nullable
 // min_balance can (see the proto's own doc comment on Account.min_balance).
+// PartyReference and PartyType (Task 6.1, audit A9.1) are left at their zero
+// value ("") when unset, the same ambiguity the proto's own doc comment on
+// Account.party_reference/party_type documents.
 func toProtoAccount(a domain.Account) *ledgerv1.Account {
 	pa := &ledgerv1.Account{Id: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency), Status: string(a.Status)}
 	if a.MinBalance != nil {
 		pa.MinBalance = *a.MinBalance
+	}
+	if a.PartyReference != nil {
+		pa.PartyReference = *a.PartyReference
+	}
+	if a.PartyType != nil {
+		pa.PartyType = *a.PartyType
 	}
 	return pa
 }
@@ -240,7 +249,9 @@ func toProtoAuditEntry(e domain.AuditEntry) *ledgerv1.AuditEntry {
 
 // CreateAccount creates an account for the calling tenant. min_balance (Task
 // 5.5, audit A1.5) is optional: 0 means no floor was requested, mirroring
-// toProtoAccount's own doc comment on the same ambiguity.
+// toProtoAccount's own doc comment on the same ambiguity. party_reference
+// and party_type (Task 6.1, audit A9.1) are optional the same way: an empty
+// string means neither was supplied.
 func (s *Server) CreateAccount(ctx context.Context, req *ledgerv1.CreateAccountRequest) (*ledgerv1.CreateAccountResponse, error) {
 	at, err := domain.ParseAccountType(req.Type)
 	if err != nil {
@@ -249,6 +260,12 @@ func (s *Server) CreateAccount(ctx context.Context, req *ledgerv1.CreateAccountR
 	acct := &domain.Account{Name: req.Name, Type: at, Currency: domain.Currency(req.Currency)}
 	if req.MinBalance != 0 {
 		acct.MinBalance = &req.MinBalance
+	}
+	if req.PartyReference != "" {
+		acct.PartyReference = &req.PartyReference
+	}
+	if req.PartyType != "" {
+		acct.PartyType = &req.PartyType
 	}
 	if err := s.accounts.Create(ctx, tenantFrom(ctx), acct); err != nil {
 		return nil, toStatus(err)

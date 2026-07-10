@@ -190,16 +190,27 @@ func (x *Transaction) GetEffectiveAt() string {
 // literal 0 floor; a caller that needs to tell "no floor" apart from "floor
 // of exactly zero" should use the REST API, whose min_balance is a JSON
 // null-able field.
+//
+// party_reference and party_type (Task 6.1, audit A9.1) are optional
+// linkage metadata for an external KYC/party system: an id and a free-text
+// classification (e.g. "individual", "business"). Both are empty string
+// when unset (proto3 has no distinct "absent" for a scalar string either); a
+// caller that needs to tell "unset" apart from "an empty string was
+// deliberately stored" should use the REST API instead, whose fields are
+// JSON null-able. Neither is validated by this service beyond a length cap;
+// the party/KYC system itself is external and out of scope.
 type Account struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Type          string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"` // asset, liability, equity, income, or expense
-	Currency      string                 `protobuf:"bytes,4,opt,name=currency,proto3" json:"currency,omitempty"`
-	Status        string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
-	MinBalance    int64                  `protobuf:"varint,6,opt,name=min_balance,json=minBalance,proto3" json:"min_balance,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Id             string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Type           string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"` // asset, liability, equity, income, or expense
+	Currency       string                 `protobuf:"bytes,4,opt,name=currency,proto3" json:"currency,omitempty"`
+	Status         string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
+	MinBalance     int64                  `protobuf:"varint,6,opt,name=min_balance,json=minBalance,proto3" json:"min_balance,omitempty"`
+	PartyReference string                 `protobuf:"bytes,7,opt,name=party_reference,json=partyReference,proto3" json:"party_reference,omitempty"`
+	PartyType      string                 `protobuf:"bytes,8,opt,name=party_type,json=partyType,proto3" json:"party_type,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Account) Reset() {
@@ -274,16 +285,35 @@ func (x *Account) GetMinBalance() int64 {
 	return 0
 }
 
+func (x *Account) GetPartyReference() string {
+	if x != nil {
+		return x.PartyReference
+	}
+	return ""
+}
+
+func (x *Account) GetPartyType() string {
+	if x != nil {
+		return x.PartyType
+	}
+	return ""
+}
+
 // min_balance (Task 5.5, audit A1.5) is optional: 0 means no floor was
 // requested, the same convention Account.min_balance above documents.
+// party_reference and party_type (Task 6.1, audit A9.1) are optional too:
+// empty string means neither was supplied, the same convention
+// Account.party_reference/party_type above document.
 type CreateAccountRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
-	Currency      string                 `protobuf:"bytes,3,opt,name=currency,proto3" json:"currency,omitempty"`
-	MinBalance    int64                  `protobuf:"varint,4,opt,name=min_balance,json=minBalance,proto3" json:"min_balance,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Type           string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	Currency       string                 `protobuf:"bytes,3,opt,name=currency,proto3" json:"currency,omitempty"`
+	MinBalance     int64                  `protobuf:"varint,4,opt,name=min_balance,json=minBalance,proto3" json:"min_balance,omitempty"`
+	PartyReference string                 `protobuf:"bytes,5,opt,name=party_reference,json=partyReference,proto3" json:"party_reference,omitempty"`
+	PartyType      string                 `protobuf:"bytes,6,opt,name=party_type,json=partyType,proto3" json:"party_type,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateAccountRequest) Reset() {
@@ -342,6 +372,20 @@ func (x *CreateAccountRequest) GetMinBalance() int64 {
 		return x.MinBalance
 	}
 	return 0
+}
+
+func (x *CreateAccountRequest) GetPartyReference() string {
+	if x != nil {
+		return x.PartyReference
+	}
+	return ""
+}
+
+func (x *CreateAccountRequest) GetPartyType() string {
+	if x != nil {
+		return x.PartyType
+	}
+	return ""
 }
 
 type CreateAccountResponse struct {
@@ -1967,7 +2011,7 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\bpostings\x18\x03 \x03(\v2\x12.ledger.v1.PostingR\bpostings\x126\n" +
 	"\x17reverses_transaction_id\x18\x04 \x01(\tR\x15reversesTransactionId\x12\x1c\n" +
 	"\treference\x18\x05 \x01(\tR\treference\x12!\n" +
-	"\feffective_at\x18\x06 \x01(\tR\veffectiveAtJ\x04\b\x02\x10\x03R\bcurrency\"\x96\x01\n" +
+	"\feffective_at\x18\x06 \x01(\tR\veffectiveAtJ\x04\b\x02\x10\x03R\bcurrency\"\xde\x01\n" +
 	"\aAccount\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -1975,13 +2019,19 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\bcurrency\x18\x04 \x01(\tR\bcurrency\x12\x16\n" +
 	"\x06status\x18\x05 \x01(\tR\x06status\x12\x1f\n" +
 	"\vmin_balance\x18\x06 \x01(\x03R\n" +
-	"minBalance\"{\n" +
+	"minBalance\x12'\n" +
+	"\x0fparty_reference\x18\a \x01(\tR\x0epartyReference\x12\x1d\n" +
+	"\n" +
+	"party_type\x18\b \x01(\tR\tpartyType\"\xc3\x01\n" +
 	"\x14CreateAccountRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x1a\n" +
 	"\bcurrency\x18\x03 \x01(\tR\bcurrency\x12\x1f\n" +
 	"\vmin_balance\x18\x04 \x01(\x03R\n" +
-	"minBalance\"E\n" +
+	"minBalance\x12'\n" +
+	"\x0fparty_reference\x18\x05 \x01(\tR\x0epartyReference\x12\x1d\n" +
+	"\n" +
+	"party_type\x18\x06 \x01(\tR\tpartyType\"E\n" +
 	"\x15CreateAccountResponse\x12,\n" +
 	"\aaccount\x18\x01 \x01(\v2\x12.ledger.v1.AccountR\aaccount\"#\n" +
 	"\x11GetAccountRequest\x12\x0e\n" +

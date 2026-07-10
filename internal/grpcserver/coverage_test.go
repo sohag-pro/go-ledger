@@ -167,6 +167,53 @@ func TestGRPCAccountStatusAndMinBalance(t *testing.T) {
 	}
 }
 
+// TestGRPCAccountPartyFields covers Task 6.1 (audit A9.1) over gRPC: a fresh
+// account defaults to empty party_reference/party_type (the documented gRPC
+// convention for "unset", mirroring min_balance's 0-means-absent
+// convention: see toProtoAccount's doc comment); creating with explicit
+// party_reference/party_type round-trips both on the create response and a
+// fresh GetAccount.
+func TestGRPCAccountPartyFields(t *testing.T) {
+	client := dialClient(t)
+	ctx := authedCtx(context.Background())
+
+	plain, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Party Fields Plain", Type: "asset", Currency: "USD"})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if plain.Account.PartyReference != "" {
+		t.Errorf("party_reference = %q, want empty (unset)", plain.Account.PartyReference)
+	}
+	if plain.Account.PartyType != "" {
+		t.Errorf("party_type = %q, want empty (unset)", plain.Account.PartyType)
+	}
+
+	linked, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{
+		Name: "Party Fields Linked", Type: "asset", Currency: "USD",
+		PartyReference: "cust-grpc-1", PartyType: "business",
+	})
+	if err != nil {
+		t.Fatalf("create account with party fields: %v", err)
+	}
+	if linked.Account.PartyReference != "cust-grpc-1" {
+		t.Errorf("party_reference = %q, want %q", linked.Account.PartyReference, "cust-grpc-1")
+	}
+	if linked.Account.PartyType != "business" {
+		t.Errorf("party_type = %q, want %q", linked.Account.PartyType, "business")
+	}
+
+	got, err := client.GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: linked.Account.Id})
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if got.Account.PartyReference != "cust-grpc-1" {
+		t.Errorf("GetAccount party_reference = %q, want %q", got.Account.PartyReference, "cust-grpc-1")
+	}
+	if got.Account.PartyType != "business" {
+		t.Errorf("GetAccount party_type = %q, want %q", got.Account.PartyType, "business")
+	}
+}
+
 func TestGRPCCreateAccountInvalidType(t *testing.T) {
 	client := dialClient(t)
 	_, err := client.CreateAccount(authedCtx(context.Background()), &ledgerv1.CreateAccountRequest{Name: "Bad Type", Type: "not-a-type", Currency: "USD"})

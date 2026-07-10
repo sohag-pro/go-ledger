@@ -139,12 +139,14 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 	}
 	return r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
 		return q.CreateAccount(ctx, sqlc.CreateAccountParams{
-			ID:         aid,
-			TenantID:   tid,
-			Name:       a.Name,
-			Type:       a.Type.String(),
-			Currency:   string(a.Currency),
-			MinBalance: ptrToInt8(a.MinBalance),
+			ID:             aid,
+			TenantID:       tid,
+			Name:           a.Name,
+			Type:           a.Type.String(),
+			Currency:       string(a.Currency),
+			MinBalance:     ptrToInt8(a.MinBalance),
+			PartyReference: ptrToText(a.PartyReference),
+			PartyType:      ptrToText(a.PartyType),
 		})
 	})
 }
@@ -171,7 +173,7 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
 	}
-	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
 }
 
 // ListAccounts returns up to limit of the tenant's accounts, ordered by name.
@@ -194,7 +196,7 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	}
 	out := make([]domain.Account, 0, len(rows))
 	for _, row := range rows {
-		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem)
+		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
 		if err != nil {
 			return nil, err
 		}
@@ -275,7 +277,7 @@ func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID st
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get or create clearing account: %w", err)
 	}
-	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
 }
 
 // CreateTransaction validates t and writes the transaction and all its postings
@@ -1799,6 +1801,27 @@ func ptrToInt8(p *int64) pgtype.Int8 {
 	return pgtype.Int8{Int64: *p, Valid: true}
 }
 
+// ptrToText converts *string to a nullable Postgres text, NULL when p is
+// nil. Used for accounts.party_reference and accounts.party_type (Task 6.1,
+// audit A9.1): nil means "no party linkage supplied", the same meaning NULL
+// carries in the column.
+func ptrToText(p *string) pgtype.Text {
+	if p == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *p, Valid: true}
+}
+
+// textToPtr is the inverse of ptrToText: nil when t is not Valid (NULL in
+// the column), otherwise a pointer to its string value.
+func textToPtr(t pgtype.Text) *string {
+	if !t.Valid {
+		return nil
+	}
+	v := t.String
+	return &v
+}
+
 // accountFromRow builds a domain.Account from the scalar fields common to every
 // account-shaped row sqlc generates (GetAccountRow, ListAccountsRow, ...). Taking
 // individual fields rather than one sqlc row type is deliberate: sqlc gives each
@@ -1807,21 +1830,24 @@ func ptrToInt8(p *int64) pgtype.Int8 {
 // columns like is_system that not every query selects), so a single shared
 // struct type would not compile across call sites.
 //
-// status, minBalance, and isSystem are Task 5.5 (audit A1.5) additions: every
+// status, minBalance, and isSystem are Task 5.5 (audit A1.5) additions;
+// partyReference and partyType are Task 6.1 (audit A9.1) additions: every
 // query that selects them (GetAccount, ListAccounts, GetOrCreateClearingAccount)
 // passes its own row's values through unchanged.
-func accountFromRow(id uuid.UUID, name, accountType, currency, status string, minBalance pgtype.Int8, isSystem bool) (domain.Account, error) {
+func accountFromRow(id uuid.UUID, name, accountType, currency, status string, minBalance pgtype.Int8, isSystem bool, partyReference, partyType pgtype.Text) (domain.Account, error) {
 	at, err := domain.ParseAccountType(accountType)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
 	}
 	a := domain.Account{
-		ID:       id.String(),
-		Name:     name,
-		Type:     at,
-		Currency: domain.Currency(currency),
-		Status:   domain.AccountStatus(status),
-		System:   isSystem,
+		ID:             id.String(),
+		Name:           name,
+		Type:           at,
+		Currency:       domain.Currency(currency),
+		Status:         domain.AccountStatus(status),
+		System:         isSystem,
+		PartyReference: textToPtr(partyReference),
+		PartyType:      textToPtr(partyType),
 	}
 	if minBalance.Valid {
 		v := minBalance.Int64

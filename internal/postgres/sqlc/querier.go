@@ -59,11 +59,13 @@ type Querier interface {
 	// alongside the chained head (ADR-017 section 5), so a caller can see whether
 	// the chain is current or behind.
 	CountPendingOutbox(ctx context.Context, tenantID uuid.UUID) (int64, error)
-	// min_balance (Task 5.5, audit A1.5) is nullable: sqlc.narg leaves it unset
-	// (NULL) when the caller passes no value, matching "no floor configured",
-	// every account's behavior before this column existed. status is NOT
-	// inserted explicitly: the column default ('active', migration 0022)
-	// applies, the same way CreateTenant leaves status to the column default.
+	// min_balance (Task 5.5, audit A1.5), party_reference, and party_type (Task
+	// 6.1, audit A9.1) are all nullable: sqlc.narg leaves each unset (NULL) when
+	// the caller passes no value, matching "no floor configured" / "no party
+	// linkage supplied", every account's behavior before these columns existed.
+	// status is NOT inserted explicitly: the column default ('active', migration
+	// 0022) applies, the same way CreateTenant leaves status to the column
+	// default.
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTenant(ctx context.Context, arg CreateTenantParams) error

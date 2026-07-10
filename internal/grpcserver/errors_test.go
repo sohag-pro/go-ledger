@@ -2,12 +2,14 @@ package grpcserver
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 func TestToStatus(t *testing.T) {
@@ -33,6 +35,12 @@ func TestToStatus(t *testing.T) {
 		{"overflow", domain.ErrOverflow, codes.InvalidArgument},
 		{"write conflict", domain.ErrConflict, codes.Unavailable},
 		{"policy violation", &domain.PolicyViolationError{Rule: domain.PolicyRuleMaxTransactionAmount, Currency: "USD", Amount: 100, Limit: 50}, codes.FailedPrecondition},
+		// Task 6.1, audit A9.1: an explicit screening veto is FailedPrecondition
+		// (well-formed request, fails a check, same class as the policy
+		// violation above); an ambiguous (non-veto) screening failure fails
+		// closed but is Unavailable, the same class as a write conflict.
+		{"screening rejected", &ledger.ScreeningRejectedError{Reason: "sanctions match"}, codes.FailedPrecondition},
+		{"screening unavailable", ledger.ErrScreeningUnavailable, codes.Unavailable},
 		{"unknown", errors.New("boom"), codes.Internal},
 	}
 	for _, tc := range cases {
@@ -48,5 +56,16 @@ func TestToStatus(t *testing.T) {
 				t.Errorf("code = %v, want %v", status.Code(got), tc.want)
 			}
 		})
+	}
+}
+
+// TestToStatus_ScreeningRejectedMessageNamesReason proves toStatus's
+// *ledger.ScreeningRejectedError branch (Task 6.1, audit A9.1) surfaces the
+// hook's own reason, not a generic message.
+func TestToStatus_ScreeningRejectedMessageNamesReason(t *testing.T) {
+	rejected := &ledger.ScreeningRejectedError{Reason: "sanctions list match"}
+	got := toStatus(rejected)
+	if !strings.Contains(status.Convert(got).Message(), "sanctions list match") {
+		t.Errorf("message = %q, want it to contain the hook's reason", status.Convert(got).Message())
 	}
 }

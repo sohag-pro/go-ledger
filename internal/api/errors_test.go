@@ -2,11 +2,13 @@ package api
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 // TestToHumaErr is a table-driven check of the domain-error-to-HTTP-status
@@ -30,6 +32,13 @@ func TestToHumaErr(t *testing.T) {
 		{"too few postings", domain.ErrTooFewPostings, 422, false},
 		{"invalid tenant policy", domain.ErrInvalidTenantPolicy, 422, false},
 		{"policy violation", &domain.PolicyViolationError{Rule: domain.PolicyRuleMaxTransactionAmount, Currency: "USD", Amount: 100, Limit: 50}, 422, false},
+		// Task 6.1, audit A9.1: an explicit screening veto is a well-formed
+		// request that just fails a check, so it maps to 422 like the other
+		// typed errors above; an ambiguous (non-veto) screening failure fails
+		// closed but is presented as retryable, mapping to 503 like
+		// domain.ErrConflict.
+		{"screening rejected", &ledger.ScreeningRejectedError{Reason: "sanctions match"}, 422, false},
+		{"screening unavailable", ledger.ErrScreeningUnavailable, 503, false},
 	}
 
 	for _, tt := range tests {
@@ -72,6 +81,39 @@ func TestToHumaErr_ConflictHasRetryAfter(t *testing.T) {
 	headersErr, ok := got.(huma.HeadersError)
 	if !ok {
 		t.Fatalf("toHumaErr(ErrConflict) = %v (%T), does not implement huma.HeadersError", got, got)
+	}
+	if retryAfter := headersErr.GetHeaders().Get("Retry-After"); retryAfter != "1" {
+		t.Errorf("Retry-After = %q, want %q", retryAfter, "1")
+	}
+}
+
+// TestToHumaErr_ScreeningRejectedMessageNamesReason proves toHumaErr's
+// *ledger.ScreeningRejectedError branch (Task 6.1, audit A9.1) surfaces the
+// hook's own reason, not a generic "screening rejected" string.
+func TestToHumaErr_ScreeningRejectedMessageNamesReason(t *testing.T) {
+	rejected := &ledger.ScreeningRejectedError{Reason: "sanctions list match"}
+	got := toHumaErr(rejected)
+	statusErr, ok := got.(huma.StatusError)
+	if !ok {
+		t.Fatalf("toHumaErr(%v) = %v (%T), does not implement huma.StatusError", rejected, got, got)
+	}
+	if statusErr.GetStatus() != 422 {
+		t.Errorf("status = %d, want 422", statusErr.GetStatus())
+	}
+	if !strings.Contains(statusErr.Error(), "sanctions list match") {
+		t.Errorf("error message = %q, want it to contain the hook's reason", statusErr.Error())
+	}
+}
+
+// TestToHumaErr_ScreeningUnavailableHasRetryAfter proves the ambiguous
+// screening-failure 503 (Task 6.1, audit A9.1) carries a Retry-After header,
+// the same as domain.ErrConflict's (TestToHumaErr_ConflictHasRetryAfter
+// above): the caller is told this is likely transient and worth retrying.
+func TestToHumaErr_ScreeningUnavailableHasRetryAfter(t *testing.T) {
+	got := toHumaErr(ledger.ErrScreeningUnavailable)
+	headersErr, ok := got.(huma.HeadersError)
+	if !ok {
+		t.Fatalf("toHumaErr(ErrScreeningUnavailable) = %v (%T), does not implement huma.HeadersError", got, got)
 	}
 	if retryAfter := headersErr.GetHeaders().Get("Retry-After"); retryAfter != "1" {
 		t.Errorf("Retry-After = %q, want %q", retryAfter, "1")

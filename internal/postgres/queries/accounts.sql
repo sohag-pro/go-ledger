@@ -1,19 +1,21 @@
 -- name: CreateAccount :exec
--- min_balance (Task 5.5, audit A1.5) is nullable: sqlc.narg leaves it unset
--- (NULL) when the caller passes no value, matching "no floor configured",
--- every account's behavior before this column existed. status is NOT
--- inserted explicitly: the column default ('active', migration 0022)
--- applies, the same way CreateTenant leaves status to the column default.
-INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance)
-VALUES ($1, $2, $3, $4, $5, sqlc.narg(min_balance));
+-- min_balance (Task 5.5, audit A1.5), party_reference, and party_type (Task
+-- 6.1, audit A9.1) are all nullable: sqlc.narg leaves each unset (NULL) when
+-- the caller passes no value, matching "no floor configured" / "no party
+-- linkage supplied", every account's behavior before these columns existed.
+-- status is NOT inserted explicitly: the column default ('active', migration
+-- 0022) applies, the same way CreateTenant leaves status to the column
+-- default.
+INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance, party_reference, party_type)
+VALUES ($1, $2, $3, $4, $5, sqlc.narg(min_balance), sqlc.narg(party_reference), sqlc.narg(party_type));
 
 -- name: GetAccount :one
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
 FROM accounts
 WHERE tenant_id = $1 AND id = $2;
 
 -- name: ListAccounts :many
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
 FROM accounts
 WHERE tenant_id = $1
 ORDER BY name, id
@@ -95,4 +97,4 @@ INSERT INTO accounts (id, tenant_id, name, type, currency, is_system)
 VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (tenant_id, name) WHERE is_system
     DO UPDATE SET id = accounts.id
-RETURNING id, tenant_id, name, type, currency, status, min_balance, is_system, created_at;
+RETURNING id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type;

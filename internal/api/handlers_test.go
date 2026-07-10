@@ -960,6 +960,57 @@ func TestCreateAccount(t *testing.T) {
 			t.Errorf("min_balance = %v, want -50000", out.MinBalance)
 		}
 	})
+
+	// Task 6.1, audit A9.1: party_reference and party_type are optional
+	// linkage metadata for an external KYC/party system; both round-trip on
+	// the create response when supplied.
+	t.Run("create with party fields 201", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]any{"name": "KYC Linked", "type": "asset", "currency": "USD", "party_reference": "cust-98765", "party_type": "individual"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.PartyReference == nil || *out.PartyReference != "cust-98765" {
+			t.Errorf("party_reference = %v, want %q", out.PartyReference, "cust-98765")
+		}
+		if out.PartyType == nil || *out.PartyType != "individual" {
+			t.Errorf("party_type = %v, want %q", out.PartyType, "individual")
+		}
+
+		// A fresh GET reflects the same linkage metadata.
+		getRec := do(t, r, http.MethodGet, "/v1/accounts/"+out.ID, nil)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("get status %d, want 200 (%s)", getRec.Code, getRec.Body.String())
+		}
+		var got AccountBody
+		_ = json.Unmarshal(getRec.Body.Bytes(), &got)
+		if got.PartyReference == nil || *got.PartyReference != "cust-98765" {
+			t.Errorf("get party_reference = %v, want %q", got.PartyReference, "cust-98765")
+		}
+		if got.PartyType == nil || *got.PartyType != "individual" {
+			t.Errorf("get party_type = %v, want %q", got.PartyType, "individual")
+		}
+	})
+
+	// Without party fields, both are omitted (nullable), the same default
+	// behavior as every account before this feature existed.
+	t.Run("create without party fields omits them", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]any{"name": "No KYC Link", "type": "asset", "currency": "USD"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.PartyReference != nil {
+			t.Errorf("party_reference = %v, want nil", out.PartyReference)
+		}
+		if out.PartyType != nil {
+			t.Errorf("party_type = %v, want nil", out.PartyType)
+		}
+	})
 }
 
 // TestSetAccountStatusEndpoint covers POST /v1/accounts/{id}/status (Task

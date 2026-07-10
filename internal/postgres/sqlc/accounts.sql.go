@@ -123,24 +123,28 @@ func (q *Queries) AccountStatusFlags(ctx context.Context, arg AccountStatusFlags
 }
 
 const createAccount = `-- name: CreateAccount :exec
-INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance, party_reference, party_type)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 `
 
 type CreateAccountParams struct {
-	ID         uuid.UUID
-	TenantID   uuid.UUID
-	Name       string
-	Type       string
-	Currency   string
-	MinBalance pgtype.Int8
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	MinBalance     pgtype.Int8
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
 }
 
-// min_balance (Task 5.5, audit A1.5) is nullable: sqlc.narg leaves it unset
-// (NULL) when the caller passes no value, matching "no floor configured",
-// every account's behavior before this column existed. status is NOT
-// inserted explicitly: the column default ('active', migration 0022)
-// applies, the same way CreateTenant leaves status to the column default.
+// min_balance (Task 5.5, audit A1.5), party_reference, and party_type (Task
+// 6.1, audit A9.1) are all nullable: sqlc.narg leaves each unset (NULL) when
+// the caller passes no value, matching "no floor configured" / "no party
+// linkage supplied", every account's behavior before these columns existed.
+// status is NOT inserted explicitly: the column default ('active', migration
+// 0022) applies, the same way CreateTenant leaves status to the column
+// default.
 func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) error {
 	_, err := q.db.Exec(ctx, createAccount,
 		arg.ID,
@@ -149,12 +153,14 @@ func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) er
 		arg.Type,
 		arg.Currency,
 		arg.MinBalance,
+		arg.PartyReference,
+		arg.PartyType,
 	)
 	return err
 }
 
 const getAccount = `-- name: GetAccount :one
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
 FROM accounts
 WHERE tenant_id = $1 AND id = $2
 `
@@ -165,15 +171,17 @@ type GetAccountParams struct {
 }
 
 type GetAccountRow struct {
-	ID         uuid.UUID
-	TenantID   uuid.UUID
-	Name       string
-	Type       string
-	Currency   string
-	Status     string
-	MinBalance pgtype.Int8
-	IsSystem   bool
-	CreatedAt  time.Time
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	Status         string
+	MinBalance     pgtype.Int8
+	IsSystem       bool
+	CreatedAt      time.Time
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
 }
 
 func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error) {
@@ -189,6 +197,8 @@ func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (GetAcco
 		&i.MinBalance,
 		&i.IsSystem,
 		&i.CreatedAt,
+		&i.PartyReference,
+		&i.PartyType,
 	)
 	return i, err
 }
@@ -198,7 +208,7 @@ INSERT INTO accounts (id, tenant_id, name, type, currency, is_system)
 VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (tenant_id, name) WHERE is_system
     DO UPDATE SET id = accounts.id
-RETURNING id, tenant_id, name, type, currency, status, min_balance, is_system, created_at
+RETURNING id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
 `
 
 type GetOrCreateClearingAccountParams struct {
@@ -210,15 +220,17 @@ type GetOrCreateClearingAccountParams struct {
 }
 
 type GetOrCreateClearingAccountRow struct {
-	ID         uuid.UUID
-	TenantID   uuid.UUID
-	Name       string
-	Type       string
-	Currency   string
-	Status     string
-	MinBalance pgtype.Int8
-	IsSystem   bool
-	CreatedAt  time.Time
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	Status         string
+	MinBalance     pgtype.Int8
+	IsSystem       bool
+	CreatedAt      time.Time
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
 }
 
 // The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
@@ -264,12 +276,14 @@ func (q *Queries) GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreat
 		&i.MinBalance,
 		&i.IsSystem,
 		&i.CreatedAt,
+		&i.PartyReference,
+		&i.PartyType,
 	)
 	return i, err
 }
 
 const listAccounts = `-- name: ListAccounts :many
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
 FROM accounts
 WHERE tenant_id = $1
 ORDER BY name, id
@@ -282,15 +296,17 @@ type ListAccountsParams struct {
 }
 
 type ListAccountsRow struct {
-	ID         uuid.UUID
-	TenantID   uuid.UUID
-	Name       string
-	Type       string
-	Currency   string
-	Status     string
-	MinBalance pgtype.Int8
-	IsSystem   bool
-	CreatedAt  time.Time
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	Status         string
+	MinBalance     pgtype.Int8
+	IsSystem       bool
+	CreatedAt      time.Time
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
 }
 
 func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error) {
@@ -312,6 +328,8 @@ func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]L
 			&i.MinBalance,
 			&i.IsSystem,
 			&i.CreatedAt,
+			&i.PartyReference,
+			&i.PartyType,
 		); err != nil {
 			return nil, err
 		}

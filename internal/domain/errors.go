@@ -168,4 +168,10 @@ var (
 	// otherwise well-formed, it just would take an account below its
 	// configured floor.
 	ErrMinBalanceBreach = errors.New("domain: posting would breach account minimum balance")
+	// ErrPartyReferenceTooLong is returned when an Account's PartyReference
+	// exceeds MaxPartyReferenceLen (Task 6.1, audit A9.1).
+	ErrPartyReferenceTooLong = errors.New("domain: account party reference too long")
+	// ErrPartyTypeTooLong is returned when an Account's PartyType exceeds
+	// MaxPartyTypeLen (Task 6.1, audit A9.1).
+	ErrPartyTypeTooLong = errors.New("domain: account party type too long")
 )

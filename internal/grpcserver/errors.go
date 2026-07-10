@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 // toStatus maps a domain error to a gRPC status error. It mirrors the REST
@@ -45,6 +46,14 @@ func toStatus(err error) error {
 	if errors.As(err, &minBalanceErr) {
 		return status.Error(codes.FailedPrecondition, minBalanceErr.Error())
 	}
+	// *ledger.ScreeningRejectedError (Task 6.1, audit A9.1): an external
+	// screening/compliance hook explicitly vetoed the post. FailedPrecondition,
+	// the same class as the checks above: the request itself is well-formed,
+	// it just fails a check, here naming the hook's own reason.
+	var screeningRejectedErr *ledger.ScreeningRejectedError
+	if errors.As(err, &screeningRejectedErr) {
+		return status.Error(codes.FailedPrecondition, screeningRejectedErr.Error())
+	}
 
 	switch {
 	case err == nil:
@@ -65,6 +74,11 @@ func toStatus(err error) error {
 		return status.Error(codes.AlreadyExists, "idempotency key was reused with a different request body")
 	case errors.Is(err, domain.ErrConflict):
 		return status.Error(codes.Unavailable, "write conflict, please retry")
+	// ledger.ErrScreeningUnavailable (Task 6.1, audit A9.1): an AMBIGUOUS
+	// screening failure (not an explicit veto), fail closed but presented as
+	// retryable, the same class as ErrConflict above.
+	case errors.Is(err, ledger.ErrScreeningUnavailable):
+		return status.Error(codes.Unavailable, "screening system unavailable, please retry")
 	case errors.Is(err, domain.ErrUnbalanced):
 		return status.Error(codes.InvalidArgument, "transaction postings must sum to zero")
 	case errors.Is(err, domain.ErrCurrencyMismatch):
