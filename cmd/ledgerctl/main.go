@@ -101,6 +101,11 @@ var commands = map[string]map[string]handler{
 	"rate": {
 		"set": rateSet,
 	},
+	"webhook": {
+		"add":    webhookAdd,
+		"list":   webhookList,
+		"remove": webhookRemove,
+	},
 }
 
 // usage is printed on a missing or unrecognized subcommand.
@@ -117,6 +122,10 @@ const usage = `usage: ledgerctl <resource> <action> [flags]
   key list --tenant ID
 
   rate set --tenant ID --base BASE --quote QUOTE --mid RATE [--spread-bps BPS] [--source SOURCE] [--effective-at RFC3339]
+
+  webhook add --tenant ID --url URL [--events a,b]
+  webhook list --tenant ID
+  webhook remove --id ID
 
 DATABASE_URL must be set.`
 
@@ -538,6 +547,112 @@ func rateSet(ctx context.Context, svc *admin.Service, out *os.File, args []strin
 	}
 	_, _ = fmt.Fprintf(out, "tenant %s: %s/%s mid_rate_e8=%d spread_bps=%d source=%s effective_at=%s\n",
 		a.tenantID, a.base, a.quote, a.midRateE8, a.spreadBps, a.source, effectiveAtStr)
+	return nil
+}
+
+// --- webhook subcommands (Task 4.1, audit A7.1) ---
+
+// parseWebhookEvents splits a comma-separated --events value into a
+// []string of action names, the same shape parseScopes uses for --scopes:
+// admin.Service validates the URL itself (domain.ErrInvalidWebhookURL); this
+// CLI does not second-guess event-type names, since new actions can be added
+// without this command needing to know their full set in advance.
+func parseWebhookEvents(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func parseWebhookAdd(args []string) (tenantID, url string, events []string, err error) {
+	fs := flag.NewFlagSet("webhook add", flag.ContinueOnError)
+	tenantFlag := fs.String("tenant", "", "tenant id (required)")
+	urlFlag := fs.String("url", "", "callback URL, http or https (required)")
+	eventsFlag := fs.String("events", "", "comma-separated event types to receive, e.g. transaction.created (omitted = every event)")
+	if err := fs.Parse(args); err != nil {
+		return "", "", nil, err
+	}
+	if *tenantFlag == "" {
+		return "", "", nil, errors.New("--tenant is required")
+	}
+	if *urlFlag == "" {
+		return "", "", nil, errors.New("--url is required")
+	}
+	return *tenantFlag, *urlFlag, parseWebhookEvents(*eventsFlag), nil
+}
+
+func webhookAdd(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
+	tenantID, url, events, err := parseWebhookAdd(args)
+	if err != nil {
+		return err
+	}
+	secret, sub, err := svc.CreateWebhookSubscription(ctx, tenantID, url, events)
+	if err != nil {
+		return fmt.Errorf("create webhook subscription: %w", err)
+	}
+	_, _ = fmt.Fprintln(out, "=============================================================")
+	_, _ = fmt.Fprintln(out, "  WEBHOOK SIGNING SECRET (shown once, store this now)")
+	_, _ = fmt.Fprintln(out, "=============================================================")
+	_, _ = fmt.Fprintf(out, "  %s\n", secret)
+	_, _ = fmt.Fprintln(out, "=============================================================")
+	eventsStr := "all"
+	if len(sub.EventTypes) > 0 {
+		eventsStr = strings.Join(sub.EventTypes, ",")
+	}
+	_, _ = fmt.Fprintf(out, "id=%s tenant=%s url=%s events=%s\n", sub.ID, sub.TenantID, sub.URL, eventsStr)
+	return nil
+}
+
+func webhookList(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
+	fs := flag.NewFlagSet("webhook list", flag.ContinueOnError)
+	tenantFlag := fs.String("tenant", "", "tenant id (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *tenantFlag == "" {
+		return errors.New("--tenant is required")
+	}
+
+	subs, err := svc.ListWebhookSubscriptions(ctx, *tenantFlag)
+	if err != nil {
+		return fmt.Errorf("list webhook subscriptions: %w", err)
+	}
+	if len(subs) == 0 {
+		_, _ = fmt.Fprintln(out, "no webhook subscriptions")
+		return nil
+	}
+	for _, s := range subs {
+		status := "active"
+		if !s.Active {
+			status = "inactive"
+		}
+		eventsStr := "all"
+		if len(s.EventTypes) > 0 {
+			eventsStr = strings.Join(s.EventTypes, ",")
+		}
+		_, _ = fmt.Fprintf(out, "%s\t%s\t%s\tevents=%s\n", s.ID, status, s.URL, eventsStr)
+	}
+	return nil
+}
+
+func webhookRemove(ctx context.Context, svc *admin.Service, out *os.File, args []string) error {
+	id, err := parseKeyID("webhook remove", args)
+	if err != nil {
+		return err
+	}
+	if err := svc.DeleteWebhookSubscription(ctx, id); err != nil {
+		return fmt.Errorf("remove webhook subscription: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, "removed webhook subscription %s\n", id)
 	return nil
 }
 

@@ -26,6 +26,9 @@ func TestResolveHandlerKnownSubcommands(t *testing.T) {
 		{"key", "revoke"},
 		{"key", "list"},
 		{"rate", "set"},
+		{"webhook", "add"},
+		{"webhook", "list"},
+		{"webhook", "remove"},
 	}
 	for _, tc := range cases {
 		h, err := resolveHandler(tc.resource, tc.action)
@@ -423,5 +426,71 @@ func TestParseTenantPolicyMissingTenant(t *testing.T) {
 	t.Parallel()
 	if _, _, err := parseTenantPolicy([]string{"--max-amount", "100"}); err == nil {
 		t.Fatal("parseTenantPolicy with no --tenant: expected an error")
+	}
+}
+
+// --- webhook subcommands (Task 4.1, audit A7.1) ---
+
+func TestParseWebhookEvents(t *testing.T) {
+	t.Parallel()
+	if got := parseWebhookEvents(""); got != nil {
+		t.Errorf("parseWebhookEvents(\"\") = %v, want nil", got)
+	}
+	got := parseWebhookEvents("transaction.created, transaction.reversed ,")
+	want := []string{"transaction.created", "transaction.reversed"}
+	if len(got) != len(want) {
+		t.Fatalf("parseWebhookEvents = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("parseWebhookEvents[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseWebhookAddValid(t *testing.T) {
+	t.Parallel()
+	tenantID, url, events, err := parseWebhookAdd([]string{
+		"--tenant", "t1", "--url", "https://example.com/hooks", "--events", "transaction.created",
+	})
+	if err != nil {
+		t.Fatalf("parseWebhookAdd: %v", err)
+	}
+	if tenantID != "t1" || url != "https://example.com/hooks" {
+		t.Errorf("tenantID/url = %q/%q, want t1/https://example.com/hooks", tenantID, url)
+	}
+	if len(events) != 1 || events[0] != "transaction.created" {
+		t.Errorf("events = %v, want [transaction.created]", events)
+	}
+}
+
+func TestParseWebhookAddOmittedEventsIsNil(t *testing.T) {
+	t.Parallel()
+	_, _, events, err := parseWebhookAdd([]string{"--tenant", "t1", "--url", "https://example.com/hooks"})
+	if err != nil {
+		t.Fatalf("parseWebhookAdd: %v", err)
+	}
+	if events != nil {
+		t.Errorf("events = %v, want nil (every event)", events)
+	}
+}
+
+func TestParseWebhookAddRequiredFlags(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing tenant", []string{"--url", "https://example.com/hooks"}},
+		{"missing url", []string{"--tenant", "t1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, _, err := parseWebhookAdd(tc.args)
+			if err == nil {
+				t.Fatalf("parseWebhookAdd(%v): expected an error", tc.args)
+			}
+		})
 	}
 }

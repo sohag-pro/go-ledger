@@ -51,6 +51,13 @@ type fakeRepo struct {
 	audit        []domain.AuditEntry
 	apiKeys      map[string]domain.APIKey // key_hash -> resolved key
 	tenants      map[string]domain.Tenant // tenant id -> tenant row
+	// webhookSubs is a minimal in-memory stand-in for webhook_subscriptions
+	// (Task 4.1, audit A7.1), keyed by subscription id. No handler test in
+	// this package exercises fan-out or delivery (that is covered by
+	// internal/webhook's own Postgres-backed integration tests, which
+	// operate directly through sqlc rather than domain.Repository); this
+	// exists only so the admin webhook CRUD handlers have something to call.
+	webhookSubs map[string]domain.WebhookSubscription
 }
 
 type postingRec struct {
@@ -77,6 +84,7 @@ func newFakeRepo() *fakeRepo {
 		idem:         map[string]fakeIdemEntry{},
 		apiKeys:      map[string]domain.APIKey{},
 		tenants:      map[string]domain.Tenant{},
+		webhookSubs:  map[string]domain.WebhookSubscription{},
 	}
 }
 
@@ -626,6 +634,42 @@ func (f *fakeRepo) TenantDailyDebits(_ context.Context, _ string) (map[string]in
 // CurrentFXRate's SQL, not on repository plumbing this fake stands in for);
 // it exists only so fakeRepo keeps satisfying domain.Repository.
 func (f *fakeRepo) InsertFXRate(_ context.Context, _ *string, _, _ domain.Currency, _ int64, _ int32, _ string, _ *time.Time) error {
+	return nil
+}
+
+// CreateWebhookSubscription mirrors the real repository's tenant-existence
+// gate (Task 4.1) so the handler tests that exercise it (a missing tenant
+// must 404, not 201) do not need a real database to prove it.
+func (f *fakeRepo) CreateWebhookSubscription(_ context.Context, sub *domain.WebhookSubscription, _ string) error {
+	if _, ok := f.tenants[sub.TenantID]; !ok {
+		return domain.ErrTenantNotFound
+	}
+	if sub.ID == "" {
+		sub.ID = uuid.NewString()
+	}
+	sub.Active = true
+	sub.CreatedAt = time.Now()
+	f.webhookSubs[sub.ID] = *sub
+	return nil
+}
+
+func (f *fakeRepo) ListWebhookSubscriptionsByTenant(_ context.Context, tenantID string) ([]domain.WebhookSubscription, error) {
+	out := make([]domain.WebhookSubscription, 0)
+	for _, s := range f.webhookSubs {
+		if s.TenantID == tenantID {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) SetWebhookSubscriptionActive(_ context.Context, id string, active bool) error {
+	s, ok := f.webhookSubs[id]
+	if !ok {
+		return domain.ErrWebhookSubscriptionNotFound
+	}
+	s.Active = active
+	f.webhookSubs[id] = s
 	return nil
 }
 

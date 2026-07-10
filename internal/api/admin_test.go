@@ -404,3 +404,129 @@ func TestAdminSetTenantPolicy(t *testing.T) {
 		t.Errorf("non-admin key: status = %d, want 403 (%s)", forbiddenRec.Code, forbiddenRec.Body.String())
 	}
 }
+
+// TestAdminWebhookSubscriptionCRUD exercises the full webhook admin surface
+// over REST (Task 4.1, audit A7.1): a non-admin key is rejected with 403
+// before the handler runs; create returns a non-empty secret exactly once;
+// list shows the subscription with no secret field at all (not just an
+// empty one: WebhookSubscriptionBody has no such field, checked here via a
+// raw map decode as belt-and-suspenders on top of the type system, the same
+// style TestAdminRotateAndRevokeKey uses for a key's plaintext); and delete
+// deactivates it (still listed, Active=false) rather than removing it.
+func TestAdminWebhookSubscriptionCRUD(t *testing.T) {
+	repo := newAdminTestRouter(t)
+	r := newAPIRouter(repo)
+
+	createBody := map[string]any{
+		"tenant_id":   adminTestTenant,
+		"url":         "https://example.com/hooks",
+		"event_types": []string{"transaction.created"},
+	}
+
+	forbidden := doAs(t, r, postOnlyKeyPlaintext, http.MethodPost, "/v1/admin/webhooks", createBody)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("post-only key creating a subscription: status = %d, want 403 (%s)", forbidden.Code, forbidden.Body.String())
+	}
+
+	createRec := doAs(t, r, adminKeyPlaintext, http.MethodPost, "/v1/admin/webhooks", createBody)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create webhook subscription: status = %d, want 201 (%s)", createRec.Code, createRec.Body.String())
+	}
+	var issued IssuedWebhookSubscriptionBody
+	if err := json.Unmarshal(createRec.Body.Bytes(), &issued); err != nil {
+		t.Fatalf("decode issued subscription: %v", err)
+	}
+	if issued.Secret == "" {
+		t.Fatal("issued subscription response has an empty secret")
+	}
+	if issued.TenantID != adminTestTenant {
+		t.Errorf("issued subscription TenantID = %q, want %q", issued.TenantID, adminTestTenant)
+	}
+	if issued.ID == "" {
+		t.Fatal("issued subscription has an empty id")
+	}
+
+	listRec := doAs(t, r, adminKeyPlaintext, http.MethodGet, "/v1/admin/webhooks?tenant_id="+adminTestTenant, nil)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list webhook subscriptions: status = %d, want 200 (%s)", listRec.Code, listRec.Body.String())
+	}
+	var listed ListWebhookSubscriptionsOutput
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listed.Body); err != nil {
+		t.Fatalf("decode subscription list: %v", err)
+	}
+	var found *WebhookSubscriptionBody
+	for i, s := range listed.Body.Subscriptions {
+		if s.ID == issued.ID {
+			found = &listed.Body.Subscriptions[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("list-webhook-subscriptions did not include the just-created subscription: %s", listRec.Body.String())
+	}
+	if !found.Active {
+		t.Error("newly created subscription Active = false, want true")
+	}
+	if len(found.EventTypes) != 1 || found.EventTypes[0] != "transaction.created" {
+		t.Errorf("EventTypes = %v, want [transaction.created]", found.EventTypes)
+	}
+
+	// The raw response never carries a "secret" field at all (
+	// WebhookSubscriptionBody has no such field): confirm none of the
+	// marshaled entries decode one, as a belt-and-suspenders check on top of
+	// the type system.
+	var raw struct {
+		Subscriptions []map[string]any `json:"subscriptions"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw subscription list: %v", err)
+	}
+	for _, s := range raw.Subscriptions {
+		if _, ok := s["secret"]; ok {
+			t.Errorf("list-webhook-subscriptions entry unexpectedly has a secret field: %v", s)
+		}
+	}
+
+	deleteRec := doAs(t, r, adminKeyPlaintext, http.MethodDelete, "/v1/admin/webhooks/"+issued.ID, nil)
+	if deleteRec.Code != http.StatusNoContent {
+		t.Fatalf("delete webhook subscription: status = %d, want 204 (%s)", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	listAfterDeleteRec := doAs(t, r, adminKeyPlaintext, http.MethodGet, "/v1/admin/webhooks?tenant_id="+adminTestTenant, nil)
+	var listedAfterDelete ListWebhookSubscriptionsOutput
+	if err := json.Unmarshal(listAfterDeleteRec.Body.Bytes(), &listedAfterDelete.Body); err != nil {
+		t.Fatalf("decode subscription list after delete: %v", err)
+	}
+	var foundAfterDelete *WebhookSubscriptionBody
+	for i, s := range listedAfterDelete.Body.Subscriptions {
+		if s.ID == issued.ID {
+			foundAfterDelete = &listedAfterDelete.Body.Subscriptions[i]
+		}
+	}
+	if foundAfterDelete == nil {
+		t.Fatal("subscription disappeared from the list after delete, want it still listed (deactivated, not removed)")
+	}
+	if foundAfterDelete.Active {
+		t.Error("subscription Active = true after delete, want false")
+	}
+
+	// Deleting an unknown id 404s.
+	notFoundRec := doAs(t, r, adminKeyPlaintext, http.MethodDelete, "/v1/admin/webhooks/00000000-0000-0000-0000-000000000000", nil)
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Errorf("delete unknown subscription: status = %d, want 404 (%s)", notFoundRec.Code, notFoundRec.Body.String())
+	}
+}
+
+// TestAdminCreateWebhookSubscriptionInvalidURLIs422 proves a malformed url
+// is rejected with 422 before any subscription is created.
+func TestAdminCreateWebhookSubscriptionInvalidURLIs422(t *testing.T) {
+	repo := newAdminTestRouter(t)
+	r := newAPIRouter(repo)
+
+	rec := doAs(t, r, adminKeyPlaintext, http.MethodPost, "/v1/admin/webhooks", map[string]any{
+		"tenant_id": adminTestTenant,
+		"url":       "not-a-url",
+	})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("create subscription with a malformed url: status = %d, want 422 (%s)", rec.Code, rec.Body.String())
+	}
+}

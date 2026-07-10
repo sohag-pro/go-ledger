@@ -245,3 +245,48 @@ func (s *Service) SetTenantPolicy(ctx context.Context, tenantID string, policy d
 	}
 	return s.repo.SetTenantSettings(ctx, tenantID, raw)
 }
+
+// CreateWebhookSubscription mints a new webhook subscription for tenantID
+// (Task 4.1, audit A7.1): it validates url before ever generating a secret
+// or writing a row (domain.WebhookSubscription.Validate, ErrInvalidWebhookURL
+// for anything that is not an absolute http/https URL), generates a fresh
+// CSPRNG signing secret (domain.GenerateWebhookSecret), and returns that
+// secret exactly once, alongside the stored subscription. It returns
+// domain.ErrTenantNotFound if tenantID names a tenant that does not exist.
+// Unlike IssueKey, it does not require the tenant to be active: an operator
+// may want to configure a subscription ahead of, or during, a status
+// change, the same reasoning SetFXRate and SetTenantPolicy already
+// document for their own calls.
+func (s *Service) CreateWebhookSubscription(ctx context.Context, tenantID, url string, eventTypes []string) (string, domain.WebhookSubscription, error) {
+	sub := domain.WebhookSubscription{TenantID: tenantID, URL: url, EventTypes: eventTypes}
+	if err := sub.Validate(); err != nil {
+		return "", domain.WebhookSubscription{}, err
+	}
+	secret, err := domain.GenerateWebhookSecret()
+	if err != nil {
+		return "", domain.WebhookSubscription{}, fmt.Errorf("admin: generate webhook secret: %w", err)
+	}
+	if err := s.repo.CreateWebhookSubscription(ctx, &sub, secret); err != nil {
+		return "", domain.WebhookSubscription{}, err
+	}
+	return secret, sub, nil
+}
+
+// ListWebhookSubscriptions returns every subscription for tenantID, oldest
+// first, active or not. It never returns a secret: that is shown once, at
+// CreateWebhookSubscription time, and domain.WebhookSubscription itself
+// carries no field capable of holding one.
+func (s *Service) ListWebhookSubscriptions(ctx context.Context, tenantID string) ([]domain.WebhookSubscription, error) {
+	return s.repo.ListWebhookSubscriptionsByTenant(ctx, tenantID)
+}
+
+// DeleteWebhookSubscription deactivates the subscription identified by id
+// (Task 4.1): it stops the fan-out worker from creating any further pending
+// deliveries for it and stops the delivery worker from attempting any of its
+// already-pending rows, without discarding delivery history (see
+// domain.Repository.SetWebhookSubscriptionActive's doc comment for why this
+// is a deactivate, not a hard delete). It returns
+// domain.ErrWebhookSubscriptionNotFound if no subscription matches id.
+func (s *Service) DeleteWebhookSubscription(ctx context.Context, id string) error {
+	return s.repo.SetWebhookSubscriptionActive(ctx, id, false)
+}

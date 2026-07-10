@@ -54,6 +54,10 @@ func toHumaErr(err error) error {
 		return huma.Error404NotFound("tenant not found")
 	case errors.Is(err, domain.ErrAPIKeyNotFound):
 		return huma.Error404NotFound("api key not found")
+	case errors.Is(err, domain.ErrWebhookSubscriptionNotFound):
+		return huma.Error404NotFound("webhook subscription not found")
+	case errors.Is(err, domain.ErrInvalidWebhookURL):
+		return huma.Error422UnprocessableEntity("webhook url must be an absolute http or https URL")
 	case errors.Is(err, domain.ErrInvalidTenant):
 		return huma.Error422UnprocessableEntity("invalid tenant name or status")
 	case errors.Is(err, admin.ErrInvalidScopes):

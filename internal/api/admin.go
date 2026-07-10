@@ -118,6 +118,93 @@ func toIssuedKeyBody(plaintext string, k domain.APIKey) IssuedKeyBody {
 	}
 }
 
+// WebhookSubscriptionBody is the JSON shape of a webhook subscription in the
+// list-webhook-subscriptions response (Task 4.1, audit A7.1). It never
+// carries the signing secret: that is shown once, at creation time, in
+// IssuedWebhookSubscriptionBody below.
+type WebhookSubscriptionBody struct {
+	ID         string    `json:"id" doc:"Subscription id (UUID)"`
+	TenantID   string    `json:"tenant_id"`
+	URL        string    `json:"url"`
+	EventTypes []string  `json:"event_types" doc:"Actions this subscription receives; empty means every action"`
+	Active     bool      `json:"active"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+func toWebhookSubscriptionBody(s domain.WebhookSubscription) WebhookSubscriptionBody {
+	eventTypes := s.EventTypes
+	if eventTypes == nil {
+		eventTypes = []string{}
+	}
+	return WebhookSubscriptionBody{
+		ID:         s.ID,
+		TenantID:   s.TenantID,
+		URL:        s.URL,
+		EventTypes: eventTypes,
+		Active:     s.Active,
+		CreatedAt:  s.CreatedAt,
+	}
+}
+
+// IssuedWebhookSubscriptionBody is the JSON shape of a just-created webhook
+// subscription: its metadata plus the signing secret, shown exactly once.
+// Store it now: only the secret's own value is ever persisted (Task 4.1,
+// unlike an api key it is not hashed, since the delivery worker must read it
+// back to sign every outbound payload), but it is still never returned
+// again by any read after this one response.
+type IssuedWebhookSubscriptionBody struct {
+	ID         string   `json:"id"`
+	TenantID   string   `json:"tenant_id"`
+	URL        string   `json:"url"`
+	EventTypes []string `json:"event_types"`
+	Secret     string   `json:"secret" doc:"HMAC-SHA256 signing secret. Shown once: store it now, it cannot be retrieved again. Verify each delivery's X-Ledger-Signature header as sha256=hex(hmac_sha256(secret, raw_body))."`
+}
+
+func toIssuedWebhookSubscriptionBody(secret string, s domain.WebhookSubscription) IssuedWebhookSubscriptionBody {
+	eventTypes := s.EventTypes
+	if eventTypes == nil {
+		eventTypes = []string{}
+	}
+	return IssuedWebhookSubscriptionBody{
+		ID:         s.ID,
+		TenantID:   s.TenantID,
+		URL:        s.URL,
+		EventTypes: eventTypes,
+		Secret:     secret,
+	}
+}
+
+// CreateWebhookSubscriptionInput is the create-subscription request body.
+type CreateWebhookSubscriptionInput struct {
+	Body struct {
+		TenantID   string   `json:"tenant_id" format:"uuid" doc:"Tenant this subscription belongs to"`
+		URL        string   `json:"url" doc:"Callback URL; must be an absolute http or https URL"`
+		EventTypes []string `json:"event_types,omitempty" doc:"Actions to receive, e.g. transaction.created, transaction.reversed. Omit (or leave empty) to receive every action."`
+	}
+}
+
+// CreateWebhookSubscriptionOutput wraps a newly created subscription.
+type CreateWebhookSubscriptionOutput struct {
+	Body IssuedWebhookSubscriptionBody
+}
+
+// ListWebhookSubscriptionsInput is the list-webhook-subscriptions request: a
+// required tenant filter.
+type ListWebhookSubscriptionsInput struct {
+	TenantID string `query:"tenant_id" format:"uuid" required:"true" doc:"Tenant to list webhook subscriptions for"`
+}
+
+// ListWebhookSubscriptionsOutput is the list-webhook-subscriptions response.
+type ListWebhookSubscriptionsOutput struct {
+	Body struct {
+		Subscriptions []WebhookSubscriptionBody `json:"subscriptions"`
+	}
+}
+
+type webhookSubscriptionIDInput struct {
+	ID string `path:"id" format:"uuid" doc:"Webhook subscription id"`
+}
+
 // scopesToStrs converts []domain.Scope to []string for a JSON response body.
 func scopesToStrs(scopes []domain.Scope) []string {
 	out := make([]string, len(scopes))
@@ -322,5 +409,60 @@ func registerAdmin(api huma.API, deps Deps) {
 			out.Body.Keys = append(out.Body.Keys, toKeyBody(k))
 		}
 		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "create-webhook-subscription",
+		Method:        http.MethodPost,
+		Path:          "/v1/admin/webhooks",
+		Summary:       "Create a webhook subscription",
+		Description:   "Registers a callback URL to receive signed, retried, at-least-once webhook deliveries for a tenant's posted transactions (Task 4.1). The signing secret is returned exactly once, in this response, and is never stored anywhere recoverable again: store it now to verify each delivery's X-Ledger-Signature header.",
+		Tags:          []string{"admin"},
+		DefaultStatus: http.StatusCreated,
+		MaxBodyBytes:  MaxRequestBodyBytes,
+		Security:      bearerSecurity,
+	}, func(ctx context.Context, in *CreateWebhookSubscriptionInput) (*CreateWebhookSubscriptionOutput, error) {
+		secret, sub, err := deps.Admin.CreateWebhookSubscription(ctx, in.Body.TenantID, in.Body.URL, in.Body.EventTypes)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &CreateWebhookSubscriptionOutput{Body: toIssuedWebhookSubscriptionBody(secret, sub)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-webhook-subscriptions",
+		Method:      http.MethodGet,
+		Path:        "/v1/admin/webhooks",
+		Summary:     "List a tenant's webhook subscriptions",
+		Description: "Lists every subscription for a tenant, active or not. Never includes the signing secret: that is shown once, at creation time, and is never recoverable afterward.",
+		Tags:        []string{"admin"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, in *ListWebhookSubscriptionsInput) (*ListWebhookSubscriptionsOutput, error) {
+		subs, err := deps.Admin.ListWebhookSubscriptions(ctx, in.TenantID)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		out := &ListWebhookSubscriptionsOutput{}
+		out.Body.Subscriptions = make([]WebhookSubscriptionBody, 0, len(subs))
+		for _, s := range subs {
+			out.Body.Subscriptions = append(out.Body.Subscriptions, toWebhookSubscriptionBody(s))
+		}
+		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "delete-webhook-subscription",
+		Method:        http.MethodDelete,
+		Path:          "/v1/admin/webhooks/{id}",
+		Summary:       "Delete a webhook subscription",
+		Description:   "Deactivates the subscription: the fan-out worker stops creating new pending deliveries for it and the delivery worker stops attempting its existing pending ones, but its delivery history is kept, not discarded.",
+		Tags:          []string{"admin"},
+		DefaultStatus: http.StatusNoContent,
+		Security:      bearerSecurity,
+	}, func(ctx context.Context, in *webhookSubscriptionIDInput) (*EmptyOutput, error) {
+		if err := deps.Admin.DeleteWebhookSubscription(ctx, in.ID); err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &EmptyOutput{}, nil
 	})
 }

@@ -197,6 +197,27 @@ components:
         - currency
         - postings
       type: object
+    CreateWebhookSubscriptionInputBody:
+      additionalProperties: false
+      properties:
+        event_types:
+          description: Actions to receive, e.g. transaction.created, transaction.reversed. Omit (or leave empty) to receive every action.
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        tenant_id:
+          description: Tenant this subscription belongs to
+          format: uuid
+          type: string
+        url:
+          description: Callback URL; must be an absolute http or https URL
+          type: string
+      required:
+        - tenant_id
+        - url
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -365,6 +386,31 @@ components:
         - expires_at
         - plaintext
       type: object
+    IssuedWebhookSubscriptionBody:
+      additionalProperties: false
+      properties:
+        event_types:
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        id:
+          type: string
+        secret:
+          description: "HMAC-SHA256 signing secret. Shown once: store it now, it cannot be retrieved again. Verify each delivery's X-Ledger-Signature header as sha256=hex(hmac_sha256(secret, raw_body))."
+          type: string
+        tenant_id:
+          type: string
+        url:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - url
+        - event_types
+        - secret
+      type: object
     KeyBody:
       additionalProperties: false
       properties:
@@ -435,6 +481,18 @@ components:
             - "null"
       required:
         - tenants
+      type: object
+    ListWebhookSubscriptionsOutputBody:
+      additionalProperties: false
+      properties:
+        subscriptions:
+          items:
+            $ref: "#/components/schemas/WebhookSubscriptionBody"
+          type:
+            - array
+            - "null"
+      required:
+        - subscriptions
       type: object
     PostingBody:
       additionalProperties: false
@@ -640,6 +698,36 @@ components:
         - checked
         - first_break_id
         - pending
+      type: object
+    WebhookSubscriptionBody:
+      additionalProperties: false
+      properties:
+        active:
+          type: boolean
+        created_at:
+          format: date-time
+          type: string
+        event_types:
+          description: Actions this subscription receives; empty means every action
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        id:
+          description: Subscription id (UUID)
+          type: string
+        tenant_id:
+          type: string
+        url:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - url
+        - event_types
+        - active
+        - created_at
       type: object
   securitySchemes:
     bearerAuth:
@@ -1132,6 +1220,92 @@ paths:
       security:
         - bearerAuth: []
       summary: Suspend, close, or reactivate a tenant
+      tags:
+        - admin
+  /v1/admin/webhooks:
+    get:
+      description: "Lists every subscription for a tenant, active or not. Never includes the signing secret: that is shown once, at creation time, and is never recoverable afterward."
+      operationId: list-webhook-subscriptions
+      parameters:
+        - description: Tenant to list webhook subscriptions for
+          explode: false
+          in: query
+          name: tenant_id
+          required: true
+          schema:
+            description: Tenant to list webhook subscriptions for
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWebhookSubscriptionsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List a tenant's webhook subscriptions
+      tags:
+        - admin
+    post:
+      description: "Registers a callback URL to receive signed, retried, at-least-once webhook deliveries for a tenant's posted transactions (Task 4.1). The signing secret is returned exactly once, in this response, and is never stored anywhere recoverable again: store it now to verify each delivery's X-Ledger-Signature header."
+      operationId: create-webhook-subscription
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWebhookSubscriptionInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedWebhookSubscriptionBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Create a webhook subscription
+      tags:
+        - admin
+  /v1/admin/webhooks/{id}:
+    delete:
+      description: "Deactivates the subscription: the fan-out worker stops creating new pending deliveries for it and the delivery worker stops attempting its existing pending ones, but its delivery history is kept, not discarded."
+      operationId: delete-webhook-subscription
+      parameters:
+        - description: Webhook subscription id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Webhook subscription id
+            format: uuid
+            type: string
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Delete a webhook subscription
       tags:
         - admin
   /v1/audit/verify:

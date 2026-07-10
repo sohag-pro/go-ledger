@@ -759,3 +759,129 @@ func TestSetTenantPolicyThenPostRespectsIt(t *testing.T) {
 		t.Errorf("PolicyViolationError.Rule = %s, want %s", pv.Rule, domain.PolicyRuleMaxTransactionAmount)
 	}
 }
+
+// TestCreateWebhookSubscriptionReturnsSecretOnceAndNeverInList proves the
+// Task 4.1 (audit A7.1) once-only secret discipline: CreateWebhookSubscription
+// returns a non-empty secret, and ListWebhookSubscriptions afterward carries
+// the subscription's metadata but has no field capable of returning that
+// secret again (domain.WebhookSubscription itself has no secret field).
+func TestCreateWebhookSubscriptionReturnsSecretOnceAndNeverInList(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "webhook create test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	secret, sub, err := svc.CreateWebhookSubscription(ctx, tenant.ID, "https://example.com/hooks", []string{domain.ActionTransactionCreated})
+	if err != nil {
+		t.Fatalf("create webhook subscription: %v", err)
+	}
+	if secret == "" {
+		t.Fatal("expected a non-empty secret")
+	}
+	if sub.ID == "" {
+		t.Fatal("expected an assigned subscription id")
+	}
+	if !sub.Active {
+		t.Error("expected a newly created subscription to be active")
+	}
+
+	subs, err := svc.ListWebhookSubscriptions(ctx, tenant.ID)
+	if err != nil {
+		t.Fatalf("list webhook subscriptions: %v", err)
+	}
+	if len(subs) != 1 || subs[0].ID != sub.ID {
+		t.Fatalf("ListWebhookSubscriptions = %v, want exactly [%s]", subs, sub.ID)
+	}
+	// domain.WebhookSubscription has no field capable of holding a secret at
+	// all, so there is nothing more to assert here beyond "it compiles and
+	// the metadata round-trips": that absence of a field is itself the
+	// guarantee a list call can never leak one.
+}
+
+// TestCreateWebhookSubscriptionInvalidURLErrors proves the URL is validated
+// before a secret is generated or any row is written: an empty or
+// non-http(s) URL fails with domain.ErrInvalidWebhookURL.
+func TestCreateWebhookSubscriptionInvalidURLErrors(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "webhook invalid url test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"empty", ""},
+		{"no scheme", "example.com/hooks"},
+		{"wrong scheme", "ftp://example.com/hooks"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, err := svc.CreateWebhookSubscription(ctx, tenant.ID, tc.url, nil)
+			if !errors.Is(err, domain.ErrInvalidWebhookURL) {
+				t.Errorf("CreateWebhookSubscription(url=%q): err = %v, want ErrInvalidWebhookURL", tc.url, err)
+			}
+		})
+	}
+}
+
+// TestCreateWebhookSubscriptionMissingTenantErrors proves creating a
+// subscription for a tenant id with no row fails closed with
+// domain.ErrTenantNotFound, before any secret is generated.
+func TestCreateWebhookSubscriptionMissingTenantErrors(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	_, _, err := svc.CreateWebhookSubscription(ctx, "00000000-0000-0000-0000-000000000000", "https://example.com/hooks", nil)
+	if !errors.Is(err, domain.ErrTenantNotFound) {
+		t.Errorf("CreateWebhookSubscription into missing tenant: err = %v, want ErrTenantNotFound", err)
+	}
+}
+
+// TestDeleteWebhookSubscriptionDeactivatesAndErrorsOnUnknownID proves
+// DeleteWebhookSubscription deactivates rather than removing the row (still
+// listed, just Active=false) and returns domain.ErrWebhookSubscriptionNotFound
+// for an id that never existed.
+func TestDeleteWebhookSubscriptionDeactivatesAndErrorsOnUnknownID(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestSvc(t)
+	ctx := context.Background()
+
+	tenant, err := svc.CreateTenant(ctx, "webhook delete test tenant")
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	_, sub, err := svc.CreateWebhookSubscription(ctx, tenant.ID, "https://example.com/hooks", nil)
+	if err != nil {
+		t.Fatalf("create webhook subscription: %v", err)
+	}
+
+	if err := svc.DeleteWebhookSubscription(ctx, sub.ID); err != nil {
+		t.Fatalf("delete webhook subscription: %v", err)
+	}
+	subs, err := svc.ListWebhookSubscriptions(ctx, tenant.ID)
+	if err != nil {
+		t.Fatalf("list webhook subscriptions: %v", err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("subscriptions after delete = %d, want still 1 (deactivated, not removed)", len(subs))
+	}
+	if subs[0].Active {
+		t.Error("subscription Active = true after delete, want false")
+	}
+
+	err = svc.DeleteWebhookSubscription(ctx, "00000000-0000-0000-0000-000000000000")
+	if !errors.Is(err, domain.ErrWebhookSubscriptionNotFound) {
+		t.Errorf("delete unknown webhook subscription: err = %v, want ErrWebhookSubscriptionNotFound", err)
+	}
+}
