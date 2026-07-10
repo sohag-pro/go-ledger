@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -360,6 +361,152 @@ func TestAuthInterceptorPostScopedKeyAllowedOnWriteRPC(t *testing.T) {
 	}
 	if !called {
 		t.Error("handler should have run for a post-scoped key on a write RPC")
+	}
+}
+
+// --- Rate limiting (Task 5.1, audit A2.2): these exercise
+// rateLimitUnaryInterceptor directly, the way the auth interceptor tests
+// above exercise authUnaryInterceptor, rather than through a full bufconn
+// server (server_test.go's TestGRPCRateLimit* covers the real chain wiring
+// end to end). ---
+
+// rateLimitTestKey is a fixed key id every rate-limit interceptor test below
+// authenticates as unless a test specifically needs a second, independent
+// key.
+var rateLimitTestKey = domain.APIKey{ID: "rate-limit-key-1", TenantID: "tenant-rl"}
+
+func rateLimitHandler(called *bool) grpc.UnaryHandler {
+	return func(_ context.Context, _ any) (any, error) {
+		*called = true
+		return nil, nil
+	}
+}
+
+func TestRateLimitInterceptorAllowsHealthCheckWithoutConsumingBudget(t *testing.T) {
+	limiter := auth.NewLimiter(1) // burst of exactly 1
+	interceptor := rateLimitUnaryInterceptor(limiter, discardLogger())
+	ctx := auth.WithKey(context.Background(), rateLimitTestKey)
+
+	for i := 0; i < 5; i++ {
+		called := false
+		_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: healthMethodPrefix + "Check"}, rateLimitHandler(&called))
+		if err != nil {
+			t.Fatalf("health check call %d: err = %v, want nil", i, err)
+		}
+		if !called {
+			t.Errorf("health check call %d: handler should have run", i)
+		}
+	}
+}
+
+func TestRateLimitInterceptorAllowsThroughWithNoKeyInContext(t *testing.T) {
+	limiter := auth.NewLimiter(1)
+	interceptor := rateLimitUnaryInterceptor(limiter, discardLogger())
+
+	called := false
+	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, rateLimitHandler(&called))
+	if err != nil {
+		t.Fatalf("no key in context: err = %v, want nil (defense-in-depth, not access control)", err)
+	}
+	if !called {
+		t.Error("handler should run when no key is in context, the same fail-open stance as HumaMiddleware")
+	}
+}
+
+// TestRateLimitInterceptorAllowsUnderLimitRejectsOverLimit proves a key within
+// its burst passes through untouched, and the call past its burst is
+// rejected with codes.ResourceExhausted carrying an errdetails.RetryInfo
+// detail, without ever reaching the handler.
+func TestRateLimitInterceptorAllowsUnderLimitRejectsOverLimit(t *testing.T) {
+	limiter := auth.NewLimiter(2) // burst of exactly 2
+	interceptor := rateLimitUnaryInterceptor(limiter, discardLogger())
+	ctx := auth.WithKey(context.Background(), rateLimitTestKey)
+	info := &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}
+
+	for i := 0; i < 2; i++ {
+		called := false
+		_, err := interceptor(ctx, nil, info, rateLimitHandler(&called))
+		if err != nil {
+			t.Fatalf("call %d within burst: err = %v, want nil", i, err)
+		}
+		if !called {
+			t.Errorf("call %d within burst: handler should have run", i)
+		}
+	}
+
+	called := false
+	_, err := interceptor(ctx, nil, info, rateLimitHandler(&called))
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("call past burst: code = %v, want ResourceExhausted", status.Code(err))
+	}
+	if called {
+		t.Error("handler should not run once the key's budget is exhausted")
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected a status error, got %v", err)
+	}
+	details := st.Details()
+	if len(details) != 1 {
+		t.Fatalf("expected exactly one detail, got %d: %v", len(details), details)
+	}
+	if _, ok := details[0].(*errdetails.RetryInfo); !ok {
+		t.Errorf("detail = %T, want *errdetails.RetryInfo", details[0])
+	}
+}
+
+// TestRateLimitInterceptorIndependentBucketsPerKey proves two distinct keys
+// each get their own budget: exhausting one does not affect the other.
+func TestRateLimitInterceptorIndependentBucketsPerKey(t *testing.T) {
+	limiter := auth.NewLimiter(1) // burst of exactly 1 per key
+	interceptor := rateLimitUnaryInterceptor(limiter, discardLogger())
+	info := &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}
+
+	keyA := domain.APIKey{ID: "rate-limit-key-A"}
+	keyB := domain.APIKey{ID: "rate-limit-key-B"}
+	ctxA := auth.WithKey(context.Background(), keyA)
+	ctxB := auth.WithKey(context.Background(), keyB)
+
+	calledA, calledB := false, false
+	if _, err := interceptor(ctxA, nil, info, rateLimitHandler(&calledA)); err != nil {
+		t.Fatalf("key A first call: err = %v, want nil", err)
+	}
+	if _, err := interceptor(ctxA, nil, info, rateLimitHandler(&calledA)); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("key A second call: code = %v, want ResourceExhausted", status.Code(err))
+	}
+	if _, err := interceptor(ctxB, nil, info, rateLimitHandler(&calledB)); err != nil {
+		t.Fatalf("key B first call: err = %v, want nil (independent bucket from key A)", err)
+	}
+	if !calledA || !calledB {
+		t.Errorf("calledA=%v calledB=%v, want both true from their own first call", calledA, calledB)
+	}
+}
+
+// TestRateLimitInterceptorSharesBucketAcrossTransports proves the design
+// decision documented on rateLimitUnaryInterceptor: passing the SAME
+// *auth.Limiter instance REST enforces means a token consumed through
+// auth.Limiter.Allow directly (standing in for a REST request having already
+// spent the key's budget) is visible to the gRPC interceptor for the exact
+// same key, so gRPC cannot be used to bypass the REST limit or vice versa.
+func TestRateLimitInterceptorSharesBucketAcrossTransports(t *testing.T) {
+	limiter := auth.NewLimiter(1) // burst of exactly 1
+	key := domain.APIKey{ID: "shared-bucket-key"}
+
+	// Simulate a REST request spending the key's entire budget.
+	if !limiter.Allow(key) {
+		t.Fatal("setup: REST-simulated Allow should have succeeded (fresh bucket)")
+	}
+
+	interceptor := rateLimitUnaryInterceptor(limiter, discardLogger())
+	ctx := auth.WithKey(context.Background(), key)
+	called := false
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, rateLimitHandler(&called))
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("gRPC call after REST spent the budget: code = %v, want ResourceExhausted", status.Code(err))
+	}
+	if called {
+		t.Error("handler should not run: the shared limiter had no budget left for this key")
 	}
 }
 

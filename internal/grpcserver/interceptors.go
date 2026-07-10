@@ -8,10 +8,12 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
@@ -124,6 +126,65 @@ func authUnaryInterceptor(resolver *auth.Resolver, log *slog.Logger) grpc.UnaryS
 		}
 
 		ctx = auth.WithKey(auth.WithTenant(ctx, key.TenantID), key)
+		return handler(ctx, req)
+	}
+}
+
+// rateLimitUnaryInterceptor enforces limiter against the calling API key for
+// every unary call except the gRPC health check (Task 5.1, audit A2.2),
+// bringing gRPC to parity with REST's auth.Limiter.HumaMiddleware. It must
+// run AFTER authUnaryInterceptor in the chain (see NewGRPCServer), so that
+// auth.KeyFromContext has a resolved key to find, the same ordering
+// HumaMiddleware depends on relative to the REST auth middleware.
+//
+// limiter is the SAME *auth.Limiter instance the REST layer enforces,
+// constructed once in cmd/server/main.go and passed to both api.Deps and
+// grpcserver.Deps: a key's per-minute budget is one shared token bucket
+// across both transports, so a client cannot spend a fresh budget on gRPC
+// after exhausting it on REST, or vice versa. Two different keys still get
+// fully independent buckets (auth.Limiter is keyed by APIKey.ID).
+//
+// Like HumaMiddleware, a missing key in context is let through rather than
+// failed closed: rate limiting is defense-in-depth on top of authentication,
+// not itself an access control, and authUnaryInterceptor is the component
+// that rejects an unauthenticated call. By the time a non-health call
+// reaches this interceptor, authUnaryInterceptor has always set a key on the
+// path that got here, so this branch is only ever reached by a future
+// ordering bug in NewGRPCServer's chain, not by normal traffic.
+//
+// Over budget -> codes.ResourceExhausted, carrying an errdetails.RetryInfo
+// with the SAME Retry-After value (via auth.Limiter.RetryAfterSeconds) REST
+// sends as a header, so a well-behaved gRPC client can back off with an
+// actual number instead of guessing.
+func rateLimitUnaryInterceptor(limiter *auth.Limiter, log *slog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if strings.HasPrefix(info.FullMethod, healthMethodPrefix) {
+			return handler(ctx, req)
+		}
+
+		key, ok := auth.KeyFromContext(ctx)
+		if !ok {
+			return handler(ctx, req)
+		}
+
+		if !limiter.Allow(key) {
+			st := status.New(codes.ResourceExhausted, "rate limit exceeded")
+			retryAfter := limiter.RetryAfterSeconds(key)
+			if withDetail, err := st.WithDetails(&errdetails.RetryInfo{
+				RetryDelay: durationpb.New(time.Duration(retryAfter) * time.Second),
+			}); err == nil {
+				st = withDetail
+			} else {
+				// WithDetails only fails if the detail message cannot be
+				// marshaled into an Any, which cannot happen for a
+				// well-formed RetryInfo; log it and still return the
+				// undecorated status rather than dropping the rejection.
+				log.LogAttrs(ctx, slog.LevelWarn, "rate limit: failed to attach RetryInfo detail",
+					slog.String("method", info.FullMethod), slog.String("error", err.Error()))
+			}
+			return nil, st.Err()
+		}
+
 		return handler(ctx, req)
 	}
 }

@@ -130,6 +130,42 @@ func TestLoadConfig_ValidatesDefaultCurrency(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_GRPCAddrDefaultsToLoopback proves GRPC_ADDR defaults to
+// loopback-only (Task 5.1, audit A2.2, ADR-015 Phase 5): the gRPC server
+// ships with no TLS of its own, so binding every interface by default (the
+// prior ":9091") would serve it in the clear to anyone who could reach the
+// box. An explicit GRPC_ADDR is still honored unchanged, so a deployment
+// that has terminated TLS in front of gRPC can still widen it deliberately.
+func TestLoadConfig_GRPCAddrDefaultsToLoopback(t *testing.T) {
+	tests := []struct {
+		name       string
+		grpcAddr   string
+		wantResult string
+	}{
+		{name: "unset defaults to loopback", grpcAddr: "", wantResult: "127.0.0.1:9091"},
+		{name: "explicit value is honored unchanged", grpcAddr: "0.0.0.0:9091", wantResult: "0.0.0.0:9091"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("DEFAULT_CURRENCY", "")
+			// t.Setenv cannot unset; loadConfig's getenv already treats an
+			// empty string as unset, so setting it to "" here has the same
+			// effect as GRPC_ADDR never being set.
+			t.Setenv("GRPC_ADDR", tt.grpcAddr)
+
+			cfg, err := loadConfig()
+			if err != nil {
+				t.Fatalf("loadConfig() with GRPC_ADDR=%q: unexpected error: %v", tt.grpcAddr, err)
+			}
+			if cfg.grpcAddr != tt.wantResult {
+				t.Errorf("grpcAddr = %q, want %q", cfg.grpcAddr, tt.wantResult)
+			}
+		})
+	}
+}
+
 // TestLoadConfig_IdempotencyTTL proves IDEMPOTENCY_TTL (Task 4.5, audit
 // A1.4) defaults to ledger.DefaultIdempotencyTTL (24h) when unset, accepts a
 // widened or narrowed override (a week, a minute), and fails loadConfig fast

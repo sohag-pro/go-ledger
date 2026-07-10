@@ -112,11 +112,31 @@ func authedCtx(ctx context.Context) context.Context {
 // hash would violate the api_keys unique constraint.
 var provisionTestAPIKeyOnce sync.Once
 
+// testDefaultRateLimitRPM is the rpm dialClient's default rate limiter uses:
+// deliberately far higher than any single test's call count (mirroring
+// loadTestAPIKeyRateLimitRPM in cmd/server/main.go), so ordinary handler and
+// integration tests never trip the rate-limit interceptor by accident. Tests
+// that specifically exercise rate limiting use dialClientWithLimiter with
+// their own tight limiter instead.
+const testDefaultRateLimitRPM = 1_000_000
+
 // dialClient starts the real gRPC server on a bufconn and returns a connected
 // generated client plus a cleanup func. opts is passed through to
 // ledger.NewTransactionService, e.g. ledger.WithFXProvider(...) for tests that
-// exercise Convert (which errors with ledger.ErrNoFXProvider without one).
+// exercise Convert (which errors with ledger.ErrNoFXProvider without one). It
+// is dialClientWithLimiter with a generous default limiter that no ordinary
+// test can exhaust; see testDefaultRateLimitRPM.
 func dialClient(t *testing.T, opts ...ledger.ServiceOption) ledgerv1.LedgerServiceClient {
+	t.Helper()
+	return dialClientWithLimiter(t, auth.NewLimiter(testDefaultRateLimitRPM), opts...)
+}
+
+// dialClientWithLimiter is dialClient but with an explicit *auth.Limiter, so
+// tests exercising the gRPC rate-limit interceptor (Task 5.1, audit A2.2) can
+// wire a tight rpm and drive it to codes.ResourceExhausted through a real
+// bufconn round trip, the same interceptor chain cmd/server/main.go wires in
+// production.
+func dialClientWithLimiter(t *testing.T, limiter *auth.Limiter, opts ...ledger.ServiceOption) ledgerv1.LedgerServiceClient {
 	t.Helper()
 	if poolErr != nil {
 		t.Skipf("skipping integration test: %v", poolErr)
@@ -140,6 +160,7 @@ func dialClient(t *testing.T, opts ...ledger.ServiceOption) ledgerv1.LedgerServi
 		Transactions: ledger.NewTransactionService(repo, nil, nil, opts...),
 		Audit:        ledger.NewAuditService(repo),
 		Auth:         auth.NewResolver(repo, time.Minute),
+		RateLimiter:  limiter,
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := grpcserver.NewGRPCServer(deps, log)

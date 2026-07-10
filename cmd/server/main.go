@@ -110,9 +110,17 @@ type config struct {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		port:            getenv("PORT", "8080"),
-		metricsAddr:     getenv("METRICS_ADDR", "127.0.0.1:9090"),
-		grpcAddr:        getenv("GRPC_ADDR", ":9091"),
+		port:        getenv("PORT", "8080"),
+		metricsAddr: getenv("METRICS_ADDR", "127.0.0.1:9090"),
+		// GRPC_ADDR defaults to loopback-only (Task 5.1, audit A2.2, ADR-015
+		// Phase 5), matching Postgres's own "listen_addresses = 'localhost'"
+		// posture: the gRPC surface moves the same money REST does but ships
+		// with no TLS of its own, so binding every interface (the prior
+		// ":9091" default) would serve it in the clear to anyone who could
+		// reach the box. A deployment that needs gRPC reachable off-box must
+		// terminate TLS in front of it first (see the TLS/loopback decision
+		// recorded on grpcserver.NewGRPCServer) and set GRPC_ADDR explicitly.
+		grpcAddr:        getenv("GRPC_ADDR", "127.0.0.1:9091"),
 		databaseURL:     os.Getenv("DATABASE_URL"),
 		defaultTenant:   getenv("DEFAULT_TENANT_ID", defaultTenantID),
 		env:             getenv("APP_ENV", "development"),
@@ -437,12 +445,21 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
+	// RateLimiter is the SAME limiter instance api.Deps.RateLimiter uses above
+	// (Task 5.1, audit A2.2): a shared bucket per API key means gRPC cannot be
+	// used to spend a fresh budget after REST has exhausted a key's limit, or
+	// vice versa. See rateLimitUnaryInterceptor's doc comment
+	// (internal/grpcserver/interceptors.go) for the full reasoning.
 	grpcSrv := grpcserver.NewGRPCServer(grpcserver.Deps{
 		Accounts:     deps.Accounts,
 		Transactions: deps.Transactions,
 		Audit:        deps.Audit,
 		Auth:         resolver,
+		RateLimiter:  limiter,
 	}, logger)
+	// cfg.grpcAddr defaults to loopback-only; see its own doc comment in
+	// loadConfig and the TLS/loopback decision recorded on
+	// grpcserver.NewGRPCServer for why exposing it further requires TLS.
 	grpcListener, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {
 		return fmt.Errorf("grpc listen on %s: %w", cfg.grpcAddr, err)

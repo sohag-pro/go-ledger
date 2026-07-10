@@ -33,6 +33,30 @@ const (
 	maxPageLimit         = 200
 )
 
+// maxPostingsPerTransaction bounds how many postings a single
+// PostTransaction RPC may submit (Task 5.1, audit A2.2). REST has no
+// explicit count check of its own: it is implicitly bounded by
+// api.MaxRequestBodyBytes (64 KB), and JSON's per-field overhead means a
+// 64 KB body cannot smuggle many more than about 100 postings anyway. gRPC's
+// protobuf encoding is dense enough that the same 64 KB (or even
+// maxGRPCRecvMsgBytes below) could carry many more, so gRPC needs its own
+// explicit count check rather than relying on the message-size cap alone.
+// 100 matches the audit's stated cap; there is no existing domain-level
+// maximum to align with instead (domain.Transaction.Validate only enforces a
+// MINIMUM of two postings and that they sum to zero per currency).
+const maxPostingsPerTransaction = 100
+
+// maxGRPCRecvMsgBytes replaces gRPC's 4 MiB default incoming-message limit
+// with a deliberate one (Task 5.1, audit A2.2), parallel to REST's 64 KB
+// MaxRequestBodyBytes cap. 1 MiB is comfortably above the largest legitimate
+// request this service ever receives (a PostTransaction at
+// maxPostingsPerTransaction postings, each with an account id, an amount,
+// and a description, is on the order of tens of KB) while still being a
+// small, deliberate fraction of the library default, so an oversized or
+// malicious payload is rejected by the transport before it is ever
+// unmarshaled or reaches a handler.
+const maxGRPCRecvMsgBytes = 1 << 20 // 1 MiB
+
 // clampLimit returns def when requested is <= 0, maxVal when requested
 // exceeds maxVal, and requested otherwise. It guards the gRPC handlers
 // against a caller requesting an unbounded scan, mirroring the REST layer's
@@ -49,12 +73,18 @@ func clampLimit(requested, def, maxVal int) int {
 
 // Deps are the shared services the gRPC handlers call, the same ones the REST
 // layer uses, plus the resolver the auth interceptor uses to authenticate
-// every call and derive its tenant (see ADR-012).
+// every call and derive its tenant (see ADR-012), and the rate limiter the
+// rate-limit interceptor enforces (Task 5.1, audit A2.2). RateLimiter must be
+// the SAME *auth.Limiter instance passed to api.Deps.RateLimiter in
+// cmd/server/main.go, not a second one: see rateLimitUnaryInterceptor's doc
+// comment (internal/grpcserver/interceptors.go) for why a shared instance is
+// the deliberate choice.
 type Deps struct {
 	Accounts     *ledger.AccountService
 	Transactions *ledger.TransactionService
 	Audit        *ledger.AuditService
 	Auth         *auth.Resolver
+	RateLimiter  *auth.Limiter
 }
 
 // Server implements the generated LedgerServiceServer as a thin adapter: it
@@ -78,16 +108,40 @@ func NewServer(d Deps) *Server {
 // gRPC health check is exempt so liveness probes work without an API key.
 // Reflection is likewise left open: it only describes the service, it does
 // not call it, so there is nothing to authenticate.
+//
+// The rate-limit interceptor is chained AFTER authUnaryInterceptor
+// deliberately (Task 5.1, audit A2.2): it reads the key authUnaryInterceptor
+// resolved into the context, so it must run downstream of it, the same
+// dependency HumaMiddleware has on the REST auth middleware.
+//
+// grpc.MaxRecvMsgSize replaces the library's 4 MiB default with
+// maxGRPCRecvMsgBytes, a deliberate bound parallel to REST's
+// api.MaxRequestBodyBytes (see maxGRPCRecvMsgBytes's own doc comment).
+//
+// TLS/loopback decision (Task 5.1, audit A2.2, ADR-015 Phase 5): this server
+// is NOT given transport credentials here. It is deployed loopback-only (see
+// cfg.grpcAddr's default in cmd/server/main.go, "127.0.0.1:9091"), the same
+// posture as Postgres ("listen_addresses = 'localhost'") and the metrics
+// endpoint (ADR-004): every caller reaching it is already on the box, so
+// there is no network hop for TLS to protect. Exposing this service to a
+// caller off-box requires terminating TLS in front of it first, either an
+// nginx grpc_pass proxy (matching how REST already terminates TLS at nginx)
+// or grpc.Creds(credentials.NewTLS(...)) added here; shipping it in the
+// clear on a public interface, which was the audit finding, is exactly what
+// the loopback default now prevents by construction rather than by
+// operator discipline.
 func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	s := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.MaxRecvMsgSize(maxGRPCRecvMsgBytes),
 		grpc.ChainUnaryInterceptor(
 			recoveryUnaryInterceptor(log),
 			loggingUnaryInterceptor(log),
 			authUnaryInterceptor(d.Auth, log),
+			rateLimitUnaryInterceptor(d.RateLimiter, log),
 		),
 	)
 	ledgerv1.RegisterLedgerServiceServer(s, NewServer(d))
@@ -284,6 +338,10 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 	key := idempotencyKeyFrom(ctx)
 	if key == "" {
 		return nil, status.Error(codes.InvalidArgument, "idempotency-key metadata is required")
+	}
+	if len(req.Postings) > maxPostingsPerTransaction {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"too many postings: got %d, max %d", len(req.Postings), maxPostingsPerTransaction)
 	}
 
 	currency := domain.Currency(req.Currency)
