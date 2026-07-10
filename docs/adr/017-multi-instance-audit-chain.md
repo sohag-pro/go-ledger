@@ -84,6 +84,20 @@ consistent total order over exactly the committed events, which is all
 tamper-evidence requires (it does not need the one "true" real-time order of
 concurrent posts, only a fixed order it can recompute).
 
+The chained rows are ordered by a database-assigned `chain_seq` (a sequence the
+single chainer writes in insert order), not by their UUID primary key: a UUIDv7
+id is monotonic only within one process, so ordering the verify walk by it would
+let a leader failover to a host with a skewed clock mint a lower id than the
+current head and read as a fork. A database sequence, assigned by the one writer
+in processing order, is monotonic and clock-skew-proof. As a defense in depth,
+`audit_log` also carries the source `outbox_id` under a UNIQUE constraint, so if
+two writers ever did run at once (the failure this ADR exists to prevent), the
+second attempt to chain the same event fails the insert instead of forking the
+chain silently. The chainer runs all of its work on the same connection that
+holds the leader advisory lock, so losing that lock session fails the very next
+query and drops leadership rather than draining blind against a lock it no longer
+holds.
+
 ### 3. Exactly one chainer: leader election via advisory lock
 
 The single-consumer guarantee is enforced with a **session-level Postgres
