@@ -137,7 +137,15 @@ func TestPostIdempotencyKeyExpires(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
-	const tinyTTL = 50 * time.Millisecond
+	// tinyTTL needs a real margin, not a real "tiny" one: the "still live"
+	// assertion below has to survive several sequential Postgres round trips
+	// (tenant-policy fetch, the first post's commit, then the retry's
+	// precheck plus its replay GetIdempotencyKey and GetTransaction) before
+	// the ttl elapses. 50ms budgeted for all of that flakes 100% of the time
+	// under parallel load/contention because round-trip latency alone can
+	// exceed it; a few seconds gives real round trips headroom while still
+	// keeping the test fast.
+	const tinyTTL = 3 * time.Second
 	svc := ledger.NewTransactionService(repo, nil, nil, ledger.WithIdempotencyTTL(tinyTTL))
 	ctx := context.Background()
 	tenant := uuid.NewString()
@@ -171,7 +179,11 @@ func TestPostIdempotencyKeyExpires(t *testing.T) {
 		t.Fatalf("retry before expiry: replayed=%v id=%s, want replayed=true id=%s", replayed, retryBeforeExpiry.ID, first.ID)
 	}
 
-	time.Sleep(4 * tinyTTL)
+	// Sleep past the ttl with its own margin on top (not a multiple of
+	// tinyTTL, which would make this needlessly slow now that tinyTTL is
+	// seconds rather than milliseconds): the point is only that this elapses
+	// after expires_at, proving the expiry path, not how tiny the ttl was.
+	time.Sleep(tinyTTL + 2*time.Second)
 
 	// Past the ttl, the SAME key with a DIFFERENT body (a different amount)
 	// is no longer a conflict: the expired key reads back as absent, so this
