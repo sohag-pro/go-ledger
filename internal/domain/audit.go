@@ -25,8 +25,10 @@ const AuditGenesisHash = ""
 // PrevHash and RowHash carry the per-tenant tamper-evident hash chain (ADR-012):
 // RowHash is ComputeAuditRowHash(tenantID, entry, PrevHash), and PrevHash is the
 // previous row's RowHash for the same tenant (or AuditGenesisHash for the first
-// row). The storage adapter computes both inside the same transaction that
-// extends the chain; callers building an AuditEntry to append do not set them.
+// row). Since ADR-017 (the multi-instance audit chain) these are computed by
+// the single background chainer, not by the transaction that posts the event:
+// a post writes an AuditEvent to the outbox instead, and the chainer is what
+// eventually produces the AuditEntry these two fields describe.
 type AuditEntry struct {
 	ID            string
 	Action        string
@@ -37,6 +39,23 @@ type AuditEntry struct {
 	CreatedAt     time.Time
 	PrevHash      string
 	RowHash       string
+}
+
+// AuditEvent is the payload a post or convert writes to the audit outbox
+// (ADR-017), inside the same transaction that writes the postings. It is a
+// deliberately smaller shape than AuditEntry: only what the caller knows at
+// post time. It has no ID, CreatedAt, PrevHash, or RowHash, because none of
+// those are post-time concerns anymore: the single background chainer
+// (internal/audit.Chainer) assigns them later, in transaction-commit order,
+// reading occurred_at back from the persisted outbox row rather than
+// recomputing a timestamp of its own (see the chainer's doc comment for why
+// that is what keeps row_hash reproducible).
+type AuditEvent struct {
+	Action        string
+	TransactionID string
+	Actor         string
+	Before        json.RawMessage
+	After         json.RawMessage
 }
 
 // ComputeAuditRowHash returns the hex SHA-256 digest chaining tenantID and e's

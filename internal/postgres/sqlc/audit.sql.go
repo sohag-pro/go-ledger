@@ -16,12 +16,21 @@ import (
 const getLastAuditHash = `-- name: GetLastAuditHash :one
 SELECT row_hash FROM audit_log
 WHERE tenant_id = $1
-ORDER BY created_at DESC, id DESC
+ORDER BY id DESC
 LIMIT 1
 `
 
 // The tenant's most recent row_hash, used to extend the per-tenant hash chain.
-// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
+// Ordered by id, not created_at (ADR-017): id is a UUIDv7 assigned by the
+// single chainer at chain-insertion time, via a generator guaranteed to
+// return strictly increasing values across successive calls in that one
+// process (see google/uuid's NewV7), so it is the true chain order. created_at
+// is copied from the ORIGINATING event's post time (audit_outbox.occurred_at),
+// which under concurrent posts across many transactions is NOT guaranteed to
+// be monotonic with the order those transactions actually commit in (a
+// transaction that starts later can commit first); ordering by created_at
+// would occasionally return the wrong "latest" row and corrupt the chain. A
+// fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
 // caller treats that as the chain's genesis (domain.AuditGenesisHash).
 func (q *Queries) GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error) {
 	row := q.db.QueryRow(ctx, getLastAuditHash, tenantID)
@@ -75,28 +84,29 @@ WHERE audit_log.tenant_id = $1
     FROM postings
     WHERE postings.tenant_id = $1 AND postings.account_id = $2
   )
-  AND (audit_log.created_at < $3
-       OR (audit_log.created_at = $3 AND audit_log.id < $4))
-ORDER BY audit_log.created_at DESC, audit_log.id DESC
-LIMIT $5
+  AND audit_log.id < $3
+ORDER BY audit_log.id DESC
+LIMIT $4
 `
 
 type ListAuditByAccountParams struct {
-	TenantID       uuid.UUID
-	AccountID      uuid.UUID
-	AfterCreatedAt time.Time
-	AfterID        uuid.UUID
-	PageLimit      int32
+	TenantID  uuid.UUID
+	AccountID uuid.UUID
+	AfterID   uuid.UUID
+	PageLimit int32
 }
 
 // Keyset page of audit rows for every transaction with a posting touching the
-// account, newest first. after_created_at / after_id are the keyset position:
-// pass a far-future timestamp and the max uuid for the first page.
+// account, newest first. after_id is the keyset position: pass the max uuid
+// for the first page. Ordered and paged by id alone, not (created_at, id):
+// see GetLastAuditHash's comment (ADR-017) for why id, assigned by the
+// chainer in true chain-insertion order, is what must drive ordering here,
+// not created_at (copied from the original event's post time, which is not
+// guaranteed monotonic with commit order under concurrent posts).
 func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error) {
 	rows, err := q.db.Query(ctx, listAuditByAccount,
 		arg.TenantID,
 		arg.AccountID,
-		arg.AfterCreatedAt,
 		arg.AfterID,
 		arg.PageLimit,
 	)
@@ -133,7 +143,7 @@ const listAuditByTransaction = `-- name: ListAuditByTransaction :many
 SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
 FROM audit_log
 WHERE tenant_id = $1 AND transaction_id = $2
-ORDER BY created_at, id
+ORDER BY id
 `
 
 type ListAuditByTransactionParams struct {
@@ -141,6 +151,8 @@ type ListAuditByTransactionParams struct {
 	TransactionID uuid.UUID
 }
 
+// Ordered by id, not created_at: see GetLastAuditHash's comment (ADR-017) for
+// why id is the chain-consistent order and created_at is not.
 func (q *Queries) ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error) {
 	rows, err := q.db.Query(ctx, listAuditByTransaction, arg.TenantID, arg.TransactionID)
 	if err != nil {
@@ -176,11 +188,12 @@ const listAuditForVerify = `-- name: ListAuditForVerify :many
 SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
 FROM audit_log
 WHERE tenant_id = $1
-ORDER BY created_at, id
+ORDER BY id
 `
 
-// Every audit row for the tenant, oldest first: the full walk used to
-// recompute and check the tamper-evident hash chain end to end.
+// Every audit row for the tenant, in true chain order: the full walk used to
+// recompute and check the tamper-evident hash chain end to end. Ordered by
+// id, not created_at: see GetLastAuditHash's comment (ADR-017) for why.
 func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error) {
 	rows, err := q.db.Query(ctx, listAuditForVerify, tenantID)
 	if err != nil {

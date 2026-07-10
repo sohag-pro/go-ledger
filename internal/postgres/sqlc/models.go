@@ -47,6 +47,20 @@ type AuditLog struct {
 	RowHash       pgtype.Text
 }
 
+type AuditOutbox struct {
+	ID            int64
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	OccurredAt    time.Time
+	Txid          int64
+	CreatedAt     time.Time
+	ProcessedAt   pgtype.Timestamptz
+}
+
 type FxRate struct {
 	ID          int64
 	Base        string

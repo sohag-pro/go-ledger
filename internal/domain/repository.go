@@ -44,20 +44,32 @@ type Tx interface {
 	// (tenantID, key) already exists.
 	InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string) error
 
-	// AppendAudit writes one audit row within the surrounding transaction.
-	AppendAudit(ctx context.Context, tenantID string, e AuditEntry) error
+	// AppendAuditOutbox writes one append-only audit_outbox row within the
+	// surrounding transaction (ADR-017): the event is durable if and only if
+	// the surrounding transaction commits. Unlike the old AppendAudit, this
+	// never reads the tenant's chain head and never computes a hash: it is a
+	// plain, conflict-free insert, which is what lets it run outside any
+	// per-tenant serialization and stay correct across any number of
+	// instances. The single background chainer (internal/audit.Chainer) is
+	// what later reads this row and extends the tenant's tamper-evident hash
+	// chain (see ComputeAuditRowHash and the chainer's doc comment).
+	AppendAuditOutbox(ctx context.Context, tenantID string, e AuditEvent) error
 
 	// TenantDailyDebits returns the tenant's already-posted per-currency
 	// debit total for "today" (created_at >= date_trunc('day', now()) on the
 	// DATABASE SERVER's clock), within the surrounding transaction (Task
-	// 2.4b, audit A3.4). It is the daily-volume policy's race-safe read:
-	// called from inside RunInTx, under the per-tenant in-process
-	// serialization (ADR-012), so two concurrent posts for the same tenant
-	// can never both read the same total and both post believing they are
-	// under the cap. The returned map is keyed by currency code; a currency
-	// with no posted debits today is simply absent, never a zero-valued
-	// entry, so a caller should treat a missing key as 0 (see
-	// CheckTransactionPolicy).
+	// 2.4b, audit A3.4). It is the daily-volume policy's read: called from
+	// inside RunInTx's SERIALIZABLE transaction, so two concurrent posts for
+	// the same tenant that would both cross the cap are a genuine read-write
+	// antidependency SERIALIZABLE can detect and abort one of. Before
+	// ADR-017 removed it, an in-process per-tenant mutex also serialized
+	// these calls; that mutex existed for the audit hash chain's read, not
+	// for this one, and its removal (RunInTx no longer holds any per-tenant
+	// lock) leaves this read backed by SERIALIZABLE alone, the same backstop
+	// RunInTx's own doc comment describes. The returned map is keyed by
+	// currency code; a currency with no posted debits today is simply
+	// absent, never a zero-valued entry, so a caller should treat a missing
+	// key as 0 (see CheckTransactionPolicy).
 	TenantDailyDebits(ctx context.Context, tenantID string) (map[string]int64, error)
 }
 
@@ -150,14 +162,27 @@ type Repository interface {
 	// times; fn must therefore be safe to run more than once. It returns the
 	// last error if retries are exhausted, or any non-retryable error from fn.
 	//
-	// tenantID also picks the per-tenant in-process mutex the adapter holds
-	// for the whole call, acquired before opening any transaction: same-tenant
-	// calls serialize one at a time, while different tenants run fully
-	// concurrently. This is what keeps the per-tenant audit hash chain
-	// (ADR-012) from repeatedly aborting concurrent same-tenant writers with a
-	// serialization failure (SQLSTATE 40001); see the adapter's RunInTx and
-	// ADR-012 for why the lock is in-process rather than a database lock.
+	// Until ADR-017, tenantID also picked an in-process per-tenant mutex the
+	// adapter held for the whole call, because every post read the tenant's
+	// audit chain head and extended it in the same transaction: two
+	// concurrent same-tenant attempts racing on that read could repeatedly
+	// abort each other with a serialization failure (SQLSTATE 40001) and
+	// exhaust the retry budget, and worse, across more than one app instance
+	// the mutex could not prevent a forked chain at all (ADR-017's Context).
+	// ADR-017 removes the audit chain from the posting transaction entirely
+	// (a post now writes an outbox row; a single background chainer builds
+	// the chain asynchronously), which removes the reason for the mutex: it
+	// is gone, and same-tenant calls now run fully concurrently, serialized
+	// only by whatever SERIALIZABLE itself detects (the balance invariant and
+	// the idempotency primary key, both still enforced in-transaction).
 	RunInTx(ctx context.Context, tenantID string, fn func(context.Context, Tx) error) error
+
+	// CountPendingOutbox returns the number of audit_outbox rows for tenantID
+	// that the chainer has not yet processed (ADR-017): the audit chain's lag,
+	// reported alongside the chained head by audit verify so a caller can see
+	// whether the chain is current or behind. Zero means every event this
+	// tenant has posted is already reflected in audit_log.
+	CountPendingOutbox(ctx context.Context, tenantID string) (int, error)
 
 	// GetAPIKeyByHash resolves an unrevoked api_keys row by the SHA-256 hex hash
 	// of a presented key, or ErrAPIKeyNotFound if no such unrevoked key exists.

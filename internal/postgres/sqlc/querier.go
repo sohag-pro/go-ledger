@@ -19,6 +19,15 @@ type Querier interface {
 	// after_created_at / after_id are the keyset position: pass a far-future
 	// timestamp and the max uuid for the first page.
 	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
+	// The oldest transaction id still in flight, cast the same way audit_outbox.txid
+	// is (xid8 has no direct cast to bigint). A row whose txid is strictly below
+	// this watermark is guaranteed committed and safe to chain (ADR-017,
+	// "Ordering: process only settled rows, in transaction-commit order").
+	AuditOutboxWatermark(ctx context.Context) (int64, error)
+	// Unprocessed outbox rows for one tenant: the lag the verify endpoint reports
+	// alongside the chained head (ADR-017 section 5), so a caller can see whether
+	// the chain is current or behind.
+	CountPendingOutbox(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTenant(ctx context.Context, arg CreateTenantParams) error
@@ -56,7 +65,16 @@ type Querier interface {
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (GetIdempotencyKeyRow, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
-	// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
+	// Ordered by id, not created_at (ADR-017): id is a UUIDv7 assigned by the
+	// single chainer at chain-insertion time, via a generator guaranteed to
+	// return strictly increasing values across successive calls in that one
+	// process (see google/uuid's NewV7), so it is the true chain order. created_at
+	// is copied from the ORIGINATING event's post time (audit_outbox.occurred_at),
+	// which under concurrent posts across many transactions is NOT guaranteed to
+	// be monotonic with the order those transactions actually commit in (a
+	// transaction that starts later can commit first); ordering by created_at
+	// would occasionally return the wrong "latest" row and corrupt the chain. A
+	// fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
 	// caller treats that as the chain's genesis (domain.AuditGenesisHash).
 	GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error)
 	// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
@@ -95,6 +113,12 @@ type Querier interface {
 	// query, the same default the api_keys.scopes column itself carries.
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
+	// Writes one outbox row inside the caller's own transaction (ADR-017): the
+	// event is durable if and only if the surrounding post/convert transaction
+	// commits. occurred_at, txid, and created_at are all left to their column
+	// defaults (the database server's now() and pg_current_xact_id(), see
+	// migration 0015): no chain read, no hash computed, here.
+	InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxParams) error
 	// fx_rates is append-only (ADR-014): a new quote is a new row, never an
 	// update, so every rate ever applied to a transaction stays reconstructible.
 	// tenant_id NULL makes this the global default rate for the pair; a non-NULL
@@ -122,20 +146,37 @@ type Querier interface {
 	ListAPIKeysByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListAPIKeysByTenantRow, error)
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error)
 	// Keyset page of audit rows for every transaction with a posting touching the
-	// account, newest first. after_created_at / after_id are the keyset position:
-	// pass a far-future timestamp and the max uuid for the first page.
+	// account, newest first. after_id is the keyset position: pass the max uuid
+	// for the first page. Ordered and paged by id alone, not (created_at, id):
+	// see GetLastAuditHash's comment (ADR-017) for why id, assigned by the
+	// chainer in true chain-insertion order, is what must drive ordering here,
+	// not created_at (copied from the original event's post time, which is not
+	// guaranteed monotonic with commit order under concurrent posts).
 	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error)
+	// Ordered by id, not created_at: see GetLastAuditHash's comment (ADR-017) for
+	// why id is the chain-consistent order and created_at is not.
 	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error)
-	// Every audit row for the tenant, oldest first: the full walk used to
-	// recompute and check the tamper-evident hash chain end to end.
+	// Every audit row for the tenant, in true chain order: the full walk used to
+	// recompute and check the tamper-evident hash chain end to end. Ordered by
+	// id, not created_at: see GetLastAuditHash's comment (ADR-017) for why.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
+	// Sets processed_at for one outbox row. The chainer calls this in the same
+	// transaction as the audit_log insert it produced, so a crash between the two
+	// is impossible: either both happen or neither does.
+	MarkAuditOutboxProcessed(ctx context.Context, id int64) error
 	// COALESCE makes this idempotent: revoking an already-revoked key keeps its
 	// original revoked_at instead of bumping it, and still reports one row
 	// affected (not zero), so the admin service can tell "no such key" (0 rows)
 	// from "already revoked" (1 row, unchanged) without a separate lookup.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// The chainer's batch read: unprocessed rows whose inserting transaction is
+	// guaranteed settled (txid < the watermark passed in), oldest commit order
+	// first. Ordering by (txid, id) is the total order ADR-017 defines: it is
+	// stable because txid is not reused and id is a bigserial tiebreaker for the
+	// (rare) case of equal txid.
+	ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error)
 	// Task 2.4b (audit A3.4): a whole-document replace of the settings jsonb
 	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
 	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)
