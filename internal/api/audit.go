@@ -61,12 +61,16 @@ func toAuditBody(e domain.AuditEntry) AuditEntryBody {
 
 // VerifyAuditOutput is the result of walking the caller's tenant audit chain
 // (ADR-012, "A per-tenant, tamper-evident audit chain"). FirstBreakID is null
-// when Valid is true.
+// when Valid is true. Pending is the number of posted events not yet
+// reflected in the chain (ADR-017): the chain is built asynchronously by a
+// single background chainer, so a just-posted transaction can briefly show
+// up here before its audit-chain link exists.
 type VerifyAuditOutput struct {
 	Body struct {
 		Valid        bool    `json:"valid"`
 		Checked      int     `json:"checked"`
 		FirstBreakID *string `json:"first_break_id" doc:"Id of the first audit row that failed to verify, or null if the chain is intact"`
+		Pending      int     `json:"pending" doc:"Posted events not yet reflected in the chain (ADR-017): the chain is built asynchronously, so this lags briefly behind posting"`
 	}
 }
 
@@ -131,7 +135,9 @@ func registerAudit(api huma.API, deps Deps) {
 		Path:        "/v1/audit/verify",
 		Summary:     "Verify the tamper-evident audit chain",
 		Description: "Walks the caller's tenant audit chain oldest first and recomputes every row's hash, " +
-			"detecting any row that was altered after it was written (ADR-012).",
+			"detecting any row that was altered after it was written (ADR-012). The chain itself is built " +
+			"asynchronously by a single background chainer (ADR-017), so `pending` reports how many posted " +
+			"events are not yet reflected in it; a nonzero, non-growing pending count is normal lag, not a fault.",
 		Tags:     []string{"audit"},
 		Security: bearerSecurity,
 	}, func(ctx context.Context, _ *struct{}) (*VerifyAuditOutput, error) {
@@ -146,6 +152,7 @@ func registerAudit(api huma.API, deps Deps) {
 		out := &VerifyAuditOutput{}
 		out.Body.Valid = result.Valid
 		out.Body.Checked = result.Checked
+		out.Body.Pending = result.Pending
 		if result.FirstBreakID != "" {
 			out.Body.FirstBreakID = &result.FirstBreakID
 		}

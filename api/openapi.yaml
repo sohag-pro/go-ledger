@@ -592,12 +592,17 @@ components:
           type:
             - string
             - "null"
+        pending:
+          description: "Posted events not yet reflected in the chain (ADR-017): the chain is built asynchronously, so this lags briefly behind posting"
+          format: int64
+          type: integer
         valid:
           type: boolean
       required:
         - valid
         - checked
         - first_break_id
+        - pending
       type: object
   securitySchemes:
     bearerAuth:
@@ -1094,7 +1099,7 @@ paths:
         - admin
   /v1/audit/verify:
     get:
-      description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012).
+      description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012). The chain itself is built asynchronously by a single background chainer (ADR-017), so `pending` reports how many posted events are not yet reflected in it; a nonzero, non-growing pending count is normal lag, not a fault.
       operationId: verify-audit-chain
       responses:
         "200":
