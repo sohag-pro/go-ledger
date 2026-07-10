@@ -45,6 +45,8 @@ type AuditLog struct {
 	CreatedAt     time.Time
 	PrevHash      pgtype.Text
 	RowHash       pgtype.Text
+	ChainSeq      int64
+	OutboxID      pgtype.Int8
 }
 
 type AuditOutbox struct {

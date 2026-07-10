@@ -1,23 +1,33 @@
 -- name: InsertAuditLog :exec
-INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+-- outbox_id is the source audit_outbox row this audit_log row was chained
+-- from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a
+-- second attempt to chain the same outbox row fails this insert with a
+-- unique violation instead of silently forking the chain. chain_seq is left
+-- to its column DEFAULT (nextval), never supplied by the caller: it is what
+-- makes chain order immune to any host's clock (see GetLastAuditHash below).
+INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
 
 -- name: GetLastAuditHash :one
 -- The tenant's most recent row_hash, used to extend the per-tenant hash chain.
--- Ordered by id, not created_at (ADR-017): id is a UUIDv7 assigned by the
--- single chainer at chain-insertion time, via a generator guaranteed to
--- return strictly increasing values across successive calls in that one
--- process (see google/uuid's NewV7), so it is the true chain order. created_at
--- is copied from the ORIGINATING event's post time (audit_outbox.occurred_at),
--- which under concurrent posts across many transactions is NOT guaranteed to
--- be monotonic with the order those transactions actually commit in (a
--- transaction that starts later can commit first); ordering by created_at
--- would occasionally return the wrong "latest" row and corrupt the chain. A
--- fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
--- caller treats that as the chain's genesis (domain.AuditGenesisHash).
+-- Ordered by chain_seq, not id (ADR-017 IMPORTANT 2, migration 0016): id is a
+-- UUIDv7, monotonic only within the ONE process that minted it, so a leader
+-- failover to a different host with clock skew can mint an id LOWER than the
+-- current head, and ordering by id would then return the wrong "latest" row
+-- and corrupt the chain. chain_seq is a plain ascending sequence the single
+-- chainer process advances on every insert, in the same order it assigns
+-- row_hash values, so it stays correct across any failover regardless of
+-- clock skew. created_at is copied from the ORIGINATING event's post time
+-- (audit_outbox.occurred_at), which under concurrent posts across many
+-- transactions is NOT guaranteed to be monotonic with the order those
+-- transactions actually commit in (a transaction that starts later can
+-- commit first); ordering by created_at would occasionally return the wrong
+-- "latest" row too. A fresh tenant (or one with no rows yet) surfaces as
+-- pgx.ErrNoRows; the caller treats that as the chain's genesis
+-- (domain.AuditGenesisHash).
 SELECT row_hash FROM audit_log
 WHERE tenant_id = sqlc.arg(tenant_id)
-ORDER BY id DESC
+ORDER BY chain_seq DESC
 LIMIT 1;
 
 -- name: ListAuditByTransaction :many
@@ -53,8 +63,10 @@ LIMIT sqlc.arg(page_limit);
 -- name: ListAuditForVerify :many
 -- Every audit row for the tenant, in true chain order: the full walk used to
 -- recompute and check the tamper-evident hash chain end to end. Ordered by
--- id, not created_at: see GetLastAuditHash's comment (ADR-017) for why.
+-- chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
+-- migration 0016) for why chain_seq, not id, is the failover-safe chain
+-- order.
 SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
 FROM audit_log
 WHERE tenant_id = sqlc.arg(tenant_id)
-ORDER BY id;
+ORDER BY chain_seq;

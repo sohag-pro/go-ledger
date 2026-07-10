@@ -574,7 +574,21 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by transaction: %w", err)
 	}
-	return auditEntriesFromRows(rows), nil
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+		})
+	}
+	return out, nil
 }
 
 // ListAuditByAccount returns one keyset page of audit rows for every
@@ -616,7 +630,21 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
 	}
-	return auditEntriesFromRows(rows), nil
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+		})
+	}
+	return out, nil
 }
 
 // ListAuditForVerify returns every audit row for the tenant, oldest first,
@@ -631,7 +659,21 @@ func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
 	}
-	return auditEntriesFromRows(rows), nil
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+		})
+	}
+	return out, nil
 }
 
 // CountPendingOutbox returns the number of tenantID's audit_outbox rows the
@@ -647,30 +689,6 @@ func (r *Repository) CountPendingOutbox(ctx context.Context, tenantID string) (i
 		return 0, fmt.Errorf("postgres: count pending outbox: %w", err)
 	}
 	return int(n), nil
-}
-
-// auditEntriesFromRows converts sqlc audit rows to domain entries. Before/After
-// are jsonb columns surfaced as []byte; they convert to json.RawMessage.
-// PrevHash/RowHash are nullable at the column level only for rows written
-// before migration 0009; every row this application writes populates both, and
-// .String on an invalid (NULL) pgtype.Text zero-values to "" for those legacy
-// rows.
-func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
-	out := make([]domain.AuditEntry, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, domain.AuditEntry{
-			ID:            row.ID.String(),
-			Action:        row.Action,
-			TransactionID: row.TransactionID.String(),
-			Actor:         row.Actor,
-			Before:        row.Before,
-			After:         row.After,
-			CreatedAt:     row.CreatedAt,
-			PrevHash:      row.PrevHash.String,
-			RowHash:       row.RowHash.String,
-		})
-	}
-	return out
 }
 
 // Balance returns the derived balance of an account in the account's currency.

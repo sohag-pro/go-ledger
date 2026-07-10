@@ -65,17 +65,21 @@ type Querier interface {
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (GetIdempotencyKeyRow, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
-	// Ordered by id, not created_at (ADR-017): id is a UUIDv7 assigned by the
-	// single chainer at chain-insertion time, via a generator guaranteed to
-	// return strictly increasing values across successive calls in that one
-	// process (see google/uuid's NewV7), so it is the true chain order. created_at
-	// is copied from the ORIGINATING event's post time (audit_outbox.occurred_at),
-	// which under concurrent posts across many transactions is NOT guaranteed to
-	// be monotonic with the order those transactions actually commit in (a
-	// transaction that starts later can commit first); ordering by created_at
-	// would occasionally return the wrong "latest" row and corrupt the chain. A
-	// fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
-	// caller treats that as the chain's genesis (domain.AuditGenesisHash).
+	// Ordered by chain_seq, not id (ADR-017 IMPORTANT 2, migration 0016): id is a
+	// UUIDv7, monotonic only within the ONE process that minted it, so a leader
+	// failover to a different host with clock skew can mint an id LOWER than the
+	// current head, and ordering by id would then return the wrong "latest" row
+	// and corrupt the chain. chain_seq is a plain ascending sequence the single
+	// chainer process advances on every insert, in the same order it assigns
+	// row_hash values, so it stays correct across any failover regardless of
+	// clock skew. created_at is copied from the ORIGINATING event's post time
+	// (audit_outbox.occurred_at), which under concurrent posts across many
+	// transactions is NOT guaranteed to be monotonic with the order those
+	// transactions actually commit in (a transaction that starts later can
+	// commit first); ordering by created_at would occasionally return the wrong
+	// "latest" row too. A fresh tenant (or one with no rows yet) surfaces as
+	// pgx.ErrNoRows; the caller treats that as the chain's genesis
+	// (domain.AuditGenesisHash).
 	GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error)
 	// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
 	// created lazily on first use. Keyed by (tenant_id, name): name is the
@@ -112,6 +116,12 @@ type Querier interface {
 	// defaults an empty Scopes slice to {read,post} before it ever reaches this
 	// query, the same default the api_keys.scopes column itself carries.
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
+	// outbox_id is the source audit_outbox row this audit_log row was chained
+	// from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a
+	// second attempt to chain the same outbox row fails this insert with a
+	// unique violation instead of silently forking the chain. chain_seq is left
+	// to its column DEFAULT (nextval), never supplied by the caller: it is what
+	// makes chain order immune to any host's clock (see GetLastAuditHash below).
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
 	// Writes one outbox row inside the caller's own transaction (ADR-017): the
 	// event is durable if and only if the surrounding post/convert transaction
@@ -152,14 +162,16 @@ type Querier interface {
 	// chainer in true chain-insertion order, is what must drive ordering here,
 	// not created_at (copied from the original event's post time, which is not
 	// guaranteed monotonic with commit order under concurrent posts).
-	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error)
+	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]ListAuditByAccountRow, error)
 	// Ordered by id, not created_at: see GetLastAuditHash's comment (ADR-017) for
 	// why id is the chain-consistent order and created_at is not.
-	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error)
+	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]ListAuditByTransactionRow, error)
 	// Every audit row for the tenant, in true chain order: the full walk used to
 	// recompute and check the tamper-evident hash chain end to end. Ordered by
-	// id, not created_at: see GetLastAuditHash's comment (ADR-017) for why.
-	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error)
+	// chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
+	// migration 0016) for why chain_seq, not id, is the failover-safe chain
+	// order.
+	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
 	// Sets processed_at for one outbox row. The chainer calls this in the same
