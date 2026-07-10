@@ -5,6 +5,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 
+	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 )
 
@@ -17,10 +18,31 @@ import (
 // amount) are all client errors too, so they map to 422 like the other
 // validation/invariant failures (ADR-014); a cross-tenant or unknown account on
 // either leg still falls through to the existing ErrAccountNotFound case above.
+//
+// The admin surface (Task 2.2b, internal/admin) reuses this same mapping
+// rather than defining its own: a *domain.TenantNotActiveError (issuing or
+// rotating a key into a suspended or closed tenant) is checked first, via
+// errors.As, so its Reason() names the exact status the way the auth
+// resolver's identical 403 already does (ADR-015); every other admin error
+// (missing tenant, missing key, invalid tenant status, invalid scopes) falls
+// through to the switch below alongside the rest of the domain's errors.
 func toHumaErr(err error) error {
+	var tenantErr *domain.TenantNotActiveError
+	if errors.As(err, &tenantErr) {
+		return huma.Error403Forbidden(tenantErr.Reason())
+	}
+
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, domain.ErrTenantNotFound):
+		return huma.Error404NotFound("tenant not found")
+	case errors.Is(err, domain.ErrAPIKeyNotFound):
+		return huma.Error404NotFound("api key not found")
+	case errors.Is(err, domain.ErrInvalidTenant):
+		return huma.Error422UnprocessableEntity("invalid tenant name or status")
+	case errors.Is(err, admin.ErrInvalidScopes):
+		return huma.Error422UnprocessableEntity("at least one valid scope (read, post, admin) is required")
 	case errors.Is(err, domain.ErrAccountNotFound):
 		return huma.Error404NotFound("account not found")
 	case errors.Is(err, domain.ErrTransactionNotFound):

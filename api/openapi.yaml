@@ -158,6 +158,17 @@ components:
         - name
         - type
       type: object
+    CreateTenantInputBody:
+      additionalProperties: false
+      properties:
+        name:
+          description: Human-readable tenant name
+          maxLength: 200
+          minLength: 1
+          type: string
+      required:
+        - name
+      type: object
     CreateTransactionInputBody:
       additionalProperties: false
       properties:
@@ -285,6 +296,138 @@ components:
       required:
         - status
       type: object
+    IssueKeyInputBody:
+      additionalProperties: false
+      properties:
+        expires_at:
+          description: Optional expiry. Omit for a key that never expires.
+          format: date-time
+          type: string
+        name:
+          description: Human-readable label for this key
+          maxLength: 200
+          minLength: 1
+          type: string
+        scopes:
+          description: "One or more of: read, post, admin"
+          items:
+            type: string
+          minItems: 1
+          type:
+            - array
+            - "null"
+        tenant_id:
+          description: Tenant this key acts as
+          format: uuid
+          type: string
+      required:
+        - tenant_id
+        - name
+        - scopes
+      type: object
+    IssuedKeyBody:
+      additionalProperties: false
+      properties:
+        expires_at:
+          description: Null if the key never expires
+          format: date-time
+          type:
+            - string
+            - "null"
+        id:
+          type: string
+        name:
+          type: string
+        plaintext:
+          description: "The api key credential, e.g. for the Authorization: Bearer header. Shown once: store it now, it cannot be retrieved again."
+          type: string
+        scopes:
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        tenant_id:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - name
+        - scopes
+        - expires_at
+        - plaintext
+      type: object
+    KeyBody:
+      additionalProperties: false
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        expires_at:
+          description: Null if the key never expires
+          format: date-time
+          type:
+            - string
+            - "null"
+        id:
+          description: Key id (UUID)
+          type: string
+        last_used_at:
+          description: Null if the key has never been used
+          format: date-time
+          type:
+            - string
+            - "null"
+        name:
+          type: string
+        revoked_at:
+          description: Null if the key is still live
+          format: date-time
+          type:
+            - string
+            - "null"
+        scopes:
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        tenant_id:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - name
+        - scopes
+        - expires_at
+        - last_used_at
+        - revoked_at
+        - created_at
+      type: object
+    ListKeysOutputBody:
+      additionalProperties: false
+      properties:
+        keys:
+          items:
+            $ref: "#/components/schemas/KeyBody"
+          type:
+            - array
+            - "null"
+      required:
+        - keys
+      type: object
+    ListTenantsOutputBody:
+      additionalProperties: false
+      properties:
+        tenants:
+          items:
+            $ref: "#/components/schemas/TenantBody"
+          type:
+            - array
+            - "null"
+      required:
+        - tenants
+      type: object
     PostingBody:
       additionalProperties: false
       properties:
@@ -321,6 +464,19 @@ components:
       required:
         - account_id
         - amount
+      type: object
+    SetTenantStatusInputBody:
+      additionalProperties: false
+      properties:
+        status:
+          description: New tenant status
+          enum:
+            - active
+            - suspended
+            - closed
+          type: string
+      required:
+        - status
       type: object
     StatementEntryBody:
       additionalProperties: false
@@ -374,6 +530,22 @@ components:
         - currency
         - entries
         - next_cursor
+      type: object
+    TenantBody:
+      additionalProperties: false
+      properties:
+        id:
+          description: Tenant id (UUID)
+          type: string
+        name:
+          type: string
+        status:
+          description: "One of: active, suspended, closed"
+          type: string
+      required:
+        - id
+        - name
+        - status
       type: object
     TransactionBody:
       additionalProperties: false
@@ -673,6 +845,201 @@ paths:
       summary: List an account's postings with running balance
       tags:
         - accounts
+  /v1/admin/keys:
+    get:
+      description: "Lists every key for a tenant, live and revoked, oldest first. Never includes a plaintext: that is shown once, at issue or rotate time, and is never recoverable afterward."
+      operationId: list-keys
+      parameters:
+        - description: Tenant to list keys for
+          explode: false
+          in: query
+          name: tenant_id
+          required: true
+          schema:
+            description: Tenant to list keys for
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListKeysOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List a tenant's api keys
+      tags:
+        - admin
+    post:
+      description: "Mints a new api key for a tenant. The plaintext is returned exactly once, in this response, and is never stored or recoverable again: store it now."
+      operationId: issue-key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IssueKeyInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedKeyBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Issue a new api key
+      tags:
+        - admin
+  /v1/admin/keys/{id}/revoke:
+    post:
+      operationId: revoke-key
+      parameters:
+        - description: Key id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Key id
+            format: uuid
+            type: string
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Revoke an api key
+      tags:
+        - admin
+  /v1/admin/keys/{id}/rotate:
+    post:
+      description: Mints a replacement key with the same tenant, name, and scopes as an existing one. The old key is left active (an overlap window for callers to cut over); revoke it explicitly once they have.
+      operationId: rotate-key
+      parameters:
+        - description: Key id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Key id
+            format: uuid
+            type: string
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedKeyBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Rotate an api key
+      tags:
+        - admin
+  /v1/admin/tenants:
+    get:
+      operationId: list-tenants
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListTenantsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List tenants
+      tags:
+        - admin
+    post:
+      operationId: create-tenant
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTenantInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Create a tenant
+      tags:
+        - admin
+  /v1/admin/tenants/{id}/status:
+    post:
+      operationId: set-tenant-status
+      parameters:
+        - description: Tenant id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Tenant id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetTenantStatusInputBody"
+        required: true
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Suspend, close, or reactivate a tenant
+      tags:
+        - admin
   /v1/audit/verify:
     get:
       description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012).

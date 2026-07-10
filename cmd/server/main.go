@@ -25,6 +25,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
@@ -269,6 +270,7 @@ func run(logger *slog.Logger) error {
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
 			ledger.WithFXProvider(fx.NewDBProvider(pool))),
 		Audit:       ledger.NewAuditService(repo),
+		Admin:       admin.NewService(repo),
 		Auth:        resolver,
 		RateLimiter: limiter,
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/fx"
@@ -291,7 +292,10 @@ func (f *fakeRepo) RunInTx(ctx context.Context, _ string, fn func(context.Contex
 // tenant that exists and is active.
 func (f *fakeRepo) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
 	k, ok := f.apiKeys[hash]
-	if !ok {
+	if !ok || k.RevokedAt != nil {
+		// Mirrors the real query's "WHERE revoked_at IS NULL": a revoked key
+		// (Task 2.2b's RevokeAPIKey) is indistinguishable from an unknown one
+		// here, same as the real repository.
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
 	}
 	if t, ok := f.tenants[k.TenantID]; ok {
@@ -313,6 +317,9 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 		// the DB default.
 		k.Scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
 	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now()
+	}
 	f.apiKeys[keyHash] = k
 	return nil
 }
@@ -321,6 +328,50 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 // last_used_at, which is covered in internal/auth's own tests.
 func (f *fakeRepo) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
 	return nil
+}
+
+// GetAPIKeyByID, ListAPIKeysByTenant, and RevokeAPIKey (Task 2.2b) all work
+// off the same hash-keyed map as InsertAPIKey and GetAPIKeyByHash: fakeRepo
+// has no separate id index, so these do a linear scan, which is fine for the
+// small number of keys any handler test provisions.
+
+func (f *fakeRepo) GetAPIKeyByID(_ context.Context, id string) (domain.APIKey, error) {
+	for _, k := range f.apiKeys {
+		if k.ID == id {
+			return k, nil
+		}
+	}
+	return domain.APIKey{}, domain.ErrAPIKeyNotFound
+}
+
+func (f *fakeRepo) ListAPIKeysByTenant(_ context.Context, tenantID string) ([]domain.APIKey, error) {
+	out := make([]domain.APIKey, 0)
+	for _, k := range f.apiKeys {
+		if k.TenantID == tenantID {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (f *fakeRepo) RevokeAPIKey(_ context.Context, id string) error {
+	for hash, k := range f.apiKeys {
+		if k.ID == id {
+			if k.RevokedAt == nil {
+				now := time.Now()
+				k.RevokedAt = &now
+			}
+			f.apiKeys[hash] = k
+			return nil
+		}
+	}
+	return domain.ErrAPIKeyNotFound
 }
 
 func (f *fakeRepo) CreateTenant(_ context.Context, tenantID, name string) error {
@@ -409,6 +460,7 @@ func newAPIRouterWithOptions(repo domain.Repository, opts ...ledger.ServiceOptio
 		Accounts:     ledger.NewAccountService(repo),
 		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, opts...),
 		Audit:        ledger.NewAuditService(repo),
+		Admin:        admin.NewService(repo),
 		Auth:         auth.NewResolver(repo, time.Minute),
 	})
 	return r

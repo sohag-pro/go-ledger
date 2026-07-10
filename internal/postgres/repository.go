@@ -829,7 +829,81 @@ func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.A
 		Scopes:       scopesFromStrings(row.Scopes),
 		ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
 		LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
+		CreatedAt:    row.CreatedAt,
+		RevokedAt:    timestamptzToPtr(row.RevokedAt),
 	}, nil
+}
+
+// GetAPIKeyByID returns the api_keys row with the given id, revoked or not,
+// or domain.ErrAPIKeyNotFound if none exists (Task 2.2b).
+func (r *Repository) GetAPIKeyByID(ctx context.Context, id string) (domain.APIKey, error) {
+	keyID, err := uuid.Parse(id)
+	if err != nil {
+		return domain.APIKey{}, fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	row, err := r.q.GetAPIKeyByID(ctx, keyID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if err != nil {
+		return domain.APIKey{}, fmt.Errorf("postgres: get api key by id: %w", err)
+	}
+	return domain.APIKey{
+		ID:           row.ID.String(),
+		TenantID:     row.TenantID.String(),
+		Name:         row.Name,
+		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+		Scopes:       scopesFromStrings(row.Scopes),
+		ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
+		LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
+		CreatedAt:    row.CreatedAt,
+		RevokedAt:    timestamptzToPtr(row.RevokedAt),
+	}, nil
+}
+
+// ListAPIKeysByTenant returns every api_keys row for tenantID, oldest first,
+// revoked or not (Task 2.2b).
+func (r *Repository) ListAPIKeysByTenant(ctx context.Context, tenantID string) ([]domain.APIKey, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.ListAPIKeysByTenant(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list api keys by tenant: %w", err)
+	}
+	out := make([]domain.APIKey, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.APIKey{
+			ID:           row.ID.String(),
+			TenantID:     row.TenantID.String(),
+			Name:         row.Name,
+			RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+			Scopes:       scopesFromStrings(row.Scopes),
+			ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
+			LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
+			CreatedAt:    row.CreatedAt,
+			RevokedAt:    timestamptzToPtr(row.RevokedAt),
+		})
+	}
+	return out, nil
+}
+
+// RevokeAPIKey sets revoked_at (if not already set) for the key identified by
+// id (Task 2.2b), or returns domain.ErrAPIKeyNotFound if no key matches id.
+func (r *Repository) RevokeAPIKey(ctx context.Context, id string) error {
+	keyID, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	rows, err := r.q.RevokeAPIKey(ctx, keyID)
+	if err != nil {
+		return fmt.Errorf("postgres: revoke api key: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrAPIKeyNotFound
+	}
+	return nil
 }
 
 // TouchAPIKeyLastUsed sets api_keys.last_used_at for the key identified by
@@ -877,7 +951,11 @@ func timestamptzToPtr(v pgtype.Timestamptz) *time.Time {
 }
 
 // InsertAPIKey assigns an identity if k.ID is empty and inserts k with keyHash
-// as its stored credential. Only the hash is ever written.
+// as its stored credential. Only the hash is ever written. An empty k.Scopes
+// defaults to {read, post} (Task 2.2b), matching the api_keys.scopes column's
+// own default, so every caller that predates scopes (cmd/server's demo and
+// load-test provisioning, and every pre-2.2 test) keeps working unchanged
+// instead of hitting the scopes NOT NULL / api_keys_scopes_valid constraint.
 func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error {
 	if k.ID == "" {
 		id, err := uuid.NewV7()
@@ -894,16 +972,41 @@ func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash 
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
+	scopes := k.Scopes
+	if len(scopes) == 0 {
+		scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	}
 	if err := r.q.InsertAPIKey(ctx, sqlc.InsertAPIKeyParams{
 		ID:           id,
 		TenantID:     tid,
 		Name:         k.Name,
 		KeyHash:      keyHash,
 		RateLimitRpm: ptrToInt4(k.RateLimitRPM),
+		Scopes:       scopesToStrings(scopes),
+		ExpiresAt:    ptrToTimestamptz(k.ExpiresAt),
 	}); err != nil {
 		return fmt.Errorf("postgres: insert api key: %w", err)
 	}
 	return nil
+}
+
+// scopesToStrings converts []domain.Scope to the raw []string the scopes
+// text[] column stores, the reverse of scopesFromStrings.
+func scopesToStrings(scopes []domain.Scope) []string {
+	out := make([]string, len(scopes))
+	for i, s := range scopes {
+		out[i] = string(s)
+	}
+	return out
+}
+
+// ptrToTimestamptz converts *time.Time to a nullable Postgres timestamptz,
+// NULL when p is nil, the reverse of timestamptzToPtr.
+func ptrToTimestamptz(p *time.Time) pgtype.Timestamptz {
+	if p == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *p, Valid: true}
 }
 
 // CreateTenant inserts a new tenant row with the given id and name, active by

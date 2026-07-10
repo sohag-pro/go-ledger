@@ -60,9 +60,49 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKe
 	return i, err
 }
 
+const getAPIKeyByID = `-- name: GetAPIKeyByID :one
+SELECT id, tenant_id, name, rate_limit_rpm, created_at, revoked_at, scopes, expires_at, last_used_at
+FROM api_keys
+WHERE id = $1
+`
+
+type GetAPIKeyByIDRow struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	Name         string
+	RateLimitRpm pgtype.Int4
+	CreatedAt    time.Time
+	RevokedAt    pgtype.Timestamptz
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
+}
+
+// Raw fetch by id, unfiltered by revoked_at: the admin surface (Task 2.2b)
+// uses this to look up an existing key (including an already-revoked one) by
+// id, for example to copy a key's tenant/name/scopes when rotating it. It
+// does not join tenants: callers that need the tenant's current status look
+// it up separately via GetTenant.
+func (q *Queries) GetAPIKeyByID(ctx context.Context, id uuid.UUID) (GetAPIKeyByIDRow, error) {
+	row := q.db.QueryRow(ctx, getAPIKeyByID, id)
+	var i GetAPIKeyByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.RateLimitRpm,
+		&i.CreatedAt,
+		&i.RevokedAt,
+		&i.Scopes,
+		&i.ExpiresAt,
+		&i.LastUsedAt,
+	)
+	return i, err
+}
+
 const insertAPIKey = `-- name: InsertAPIKey :exec
-INSERT INTO api_keys (id, tenant_id, name, key_hash, rate_limit_rpm)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO api_keys (id, tenant_id, name, key_hash, rate_limit_rpm, scopes, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type InsertAPIKeyParams struct {
@@ -71,8 +111,17 @@ type InsertAPIKeyParams struct {
 	Name         string
 	KeyHash      string
 	RateLimitRpm pgtype.Int4
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
 }
 
+// scopes and expires_at (Task 2.2b) are now written on insert: the admin
+// surface (internal/admin) is what actually sets them to something other
+// than the column default. Every pre-2.2b caller (cmd/server's demo and
+// load-test key provisioning, and every repository test that predates
+// scopes) still works unchanged, because the Go-level repository method
+// defaults an empty Scopes slice to {read,post} before it ever reaches this
+// query, the same default the api_keys.scopes column itself carries.
 func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error {
 	_, err := q.db.Exec(ctx, insertAPIKey,
 		arg.ID,
@@ -80,8 +129,80 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) erro
 		arg.Name,
 		arg.KeyHash,
 		arg.RateLimitRpm,
+		arg.Scopes,
+		arg.ExpiresAt,
 	)
 	return err
+}
+
+const listAPIKeysByTenant = `-- name: ListAPIKeysByTenant :many
+SELECT id, tenant_id, name, rate_limit_rpm, created_at, revoked_at, scopes, expires_at, last_used_at
+FROM api_keys
+WHERE tenant_id = $1
+ORDER BY created_at, id
+`
+
+type ListAPIKeysByTenantRow struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	Name         string
+	RateLimitRpm pgtype.Int4
+	CreatedAt    time.Time
+	RevokedAt    pgtype.Timestamptz
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
+}
+
+// Every key for a tenant, oldest first, including revoked ones: the admin
+// surface's list view (Task 2.2b) is meant to show a tenant's full key
+// history, not just its live keys. Never selects key_hash: plaintext is
+// shown once at issue/rotate time and is never recoverable afterward, and
+// the hash itself has no business leaving the resolver's lookup path.
+func (q *Queries) ListAPIKeysByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListAPIKeysByTenantRow, error) {
+	rows, err := q.db.Query(ctx, listAPIKeysByTenant, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAPIKeysByTenantRow
+	for rows.Next() {
+		var i ListAPIKeysByTenantRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Name,
+			&i.RateLimitRpm,
+			&i.CreatedAt,
+			&i.RevokedAt,
+			&i.Scopes,
+			&i.ExpiresAt,
+			&i.LastUsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeAPIKey = `-- name: RevokeAPIKey :execrows
+UPDATE api_keys SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1
+`
+
+// COALESCE makes this idempotent: revoking an already-revoked key keeps its
+// original revoked_at instead of bumping it, and still reports one row
+// affected (not zero), so the admin service can tell "no such key" (0 rows)
+// from "already revoked" (1 row, unchanged) without a separate lookup.
+func (q *Queries) RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeAPIKey, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const touchAPIKeyLastUsed = `-- name: TouchAPIKeyLastUsed :exec

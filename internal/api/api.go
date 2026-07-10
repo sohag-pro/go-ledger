@@ -14,6 +14,7 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
@@ -53,7 +54,12 @@ type Deps struct {
 	Accounts     *ledger.AccountService
 	Transactions *ledger.TransactionService
 	Audit        *ledger.AuditService
-	Auth         *auth.Resolver
+	// Admin backs the /v1/admin operations (Task 2.2b): onboarding a tenant
+	// and issuing/rotating/revoking its api keys. Every /v1/admin/ path
+	// already requires domain.ScopeAdmin via auth.HumaMiddleware
+	// (RequiredHTTPScope), so the operations themselves add no further auth.
+	Admin *admin.Service
+	Auth  *auth.Resolver
 	// RateLimiter, if set, is registered immediately after the auth middleware
 	// (see New). It is optional: a zero Deps (spec generation, and tests that
 	// only exercise unauthenticated routes) leaves it nil and no rate-limit
@@ -166,6 +172,7 @@ func registerOperations(api huma.API, deps Deps) {
 	registerAccounts(api, deps)
 	registerTransactions(api, deps)
 	registerAudit(api, deps)
+	registerAdmin(api, deps)
 }
 
 // SpecYAML builds the API on a throwaway router and serializes its OpenAPI spec

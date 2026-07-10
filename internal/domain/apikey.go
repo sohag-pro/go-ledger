@@ -58,6 +58,13 @@ func (s Scope) Valid() bool {
 // that has never been used (or whose last use has not yet been persisted,
 // since the auth resolver touches it best-effort and throttled rather than on
 // every request).
+//
+// CreatedAt and RevokedAt are the Task 2.2b admin-surface fields: CreatedAt
+// is stamped by the database default on insert, and RevokedAt is nil for a
+// live key, set to when RevokeKey (internal/admin) revoked it otherwise. The
+// auth resolver never sees a revoked key at all (GetAPIKeyByHash filters
+// revoked_at IS NULL), so RevokedAt is only ever non-nil on a key surfaced
+// through the admin listing.
 type APIKey struct {
 	ID           string
 	TenantID     string
@@ -67,6 +74,8 @@ type APIKey struct {
 	Scopes       []Scope
 	ExpiresAt    *time.Time
 	LastUsedAt   *time.Time
+	CreatedAt    time.Time
+	RevokedAt    *time.Time
 }
 
 // HasScope reports whether k is allowed to perform an operation requiring

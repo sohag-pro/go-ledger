@@ -147,8 +147,30 @@ type Repository interface {
 	GetAPIKeyByHash(ctx context.Context, hash string) (APIKey, error)
 
 	// InsertAPIKey persists k with keyHash as its stored credential. Only the
-	// hash is ever written; the plaintext is never stored.
+	// hash is ever written; the plaintext is never stored. k.Scopes and
+	// k.ExpiresAt (Task 2.2b) are persisted as given; an empty k.Scopes
+	// defaults to {read, post}, matching the api_keys.scopes column default,
+	// so every caller that predates scopes keeps working unchanged.
 	InsertAPIKey(ctx context.Context, k APIKey, keyHash string) error
+
+	// GetAPIKeyByID returns the api_keys row with the given id, revoked or
+	// not, or ErrAPIKeyNotFound if no such row exists (Task 2.2b). Unlike
+	// GetAPIKeyByHash it does not filter on revoked_at or join tenants: it is
+	// the admin surface's raw lookup, used to copy an existing key's
+	// tenant/name/scopes when rotating it.
+	GetAPIKeyByID(ctx context.Context, id string) (APIKey, error)
+
+	// ListAPIKeysByTenant returns every api_keys row for tenantID, oldest
+	// first, revoked or not (Task 2.2b): the admin surface's list view shows
+	// a tenant's full key history. Never carries the plaintext (it is never
+	// stored) or the hash.
+	ListAPIKeysByTenant(ctx context.Context, tenantID string) ([]APIKey, error)
+
+	// RevokeAPIKey sets revoked_at (if not already set) for the key
+	// identified by id (Task 2.2b). It returns ErrAPIKeyNotFound if no key
+	// matches id. Revoking an already-revoked key is a no-op success, not an
+	// error: the caller's intent (this key must not work) is already true.
+	RevokeAPIKey(ctx context.Context, id string) error
 
 	// TouchAPIKeyLastUsed sets the last_used_at timestamp for the key
 	// identified by id (Task 2.2). Called best-effort and throttled from the

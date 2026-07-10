@@ -1,6 +1,41 @@
 -- name: InsertAPIKey :exec
-INSERT INTO api_keys (id, tenant_id, name, key_hash, rate_limit_rpm)
-VALUES ($1, $2, $3, $4, $5);
+-- scopes and expires_at (Task 2.2b) are now written on insert: the admin
+-- surface (internal/admin) is what actually sets them to something other
+-- than the column default. Every pre-2.2b caller (cmd/server's demo and
+-- load-test key provisioning, and every repository test that predates
+-- scopes) still works unchanged, because the Go-level repository method
+-- defaults an empty Scopes slice to {read,post} before it ever reaches this
+-- query, the same default the api_keys.scopes column itself carries.
+INSERT INTO api_keys (id, tenant_id, name, key_hash, rate_limit_rpm, scopes, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
+
+-- name: GetAPIKeyByID :one
+-- Raw fetch by id, unfiltered by revoked_at: the admin surface (Task 2.2b)
+-- uses this to look up an existing key (including an already-revoked one) by
+-- id, for example to copy a key's tenant/name/scopes when rotating it. It
+-- does not join tenants: callers that need the tenant's current status look
+-- it up separately via GetTenant.
+SELECT id, tenant_id, name, rate_limit_rpm, created_at, revoked_at, scopes, expires_at, last_used_at
+FROM api_keys
+WHERE id = $1;
+
+-- name: ListAPIKeysByTenant :many
+-- Every key for a tenant, oldest first, including revoked ones: the admin
+-- surface's list view (Task 2.2b) is meant to show a tenant's full key
+-- history, not just its live keys. Never selects key_hash: plaintext is
+-- shown once at issue/rotate time and is never recoverable afterward, and
+-- the hash itself has no business leaving the resolver's lookup path.
+SELECT id, tenant_id, name, rate_limit_rpm, created_at, revoked_at, scopes, expires_at, last_used_at
+FROM api_keys
+WHERE tenant_id = $1
+ORDER BY created_at, id;
+
+-- name: RevokeAPIKey :execrows
+-- COALESCE makes this idempotent: revoking an already-revoked key keeps its
+-- original revoked_at instead of bumping it, and still reports one row
+-- affected (not zero), so the admin service can tell "no such key" (0 rows)
+-- from "already revoked" (1 row, unchanged) without a separate lookup.
+UPDATE api_keys SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1;
 
 -- name: GetAPIKeyByHash :one
 -- Joins tenants so the resolver gets the tenant's current status alongside

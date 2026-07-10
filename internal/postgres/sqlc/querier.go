@@ -41,6 +41,12 @@ type Querier interface {
 	// expiry and scope enforcement happen in the resolver and the transport
 	// middleware, not in this query.
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
+	// Raw fetch by id, unfiltered by revoked_at: the admin surface (Task 2.2b)
+	// uses this to look up an existing key (including an already-revoked one) by
+	// id, for example to copy a key's tenant/name/scopes when rotating it. It
+	// does not join tenants: callers that need the tenant's current status look
+	// it up separately via GetTenant.
+	GetAPIKeyByID(ctx context.Context, id uuid.UUID) (GetAPIKeyByIDRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
@@ -74,12 +80,25 @@ type Querier interface {
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
 	GetTenant(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
+	// scopes and expires_at (Task 2.2b) are now written on insert: the admin
+	// surface (internal/admin) is what actually sets them to something other
+	// than the column default. Every pre-2.2b caller (cmd/server's demo and
+	// load-test key provisioning, and every repository test that predates
+	// scopes) still works unchanged, because the Go-level repository method
+	// defaults an empty Scopes slice to {read,post} before it ever reaches this
+	// query, the same default the api_keys.scopes column itself carries.
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
 	// fx_rates is append-only (ADR-014): a new quote is a new row, never an
 	// update, so every rate ever applied to a transaction stays reconstructible.
 	InsertFXRate(ctx context.Context, arg InsertFXRateParams) (FxRate, error)
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
+	// Every key for a tenant, oldest first, including revoked ones: the admin
+	// surface's list view (Task 2.2b) is meant to show a tenant's full key
+	// history, not just its live keys. Never selects key_hash: plaintext is
+	// shown once at issue/rotate time and is never recoverable afterward, and
+	// the hash itself has no business leaving the resolver's lookup path.
+	ListAPIKeysByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListAPIKeysByTenantRow, error)
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error)
 	// Keyset page of audit rows for every transaction with a posting touching the
 	// account, newest first. after_created_at / after_id are the keyset position:
@@ -91,6 +110,11 @@ type Querier interface {
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
+	// COALESCE makes this idempotent: revoking an already-revoked key keeps its
+	// original revoked_at instead of bumping it, and still reports one row
+	// affected (not zero), so the admin service can tell "no such key" (0 rows)
+	// from "already revoked" (1 row, unchanged) without a separate lookup.
+	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
 	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
 	// Updates last_used_at for a single key by id. Called best-effort and
 	// throttled from the auth resolver (Task 2.2): not every request, so this is
