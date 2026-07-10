@@ -21,6 +21,7 @@ type Querier interface {
 	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
+	CreateTenant(ctx context.Context, arg CreateTenantParams) error
 	// currency lives on each posting now (ADR-014), not here: an FX transaction
 	// spans two currencies, so there is no single transaction-level value left to
 	// store. The fx_* columns are the immutable snapshot of the conversion
@@ -32,6 +33,11 @@ type Querier interface {
 	// example a re-seed within the same second), so "current" always resolves to
 	// exactly one row.
 	CurrentFXRate(ctx context.Context, arg CurrentFXRateParams) (FxRate, error)
+	// Joins tenants so the resolver gets the tenant's current status alongside
+	// the key in the same round trip (Task 2.1, ADR-015): gating needs no extra
+	// query. The join is safe against a dangling reference: api_keys_tenant_fk
+	// (migration 0011) guarantees every api_keys row's tenant_id has a tenants
+	// row.
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
@@ -64,6 +70,7 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
+	GetTenant(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
@@ -81,6 +88,8 @@ type Querier interface {
 	// recompute and check the tamper-evident hash chain end to end.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
+	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
+	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)

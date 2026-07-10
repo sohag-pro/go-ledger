@@ -72,4 +72,18 @@ var (
 	// ErrSameCurrencyConversion is returned when a Convert request's from and
 	// to accounts share a currency: that is a transfer, not a conversion.
 	ErrSameCurrencyConversion = errors.New("domain: convert from and to account must have different currencies")
+	// ErrInvalidTenant is returned when a Tenant is missing a required field
+	// (name) or carries a status outside TenantStatus.Valid().
+	ErrInvalidTenant = errors.New("domain: invalid tenant")
+	// ErrTenantNotFound is returned when no tenant matches the given id.
+	ErrTenantNotFound = errors.New("domain: tenant not found")
+	// ErrTenantNotActive is the sentinel matched via errors.Is for any
+	// *TenantNotActiveError, regardless of which status (suspended or closed)
+	// caused it. A transport layer maps it to 403 Forbidden (REST) or
+	// codes.PermissionDenied (gRPC): the credential itself is valid, only the
+	// tenant it belongs to is not.
+	ErrTenantNotActive = errors.New("domain: tenant not active")
+	// ErrTenantAlreadyExists is returned when CreateTenant is called with an
+	// id that already has a tenant row.
+	ErrTenantAlreadyExists = errors.New("domain: tenant already exists")
 )

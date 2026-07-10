@@ -11,11 +11,20 @@ const apiKeyPrefix = "glk_"
 
 // APIKey is a resolved credential: which tenant it acts as and its optional
 // per-key rate limit (nil means the server default).
+//
+// TenantStatus is the status of TenantID as of the resolving lookup (Task
+// 2.1, ADR-015): the auth resolver gates on it so a suspended or closed
+// tenant's key stops working within one cache TTL, with no extra round trip
+// beyond the key lookup itself. A lookup that does not join the tenants
+// table (a test double that predates tenants, for instance) leaves this at
+// its zero value, which is not a valid TenantStatus and is treated as not
+// active.
 type APIKey struct {
 	ID           string
 	TenantID     string
 	Name         string
 	RateLimitRPM *int
+	TenantStatus TenantStatus
 }
 
 // GenerateAPIKey returns a new random key plaintext ("glk_<base64url>") and its

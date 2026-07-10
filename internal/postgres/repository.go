@@ -6,6 +6,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -824,6 +825,7 @@ func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.A
 		TenantID:     row.TenantID.String(),
 		Name:         row.Name,
 		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+		TenantStatus: domain.TenantStatus(row.TenantStatus),
 	}, nil
 }
 
@@ -855,6 +857,88 @@ func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash 
 		return fmt.Errorf("postgres: insert api key: %w", err)
 	}
 	return nil
+}
+
+// CreateTenant inserts a new tenant row with the given id and name, active by
+// default (the column default; this method never sets status explicitly). It
+// returns domain.ErrTenantAlreadyExists if id is already in use.
+func (r *Repository) CreateTenant(ctx context.Context, tenantID, name string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if err := (domain.Tenant{Name: name, Status: domain.TenantActive}).Validate(); err != nil {
+		return err
+	}
+	if err := r.q.CreateTenant(ctx, sqlc.CreateTenantParams{ID: tid, Name: name}); err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrTenantAlreadyExists
+		}
+		return fmt.Errorf("postgres: create tenant: %w", err)
+	}
+	return nil
+}
+
+// GetTenant returns the tenant with the given id, or domain.ErrTenantNotFound
+// if none exists.
+func (r *Repository) GetTenant(ctx context.Context, tenantID string) (domain.Tenant, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Tenant{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	row, err := r.q.GetTenant(ctx, tid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Tenant{}, domain.ErrTenantNotFound
+	}
+	if err != nil {
+		return domain.Tenant{}, fmt.Errorf("postgres: get tenant: %w", err)
+	}
+	return tenantFromRow(row), nil
+}
+
+// ListTenants returns up to limit tenants, oldest first.
+func (r *Repository) ListTenants(ctx context.Context, limit int) ([]domain.Tenant, error) {
+	rows, err := r.q.ListTenants(ctx, int32(limit)) //nolint:gosec // limit is bounded by the caller
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list tenants: %w", err)
+	}
+	out := make([]domain.Tenant, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, tenantFromRow(row))
+	}
+	return out, nil
+}
+
+// SetTenantStatus updates the tenant's status. It returns domain.ErrInvalidTenant
+// if status is not one of TenantStatus.Valid()'s three values, or
+// domain.ErrTenantNotFound if no tenant matches id.
+func (r *Repository) SetTenantStatus(ctx context.Context, tenantID string, status domain.TenantStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidTenant
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.SetTenantStatus(ctx, sqlc.SetTenantStatusParams{ID: tid, Status: string(status)})
+	if err != nil {
+		return fmt.Errorf("postgres: set tenant status: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrTenantNotFound
+	}
+	return nil
+}
+
+// tenantFromRow converts a sqlc Tenant row to a domain.Tenant.
+func tenantFromRow(row sqlc.Tenant) domain.Tenant {
+	return domain.Tenant{
+		ID:        row.ID.String(),
+		Name:      row.Name,
+		Status:    domain.TenantStatus(row.Status),
+		Settings:  json.RawMessage(row.Settings),
+		CreatedAt: row.CreatedAt,
+	}
 }
 
 // int4ToPtr converts a nullable Postgres int4 to *int, nil when the column is

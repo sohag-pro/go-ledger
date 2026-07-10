@@ -149,4 +149,22 @@ type Repository interface {
 	// InsertAPIKey persists k with keyHash as its stored credential. Only the
 	// hash is ever written; the plaintext is never stored.
 	InsertAPIKey(ctx context.Context, k APIKey, keyHash string) error
+
+	// CreateTenant inserts a new tenant row, active by default. It returns
+	// ErrTenantAlreadyExists if tenantID already has a row.
+	CreateTenant(ctx context.Context, tenantID, name string) error
+
+	// GetTenant returns the tenant with the given id, or ErrTenantNotFound if
+	// none exists.
+	GetTenant(ctx context.Context, tenantID string) (Tenant, error)
+
+	// ListTenants returns up to limit tenants, oldest first. It is an
+	// operator-facing listing, not scoped to any one tenant.
+	ListTenants(ctx context.Context, limit int) ([]Tenant, error)
+
+	// SetTenantStatus updates the tenant's status (the operator action that
+	// suspends, closes, or reactivates a tenant). It returns ErrInvalidTenant
+	// if status is not one of TenantStatus.Valid()'s three values, or
+	// ErrTenantNotFound if no tenant matches tenantID.
+	SetTenantStatus(ctx context.Context, tenantID string, status TenantStatus) error
 }

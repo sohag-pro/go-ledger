@@ -74,6 +74,14 @@ type Posting struct {
 	Currency      string
 }
 
+type Tenant struct {
+	ID        uuid.UUID
+	Name      string
+	Status    string
+	Settings  []byte
+	CreatedAt time.Time
+}
+
 type Transaction struct {
 	ID                uuid.UUID
 	TenantID          uuid.UUID
