@@ -145,4 +145,11 @@ var (
 	// happens to reuse someone else's external reference, not a retry of the
 	// same one.
 	ErrDuplicateReference = errors.New("domain: reference already exists for this tenant")
+	// ErrInvalidWebhookURL is returned when a WebhookSubscription's URL is
+	// empty, unparsable, not http/https, or has no host (Task 4.1, audit
+	// A7.1). Checked before a secret is generated or any row is written.
+	ErrInvalidWebhookURL = errors.New("domain: webhook url must be an absolute http or https URL")
+	// ErrWebhookSubscriptionNotFound is returned when no webhook_subscriptions
+	// row matches the given id.
+	ErrWebhookSubscriptionNotFound = errors.New("domain: webhook subscription not found")
 )

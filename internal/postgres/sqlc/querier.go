@@ -123,6 +123,15 @@ type Querier interface {
 	GetReversalOf(ctx context.Context, arg GetReversalOfParams) (Transaction, error)
 	GetTenant(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
+	// Raw fetch by id: tests and any future delivery-inspection tooling read a
+	// single row's full lifecycle state back this way.
+	GetWebhookDelivery(ctx context.Context, id uuid.UUID) (WebhookDelivery, error)
+	// Reads the singleton fan-out cursor and locks its row for the rest of the
+	// surrounding transaction (Task 4.1): the same "read the watermark, then
+	// act, all in one transaction" shape ADR-017's chainer uses for audit_log,
+	// so the cursor read and its eventual advance (SetWebhookFanoutCursor) never
+	// race a concurrent fan-out pass.
+	GetWebhookFanoutCursorForUpdate(ctx context.Context) (int64, error)
 	// scopes and expires_at (Task 2.2b) are now written on insert: the admin
 	// surface (internal/admin) is what actually sets them to something other
 	// than the column default. Every pre-2.2b caller (cmd/server's demo and
@@ -180,6 +189,20 @@ type Querier interface {
 	// domain.ErrDuplicateIdempotencyKey exactly as a plain unique-violation used
 	// to, preserving replay-on-duplicate for the still-live case.
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (uuid.UUID, error)
+	// Creates one fan-out row for a (subscription, audit event) pairing. The
+	// ON CONFLICT DO NOTHING against the UNIQUE (subscription_id,
+	// audit_chain_seq) index (migration 0021) is what makes fan-out
+	// exactly-once into this table even if the fan-out step ever ran twice over
+	// the same audit_log range: a repeat attempt is a silent no-op, not a
+	// duplicate delivery row, so execrows reports 0 for a pairing that already
+	// existed and 1 for a genuinely new one.
+	InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDeliveryParams) (int64, error)
+	// Inserts a new webhook_subscriptions row, always active (a caller creates a
+	// subscription to receive events; deactivating happens later, via
+	// SetWebhookSubscriptionActive). secret is stored as-is, never hashed (Task
+	// 4.1, audit A7.1): the delivery worker must read it back in full to sign
+	// every outbound payload.
+	InsertWebhookSubscription(ctx context.Context, arg InsertWebhookSubscriptionParams) error
 	// Every key for a tenant, oldest first, including revoked ones: the admin
 	// surface's list view (Task 2.2b) is meant to show a tenant's full key
 	// history, not just its live keys. Never selects key_hash: plaintext is
@@ -187,6 +210,12 @@ type Querier interface {
 	// the hash itself has no business leaving the resolver's lookup path.
 	ListAPIKeysByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListAPIKeysByTenantRow, error)
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error)
+	// The fan-out step's per-tenant read (Task 4.1): every ACTIVE subscription
+	// for one tenant, including the secret and event_types the fan-out needs to
+	// decide whether and how to create a webhook_deliveries row for it. Ordered
+	// by id only for a stable, deterministic iteration order within one fan-out
+	// pass; it carries no meaning beyond that.
+	ListActiveWebhookSubscriptionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListActiveWebhookSubscriptionsByTenantRow, error)
 	// Keyset page of audit rows for every transaction with a posting touching the
 	// account, newest first. after_id is the keyset position: pass the max uuid
 	// for the first page. Ordered and paged by id alone, not (created_at, id):
@@ -204,6 +233,28 @@ type Querier interface {
 	// migration 0016) for why chain_seq, not id, is the failover-safe chain
 	// order.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
+	// The fan-out step's source read: every chained audit_log event past the
+	// cursor, oldest first, up to batch_limit. Reads chain_seq (ADR-017's
+	// failover-safe, skew-proof linearization key), not id or created_at, for
+	// the same reason GetLastAuditHash does: it is the one order the chainer
+	// itself guarantees is monotonic across any failover.
+	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
+	// The delivery worker's batch read: pending/failed rows whose backoff has
+	// elapsed, oldest due first, joined to their subscription for the url and
+	// secret needed to sign and send. "AND ws.active" means a subscription that
+	// was deactivated after fan-out already created pending rows for it simply
+	// stops being picked up here (see SetWebhookSubscriptionActive's doc
+	// comment): its existing rows are left exactly as they are, neither
+	// delivered nor purged, just never attempted again. FOR UPDATE OF wd SKIP
+	// LOCKED is defense in depth against two workers ever running at once (the
+	// leader-election lock is what actually prevents that in normal operation,
+	// ADR-017's discipline mirrored for this worker): a second reader skips a
+	// row the first is mid-processing rather than picking it up concurrently.
+	// This query runs as its own standalone statement (never inside a
+	// surrounding transaction that also makes the outbound HTTP call), so the
+	// row lock is released the moment this statement completes; correctness
+	// does not depend on holding it any longer than that.
+	ListDueWebhookDeliveries(ctx context.Context, batchLimit int32) ([]ListDueWebhookDeliveriesRow, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	// Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
 	// ListTransactions returns up to a page's worth of transaction rows, and
@@ -231,10 +282,31 @@ type Querier interface {
 	// trip; this query itself just returns up to page_limit rows in whatever
 	// amount it is asked for.
 	ListTransactions(ctx context.Context, arg ListTransactionsParams) ([]Transaction, error)
+	// Every delivery row for one subscription, in fan-out order (the same
+	// chain_seq order the source audit_log events were read in). Used by tests
+	// to assert fan-out and delivery outcomes end to end.
+	ListWebhookDeliveriesBySubscription(ctx context.Context, subscriptionID uuid.UUID) ([]WebhookDelivery, error)
+	// Every subscription for a tenant, oldest first, active or not: the admin
+	// surface's list view. Never selects secret: it is shown once, at creation
+	// time, and never recoverable through a list call.
+	ListWebhookSubscriptionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListWebhookSubscriptionsByTenantRow, error)
 	// Sets processed_at for one outbox row. The chainer calls this in the same
 	// transaction as the audit_log insert it produced, so a crash between the two
 	// is impossible: either both happen or neither does.
 	MarkAuditOutboxProcessed(ctx context.Context, id int64) error
+	// A 2xx response: terminal success. attempts is set to the total number of
+	// tries this delivery took (including the successful one), the same total
+	// MarkWebhookDeliveryFailed accumulates on the way here, so attempts always
+	// means "how many times this delivery was actually tried", not just "how
+	// many times it failed".
+	MarkWebhookDeliveryDelivered(ctx context.Context, arg MarkWebhookDeliveryDeliveredParams) error
+	// A non-2xx response or transport error: the caller (internal/webhook)
+	// computes the new attempts count, the resulting status ('failed' to retry
+	// again later, or 'dead' once attempts reaches the configured max), the next
+	// backoff deadline, and the error text to record, all in Go (backoff and the
+	// max-attempts cap are application config, not schema), and this query just
+	// persists that decision.
+	MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) error
 	// COALESCE makes this idempotent: revoking an already-revoked key keeps its
 	// original revoked_at instead of bumping it, and still reports one row
 	// affected (not zero), so the admin service can tell "no such key" (0 rows)
@@ -250,6 +322,21 @@ type Querier interface {
 	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
 	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)
 	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
+	// Advances the singleton fan-out cursor. Always called in the same
+	// transaction as the webhook_deliveries inserts it corresponds to (Task
+	// 4.1), so a crash between the two is impossible: either both the inserts
+	// and the cursor advance land, or neither does, and a retried fan-out pass
+	// sees the same audit_log rows again (harmless: InsertWebhookDelivery's
+	// ON CONFLICT DO NOTHING against the (subscription_id, audit_chain_seq)
+	// unique index makes re-inserting the same pairing a no-op).
+	SetWebhookFanoutCursor(ctx context.Context, lastChainSeq int64) error
+	// Flips active for one subscription by id. The admin surface's
+	// DeleteSubscription calls this with active=false instead of a hard DELETE
+	// (see domain.Repository.SetWebhookSubscriptionActive's doc comment for
+	// why): a webhook_deliveries row's foreign key to its subscription has no
+	// cascade, so deactivating, not deleting, is what "stops future deliveries"
+	// without breaking or discarding delivery history.
+	SetWebhookSubscriptionActive(ctx context.Context, arg SetWebhookSubscriptionActiveParams) (int64, error)
 	// Deletes up to batch_size idempotency keys whose replay window has passed,
 	// across all tenants (Task 4.5, audit A1.4; batched per the follow-up
 	// review: a plain "DELETE ... WHERE expires_at < now()" has no bound, so a

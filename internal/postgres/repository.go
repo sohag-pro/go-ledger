@@ -1442,3 +1442,97 @@ func accountFromRow(id uuid.UUID, name, accountType, currency string) (domain.Ac
 		Currency: domain.Currency(currency),
 	}, nil
 }
+
+// CreateWebhookSubscription assigns an identity if sub.ID is empty and
+// inserts sub with secret as its stored HMAC signing key (Task 4.1, audit
+// A7.1). It precisely mirrors InsertFXRate's own tenant-existence precheck
+// (a plain GetTenant lookup before ever writing) rather than catching the
+// webhook_subscriptions_tenant_id_fkey violation after the fact, so a
+// missing tenant surfaces as domain.ErrTenantNotFound instead of a raw
+// foreign-key-violation error reaching the caller.
+func (r *Repository) CreateWebhookSubscription(ctx context.Context, sub *domain.WebhookSubscription, secret string) error {
+	if sub.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate webhook subscription id: %w", err)
+		}
+		sub.ID = id.String()
+	}
+	id, err := uuid.Parse(sub.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse webhook subscription id: %w", err)
+	}
+	tid, err := uuid.Parse(sub.TenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if _, err := r.q.GetTenant(ctx, tid); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrTenantNotFound
+		}
+		return fmt.Errorf("postgres: check tenant exists: %w", err)
+	}
+
+	eventTypes := sub.EventTypes
+	if eventTypes == nil {
+		eventTypes = []string{}
+	}
+	if err := r.q.InsertWebhookSubscription(ctx, sqlc.InsertWebhookSubscriptionParams{
+		ID:         id,
+		TenantID:   tid,
+		Url:        sub.URL,
+		Secret:     secret,
+		EventTypes: eventTypes,
+	}); err != nil {
+		return fmt.Errorf("postgres: insert webhook subscription: %w", err)
+	}
+	sub.Active = true
+	return nil
+}
+
+// ListWebhookSubscriptionsByTenant returns every webhook_subscriptions row
+// for tenantID, oldest first, active or not (Task 4.1). Never carries a
+// secret: domain.WebhookSubscription has no field for one.
+func (r *Repository) ListWebhookSubscriptionsByTenant(ctx context.Context, tenantID string) ([]domain.WebhookSubscription, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.ListWebhookSubscriptionsByTenant(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list webhook subscriptions by tenant: %w", err)
+	}
+	out := make([]domain.WebhookSubscription, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.WebhookSubscription{
+			ID:         row.ID.String(),
+			TenantID:   row.TenantID.String(),
+			URL:        row.Url,
+			EventTypes: row.EventTypes,
+			Active:     row.Active,
+			CreatedAt:  row.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+// SetWebhookSubscriptionActive sets active for the subscription identified
+// by id (Task 4.1), or returns domain.ErrWebhookSubscriptionNotFound if no
+// subscription matches id.
+func (r *Repository) SetWebhookSubscriptionActive(ctx context.Context, id string, active bool) error {
+	subID, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse webhook subscription id: %w", err)
+	}
+	rows, err := r.q.SetWebhookSubscriptionActive(ctx, sqlc.SetWebhookSubscriptionActiveParams{
+		Active: active,
+		ID:     subID,
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: set webhook subscription active: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrWebhookSubscriptionNotFound
+	}
+	return nil
+}

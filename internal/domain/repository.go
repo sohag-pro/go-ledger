@@ -342,4 +342,37 @@ type Repository interface {
 	// column yet worth preserving. It returns ErrTenantNotFound if tenantID
 	// has no row.
 	SetTenantSettings(ctx context.Context, tenantID string, settings json.RawMessage) error
+
+	// CreateWebhookSubscription persists sub with secret as its stored HMAC
+	// signing key (Task 4.1, audit A7.1). If sub.ID is empty the adapter
+	// assigns one and writes it back to sub. Unlike InsertAPIKey/keyHash,
+	// secret is stored as-is, never hashed: the delivery worker must read it
+	// back in full to sign every outbound payload. It returns
+	// domain.ErrTenantNotFound if sub.TenantID names a tenant that does not
+	// exist (the webhook_subscriptions_tenant_id_fkey foreign key).
+	CreateWebhookSubscription(ctx context.Context, sub *WebhookSubscription, secret string) error
+
+	// ListWebhookSubscriptionsByTenant returns every webhook_subscriptions
+	// row for tenantID, oldest first, active or not (Task 4.1): the admin
+	// surface's list view. Never selects the secret column: it is shown once,
+	// at creation time, and is never recoverable through a list call, the
+	// same discipline ListAPIKeysByTenant follows for a key's plaintext.
+	ListWebhookSubscriptionsByTenant(ctx context.Context, tenantID string) ([]WebhookSubscription, error)
+
+	// SetWebhookSubscriptionActive sets active for the subscription
+	// identified by id (Task 4.1). The admin surface's DeleteSubscription
+	// calls this with active=false rather than issuing a hard DELETE: a
+	// webhook_deliveries row references its subscription
+	// (webhook_deliveries_subscription_id_fkey) with no ON DELETE cascade, so
+	// a subscription with delivery history (which is the common case: the
+	// whole point of a subscription is to accumulate deliveries) cannot be
+	// hard-deleted without either losing that history or cascading the
+	// delete into it. Deactivating achieves the caller-visible contract
+	// ("delete stops future deliveries": the fan-out step only creates new
+	// pending deliveries for active subscriptions, and the delivery worker
+	// only attempts delivery for an active subscription's rows) while
+	// keeping every already-created delivery row, and its audit trail,
+	// intact. It returns domain.ErrWebhookSubscriptionNotFound if no
+	// subscription matches id.
+	SetWebhookSubscriptionActive(ctx context.Context, id string, active bool) error
 }

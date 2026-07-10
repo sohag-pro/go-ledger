@@ -120,3 +120,33 @@ type Transaction struct {
 	Reference             pgtype.Text
 	EffectiveAt           pgtype.Timestamptz
 }
+
+type WebhookDelivery struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	SubscriptionID uuid.UUID
+	AuditChainSeq  int64
+	EventType      string
+	Payload        []byte
+	Status         string
+	Attempts       int32
+	NextAttemptAt  time.Time
+	LastError      pgtype.Text
+	CreatedAt      time.Time
+	DeliveredAt    pgtype.Timestamptz
+}
+
+type WebhookFanoutCursor struct {
+	ID           bool
+	LastChainSeq int64
+}
+
+type WebhookSubscription struct {
+	ID         uuid.UUID
+	TenantID   uuid.UUID
+	Url        string
+	Secret     string
+	EventTypes []string
+	Active     bool
+	CreatedAt  time.Time
+}
