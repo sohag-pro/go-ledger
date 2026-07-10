@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver for goose
 	"github.com/pressly/goose/v3"
@@ -134,6 +137,30 @@ func TestMigration0024_RowLevelSecurity(t *testing.T) {
 
 	repo := postgres.NewRepository(appPool)
 
+	// A second pool to the same non-superuser role, wired with a SQL spy
+	// (below) instead of the otelpgx tracer postgres.NewPool installs. It
+	// exists solely to prove CreateAccount's write now runs inside
+	// withTenant's set_config transaction (audit A3.5 follow-up): the
+	// typed API validates tenantID before CreateAccount ever builds its
+	// query, so there is no way to make the GUC and the inserted row's
+	// tenant_id disagree, and therefore no way to force a genuine WITH
+	// CHECK rejection through repo.CreateAccount the way the raw
+	// INSERT/UPDATE case below does for the accounts table in general.
+	// Watching for the set_config statement is the "at minimum" fallback:
+	// it proves the backstop is wired, not that it fires on a mismatch.
+	spy := &sqlSpy{}
+	spyCfg, err := pgxpool.ParseConfig(appDSN)
+	if err != nil {
+		t.Fatalf("parse spy pool config: %v", err)
+	}
+	spyCfg.ConnConfig.Tracer = spy
+	spyPool, err := pgxpool.NewWithConfig(ctx, spyCfg)
+	if err != nil {
+		t.Fatalf("new spy pool: %v", err)
+	}
+	defer spyPool.Close()
+	spyRepo := postgres.NewRepository(spyPool)
+
 	tenantA := uuid.NewString()
 	tenantB := uuid.NewString()
 	if err := repo.CreateTenant(ctx, tenantA, "rls tenant A"); err != nil {
@@ -169,6 +196,22 @@ func TestMigration0024_RowLevelSecurity(t *testing.T) {
 	}
 	if len(txns) != 1 || txns[0].Transaction.ID != txnA {
 		t.Errorf("ListTransactions tenant A: got %d rows, want 1 matching %q", len(txns), txnA)
+	}
+
+	// CreateAccount for tenant A still works normally through this same
+	// RLS-restricted role (the fix must not break the common case). Using
+	// spyRepo (not repo) so the assertions right below can see exactly what
+	// SQL this call issued.
+	spy.reset()
+	newAcct := &domain.Account{Name: "GUC check", Type: domain.Asset, Currency: "USD"}
+	if err := spyRepo.CreateAccount(ctx, tenantA, newAcct); err != nil {
+		t.Fatalf("CreateAccount tenant A (GUC-set path): %v", err)
+	}
+	if !spy.contains("INSERT INTO accounts") {
+		t.Fatal("CreateAccount did not issue the expected INSERT INTO accounts (spy wiring broken?)")
+	}
+	if !spy.contains("set_config") {
+		t.Error("CreateAccount did not set app.tenant_id: the RLS WITH CHECK backstop is not wired (CreateAccount is routing around withTenant)")
 	}
 
 	// --- The forgotten-filter case: RLS blocks the cross-tenant leak ---
@@ -399,6 +442,44 @@ func rawExecAsTenant(ctx context.Context, pool *pgxpool.Pool, tenantID, stmt str
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// sqlSpy is a pgx.QueryTracer that records the SQL text of every statement
+// run through a pool it's installed on. It backs the CreateAccount GUC
+// assertion above: see that call site's comment for why a spy, rather than a
+// genuine cross-tenant write, is what proves the backstop is wired.
+type sqlSpy struct {
+	mu    sync.Mutex
+	stmts []string
+}
+
+func (s *sqlSpy) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	s.mu.Lock()
+	s.stmts = append(s.stmts, data.SQL)
+	s.mu.Unlock()
+	return ctx
+}
+
+func (s *sqlSpy) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// reset clears recorded statements so a subsequent call's SQL can be checked
+// in isolation from setup that ran before it.
+func (s *sqlSpy) reset() {
+	s.mu.Lock()
+	s.stmts = nil
+	s.mu.Unlock()
+}
+
+// contains reports whether any recorded statement contains substr.
+func (s *sqlSpy) contains(substr string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, stmt := range s.stmts {
+		if strings.Contains(stmt, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 // assertAllTenant fails t if any row in got is not want, the shape of the

@@ -70,7 +70,7 @@ var _ domain.Repository = (*Repository)(nil)
 // what makes the GUC actually apply while fn runs.
 //
 // It is also used for the handful of standalone writes that, like the
-// reads above, run outside RunInTx (GetOrCreateClearingAccount,
+// reads above, run outside RunInTx (CreateAccount, GetOrCreateClearingAccount,
 // SetAccountStatus, CreateWebhookSubscription, a tenant-specific
 // InsertFXRate): the same "forgotten WHERE/mismatched value" defense in
 // depth RunInTx gives every write inside a domain.Tx applies to these too.
@@ -137,13 +137,15 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 	if err != nil {
 		return fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	return r.q.CreateAccount(ctx, sqlc.CreateAccountParams{
-		ID:         aid,
-		TenantID:   tid,
-		Name:       a.Name,
-		Type:       a.Type.String(),
-		Currency:   string(a.Currency),
-		MinBalance: ptrToInt8(a.MinBalance),
+	return r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		return q.CreateAccount(ctx, sqlc.CreateAccountParams{
+			ID:         aid,
+			TenantID:   tid,
+			Name:       a.Name,
+			Type:       a.Type.String(),
+			Currency:   string(a.Currency),
+			MinBalance: ptrToInt8(a.MinBalance),
+		})
 	})
 }
 
