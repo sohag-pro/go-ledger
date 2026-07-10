@@ -96,6 +96,8 @@ type config struct {
 	loadTestTenants          int
 	rateLimitRPM             int
 	authCacheTTL             time.Duration
+	authNegativeMaxFailures  int
+	authNegativeWindow       time.Duration
 	defaultCurrency          string
 	fxRates                  string
 	chainerEnabled           bool
@@ -133,8 +135,18 @@ func loadConfig() (config, error) {
 		loadTestTenants: getenvInt("LOAD_TEST_TENANTS", 8),
 		rateLimitRPM:    getenvInt("RATE_LIMIT_RPM", 120),
 		authCacheTTL:    getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
-		defaultCurrency: getenv("DEFAULT_CURRENCY", "USD"),
-		fxRates:         os.Getenv("FX_RATES"),
+		// AUTH_NEGATIVE_MAX_FAILURES / AUTH_NEGATIVE_WINDOW configure the
+		// negative-lookup throttle (Task 5.2, audit A2.5/A6.4): auth.Resolver
+		// deliberately never caches a miss (see its own doc comment), so
+		// every unknown or expired key is a database round trip; this
+		// throttle caps how many of those a single client IP can trigger
+		// before being rejected without a lookup at all, protecting the
+		// connection pool from a garbage-API-key flood. Defaults mirror
+		// auth.DefaultNegativeThrottleMaxFailures / Window.
+		authNegativeMaxFailures: getenvInt("AUTH_NEGATIVE_MAX_FAILURES", auth.DefaultNegativeThrottleMaxFailures),
+		authNegativeWindow:      getenvDuration("AUTH_NEGATIVE_WINDOW", auth.DefaultNegativeThrottleWindow),
+		defaultCurrency:         getenv("DEFAULT_CURRENCY", "USD"),
+		fxRates:                 os.Getenv("FX_RATES"),
 		// The audit chainer (ADR-017): on by default, since every deployment
 		// (single instance or a fleet) needs it to turn posted audit_outbox
 		// rows into the tamper-evident chain. CHAINER_ENABLED exists mainly
@@ -323,15 +335,22 @@ func run(logger *slog.Logger) error {
 	// the key auth resolved into the context is present when it runs (see
 	// ADR-012, "Per-key rate limiting", and internal/api/api.go).
 	limiter := auth.NewLimiter(cfg.rateLimitRPM)
+	// Negative-lookup throttle (Task 5.2, audit A2.5/A6.4): wired into
+	// auth.HumaMiddleware INSIDE api.New, ahead of resolver.Resolve, so a
+	// client IP over its failed-auth budget is rejected before the database
+	// lookup runs at all. See its own doc comment (internal/auth/negativethrottle.go)
+	// for the full reasoning and the bounded-map design.
+	negativeThrottle := auth.NewNegativeThrottle(cfg.authNegativeMaxFailures, cfg.authNegativeWindow)
 	deps := api.Deps{
 		Accounts: ledger.NewAccountService(repo, ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency))),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
 			ledger.WithFXProvider(fx.NewDBProvider(pool)),
 			ledger.WithIdempotencyTTL(cfg.idempotencyTTL)),
-		Audit:       ledger.NewAuditService(repo),
-		Admin:       admin.NewService(repo),
-		Auth:        resolver,
-		RateLimiter: limiter,
+		Audit:            ledger.NewAuditService(repo),
+		Admin:            admin.NewService(repo),
+		Auth:             resolver,
+		RateLimiter:      limiter,
+		NegativeThrottle: negativeThrottle,
 	}
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
@@ -404,7 +423,8 @@ func run(logger *slog.Logger) error {
 	// Wrap the router in one OTel server span per request. Health checks are
 	// filtered out so traces are real request work, not liveness noise; the
 	// metrics server (below) is never wrapped (ADR-004, ADR-010).
-	tracedHandler := otelhttp.NewHandler(router, "http.server",
+	tracedHandler := otelhttp.NewHandler(
+		router, "http.server",
 		otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/healthz" }),
 	)
 	srv := &http.Server{
@@ -728,7 +748,8 @@ func slogLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
-			logger.LogAttrs(r.Context(), slog.LevelInfo, "http request",
+			logger.LogAttrs(
+				r.Context(), slog.LevelInfo, "http request",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Int("status", ww.Status()),

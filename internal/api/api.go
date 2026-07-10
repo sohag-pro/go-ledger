@@ -65,6 +65,13 @@ type Deps struct {
 	// only exercise unauthenticated routes) leaves it nil and no rate-limit
 	// middleware is registered at all, rather than one that always fails open.
 	RateLimiter *auth.Limiter
+	// NegativeThrottle, if set, is passed straight through to
+	// auth.HumaMiddleware (Task 5.2, audit A2.5/A6.4): it caps failed-auth
+	// attempts per client IP BEFORE the resolver's database lookup runs, so a
+	// garbage-API-key flood cannot exhaust the connection pool. Optional for
+	// the same reason RateLimiter is: a nil value skips the gate entirely
+	// rather than failing closed.
+	NegativeThrottle *auth.NegativeThrottle
 }
 
 // tenantFromCtx reads the tenant HumaMiddleware resolved from the caller's API
@@ -146,7 +153,7 @@ func New(router chi.Router, deps Deps) huma.API {
 	// matched operation's path rather than by chi-level routing (see
 	// docs/adr/012-api-authentication-and-hardening.md and
 	// internal/auth/middleware.go).
-	api.UseMiddleware(auth.HumaMiddleware(api, deps.Auth, slog.Default()))
+	api.UseMiddleware(auth.HumaMiddleware(api, deps.Auth, deps.NegativeThrottle, slog.Default()))
 
 	// Rate limiting is registered immediately after auth, never before: it
 	// reads the key auth.HumaMiddleware just resolved into the context

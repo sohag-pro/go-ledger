@@ -47,9 +47,21 @@ func isV1Path(path string) bool {
 // only from the key. On any failure it writes a problem+json body and never
 // calls next, so the handler body never runs.
 //
+// Before any of that, if throttle is non-nil, it is checked against the
+// caller's IP (via clientIPFromHuma) and, if that IP is over its failed-auth
+// budget, the request is rejected with 401 WITHOUT calling resolver at all
+// (Task 5.2, audit A2.5/A6.4): this is what stops a garbage-API-key flood
+// from turning into one database lookup per bad key, since resolver never
+// caches a miss (see Resolver's own doc comment on that trade). A resolve
+// that fails with ErrUnauthorized records a failure against the caller's IP;
+// a resolve that succeeds clears it. throttle may be nil (spec generation,
+// and tests that only exercise unauthenticated routes), in which case this
+// entire gate is skipped, matching how a nil RateLimiter is handled
+// downstream.
+//
 // api is the same huma.API this middleware is registered on; huma.WriteErr
 // needs it for content negotiation when writing the error body.
-func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(huma.Context, func(huma.Context)) {
+func HumaMiddleware(api huma.API, resolver *Resolver, throttle *NegativeThrottle, log *slog.Logger) func(huma.Context, func(huma.Context)) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -67,8 +79,17 @@ func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(hum
 			return
 		}
 
+		ip := clientIPFromHuma(ctx)
+		if throttle != nil && !throttle.Allowed(ip) {
+			_ = huma.WriteErr(api, ctx, http.StatusUnauthorized, "")
+			return
+		}
+
 		key, err := resolver.Resolve(ctx.Context(), ctx.Header(authHeader))
 		if err != nil {
+			if throttle != nil && errors.Is(err, ErrUnauthorized) {
+				throttle.RecordFailure(ip)
+			}
 			var tenantErr *domain.TenantNotActiveError
 			if errors.As(err, &tenantErr) {
 				_ = huma.WriteErr(api, ctx, http.StatusForbidden, tenantErr.Reason())
@@ -82,6 +103,9 @@ func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(hum
 				slog.String("path", op.Path), slog.String("error", err.Error()))
 			_ = huma.WriteErr(api, ctx, http.StatusInternalServerError, "")
 			return
+		}
+		if throttle != nil {
+			throttle.RecordSuccess(ip)
 		}
 
 		required := RequiredHTTPScope(op.Method, op.Path)
@@ -106,14 +130,30 @@ func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(hum
 // cleanly (huma.Context.Operation().Path and huma.WithContext), so this
 // function is not wired into cmd/server today, but is kept ready if a huma
 // upgrade or a non-huma route ever needs chi-level auth.
-func Middleware(resolver *Resolver, log *slog.Logger) func(http.Handler) http.Handler {
+//
+// throttle, if non-nil, gates the resolver the same way it does in
+// HumaMiddleware: an IP (via clientIP) over its failed-auth budget is
+// rejected with 401 before resolver is called at all, a resolve failing with
+// ErrUnauthorized records a failure, and a successful resolve clears it. See
+// HumaMiddleware's doc comment for the full reasoning (Task 5.2, audit
+// A2.5/A6.4); throttle may be nil to skip this gate entirely.
+func Middleware(resolver *Resolver, throttle *NegativeThrottle, log *slog.Logger) func(http.Handler) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := clientIP(r)
+			if throttle != nil && !throttle.Allowed(ip) {
+				writeUnauthorized(w)
+				return
+			}
+
 			key, err := resolver.Resolve(r.Context(), r.Header.Get(authHeader))
 			if err != nil {
+				if throttle != nil && errors.Is(err, ErrUnauthorized) {
+					throttle.RecordFailure(ip)
+				}
 				var tenantErr *domain.TenantNotActiveError
 				if errors.As(err, &tenantErr) {
 					writeForbidden(w, tenantErr.Reason())
@@ -125,6 +165,9 @@ func Middleware(resolver *Resolver, log *slog.Logger) func(http.Handler) http.Ha
 				}
 				writeUnauthorized(w)
 				return
+			}
+			if throttle != nil {
+				throttle.RecordSuccess(ip)
 			}
 
 			required := RequiredHTTPScope(r.Method, r.URL.Path)

@@ -48,9 +48,17 @@ func discardLogger() *slog.Logger {
 // operation outside /v1 (standing in for /healthz) that requires nothing.
 func newTestAPI(t *testing.T, resolver *Resolver) (http.Handler, humatest.TestAPI) {
 	t.Helper()
+	return newTestAPIWithThrottle(t, resolver, nil)
+}
+
+// newTestAPIWithThrottle is newTestAPI with an explicit (possibly nil)
+// NegativeThrottle wired into HumaMiddleware, for the throttle-specific
+// tests below.
+func newTestAPIWithThrottle(t *testing.T, resolver *Resolver, throttle *NegativeThrottle) (http.Handler, humatest.TestAPI) {
+	t.Helper()
 
 	mux, api := humatest.New(t)
-	api.UseMiddleware(HumaMiddleware(api, resolver, discardLogger()))
+	api.UseMiddleware(HumaMiddleware(api, resolver, throttle, discardLogger()))
 
 	echoTenant := func(ctx context.Context, _ *struct{}) (*tenantEchoOutput, error) {
 		tenant, _ := TenantFromContext(ctx)
@@ -267,7 +275,7 @@ func TestMiddleware_NetHTTPFallback(t *testing.T) {
 	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
 
 	var sawTenant string
-	handler := Middleware(resolver, discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Middleware(resolver, nil, discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tenant, _ := TenantFromContext(r.Context())
 		sawTenant = tenant
 		w.WriteHeader(http.StatusOK)
@@ -303,7 +311,7 @@ func TestMiddleware_NetHTTPFallback(t *testing.T) {
 		suspendedKey := domain.APIKey{ID: "key-3", TenantID: "tenant-susp", Name: "test key", TenantStatus: domain.TenantSuspended}
 		suspendedResolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(suspendedPlaintext): suspendedKey}), time.Minute)
 		called := false
-		suspendedHandler := Middleware(suspendedResolver, discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		suspendedHandler := Middleware(suspendedResolver, nil, discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			called = true
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -449,5 +457,178 @@ func TestHumaMiddleware_AdminPathRequiresAdminScope(t *testing.T) {
 	}
 	if body["detail"] != "missing required scope: admin" {
 		t.Errorf("body detail = %v, want %q", body["detail"], "missing required scope: admin")
+	}
+}
+
+// --- Negative-lookup throttle wiring (Task 5.2, audit A2.5/A6.4): a flood of
+// bad keys from one IP must stop reaching the resolver/lookup once it is over
+// its failure budget, closing the vector where auth.Resolver's deliberate
+// non-caching of misses turns every garbage key into a database round trip. ---
+
+// floodBadKeyRequest is one request from a fixed attacker IP carrying a key
+// that has never been issued, so every attempt is a resolver miss.
+// httptest.NewRequest's default RemoteAddr ("192.0.2.1:1234") is stable
+// across calls within a test, so a run of these requests all share one
+// throttle key without any header gymnastics.
+func floodBadKeyRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	req.Header.Set(authHeader, "Bearer glk_never-issued")
+	return req
+}
+
+func TestHumaMiddleware_ThrottleStopsResolverAfterMaxFailures(t *testing.T) {
+	t.Parallel()
+
+	lookup := newFakeLookup(nil)
+	resolver := NewResolver(lookup, time.Minute)
+	throttle := NewNegativeThrottle(3, time.Minute)
+	mux, _ := newTestAPIWithThrottle(t, resolver, throttle)
+
+	// The first 3 attempts are each a resolver miss: 401, and the lookup is
+	// called once per attempt.
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, floodBadKeyRequest())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, rec.Code)
+		}
+	}
+	if got := lookup.callCount(); got != 3 {
+		t.Fatalf("lookup calls after 3 failures = %d, want 3", got)
+	}
+
+	// From here on the throttle itself should reject the request with 401
+	// WITHOUT ever calling the resolver's lookup again: this is the pool
+	// protection the throttle exists for.
+	for i := 0; i < 10; i++ {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, floodBadKeyRequest())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("throttled attempt %d: status = %d, want 401", i, rec.Code)
+		}
+	}
+	if got := lookup.callCount(); got != 3 {
+		t.Fatalf("lookup calls after the flood continued past the threshold = %d, want still 3 (the throttle must short-circuit before the DB lookup)", got)
+	}
+}
+
+// TestHumaMiddleware_ThrottleDoesNotAffectOtherIPs proves the throttle's key
+// is per-IP: a flood from one attacker address must not lock out a
+// legitimate caller arriving from a different one.
+func TestHumaMiddleware_ThrottleDoesNotAffectOtherIPs(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_throttle-other-ip-key"
+	key := domain.APIKey{ID: "key-throttle-1", TenantID: "tenant-throttle", Name: "test key", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeRead}}
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key})
+	resolver := NewResolver(lookup, time.Minute)
+	throttle := NewNegativeThrottle(3, time.Minute)
+	mux, _ := newTestAPIWithThrottle(t, resolver, throttle)
+
+	for i := 0; i < 5; i++ {
+		mux.ServeHTTP(httptest.NewRecorder(), floodBadKeyRequest())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	req.Header.Set(authHeader, "Bearer "+plaintext)
+	req.RemoteAddr = "203.0.113.9:5555"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legitimate caller behind a different IP: status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHumaMiddleware_ThrottleStillAllowsValidKeyFromFloodedIP documents the
+// tradeoff called out in the task brief: a legitimate user who happens to
+// share an IP with an ongoing flood (a NAT gateway, a shared office egress)
+// is only blocked while that IP is over budget. Here the flood has not yet
+// crossed the threshold, so a valid key from the same IP still authenticates
+// normally; TestHumaMiddleware_ThrottleStopsResolverAfterMaxFailures covers
+// the case once the budget IS exhausted, where the doc comment on
+// HumaMiddleware and NegativeThrottle explains the accepted tradeoff.
+func TestHumaMiddleware_ThrottleStillAllowsValidKeyFromFloodedIP(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_throttle-same-ip-key"
+	key := domain.APIKey{ID: "key-throttle-2", TenantID: "tenant-throttle-2", Name: "test key", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeRead}}
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key})
+	resolver := NewResolver(lookup, time.Minute)
+	throttle := NewNegativeThrottle(3, time.Minute)
+	mux, _ := newTestAPIWithThrottle(t, resolver, throttle)
+
+	// Two failures from the shared IP: under the budget of 3, so the next
+	// request from the same IP is still evaluated by the resolver.
+	for i := 0; i < 2; i++ {
+		mux.ServeHTTP(httptest.NewRecorder(), floodBadKeyRequest())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	req.Header.Set(authHeader, "Bearer "+plaintext)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid key under the flood IP's budget: status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHumaMiddleware_NilThrottleSkipsGate proves a nil throttle (spec
+// generation, and any caller that does not wire one) behaves exactly like
+// today: every attempt reaches the resolver, never short-circuited.
+func TestHumaMiddleware_NilThrottleSkipsGate(t *testing.T) {
+	t.Parallel()
+
+	lookup := newFakeLookup(nil)
+	resolver := NewResolver(lookup, time.Minute)
+	mux, _ := newTestAPIWithThrottle(t, resolver, nil)
+
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, floodBadKeyRequest())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, rec.Code)
+		}
+	}
+	if got := lookup.callCount(); got != 5 {
+		t.Fatalf("lookup calls with a nil throttle = %d, want 5 (no gate should be applied)", got)
+	}
+}
+
+// TestMiddleware_NetHTTPThrottleStopsResolverAfterMaxFailures is the
+// net/http-fallback equivalent of
+// TestHumaMiddleware_ThrottleStopsResolverAfterMaxFailures: the chi-level
+// Middleware must apply the same pool-protecting gate.
+func TestMiddleware_NetHTTPThrottleStopsResolverAfterMaxFailures(t *testing.T) {
+	t.Parallel()
+
+	lookup := newFakeLookup(nil)
+	resolver := NewResolver(lookup, time.Minute)
+	throttle := NewNegativeThrottle(2, time.Minute)
+	handler := Middleware(resolver, throttle, discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, floodBadKeyRequest())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, rec.Code)
+		}
+	}
+	if got := lookup.callCount(); got != 2 {
+		t.Fatalf("lookup calls after 2 failures = %d, want 2", got)
+	}
+
+	for i := 0; i < 10; i++ {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, floodBadKeyRequest())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("throttled attempt %d: status = %d, want 401", i, rec.Code)
+		}
+	}
+	if got := lookup.callCount(); got != 2 {
+		t.Fatalf("lookup calls after the flood continued past the threshold = %d, want still 2", got)
 	}
 }
