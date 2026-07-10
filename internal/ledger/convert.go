@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -77,7 +78,20 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, domain.ErrNonPositiveConvertAmount
 	}
 
-	fingerprint := domain.ConvertRequestFingerprint(req.FromAccountID, req.ToAccountID, req.SourceAmount)
+	// Routed through the scheme dispatcher, not a direct
+	// ConvertRequestFingerprint call, so the value stored below is always
+	// whatever CurrentFingerprintScheme actually means today. For a convert
+	// request this happens to be byte-identical to ConvertRequestFingerprint
+	// regardless of scheme (see ConvertFingerprint's doc comment: there is no
+	// reference or effective_at on a convert request to add for "v2"), but
+	// going through the dispatcher keeps this path from silently drifting out
+	// of step with whatever scheme name gets stamped alongside it. ok is only
+	// false if CurrentFingerprintScheme itself is not registered, a
+	// programmer error this binary would make about itself.
+	fingerprint, ok := domain.ConvertFingerprint(domain.CurrentFingerprintScheme, req.FromAccountID, req.ToAccountID, req.SourceAmount)
+	if !ok {
+		return nil, false, fmt.Errorf("ledger: fingerprint scheme %q (CurrentFingerprintScheme) is not registered in ConvertFingerprint", domain.CurrentFingerprintScheme)
+	}
 
 	// Idempotency is resolved from the request fingerprint, before the rate
 	// lookup: a hit here replays the stored transaction without ever calling

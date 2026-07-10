@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -100,7 +101,58 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		return false, err
 	}
 
-	fingerprint := t.Fingerprint()
+	// Computed under CurrentFingerprintScheme, and snapshotted as a plain
+	// value (before) rather than re-read off *t later, both before RunInTx
+	// runs: tx.CreateTransaction below resolves t.EffectiveAt's nil fallback
+	// to the row's created_at as a side effect on this same *t, even on an
+	// attempt that ultimately rolls back (a Go-level mutation is not undone
+	// by a SQL ROLLBACK). Fingerprinting *t again after that point, as
+	// replay() below would if it recomputed from *t directly, would hash a
+	// resolved timestamp the client never supplied instead of the absent
+	// marker the ORIGINAL successful post's fingerprint was computed and
+	// stored with, corrupting the "v2" scheme's comparison (Task 4.3, audit
+	// A1.3) on every legitimate retry that omits effective_at. Capturing
+	// "before" here, ahead of any mutation, is what keeps that comparison
+	// honest. ok is only false if CurrentFingerprintScheme itself is not
+	// registered in TransactionFingerprint, a programmer error this binary
+	// would make about itself, never about caller input.
+	fingerprint, ok := domain.TransactionFingerprint(domain.CurrentFingerprintScheme, *t)
+	if !ok {
+		return false, fmt.Errorf("ledger: fingerprint scheme %q (CurrentFingerprintScheme) is not registered in TransactionFingerprint", domain.CurrentFingerprintScheme)
+	}
+	before := *t
+
+	// Idempotency is resolved against any EXISTING stored key before ever
+	// attempting to write, mirroring Convert's own precheck (see convert.go).
+	// Post did not need this before Task 4.3: every prior unique constraint a
+	// retry could trip (transactions_pkey, the one-reversal index) only ever
+	// fired for a genuinely NEW transaction, never for an identical retry, so
+	// letting RunInTx's own ErrDuplicateIdempotencyKey handling below catch
+	// the retry was enough. transactions_tenant_reference_idx changes that:
+	// an identical retry that reuses the SAME reference now races its OWN
+	// prior success there too, and CreateTransaction runs before
+	// InsertIdempotencyKey inside RunInTx, so that reference collision would
+	// surface as ErrDuplicateReference and return a spurious conflict instead
+	// of ever reaching the idempotency-key check that should have replayed
+	// it. Checking here first avoids attempting that second insert at all for
+	// the common (non-concurrent) retry. RunInTx's post-hoc
+	// ErrDuplicateIdempotencyKey handling still exists below to catch the
+	// remaining race window: two concurrent identical requests for a
+	// brand-new key can both pass this precheck before either commits (see
+	// TestPostIdempotentHammer).
+	if idem != nil {
+		_, err := s.repo.GetIdempotencyKey(ctx, tenantID, idem.Key)
+		switch {
+		case err == nil:
+			return s.replay(ctx, tenantID, idem.Key, before, t)
+		case errors.Is(err, domain.ErrIdempotencyKeyNotFound):
+			// No existing key: proceed with a real post.
+		default:
+			span.RecordError(err)
+			return false, err
+		}
+	}
+
 	start := time.Now()
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
@@ -129,7 +181,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 
 	if runErr != nil {
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
-			return s.replay(ctx, tenantID, idem.Key, t)
+			return s.replay(ctx, tenantID, idem.Key, before, t)
 		}
 		span.RecordError(runErr)
 		span.SetStatus(codes.Error, "post failed")
@@ -145,23 +197,28 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 	return false, nil
 }
 
-// replay resolves a duplicate idempotency key: it recomputes t's fingerprint
-// under the SCHEME THE STORED RECORD CARRIES (rec.Scheme), not necessarily
-// the scheme this binary currently writes (domain.CurrentFingerprintScheme),
-// so a fingerprint-scheme change never false-conflicts a key stored under an
-// older scheme (Task 2.3, audit A1.6). If that recomputation matches the
+// replay resolves a duplicate idempotency key: it recomputes before's
+// fingerprint under the SCHEME THE STORED RECORD CARRIES (rec.Scheme), not
+// necessarily the scheme this binary currently writes
+// (domain.CurrentFingerprintScheme), so a fingerprint-scheme change never
+// false-conflicts a key stored under an older scheme (Task 2.3, audit A1.6).
+// before is the pre-RunInTx snapshot Post captured, not a fresh read off *t:
+// see Post's doc comment at the call site for why recomputing from *t here
+// instead would corrupt the comparison for the "v2" scheme (Task 4.3, audit
+// A1.3), whose fingerprint includes EffectiveAt, once tx.CreateTransaction's
+// nil fallback has mutated it. If the recomputation over before matches the
 // stored fingerprint, it loads the original transaction into t and reports a
 // replay; if not, the key was reused with a different body and it returns
 // ErrIdempotencyConflict. If rec.Scheme is not one this binary knows how to
 // compute (for example a key written by a newer binary, then read by this
 // one after a downgrade), it fails closed with ErrIdempotencyConflict rather
 // than risk replaying a transaction it cannot verify the body of.
-func (s *TransactionService) replay(ctx context.Context, tenantID, key string, t *domain.Transaction) (bool, error) {
+func (s *TransactionService) replay(ctx context.Context, tenantID, key string, before domain.Transaction, t *domain.Transaction) (bool, error) {
 	rec, err := s.repo.GetIdempotencyKey(ctx, tenantID, key)
 	if err != nil {
 		return false, err
 	}
-	expected, ok := domain.TransactionFingerprint(rec.Scheme, *t)
+	expected, ok := domain.TransactionFingerprint(rec.Scheme, before)
 	if !ok || rec.Fingerprint != expected {
 		metrics.IdempotencyConflicts.Inc()
 		return false, domain.ErrIdempotencyConflict
