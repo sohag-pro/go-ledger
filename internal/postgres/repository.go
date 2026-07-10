@@ -1385,6 +1385,58 @@ func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, 
 	return entries, nil
 }
 
+// StatementExport returns up to limit postings affecting the account within
+// an optional [from, to) created_at window, newest first, each with its
+// running balance (Task 6.3, audit A9.2): the per-account period statement
+// export's bounded, unpaged counterpart to Statement.
+func (r *Repository) StatementExport(ctx context.Context, tenantID, accountID string, currency domain.Currency, from, to *time.Time, limit int) ([]domain.StatementEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+
+	var rows []sqlc.AccountStatementRangeRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.AccountStatementRange(ctx, sqlc.AccountStatementRangeParams{
+			TenantID:  tid,
+			AccountID: aid,
+			FromTs:    ptrToTimestamptz(from),
+			ToTs:      ptrToTimestamptz(to),
+			RowLimit:  int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: account statement export: %w", err)
+	}
+
+	entries := make([]domain.StatementEntry, 0, len(rows))
+	for _, row := range rows {
+		amount, err := domain.NewMoney(row.Amount, currency)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: statement export amount: %w", err)
+		}
+		running, err := domain.NewMoney(row.RunningBalance, currency)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: statement export running balance: %w", err)
+		}
+		entries = append(entries, domain.StatementEntry{
+			ID:             row.ID.String(),
+			TransactionID:  row.TransactionID.String(),
+			Amount:         amount,
+			RunningBalance: running,
+			Description:    row.Description,
+			CreatedAt:      row.CreatedAt,
+		})
+	}
+	return entries, nil
+}
+
 // GetAPIKeyByHash resolves an unrevoked api_keys row by hash, or
 // domain.ErrAPIKeyNotFound if none exists.
 func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.APIKey, error) {

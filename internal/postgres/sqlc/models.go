@@ -83,6 +83,17 @@ type CryptoKey struct {
 	Version    int32
 }
 
+type Dispute struct {
+	ID                      uuid.UUID
+	TenantID                uuid.UUID
+	TransactionID           uuid.UUID
+	Status                  string
+	Reason                  string
+	ResolutionTransactionID pgtype.UUID
+	CreatedAt               time.Time
+	ResolvedAt              pgtype.Timestamptz
+}
+
 type FxRate struct {
 	ID          int64
 	Base        string

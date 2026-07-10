@@ -32,6 +32,16 @@ type Querier interface {
 	// after_created_at / after_id are the keyset position: pass a far-future
 	// timestamp and the max uuid for the first page.
 	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
+	// The per-account period statement export (Task 6.3, audit A9.2): like
+	// AccountStatement above, the running balance is a window SUM over the
+	// account's FULL posting history (the CTE), so a filtered page still shows
+	// each entry's real running balance, not one reset to the filtered window.
+	// from_ts/to_ts are optional via sqlc.narg (NULL disables that bound, the
+	// same half-open [from, to) convention ListTransactions uses); the outer
+	// query applies the date filter and caps the result at row_limit, requested
+	// by the caller as one more than the export cap it wants so a truncated
+	// export can be detected without a second round trip.
+	AccountStatementRange(ctx context.Context, arg AccountStatementRangeParams) ([]AccountStatementRangeRow, error)
 	// Task 5.5, audit A1.5: each named account's current status, min_balance,
 	// and is_system flag ONLY (no balance), read inside the caller's
 	// SERIALIZABLE RunInTx body (see domain.Tx.AccountPostingStates). This is
@@ -67,6 +77,10 @@ type Querier interface {
 	// 0022) applies, the same way CreateTenant leaves status to the column
 	// default.
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
+	// Task 6.3, audit A9.2: status is NOT inserted explicitly (the column
+	// default 'open' applies), the same convention CreateAccount leaves status
+	// to its own column default for.
+	CreateDispute(ctx context.Context, arg CreateDisputeParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
 	CreateTenant(ctx context.Context, arg CreateTenantParams) error
 	// currency lives on each posting now (ADR-014), not here: an FX transaction
@@ -131,6 +145,7 @@ type Querier interface {
 	// encrypted anything and never been shredded: a genuine first-use case, not
 	// an error, for the caller to handle.
 	GetCurrentCryptoKey(ctx context.Context, tenantID uuid.UUID) (GetCurrentCryptoKeyRow, error)
+	GetDispute(ctx context.Context, arg GetDisputeParams) (Dispute, error)
 	// An expired row is treated as absent (Task 4.5, audit A1.4): the "AND
 	// expires_at > now()" filter is what makes a key whose replay window has
 	// passed behave exactly like a key that was never written, from the caller's
@@ -332,6 +347,12 @@ type Querier interface {
 	// the same reason GetLastAuditHash does: it is the one order the chainer
 	// itself guarantees is monotonic across any failover.
 	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
+	// Filtered, keyset-paged list of a tenant's disputes, newest first (Task
+	// 6.3, audit A9.2). status is an optional filter via sqlc.narg: NULL
+	// disables it (every status is returned). Keyset paged by (created_at, id)
+	// descending, the identical cursor shape ListTransactions and
+	// AccountStatement already use.
+	ListDisputes(ctx context.Context, arg ListDisputesParams) ([]Dispute, error)
 	// The delivery worker's batch read: pending/failed rows whose backoff has
 	// elapsed, oldest due first, joined to their subscription for the url and
 	// secret needed to sign and send. "AND ws.active" means a subscription that
@@ -428,6 +449,13 @@ type Querier interface {
 	// tenant_id is of type uuid but expression is of type text"). Casting to
 	// uuid explicitly at each use pins its type regardless of statement order.
 	MintCryptoKeyVersion(ctx context.Context, arg MintCryptoKeyVersionParams) (MintCryptoKeyVersionRow, error)
+	// Task 6.3, audit A9.2: the guarded transition out of 'open'. The WHERE
+	// status = 'open' clause is what makes resolving an already-resolved (or
+	// concurrently-being-resolved) dispute return zero rows rather than
+	// silently overwriting a prior resolution: the caller
+	// (postgres.Repository.ResolveDispute) treats a zero-row result as
+	// domain.ErrDisputeAlreadyResolved.
+	ResolveDispute(ctx context.Context, arg ResolveDisputeParams) (Dispute, error)
 	// COALESCE makes this idempotent: revoking an already-revoked key keeps its
 	// original revoked_at instead of bumping it, and still reports one row
 	// affected (not zero), so the admin service can tell "no such key" (0 rows)
@@ -517,6 +545,16 @@ type Querier interface {
 	// throttled from the auth resolver (Task 2.2): not every request, so this is
 	// not a write on the hot path of every authenticated call.
 	TouchAPIKeyLastUsed(ctx context.Context, arg TouchAPIKeyLastUsedParams) error
+	// Task 6.3, audit A9.2: every account's derived balance, including system
+	// (FX clearing) accounts, which hold the FX position and are part of the
+	// balance proof. The LEFT JOIN means an account with no postings yet still
+	// returns one row, with balance COALESCEd to 0, the same shape
+	// AccountBalances (postings.sql) already uses.
+	TrialBalanceAccounts(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceAccountsRow, error)
+	// Task 6.3, audit A9.2: the double-entry balance proof. Each currency's net
+	// posted total across every account in the tenant; in a correct ledger every
+	// total is zero (ADR-001).
+	TrialBalanceByCurrency(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceByCurrencyRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

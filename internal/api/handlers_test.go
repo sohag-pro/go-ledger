@@ -58,6 +58,9 @@ type fakeRepo struct {
 	// operate directly through sqlc rather than domain.Repository); this
 	// exists only so the admin webhook CRUD handlers have something to call.
 	webhookSubs map[string]domain.WebhookSubscription
+	// disputes is a minimal in-memory stand-in for the disputes table (Task
+	// 6.3, audit A9.2), keyed by dispute id.
+	disputes map[string]domain.Dispute
 }
 
 type postingRec struct {
@@ -85,6 +88,7 @@ func newFakeRepo() *fakeRepo {
 		apiKeys:      map[string]domain.APIKey{},
 		tenants:      map[string]domain.Tenant{},
 		webhookSubs:  map[string]domain.WebhookSubscription{},
+		disputes:     map[string]domain.Dispute{},
 	}
 }
 
@@ -550,6 +554,52 @@ func (f *fakeRepo) Statement(_ context.Context, _, accountID string, currency do
 	return out, nil
 }
 
+// StatementExport mirrors Statement above (Task 6.3, audit A9.2), but
+// filters by an optional [from, to) created_at window instead of a keyset
+// cursor, and caps the result at limit without a "more pages" concept: the
+// caller (ledger.AccountService.StatementExport) detects truncation from
+// len(entries) > limit itself.
+func (f *fakeRepo) StatementExport(_ context.Context, _, accountID string, currency domain.Currency, from, to *time.Time, limit int) ([]domain.StatementEntry, error) {
+	recs := make([]postingRec, 0)
+	for _, p := range f.postings {
+		if p.accountID == accountID {
+			recs = append(recs, p)
+		}
+	}
+	sort.Slice(recs, func(i, j int) bool {
+		if !recs[i].createdAt.Equal(recs[j].createdAt) {
+			return recs[i].createdAt.Before(recs[j].createdAt)
+		}
+		return recs[i].id < recs[j].id
+	})
+	var run int64
+	asc := make([]domain.StatementEntry, 0, len(recs))
+	for _, r := range recs {
+		run += r.amount
+		amt, _ := domain.NewMoney(r.amount, currency)
+		rb, _ := domain.NewMoney(run, currency)
+		asc = append(asc, domain.StatementEntry{
+			ID: r.id, TransactionID: r.txnID, Amount: amt, RunningBalance: rb,
+			Description: r.description, CreatedAt: r.createdAt,
+		})
+	}
+	out := make([]domain.StatementEntry, 0, len(asc))
+	for i := len(asc) - 1; i >= 0; i-- {
+		e := asc[i]
+		if from != nil && e.CreatedAt.Before(*from) {
+			continue
+		}
+		if to != nil && !e.CreatedAt.Before(*to) {
+			continue
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeRepo) RunInTx(ctx context.Context, _ string, fn func(context.Context, domain.Tx) error) error {
 	return fn(ctx, f)
 }
@@ -774,6 +824,131 @@ func (f *fakeRepo) ShredTenantCryptoKey(_ context.Context, _ string) error {
 	return nil
 }
 
+// TrialBalanceByCurrency mirrors the real query (Task 6.3, audit A9.2):
+// SUM(amount) over every posting, grouped by the owning account's currency
+// (f.postings itself carries no currency, unlike the real postings table, so
+// this looks it up via the account).
+func (f *fakeRepo) TrialBalanceByCurrency(_ context.Context, _ string) ([]domain.CurrencyTotal, error) {
+	totals := map[domain.Currency]int64{}
+	for _, p := range f.postings {
+		a, ok := f.accounts[p.accountID]
+		if !ok {
+			continue
+		}
+		totals[a.Currency] += p.amount
+	}
+	out := make([]domain.CurrencyTotal, 0, len(totals))
+	for c, net := range totals {
+		out = append(out, domain.CurrencyTotal{Currency: c, Net: net})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Currency < out[j].Currency })
+	return out, nil
+}
+
+// TrialBalanceAccounts mirrors the real query (Task 6.3, audit A9.2): every
+// account's derived balance, including system accounts.
+func (f *fakeRepo) TrialBalanceAccounts(_ context.Context, _ string) ([]domain.AccountBalance, error) {
+	balances := map[string]int64{}
+	for _, p := range f.postings {
+		balances[p.accountID] += p.amount
+	}
+	out := make([]domain.AccountBalance, 0, len(f.accounts))
+	for id, a := range f.accounts {
+		out = append(out, domain.AccountBalance{
+			AccountID: id,
+			Name:      a.Name,
+			Type:      a.Type,
+			Currency:  a.Currency,
+			IsSystem:  a.System,
+			Balance:   balances[id],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// CreateDispute mirrors postgres.Repository.CreateDispute (Task 6.3, audit
+// A9.2): assigns an id if empty, validates, and stores.
+func (f *fakeRepo) CreateDispute(_ context.Context, tenantID string, d *domain.Dispute) error {
+	if d.ID == "" {
+		d.ID = uuid.NewString()
+	}
+	if d.Status == "" {
+		d.Status = domain.DisputeOpen
+	}
+	d.TenantID = tenantID
+	if err := d.Validate(); err != nil {
+		return err
+	}
+	f.clock++
+	d.CreatedAt = time.Unix(f.clock, 0).UTC()
+	f.disputes[d.ID] = *d
+	return nil
+}
+
+func (f *fakeRepo) GetDispute(_ context.Context, tenantID, id string) (domain.Dispute, error) {
+	d, ok := f.disputes[id]
+	if !ok || d.TenantID != tenantID {
+		return domain.Dispute{}, domain.ErrDisputeNotFound
+	}
+	return d, nil
+}
+
+// ListDisputes mirrors ListTransactions' "collect, sort ascending, then walk
+// from the newest applying the cursor" style (Task 6.3, audit A9.2).
+func (f *fakeRepo) ListDisputes(_ context.Context, tenantID string, status *domain.DisputeStatus, after *domain.StatementCursor, limit int) ([]domain.Dispute, error) {
+	asc := make([]domain.Dispute, 0, len(f.disputes))
+	for _, d := range f.disputes {
+		if d.TenantID != tenantID {
+			continue
+		}
+		if status != nil && d.Status != *status {
+			continue
+		}
+		asc = append(asc, d)
+	}
+	sort.Slice(asc, func(i, j int) bool {
+		if !asc[i].CreatedAt.Equal(asc[j].CreatedAt) {
+			return asc[i].CreatedAt.Before(asc[j].CreatedAt)
+		}
+		return asc[i].ID < asc[j].ID
+	})
+	out := make([]domain.Dispute, 0, len(asc))
+	for i := len(asc) - 1; i >= 0; i-- {
+		d := asc[i]
+		if after != nil {
+			if d.CreatedAt.After(after.CreatedAt) || (d.CreatedAt.Equal(after.CreatedAt) && d.ID >= after.ID) {
+				continue
+			}
+		}
+		out = append(out, d)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ResolveDispute mirrors postgres.Repository.ResolveDispute's guarded
+// transition (Task 6.3, audit A9.2): domain.ErrDisputeAlreadyResolved for
+// anything not currently open, domain.ErrDisputeNotFound for an unknown id.
+func (f *fakeRepo) ResolveDispute(_ context.Context, tenantID, id string, status domain.DisputeStatus, resolutionTransactionID *string) (domain.Dispute, error) {
+	d, ok := f.disputes[id]
+	if !ok || d.TenantID != tenantID {
+		return domain.Dispute{}, domain.ErrDisputeNotFound
+	}
+	if d.Status.Terminal() {
+		return domain.Dispute{}, domain.ErrDisputeAlreadyResolved
+	}
+	d.Status = status
+	d.ResolutionTransactionID = resolutionTransactionID
+	f.clock++
+	resolvedAt := time.Unix(f.clock, 0).UTC()
+	d.ResolvedAt = &resolvedAt
+	f.disputes[id] = d
+	return d, nil
+}
+
 var _ domain.Repository = (*fakeRepo)(nil)
 
 // fakeFXProvider is a fixed-rate fx.Provider for handler tests: it stands in
@@ -815,12 +990,15 @@ func newAPIRouterWithOptions(repo domain.Repository, opts ...ledger.ServiceOptio
 		panic("newAPIRouter: provision default test key: " + err.Error())
 	}
 
+	transactions := ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, opts...)
 	r := chi.NewRouter()
 	New(r, Deps{
 		Accounts:     ledger.NewAccountService(repo),
-		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, opts...),
+		Transactions: transactions,
 		Audit:        ledger.NewAuditService(repo),
 		Admin:        admin.NewService(repo),
+		Reports:      ledger.NewReportService(repo),
+		Disputes:     ledger.NewDisputeService(repo, transactions),
 		Auth:         auth.NewResolver(repo, time.Minute),
 	})
 	return r

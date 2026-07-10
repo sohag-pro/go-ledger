@@ -111,6 +111,20 @@ func toHumaErr(err error) error {
 		return huma.Error404NotFound("account not found")
 	case errors.Is(err, domain.ErrTransactionNotFound):
 		return huma.Error404NotFound("transaction not found")
+	case errors.Is(err, domain.ErrDisputeNotFound):
+		return huma.Error404NotFound("dispute not found")
+	case errors.Is(err, domain.ErrInvalidDispute):
+		return huma.Error422UnprocessableEntity("dispute is missing a required field")
+	case errors.Is(err, domain.ErrDisputeReasonTooLong):
+		return huma.Error422UnprocessableEntity("dispute reason is too long")
+	case errors.Is(err, domain.ErrInvalidDisputeAction):
+		return huma.Error422UnprocessableEntity("dispute action must be reverse or reject")
+	// domain.ErrDisputeAlreadyResolved (Task 6.3, audit A9.2) maps to 409,
+	// the same class as ErrDuplicateTransaction and ErrIdempotencyConflict
+	// above: the request is otherwise well-formed, it just targets a
+	// dispute that is no longer in the state (open) the action requires.
+	case errors.Is(err, domain.ErrDisputeAlreadyResolved):
+		return huma.Error409Conflict("dispute is already resolved")
 	case errors.Is(err, domain.ErrCannotReverseReversal):
 		return huma.Error422UnprocessableEntity("cannot reverse a transaction that is itself a reversal")
 	case errors.Is(err, domain.ErrDuplicateTransaction):

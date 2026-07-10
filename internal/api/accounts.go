@@ -1,8 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -129,6 +133,68 @@ type StatementOutput struct {
 		Entries    []StatementEntryBody `json:"entries"`
 		NextCursor *string              `json:"next_cursor" doc:"Cursor for the next page, or null if this is the last page"`
 	}
+}
+
+// StatementExportInput is the export-account-statement request: a path id,
+// an optional from/to created_at window (RFC3339, half-open like
+// TransactionExportInput's), plus format (Task 6.3, audit A9.2). Unlike GET
+// /v1/accounts/{id}/statement this is not keyset paged: it returns every
+// matching entry up to ledger.MaxExportRows in a single response, the same
+// bounded-export shape GET /v1/transactions/export uses.
+type StatementExportInput struct {
+	ID     string `path:"id" format:"uuid" doc:"Account id"`
+	From   string `query:"from" doc:"RFC3339 timestamp. Only postings created at or after this time."`
+	To     string `query:"to" doc:"RFC3339 timestamp. Only postings created strictly before this time."`
+	Format string `query:"format" default:"csv" enum:"csv,json" doc:"csv (default): one row per posting, with a header row. json: an array of statement entries."`
+}
+
+// StatementExportOutput is a raw csv or json export body, the same shape
+// TransactionExportOutput uses (Task 6.3, audit A9.2): Body is a []byte,
+// which huma writes out verbatim instead of JSON-encoding it.
+type StatementExportOutput struct {
+	ContentType        string `header:"Content-Type"`
+	ContentDisposition string `header:"Content-Disposition" doc:"Set to attachment for csv; unset for json"`
+	Truncated          bool   `header:"Export-Truncated" doc:"true if the account's matching posting history exceeds the export row cap and this export contains only the newest rows up to it"`
+	Body               []byte
+}
+
+// statementExportJSONEntry is the json format's per-entry shape: the same
+// fields StatementEntryBody carries, plus TransactionID (already present)
+// with the csv header's exact column names as json keys, so the two formats
+// describe the identical data.
+type statementExportJSONEntry struct {
+	PostingID      string    `json:"posting_id"`
+	TransactionID  string    `json:"transaction_id"`
+	CreatedAt      time.Time `json:"created_at"`
+	Amount         int64     `json:"amount"`
+	Currency       string    `json:"currency"`
+	RunningBalance int64     `json:"running_balance"`
+	Description    string    `json:"description"`
+}
+
+// statementCSV renders entries as a csv with the header the brief specifies
+// exactly: posting_id, transaction_id, created_at, amount, currency,
+// running_balance, description (Task 6.3, audit A9.2).
+func statementCSV(entries []domain.StatementEntry, currency string) []byte {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{
+		"posting_id", "transaction_id", "created_at", "amount", "currency",
+		"running_balance", "description",
+	})
+	for _, e := range entries {
+		_ = w.Write([]string{
+			e.ID,
+			e.TransactionID,
+			e.CreatedAt.UTC().Format(time.RFC3339Nano),
+			strconv.FormatInt(e.Amount.Amount(), 10),
+			currency,
+			strconv.FormatInt(e.RunningBalance.Amount(), 10),
+			e.Description,
+		})
+	}
+	w.Flush()
+	return buf.Bytes()
 }
 
 func registerAccounts(api huma.API, deps Deps) {
@@ -293,4 +359,78 @@ func registerAccounts(api huma.API, deps Deps) {
 		}
 		return out, nil
 	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "export-account-statement",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts/{id}/statement/export",
+		Summary:     "Export an account's period statement",
+		Description: "Exports the account's postings within an optional from/to created_at window (from inclusive, to exclusive), each with its running balance, as csv (default, one row per posting) or json. Not paged: bounded instead at a fixed row cap (the same ledger.MaxExportRows GET /v1/transactions/export uses), so a longer matching history than the cap yields only the newest rows up to it, reported via the Export-Truncated response header.",
+		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, in *StatementExportInput) (*StatementExportOutput, error) {
+		from, to, err := parseTimeRange(in.From, in.To)
+		if err != nil {
+			return nil, err
+		}
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		acct, entries, truncated, err := deps.Accounts.StatementExport(ctx, tenant, in.ID, from, to)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+
+		out := &StatementExportOutput{Truncated: truncated}
+		if in.Format == "json" {
+			items := make([]statementExportJSONEntry, 0, len(entries))
+			for _, e := range entries {
+				items = append(items, statementExportJSONEntry{
+					PostingID:      e.ID,
+					TransactionID:  e.TransactionID,
+					CreatedAt:      e.CreatedAt,
+					Amount:         e.Amount.Amount(),
+					Currency:       string(acct.Currency),
+					RunningBalance: e.RunningBalance.Amount(),
+					Description:    e.Description,
+				})
+			}
+			b, err := json.Marshal(items)
+			if err != nil {
+				return nil, huma.Error500InternalServerError("marshal export")
+			}
+			out.ContentType = "application/json"
+			out.Body = b
+			return out, nil
+		}
+		out.ContentType = "text/csv"
+		out.ContentDisposition = `attachment; filename="statement.csv"`
+		out.Body = statementCSV(entries, string(acct.Currency))
+		return out, nil
+	})
+}
+
+// parseTimeRange parses the optional from/to RFC3339 query parameters shared
+// by StatementExportInput, mirroring parseTransactionFilter's from/to
+// handling (Task 4.4, audit A7.2) without the reference field a per-account
+// statement export has no use for. An empty string leaves that side of the
+// window unset (nil).
+func parseTimeRange(from, to string) (*time.Time, *time.Time, error) {
+	var f, t *time.Time
+	if from != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, from)
+		if err != nil {
+			return nil, nil, huma.Error422UnprocessableEntity("from must be an RFC3339 timestamp")
+		}
+		f = &parsed
+	}
+	if to != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, to)
+		if err != nil {
+			return nil, nil, huma.Error422UnprocessableEntity("to must be an RFC3339 timestamp")
+		}
+		t = &parsed
+	}
+	return f, t, nil
 }

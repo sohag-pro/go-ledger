@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const accountBalance = `-- name: AccountBalance :one
@@ -87,6 +88,85 @@ func (q *Queries) AccountStatement(ctx context.Context, arg AccountStatementPara
 	var items []AccountStatementRow
 	for rows.Next() {
 		var i AccountStatementRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TransactionID,
+			&i.Amount,
+			&i.RunningBalance,
+			&i.Description,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const accountStatementRange = `-- name: AccountStatementRange :many
+WITH entries AS (
+    SELECT
+        id,
+        transaction_id,
+        amount,
+        description,
+        created_at,
+        (SUM(amount) OVER (ORDER BY created_at, id))::bigint AS running_balance
+    FROM postings
+    WHERE tenant_id = $1 AND account_id = $2
+)
+SELECT id, transaction_id, amount, running_balance, description, created_at
+FROM entries
+WHERE ($3::timestamptz IS NULL OR created_at >= $3)
+  AND ($4::timestamptz IS NULL OR created_at < $4)
+ORDER BY created_at DESC, id DESC
+LIMIT $5
+`
+
+type AccountStatementRangeParams struct {
+	TenantID  uuid.UUID
+	AccountID uuid.UUID
+	FromTs    pgtype.Timestamptz
+	ToTs      pgtype.Timestamptz
+	RowLimit  int32
+}
+
+type AccountStatementRangeRow struct {
+	ID             uuid.UUID
+	TransactionID  uuid.UUID
+	Amount         int64
+	RunningBalance int64
+	Description    string
+	CreatedAt      time.Time
+}
+
+// The per-account period statement export (Task 6.3, audit A9.2): like
+// AccountStatement above, the running balance is a window SUM over the
+// account's FULL posting history (the CTE), so a filtered page still shows
+// each entry's real running balance, not one reset to the filtered window.
+// from_ts/to_ts are optional via sqlc.narg (NULL disables that bound, the
+// same half-open [from, to) convention ListTransactions uses); the outer
+// query applies the date filter and caps the result at row_limit, requested
+// by the caller as one more than the export cap it wants so a truncated
+// export can be detected without a second round trip.
+func (q *Queries) AccountStatementRange(ctx context.Context, arg AccountStatementRangeParams) ([]AccountStatementRangeRow, error) {
+	rows, err := q.db.Query(ctx, accountStatementRange,
+		arg.TenantID,
+		arg.AccountID,
+		arg.FromTs,
+		arg.ToTs,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AccountStatementRangeRow
+	for rows.Next() {
+		var i AccountStatementRangeRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TransactionID,

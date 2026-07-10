@@ -59,7 +59,12 @@ type Deps struct {
 	// already requires domain.ScopeAdmin via auth.HumaMiddleware
 	// (RequiredHTTPScope), so the operations themselves add no further auth.
 	Admin *admin.Service
-	Auth  *auth.Resolver
+	// Reports backs GET /v1/reports/trial-balance (Task 6.3, audit A9.2).
+	Reports *ledger.ReportService
+	// Disputes backs the /v1/disputes operations (Task 6.3, audit A9.2): a
+	// dispute/chargeback data model built on the reversal primitive.
+	Disputes *ledger.DisputeService
+	Auth     *auth.Resolver
 	// RateLimiter, if set, is registered immediately after the auth middleware
 	// (see New). It is optional: a zero Deps (spec generation, and tests that
 	// only exercise unauthenticated routes) leaves it nil and no rate-limit
@@ -186,6 +191,8 @@ func registerOperations(api huma.API, deps Deps) {
 	registerTransactions(api, deps)
 	registerAudit(api, deps)
 	registerAdmin(api, deps)
+	registerReports(api, deps)
+	registerDisputes(api, deps)
 }
 
 // SpecYAML builds the API on a throwaway router and serializes its OpenAPI spec

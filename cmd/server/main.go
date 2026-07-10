@@ -473,24 +473,32 @@ func run(logger *slog.Logger) error {
 	// lookup runs at all. See its own doc comment (internal/auth/negativethrottle.go)
 	// for the full reasoning and the bounded-map design.
 	negativeThrottle := auth.NewNegativeThrottle(cfg.authNegativeMaxFailures, cfg.authNegativeWindow)
+	transactions := ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
+		ledger.WithFXProvider(fx.NewDBProvider(pool)),
+		ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
+		// PrePostHook (Task 6.1, audit A9.1) is scaffolding for an external
+		// compliance/screening integration: wired explicitly to
+		// NoopPrePostHook here, the same default TransactionService falls
+		// back to on its own, so this deployment allows every transaction
+		// exactly as it did before this hook existed. A real screening
+		// integration replaces this one line with its own PrePostHook
+		// implementation; nothing else in the posting path needs to change.
+		ledger.WithPrePostHook(ledger.NoopPrePostHook{}),
+		ledger.WithCipher(cipher))
 	deps := api.Deps{
 		Accounts: ledger.NewAccountService(repo,
 			ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency)),
 			ledger.WithAccountCipher(cipher)),
-		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
-			ledger.WithFXProvider(fx.NewDBProvider(pool)),
-			ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
-			// PrePostHook (Task 6.1, audit A9.1) is scaffolding for an external
-			// compliance/screening integration: wired explicitly to
-			// NoopPrePostHook here, the same default TransactionService falls
-			// back to on its own, so this deployment allows every transaction
-			// exactly as it did before this hook existed. A real screening
-			// integration replaces this one line with its own PrePostHook
-			// implementation; nothing else in the posting path needs to change.
-			ledger.WithPrePostHook(ledger.NoopPrePostHook{}),
-			ledger.WithCipher(cipher)),
-		Audit:            ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher)),
-		Admin:            admin.NewService(repo),
+		Transactions: transactions,
+		Audit:        ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher)),
+		Admin:        admin.NewService(repo),
+		Reports:      ledger.NewReportService(repo),
+		// Disputes resolves action=reverse through the SAME
+		// TransactionService instance handling POST /v1/transactions: a
+		// dispute-driven reversal goes through the identical screening,
+		// policy, account-status, and encryption checks a caller-initiated
+		// reversal does (Task 6.3, audit A9.2).
+		Disputes:         ledger.NewDisputeService(repo, transactions),
 		Auth:             resolver,
 		RateLimiter:      limiter,
 		NegativeThrottle: negativeThrottle,

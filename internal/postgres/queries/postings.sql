@@ -52,6 +52,34 @@ WHERE created_at < sqlc.arg(after_created_at)
 ORDER BY created_at DESC, id DESC
 LIMIT sqlc.arg(page_limit);
 
+-- name: AccountStatementRange :many
+-- The per-account period statement export (Task 6.3, audit A9.2): like
+-- AccountStatement above, the running balance is a window SUM over the
+-- account's FULL posting history (the CTE), so a filtered page still shows
+-- each entry's real running balance, not one reset to the filtered window.
+-- from_ts/to_ts are optional via sqlc.narg (NULL disables that bound, the
+-- same half-open [from, to) convention ListTransactions uses); the outer
+-- query applies the date filter and caps the result at row_limit, requested
+-- by the caller as one more than the export cap it wants so a truncated
+-- export can be detected without a second round trip.
+WITH entries AS (
+    SELECT
+        id,
+        transaction_id,
+        amount,
+        description,
+        created_at,
+        (SUM(amount) OVER (ORDER BY created_at, id))::bigint AS running_balance
+    FROM postings
+    WHERE tenant_id = $1 AND account_id = $2
+)
+SELECT id, transaction_id, amount, running_balance, description, created_at
+FROM entries
+WHERE (sqlc.narg('from_ts')::timestamptz IS NULL OR created_at >= sqlc.narg('from_ts'))
+  AND (sqlc.narg('to_ts')::timestamptz IS NULL OR created_at < sqlc.narg('to_ts'))
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg(row_limit);
+
 -- name: TenantDailyDebits :many
 -- Task 2.4b (audit A3.4): each currency's already-posted debit total for
 -- today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines

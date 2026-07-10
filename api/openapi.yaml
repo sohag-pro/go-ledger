@@ -18,6 +18,33 @@ components:
         - entries
         - next_cursor
       type: object
+    AccountBalanceBody:
+      additionalProperties: false
+      properties:
+        account_id:
+          type: string
+        balance:
+          description: Signed derived balance in minor units
+          format: int64
+          type: integer
+        currency:
+          type: string
+        is_system:
+          description: true for a system account (e.g. an FX clearing account), which carries a permanent open position rather than a normal user-owned balance
+          type: boolean
+        name:
+          type: string
+        type:
+          description: "One of: asset, liability, equity, income, expense"
+          type: string
+      required:
+        - account_id
+        - name
+        - type
+        - currency
+        - is_system
+        - balance
+      type: object
     AccountBody:
       additionalProperties: false
       properties:
@@ -272,6 +299,52 @@ components:
         - tenant_id
         - url
       type: object
+    CurrencyBalanceBody:
+      additionalProperties: false
+      properties:
+        currency:
+          type: string
+        imbalance:
+          description: true if net is nonzero, which should never happen
+          type: boolean
+        net:
+          description: Sum of every posting in this currency across the tenant, in minor units. Must be zero in a correct double-entry ledger.
+          format: int64
+          type: integer
+      required:
+        - currency
+        - net
+        - imbalance
+      type: object
+    DisputeBody:
+      additionalProperties: false
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        reason:
+          type: string
+        resolution_transaction_id:
+          description: The reversal posted on resolution, if any. Only set when status is resolved_reversed.
+          type: string
+        resolved_at:
+          description: When the dispute was resolved. Unset while status is open.
+          format: date-time
+          type: string
+        status:
+          description: "One of: open, resolved_reversed, resolved_rejected"
+          type: string
+        transaction_id:
+          type: string
+      required:
+        - id
+        - transaction_id
+        - status
+        - reason
+        - created_at
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -518,6 +591,24 @@ components:
         - revoked_at
         - created_at
       type: object
+    ListDisputesOutputBody:
+      additionalProperties: false
+      properties:
+        disputes:
+          items:
+            $ref: "#/components/schemas/DisputeBody"
+          type:
+            - array
+            - "null"
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+      required:
+        - disputes
+        - next_cursor
+      type: object
     ListKeysOutputBody:
       additionalProperties: false
       properties:
@@ -553,6 +644,22 @@ components:
             - "null"
       required:
         - subscriptions
+      type: object
+    OpenDisputeInputBody:
+      additionalProperties: false
+      properties:
+        reason:
+          description: Free-text reason for the dispute
+          maxLength: 256
+          minLength: 1
+          type: string
+        transaction_id:
+          description: The transaction being disputed; must belong to the caller's tenant
+          format: uuid
+          type: string
+      required:
+        - transaction_id
+        - reason
       type: object
     PostingBody:
       additionalProperties: false
@@ -590,6 +697,18 @@ components:
       required:
         - account_id
         - amount
+      type: object
+    ResolveDisputeInputBody:
+      additionalProperties: false
+      properties:
+        action:
+          description: "reverse: post a real reversal of the disputed transaction. reject: no money moves."
+          enum:
+            - reverse
+            - reject
+          type: string
+      required:
+        - action
       type: object
     SetAccountStatusInputBody:
       additionalProperties: false
@@ -757,6 +876,25 @@ components:
       required:
         - transactions
         - next_cursor
+      type: object
+    TrialBalanceOutputBody:
+      additionalProperties: false
+      properties:
+        accounts:
+          items:
+            $ref: "#/components/schemas/AccountBalanceBody"
+          type:
+            - array
+            - "null"
+        currencies:
+          items:
+            $ref: "#/components/schemas/CurrencyBalanceBody"
+          type:
+            - array
+            - "null"
+      required:
+        - currencies
+        - accounts
       type: object
     VerifyAuditOutputBody:
       additionalProperties: false
@@ -1082,6 +1220,75 @@ paths:
       security:
         - bearerAuth: []
       summary: List an account's postings with running balance
+      tags:
+        - accounts
+  /v1/accounts/{id}/statement/export:
+    get:
+      description: "Exports the account's postings within an optional from/to created_at window (from inclusive, to exclusive), each with its running balance, as csv (default, one row per posting) or json. Not paged: bounded instead at a fixed row cap (the same ledger.MaxExportRows GET /v1/transactions/export uses), so a longer matching history than the cap yields only the newest rows up to it, reported via the Export-Truncated response header."
+      operationId: export-account-statement
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+        - description: RFC3339 timestamp. Only postings created at or after this time.
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: RFC3339 timestamp. Only postings created at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only postings created strictly before this time.
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: RFC3339 timestamp. Only postings created strictly before this time.
+            type: string
+        - description: "csv (default): one row per posting, with a header row. json: an array of statement entries."
+          explode: false
+          in: query
+          name: format
+          schema:
+            default: csv
+            description: "csv (default): one row per posting, with a header row. json: an array of statement entries."
+            enum:
+              - csv
+              - json
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                contentEncoding: base64
+                type: string
+          description: OK
+          headers:
+            Content-Disposition:
+              schema:
+                description: Set to attachment for csv; unset for json
+                type: string
+            Content-Type:
+              schema:
+                type: string
+            Export-Truncated:
+              schema:
+                description: true if the account's matching posting history exceeds the export row cap and this export contains only the newest rows up to it
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Export an account's period statement
       tags:
         - accounts
   /v1/accounts/{id}/status:
@@ -1497,6 +1704,170 @@ paths:
       summary: Verify the tamper-evident audit chain
       tags:
         - audit
+  /v1/disputes:
+    get:
+      description: "Lists the tenant's disputes, newest first, optionally filtered by status. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
+      operationId: list-disputes
+      parameters:
+        - description: "Optional filter: one of open, resolved_reversed, resolved_rejected. Omitted returns every status."
+          explode: false
+          in: query
+          name: status
+          schema:
+            description: "Optional filter: one of open, resolved_reversed, resolved_rejected. Omitted returns every status."
+            type: string
+        - description: Max disputes per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max disputes per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListDisputesOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List disputes
+      tags:
+        - disputes
+    post:
+      description: Opens a dispute (status open) against transaction_id, which must belong to the caller's tenant. Opening a dispute records intent only; no money moves until it is resolved (POST /v1/disputes/{id}/resolve).
+      operationId: open-dispute
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenDisputeInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Open a dispute against a transaction
+      tags:
+        - disputes
+  /v1/disputes/{id}:
+    get:
+      operationId: get-dispute
+      parameters:
+        - description: Dispute id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Dispute id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Get a dispute
+      tags:
+        - disputes
+  /v1/disputes/{id}/resolve:
+    post:
+      description: Resolves the dispute named by id. action=reverse posts a real reversal of the disputed transaction through the normal posting path (screening, policy, account status, encryption), sets resolution_transaction_id to the reversal's id, and moves status to resolved_reversed; if the transaction was already reversed by other means, the existing reversal is reused rather than posting a second one. action=reject moves status to resolved_rejected with no money movement. Resolving an already-resolved dispute returns 409 Conflict.
+      operationId: resolve-dispute
+      parameters:
+        - description: Dispute id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Dispute id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveDisputeInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Resolve a dispute
+      tags:
+        - disputes
+  /v1/reports/trial-balance:
+    get:
+      description: Returns, for the caller's tenant, each currency's net posted total (which must be zero in a correct double-entry ledger, the balance proof) and every account's derived balance, including system (FX clearing) accounts, which hold the FX position and are part of the proof.
+      operationId: trial-balance
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrialBalanceOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: "Trial balance: the double-entry balance proof"
+      tags:
+        - reports
   /v1/transactions:
     get:
       description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive) and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."

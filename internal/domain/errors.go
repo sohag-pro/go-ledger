@@ -174,4 +174,28 @@ var (
 	// ErrPartyTypeTooLong is returned when an Account's PartyType exceeds
 	// MaxPartyTypeLen (Task 6.1, audit A9.1).
 	ErrPartyTypeTooLong = errors.New("domain: account party type too long")
+	// ErrInvalidDispute is returned when a Dispute is missing a required
+	// field (TransactionID or Reason) or carries a Status outside
+	// DisputeStatus.Valid() (Task 6.3, audit A9.2).
+	ErrInvalidDispute = errors.New("domain: invalid dispute")
+	// ErrDisputeReasonTooLong is returned when a Dispute's Reason exceeds
+	// MaxDisputeReasonLen (Task 6.3, audit A9.2).
+	ErrDisputeReasonTooLong = errors.New("domain: dispute reason too long")
+	// ErrDisputeNotFound is returned when no dispute matches the given id
+	// within the tenant (Task 6.3, audit A9.2).
+	ErrDisputeNotFound = errors.New("domain: dispute not found")
+	// ErrDisputeAlreadyResolved is returned when Resolve is called for a
+	// dispute whose Status is no longer "open" (Task 6.3, audit A9.2): a
+	// dispute is resolved at most once, and resolving one twice (whether
+	// sequentially or racing concurrently, see postgres.Repository.ResolveDispute's
+	// guarded UPDATE) is rejected with this error rather than silently
+	// replaying or overwriting the first resolution.
+	ErrDisputeAlreadyResolved = errors.New("domain: dispute already resolved")
+	// ErrInvalidDisputeAction is returned when Resolve is called with an
+	// action that is neither "reverse" nor "reject" (Task 6.3, audit A9.2).
+	// The REST layer's enum schema tag already rejects any other value
+	// before it reaches the service, so this is a defensive backstop for any
+	// other caller (for example a future gRPC surface) that does not share
+	// that validation.
+	ErrInvalidDisputeAction = errors.New("domain: dispute action must be reverse or reject")
 )

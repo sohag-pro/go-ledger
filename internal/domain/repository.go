@@ -269,6 +269,68 @@ type Repository interface {
 	// account simply yields no entries.
 	Statement(ctx context.Context, tenantID, accountID string, currency Currency, after *StatementCursor, limit int) ([]StatementEntry, error)
 
+	// StatementExport returns up to limit postings affecting the account,
+	// newest first, each with its running balance, bounded by an optional
+	// [from, to) created_at window rather than keyset paged (Task 6.3, audit
+	// A9.2): the per-account period statement export. Either bound nil
+	// disables that side of the window, the same half-open convention
+	// TransactionFilter's From/To use. limit is requested by the caller as
+	// one more than the export cap it actually wants, the same
+	// detect-a-next-row-without-a-second-round-trip trick ExportTransactions
+	// already uses for MaxExportRows, so the caller can tell the export was
+	// truncated without a second query.
+	StatementExport(ctx context.Context, tenantID, accountID string, currency Currency, from, to *time.Time, limit int) ([]StatementEntry, error)
+
+	// TrialBalanceByCurrency returns tenantID's net posted total per
+	// currency (Task 6.3, audit A9.2): SUM(amount) over every posting,
+	// grouped by currency. In a correct double-entry ledger each total is
+	// zero (the balance proof, ADR-001); the caller (ledger.ReportService)
+	// flags any nonzero total as an imbalance, which should never happen. A
+	// currency with no postings at all is simply absent, not a zero-valued
+	// entry.
+	TrialBalanceByCurrency(ctx context.Context, tenantID string) ([]CurrencyTotal, error)
+
+	// TrialBalanceAccounts returns every one of tenantID's accounts with its
+	// derived balance (Task 6.3, audit A9.2), including system (FX clearing)
+	// accounts, marked via AccountBalance.IsSystem: they hold the FX
+	// position and are part of the balance proof, so they are not filtered
+	// out the way a user-facing balance listing might.
+	TrialBalanceAccounts(ctx context.Context, tenantID string) ([]AccountBalance, error)
+
+	// CreateDispute persists d (Task 6.3, audit A9.2). If d.ID is empty the
+	// adapter assigns one and writes it back to d, the same convention
+	// CreateAccount and CreateTransaction follow. It returns d's validation
+	// error if d is invalid. The caller (ledger.DisputeService) is expected
+	// to have already confirmed d.TransactionID names a real transaction
+	// within tenantID (via GetTransaction) before calling this; the
+	// composite FK (migration 0029, disputes_txn_fk) enforces the same
+	// constraint at the database as a backstop.
+	CreateDispute(ctx context.Context, tenantID string, d *Dispute) error
+
+	// GetDispute returns the dispute with the given id within the tenant, or
+	// ErrDisputeNotFound if none exists (Task 6.3, audit A9.2).
+	GetDispute(ctx context.Context, tenantID, id string) (Dispute, error)
+
+	// ListDisputes returns up to limit of the tenant's disputes, newest
+	// first, keyset paged the same way Statement and ListTransactions page
+	// (Task 6.3, audit A9.2). status, if non-nil, filters to only that
+	// status; nil returns every status. after is the keyset position to
+	// page from; nil starts at the newest dispute.
+	ListDisputes(ctx context.Context, tenantID string, status *DisputeStatus, after *StatementCursor, limit int) ([]Dispute, error)
+
+	// ResolveDispute transitions the dispute identified by id from open to
+	// status, stamping resolution_transaction_id (nil for a reject) and
+	// resolved_at (Task 6.3, audit A9.2). The transition is guarded at the
+	// database (an UPDATE ... WHERE status = 'open'), so it returns
+	// ErrDisputeAlreadyResolved for a dispute that is not currently open,
+	// whether that is because a prior call already resolved it or because a
+	// concurrent call won the race, and ErrDisputeNotFound if no dispute
+	// matches id within tenantID at all. The caller (ledger.DisputeService)
+	// always calls this AFTER any real reversal has already been posted
+	// through TransactionService.ReverseTransaction: this method itself
+	// never moves money, it only records the outcome.
+	ResolveDispute(ctx context.Context, tenantID, id string, status DisputeStatus, resolutionTransactionID *string) (Dispute, error)
+
 	// RunInTx executes fn inside a SERIALIZABLE database transaction, scoped to
 	// tenantID. It commits if fn returns nil and rolls back otherwise. Because
 	// SERIALIZABLE can abort a transaction with a serialization conflict under
