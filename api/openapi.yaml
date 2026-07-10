@@ -176,6 +176,10 @@ components:
           description: ISO 4217 code shared by every posting
           pattern: ^[A-Z]{3}$
           type: string
+        effective_at:
+          description: Optional value date, distinct from when the transaction was posted. Defaults to the post time when omitted.
+          format: date-time
+          type: string
         postings:
           description: Two or more legs that must sum to zero
           items:
@@ -185,6 +189,10 @@ components:
           type:
             - array
             - "null"
+        reference:
+          description: Optional external reference for reconciliation, unique per tenant. Reusing one already in use returns 409.
+          maxLength: 256
+          type: string
       required:
         - currency
         - postings
@@ -569,6 +577,10 @@ components:
     TransactionBody:
       additionalProperties: false
       properties:
+        effective_at:
+          description: Value date; defaults to when the transaction was posted if not supplied
+          format: date-time
+          type: string
         id:
           type: string
         postings:
@@ -577,12 +589,16 @@ components:
           type:
             - array
             - "null"
+        reference:
+          description: Optional client-supplied external reference, unique per tenant
+          type: string
         reverses_transaction_id:
           description: "Set only when this transaction is a reversal: the id of the transaction it reverses"
           type: string
       required:
         - id
         - postings
+        - effective_at
       type: object
     VerifyAuditOutputBody:
       additionalProperties: false
@@ -1124,7 +1140,7 @@ paths:
         - audit
   /v1/transactions:
     post:
-      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
+      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time."
       operationId: create-transaction
       parameters:
         - description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.

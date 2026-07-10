@@ -41,6 +41,15 @@ type TransactionBody struct {
 	// reversal (Task 4.2, audit A1.2): the id of the transaction it reverses.
 	// Omitted for an ordinary post or convert.
 	ReversesTransactionID *string `json:"reverses_transaction_id,omitempty" doc:"Set only when this transaction is a reversal: the id of the transaction it reverses"`
+	// Reference is the caller's optional external id for reconciliation
+	// (Task 4.3, audit A1.3), unique per tenant when present. Omitted when
+	// the transaction was posted without one.
+	Reference *string `json:"reference,omitempty" doc:"Optional client-supplied external reference, unique per tenant"`
+	// EffectiveAt is the value date (Task 4.3, audit A1.3): when the
+	// transaction is considered to have happened economically. Always
+	// present in a response, even when the caller supplied none: it then
+	// falls back to when the transaction was actually posted.
+	EffectiveAt time.Time `json:"effective_at" doc:"Value date; defaults to when the transaction was posted if not supplied"`
 }
 
 // CreateTransactionInput is the post-transaction request body.
@@ -52,6 +61,15 @@ type CreateTransactionInput struct {
 	Body           struct {
 		Currency string         `json:"currency" pattern:"^[A-Z]{3}$" doc:"ISO 4217 code shared by every posting"`
 		Postings []PostingInput `json:"postings" minItems:"2" maxItems:"100" doc:"Two or more legs that must sum to zero"`
+		// Reference is an optional external id for reconciliation (Task 4.3,
+		// audit A1.3), for example an upstream payment processor's charge id
+		// or a bank statement line. Must be unique for this tenant when
+		// supplied: reusing one already in use returns 409 Conflict.
+		Reference *string `json:"reference,omitempty" maxLength:"256" doc:"Optional external reference for reconciliation, unique per tenant. Reusing one already in use returns 409."`
+		// EffectiveAt is an optional value date (Task 4.3, audit A1.3),
+		// distinct from when the row is actually written. Omitted, it
+		// defaults to the post time.
+		EffectiveAt *time.Time `json:"effective_at,omitempty" doc:"Optional value date, distinct from when the transaction was posted. Defaults to the post time when omitted."`
 	}
 }
 
@@ -93,7 +111,17 @@ func toTransactionBody(t domain.Transaction) TransactionBody {
 			Description: p.Description,
 		})
 	}
-	return TransactionBody{ID: t.ID, Postings: postings, ReversesTransactionID: t.ReversesTransactionID}
+	body := TransactionBody{ID: t.ID, Postings: postings, ReversesTransactionID: t.ReversesTransactionID, Reference: t.Reference}
+	// EffectiveAt is always populated by the time a transaction reaches here
+	// (CreateTransaction resolves the read-time fallback to created_at
+	// itself, see postgres.txRepo.CreateTransaction and
+	// Repository.transactionFromRow), but toTransactionBody stays defensive
+	// against a nil for any future caller that builds a domain.Transaction
+	// by hand.
+	if t.EffectiveAt != nil {
+		body.EffectiveAt = *t.EffectiveAt
+	}
+	return body
 }
 
 // FXDetailBody is the applied-rate detail for a cross-currency convert: the
@@ -167,7 +195,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/transactions",
 		Summary:       "Post a transaction",
-		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict.",
+		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time.",
 		Tags:          []string{"transactions"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
@@ -189,7 +217,7 @@ func registerTransactions(api huma.API, deps Deps) {
 				Description: p.Description,
 			})
 		}
-		txn := &domain.Transaction{Postings: postings}
+		txn := &domain.Transaction{Postings: postings, Reference: in.Body.Reference, EffectiveAt: in.Body.EffectiveAt}
 		idem := &domain.Idempotency{Key: in.IdempotencyKey}
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {

@@ -19,6 +19,12 @@ import (
 // validation/invariant failures (ADR-014); a cross-tenant or unknown account on
 // either leg still falls through to the existing ErrAccountNotFound case above.
 //
+// A duplicate external reference (Task 4.3, audit A1.3,
+// domain.ErrDuplicateReference) also maps to 409, like ErrDuplicateTransaction
+// and ErrIdempotencyConflict, but is kept as its own case: it is a different
+// request that happens to reuse someone else's reference, not a retried
+// request replaying under the same idempotency key.
+//
 // The admin surface (Task 2.2b, internal/admin) reuses this same mapping
 // rather than defining its own: a *domain.TenantNotActiveError (issuing or
 // rotating a key into a suspended or closed tenant) is checked first, via
@@ -62,6 +68,8 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("cannot reverse a transaction that is itself a reversal")
 	case errors.Is(err, domain.ErrDuplicateTransaction):
 		return huma.Error409Conflict("transaction already exists")
+	case errors.Is(err, domain.ErrDuplicateReference):
+		return huma.Error409Conflict("reference already exists for this tenant")
 	case errors.Is(err, domain.ErrIdempotencyConflict):
 		return huma.Error409Conflict("idempotency key was reused with a different request body")
 	case errors.Is(err, domain.ErrConflict):
@@ -82,6 +90,10 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("invalid currency code (expected three uppercase letters)")
 	case errors.Is(err, domain.ErrDescriptionTooLong):
 		return huma.Error422UnprocessableEntity("posting description is too long")
+	case errors.Is(err, domain.ErrInvalidReference):
+		return huma.Error422UnprocessableEntity("reference must not be empty when present")
+	case errors.Is(err, domain.ErrReferenceTooLong):
+		return huma.Error422UnprocessableEntity("reference is too long")
 	case errors.Is(err, domain.ErrOverflow):
 		return huma.Error422UnprocessableEntity("amount is out of range")
 	case errors.Is(err, domain.ErrConversionDust):

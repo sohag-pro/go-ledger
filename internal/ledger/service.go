@@ -198,6 +198,14 @@ func (s *TransactionService) replay(ctx context.Context, tenantID, key string, t
 // ordinary (non-reversal) transactions, so this stays byte-identical to the
 // pre-existing snapshot for the create path and every previously written
 // audit row's hash is unaffected.
+//
+// effective_at (Task 4.3, audit A1.3) is always included: by the time this
+// runs, t.CreateTransaction has already resolved the read-time fallback to
+// created_at (see postgres.txRepo.CreateTransaction), so the value here is
+// never the zero time even for a caller that supplied none. reference is
+// included only when set, the same optional-field convention
+// reverses_transaction_id uses above: most transactions carry no external
+// reference at all.
 func auditSnapshot(t *domain.Transaction) map[string]any {
 	postings := make([]map[string]any, 0, len(t.Postings))
 	for _, p := range t.Postings {
@@ -214,6 +222,12 @@ func auditSnapshot(t *domain.Transaction) map[string]any {
 	}
 	if t.ReversesTransactionID != nil {
 		snapshot["reverses_transaction_id"] = *t.ReversesTransactionID
+	}
+	if t.Reference != nil {
+		snapshot["reference"] = *t.Reference
+	}
+	if t.EffectiveAt != nil {
+		snapshot["effective_at"] = *t.EffectiveAt
 	}
 	if t.FX != nil {
 		snapshot["fx"] = map[string]any{

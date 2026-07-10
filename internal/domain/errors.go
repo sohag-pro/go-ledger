@@ -129,4 +129,20 @@ var (
 	// caller, so a concurrent double-reverse resolves to exactly one
 	// reversal, whichever attempt's insert won the race.
 	ErrTransactionAlreadyReversed = errors.New("domain: transaction already reversed")
+	// ErrInvalidReference is returned when a Transaction's Reference is
+	// present but empty (Task 4.3, audit A1.3): a client that sets the field
+	// at all must give it real content, a bare "" is not a meaningful
+	// external reference.
+	ErrInvalidReference = errors.New("domain: reference must not be empty when present")
+	// ErrReferenceTooLong is returned when a Transaction's Reference exceeds
+	// MaxTransactionReferenceLen.
+	ErrReferenceTooLong = errors.New("domain: reference too long")
+	// ErrDuplicateReference is returned when a transaction is posted with a
+	// Reference that already exists for the same tenant
+	// (transactions_tenant_reference_idx, migration 0018). A transport layer
+	// should map it to 409 Conflict (REST) or codes.AlreadyExists (gRPC),
+	// distinct from ErrIdempotencyConflict: this is a different request that
+	// happens to reuse someone else's external reference, not a retry of the
+	// same one.
+	ErrDuplicateReference = errors.New("domain: reference already exists for this tenant")
 )

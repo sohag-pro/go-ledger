@@ -126,6 +126,19 @@ func toProtoTransaction(t domain.Transaction) *ledgerv1.Transaction {
 	if t.ReversesTransactionID != nil {
 		pt.ReversesTransactionId = *t.ReversesTransactionID
 	}
+	// reference (Task 4.3, audit A1.3) is left at its zero value ("") when t
+	// was posted without one.
+	if t.Reference != nil {
+		pt.Reference = *t.Reference
+	}
+	// effective_at (Task 4.3, audit A1.3) is always set by the time t reaches
+	// here: CreateTransaction resolves the read-time fallback to created_at
+	// itself (see postgres.txRepo.CreateTransaction and
+	// Repository.transactionFromRow). Defensive nil check anyway, the same
+	// as toTransactionBody's REST counterpart.
+	if t.EffectiveAt != nil {
+		pt.EffectiveAt = t.EffectiveAt.UTC().Format(time.RFC3339Nano)
+	}
 	return pt
 }
 
@@ -257,6 +270,21 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 		postings = append(postings, domain.Posting{AccountID: p.AccountId, Amount: amount, Description: p.Description})
 	}
 	txn := &domain.Transaction{Postings: postings}
+	// reference and effective_at (Task 4.3, audit A1.3) are both optional:
+	// an empty proto string means "not supplied", the same convention
+	// idempotency-key metadata already uses, so an unset reference stays nil
+	// rather than becoming a pointer to "" (which Transaction.Validate would
+	// reject as ErrInvalidReference).
+	if req.Reference != "" {
+		txn.Reference = &req.Reference
+	}
+	if req.EffectiveAt != "" {
+		effectiveAt, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "effective_at must be an RFC3339 timestamp")
+		}
+		txn.EffectiveAt = &effectiveAt
+	}
 	idem := &domain.Idempotency{Key: key}
 	replayed, err := s.txns.Post(ctx, tenantFrom(ctx), txn, idem)
 	if err != nil {

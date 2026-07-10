@@ -367,19 +367,52 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 		}
 		params.ReversesTransactionID = pgtype.UUID{Bytes: reversesID, Valid: true}
 	}
-	if err := tr.q.CreateTransaction(ctx, params); err != nil {
+	// reference and effective_at (Task 4.3, audit A1.3) are both nil for a
+	// caller that supplies neither; t.Validate (called before this, by
+	// Repository.CreateTransaction) already rejected a present-but-empty or
+	// over-length reference, so nothing left to check here.
+	if t.Reference != nil {
+		params.Reference = pgtype.Text{String: *t.Reference, Valid: true}
+	}
+	if t.EffectiveAt != nil {
+		params.EffectiveAt = pgtype.Timestamptz{Time: *t.EffectiveAt, Valid: true}
+	}
+	createdAt, err := tr.q.CreateTransaction(ctx, params)
+	if err != nil {
 		if isUniqueViolation(err) {
+			switch pgConstraint(err) {
 			// transactions_one_reversal_idx (migration 0017): a second
 			// reversal of the same original. Distinguished from an ordinary
 			// id collision (transactions_pkey) so the service can catch it
 			// specifically and read back the existing reversal instead of
 			// treating it as ErrDuplicateTransaction.
-			if pgConstraint(err) == "transactions_one_reversal_idx" {
+			case "transactions_one_reversal_idx":
 				return domain.ErrTransactionAlreadyReversed
+			// transactions_tenant_reference_idx (migration 0018): a second
+			// transaction reusing a reference already taken in this tenant.
+			// Distinguished from both transactions_pkey and
+			// transactions_one_reversal_idx above, and deliberately its own
+			// domain error (not ErrDuplicateTransaction): a duplicate
+			// reference is a different failure than an id collision.
+			case "transactions_tenant_reference_idx":
+				return domain.ErrDuplicateReference
+			default:
+				return domain.ErrDuplicateTransaction
 			}
-			return domain.ErrDuplicateTransaction
 		}
 		return fmt.Errorf("postgres: insert transaction: %w", err)
+	}
+	// EffectiveAt's read-time fallback to created_at (see
+	// Repository.transactionFromRow) applies just as much to the object this
+	// call just built as to one read back later: without resolving it here,
+	// a caller that reads t.EffectiveAt straight off the value CreateTransaction
+	// was handed (the common case, no round trip through GetTransaction) would
+	// see nil for a caller that omitted it, while every later GetTransaction
+	// or List call on the very same row would see the fallback. Resolving it
+	// here, from the RETURNING created_at above, keeps both views consistent
+	// without a second query.
+	if t.EffectiveAt == nil {
+		t.EffectiveAt = &createdAt
 	}
 	for i := range t.Postings {
 		p := &t.Postings[i]
@@ -593,6 +626,20 @@ func (r *Repository) transactionFromRow(ctx context.Context, tid uuid.UUID, row 
 		reversesID := uuid.UUID(row.ReversesTransactionID.Bytes).String()
 		out.ReversesTransactionID = &reversesID
 	}
+	// reference (Task 4.3, audit A1.3) is NULL when the caller supplied
+	// none; left nil rather than a pointer to "".
+	if row.Reference.Valid {
+		reference := row.Reference.String
+		out.Reference = &reference
+	}
+	// effective_at falls back to created_at when NULL (Task 4.3, audit
+	// A1.3): the column is never backfilled, so a transaction posted with no
+	// value date reads back as having happened when its row was written.
+	effectiveAt := row.CreatedAt
+	if row.EffectiveAt.Valid {
+		effectiveAt = row.EffectiveAt.Time
+	}
+	out.EffectiveAt = &effectiveAt
 	return out, nil
 }
 

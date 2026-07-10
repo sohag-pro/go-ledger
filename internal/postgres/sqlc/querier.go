@@ -6,6 +6,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -36,8 +37,12 @@ type Querier interface {
 	// store. The fx_* columns are the immutable snapshot of the conversion
 	// actually applied; all nullable, since a single-currency transaction (still
 	// the common case) has none of this. reverses_transaction_id (Task 4.2,
-	// audit A1.2) is likewise nullable: only a reversal carries it.
-	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
+	// audit A1.2) is likewise nullable: only a reversal carries it. reference and
+	// effective_at (Task 4.3, audit A1.3) are both nullable client-supplied
+	// fields. created_at is RETURNED (not just inserted): the caller uses it to
+	// resolve effective_at's read-time fallback right after a fresh insert,
+	// without a second round trip (see Repository.txRepo.CreateTransaction).
+	CreateTransaction(ctx context.Context, arg CreateTransactionParams) (time.Time, error)
 	// The latest quote for (base, quote) at or before now, preferring a
 	// tenant-specific row over the global default (Task 2.4, audit A3.3):
 	// tenant_id = $1 matches the tenant's own rows, and tenant_id IS NULL always

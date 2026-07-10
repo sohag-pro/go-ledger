@@ -93,8 +93,28 @@ func (f *fakeRepo) ListAccounts(_ context.Context, _ string, limit int) ([]domai
 }
 
 func (f *fakeRepo) CreateTransaction(_ context.Context, _ string, t *domain.Transaction) error {
+	// Mirror the real repo's transactions_tenant_reference_idx (migration
+	// 0018, Task 4.3, audit A1.3): a linear scan is fine for a handler test's
+	// tiny fixture set, the same style GetReversalOf below already uses.
+	// fakeRepo is single-tenant, so this checks the whole map, matching the
+	// real unique index scoped to one tenant.
+	if t.Reference != nil {
+		for _, existing := range f.txns {
+			if existing.Reference != nil && *existing.Reference == *t.Reference {
+				return domain.ErrDuplicateReference
+			}
+		}
+	}
 	if t.ID == "" {
 		t.ID = uuid.NewString()
+	}
+	// effective_at falls back to created_at when the caller supplied none
+	// (Task 4.3, audit A1.3), mirroring postgres.txRepo.CreateTransaction /
+	// Repository.transactionFromRow: f.clock is this fake's stand-in clock.
+	if t.EffectiveAt == nil {
+		f.clock++
+		createdAt := time.Unix(f.clock, 0).UTC()
+		t.EffectiveAt = &createdAt
 	}
 	f.txns[t.ID] = *t
 	for _, p := range t.Postings {
@@ -1119,6 +1139,139 @@ func TestCreateTransactionIdempotentReplayHeader(t *testing.T) {
 	if rec3.Code != http.StatusConflict {
 		t.Errorf("conflict status = %d, want 409", rec3.Code)
 	}
+}
+
+// TestCreateTransactionReferenceAndEffectiveAt covers the Task 4.3 (audit
+// A1.3) request/response fields end to end over REST: reference and
+// effective_at round-trip through both the create response and a later GET,
+// omitting both leaves reference absent and effective_at defaulted to the
+// post time, and reusing a reference already in use for the tenant is
+// rejected with 409 (distinct from the idempotency-key 409 the test above
+// already covers).
+func TestCreateTransactionReferenceAndEffectiveAt(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	rev := createAccount(t, r, "Revenue", "income")
+
+	t.Run("reference and effective_at round-trip", func(t *testing.T) {
+		past := time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 500},
+				{"account_id": rev, "amount": -500},
+			},
+			"reference":    "REST-INV-1001",
+			"effective_at": past,
+		}, map[string]string{"Idempotency-Key": "reference-roundtrip-1"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			ID          string `json:"id"`
+			Reference   string `json:"reference"`
+			EffectiveAt string `json:"effective_at"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+		}
+		if out.Reference != "REST-INV-1001" {
+			t.Errorf("reference = %q, want REST-INV-1001", out.Reference)
+		}
+		if out.EffectiveAt != past {
+			t.Errorf("effective_at = %q, want %q", out.EffectiveAt, past)
+		}
+
+		getRec := do(t, r, http.MethodGet, "/v1/transactions/"+out.ID, nil)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("get status %d", getRec.Code)
+		}
+		var reread struct {
+			Reference   string `json:"reference"`
+			EffectiveAt string `json:"effective_at"`
+		}
+		if err := json.Unmarshal(getRec.Body.Bytes(), &reread); err != nil {
+			t.Fatalf("unmarshal get: %v", err)
+		}
+		if reread.Reference != "REST-INV-1001" {
+			t.Errorf("re-read reference = %q, want REST-INV-1001", reread.Reference)
+		}
+		if reread.EffectiveAt != past {
+			t.Errorf("re-read effective_at = %q, want %q", reread.EffectiveAt, past)
+		}
+	})
+
+	t.Run("omitted reference and effective_at default cleanly", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 50},
+				{"account_id": rev, "amount": -50},
+			},
+		}, map[string]string{"Idempotency-Key": "reference-omitted-1"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Reference   string    `json:"reference"`
+			EffectiveAt time.Time `json:"effective_at"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+		}
+		if out.Reference != "" {
+			t.Errorf("reference = %q, want empty (omitted)", out.Reference)
+		}
+		// fakeRepo's clock is a synthetic counter (see CreateTransaction), not
+		// wall time, so the fallback is checked against the zero value only:
+		// the point here is that SOME fallback value was resolved, not that
+		// it matches real time (the real Postgres adapter's created_at
+		// fallback is covered by internal/ledger's
+		// TestPost_EffectiveAtDefaultsToCreatedAt).
+		if out.EffectiveAt.IsZero() {
+			t.Error("effective_at is the zero value, want the created_at fallback")
+		}
+	})
+
+	t.Run("duplicate reference 409", func(t *testing.T) {
+		first := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10},
+				{"account_id": rev, "amount": -10},
+			},
+			"reference": "REST-DUP-1",
+		}, map[string]string{"Idempotency-Key": "reference-dup-1"})
+		if first.Code != http.StatusCreated {
+			t.Fatalf("first status %d, want 201 (%s)", first.Code, first.Body.String())
+		}
+
+		second := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 20},
+				{"account_id": rev, "amount": -20},
+			},
+			"reference": "REST-DUP-1",
+		}, map[string]string{"Idempotency-Key": "reference-dup-2"})
+		if second.Code != http.StatusConflict {
+			t.Errorf("duplicate reference status = %d, want 409 (%s)", second.Code, second.Body.String())
+		}
+	})
+
+	t.Run("empty reference is rejected 422", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10},
+				{"account_id": rev, "amount": -10},
+			},
+			"reference": "",
+		}, map[string]string{"Idempotency-Key": "reference-empty-1"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 func TestAuditEndpoints(t *testing.T) {

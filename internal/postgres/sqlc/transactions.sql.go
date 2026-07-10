@@ -7,19 +7,21 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createTransaction = `-- name: CreateTransaction :exec
+const createTransaction = `-- name: CreateTransaction :one
 INSERT INTO transactions (
     id, tenant_id,
     fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
     fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id,
-    reverses_transaction_id
+    reverses_transaction_id, reference, effective_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+RETURNING created_at
 `
 
 type CreateTransactionParams struct {
@@ -34,6 +36,8 @@ type CreateTransactionParams struct {
 	FxEffectiveAt         pgtype.Timestamptz
 	FxRateID              pgtype.Int8
 	ReversesTransactionID pgtype.UUID
+	Reference             pgtype.Text
+	EffectiveAt           pgtype.Timestamptz
 }
 
 // currency lives on each posting now (ADR-014), not here: an FX transaction
@@ -41,9 +45,13 @@ type CreateTransactionParams struct {
 // store. The fx_* columns are the immutable snapshot of the conversion
 // actually applied; all nullable, since a single-currency transaction (still
 // the common case) has none of this. reverses_transaction_id (Task 4.2,
-// audit A1.2) is likewise nullable: only a reversal carries it.
-func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionParams) error {
-	_, err := q.db.Exec(ctx, createTransaction,
+// audit A1.2) is likewise nullable: only a reversal carries it. reference and
+// effective_at (Task 4.3, audit A1.3) are both nullable client-supplied
+// fields. created_at is RETURNED (not just inserted): the caller uses it to
+// resolve effective_at's read-time fallback right after a fresh insert,
+// without a second round trip (see Repository.txRepo.CreateTransaction).
+func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionParams) (time.Time, error) {
+	row := q.db.QueryRow(ctx, createTransaction,
 		arg.ID,
 		arg.TenantID,
 		arg.FxSourceAmount,
@@ -55,15 +63,19 @@ func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionPa
 		arg.FxEffectiveAt,
 		arg.FxRateID,
 		arg.ReversesTransactionID,
+		arg.Reference,
+		arg.EffectiveAt,
 	)
-	return err
+	var created_at time.Time
+	err := row.Scan(&created_at)
+	return created_at, err
 }
 
 const getReversalOf = `-- name: GetReversalOf :one
 SELECT id, tenant_id, created_at,
        fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
        fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id,
-       reverses_transaction_id
+       reverses_transaction_id, reference, effective_at
 FROM transactions
 WHERE tenant_id = $1 AND reverses_transaction_id = $2
 `
@@ -92,6 +104,8 @@ func (q *Queries) GetReversalOf(ctx context.Context, arg GetReversalOfParams) (T
 		&i.FxEffectiveAt,
 		&i.FxRateID,
 		&i.ReversesTransactionID,
+		&i.Reference,
+		&i.EffectiveAt,
 	)
 	return i, err
 }
@@ -100,7 +114,7 @@ const getTransaction = `-- name: GetTransaction :one
 SELECT id, tenant_id, created_at,
        fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
        fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id,
-       reverses_transaction_id
+       reverses_transaction_id, reference, effective_at
 FROM transactions
 WHERE tenant_id = $1 AND id = $2
 `
@@ -126,6 +140,8 @@ func (q *Queries) GetTransaction(ctx context.Context, arg GetTransactionParams) 
 		&i.FxEffectiveAt,
 		&i.FxRateID,
 		&i.ReversesTransactionID,
+		&i.Reference,
+		&i.EffectiveAt,
 	)
 	return i, err
 }

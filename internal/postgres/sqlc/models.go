@@ -116,4 +116,6 @@ type Transaction struct {
 	FxEffectiveAt         pgtype.Timestamptz
 	FxRateID              pgtype.Int8
 	ReversesTransactionID pgtype.UUID
+	Reference             pgtype.Text
+	EffectiveAt           pgtype.Timestamptz
 }

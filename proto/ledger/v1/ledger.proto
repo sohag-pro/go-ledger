@@ -26,6 +26,15 @@ message Transaction {
   // reversal (Task 4.2, audit A1.2): the id of the transaction it reverses.
   // Empty for an ordinary post or convert.
   string reverses_transaction_id = 4;
+  // reference is the caller's optional external id for reconciliation (Task
+  // 4.3, audit A1.3), unique per tenant when present. Empty when the
+  // transaction was posted without one.
+  string reference = 5;
+  // effective_at is the value date (Task 4.3, audit A1.3): when the
+  // transaction is considered to have happened economically. Always set,
+  // even when the caller supplied none: it then falls back to when the
+  // transaction was actually posted. RFC3339 timestamp.
+  string effective_at = 6;
 }
 
 message Account {
@@ -93,6 +102,14 @@ message GetStatementResponse {
 message PostTransactionRequest {
   string currency = 1;
   repeated Posting postings = 2;
+  // reference is an optional external id for reconciliation (Task 4.3, audit
+  // A1.3), unique per tenant when supplied. Reusing one already in use
+  // returns ALREADY_EXISTS.
+  string reference = 3;
+  // effective_at is an optional value date (Task 4.3, audit A1.3), distinct
+  // from when the row is actually written. Empty defaults to the post time.
+  // RFC3339 timestamp.
+  string effective_at = 4;
 }
 message PostTransactionResponse {
   Transaction transaction = 1;

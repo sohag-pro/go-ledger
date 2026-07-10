@@ -1,7 +1,16 @@
 package domain
 
+import "time"
+
 // MaxPostingDescriptionLen bounds a posting's free-text narration.
 const MaxPostingDescriptionLen = 256
+
+// MaxTransactionReferenceLen bounds a transaction's optional external
+// reference (Task 4.3, audit A1.3), reusing the same 256 cap as a posting's
+// description: there is nothing special about that number here, it is just a
+// sane, already-established ceiling for a free-form identifier a client
+// supplies.
+const MaxTransactionReferenceLen = 256
 
 // Posting is one signed entry against a single account. The sign carries
 // direction: a positive Amount is a debit, a negative Amount is a credit. This
@@ -51,13 +60,30 @@ type Transaction struct {
 	// (see ErrCannotReverseReversal): there is no reversal of a reversal in
 	// this model, only forward corrections.
 	ReversesTransactionID *string
+	// Reference is an optional, client-supplied external id for
+	// reconciliation against an upstream system (Task 4.3, audit A1.3): a
+	// bank statement line, a payment processor's charge id, and so on. Unique
+	// per tenant when present (migration 0018's transactions_tenant_reference_idx),
+	// nil when the caller supplies none. A duplicate within the same tenant
+	// surfaces as ErrDuplicateReference from CreateTransaction, distinct from
+	// the idempotency-key conflict: the same request retried with the same
+	// Idempotency-Key replays; a different request that happens to reuse
+	// someone else's reference is rejected instead.
+	Reference *string
+	// EffectiveAt is the value date: when the transaction is considered to
+	// have happened economically, as distinct from when the row was actually
+	// written (Task 4.3, audit A1.3). Optional on input (nil means the caller
+	// supplied none); on read from storage it is never nil, since the
+	// adapter falls back to the row's created_at rather than leaving it
+	// unset (see postgres.Repository.transactionFromRow).
+	EffectiveAt *time.Time
 }
 
 // Validate enforces the double-entry invariant. It requires at least two
 // postings, every posting valid, and, for each currency present across the
 // postings, that currency's signed amounts summing to exactly zero. It
 // returns the first error found: ErrTooFewPostings, ErrInvalidPosting,
-// ErrOverflow, or ErrUnbalanced.
+// ErrOverflow, ErrInvalidReference, ErrReferenceTooLong, or ErrUnbalanced.
 //
 // Postings are grouped by currency and accumulated with Money.Add, which is
 // only ever called on two Money values of the same currency (every add is
@@ -78,6 +104,14 @@ func (t Transaction) Validate() error {
 	for _, p := range t.Postings {
 		if err := p.Validate(); err != nil {
 			return err
+		}
+	}
+	if t.Reference != nil {
+		if *t.Reference == "" {
+			return ErrInvalidReference
+		}
+		if len(*t.Reference) > MaxTransactionReferenceLen {
+			return ErrReferenceTooLong
 		}
 	}
 	sums := make(map[Currency]Money, len(t.Postings))

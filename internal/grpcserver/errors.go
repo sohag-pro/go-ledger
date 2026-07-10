@@ -17,7 +17,10 @@ import (
 // layer's toHumaErr: missing resources are NotFound, a duplicate or reused
 // idempotency key is AlreadyExists, validation and invariant failures are
 // InvalidArgument, an exhausted serialization conflict is Unavailable, and
-// anything unrecognized is Internal without leaking internals.
+// anything unrecognized is Internal without leaking internals. A duplicate
+// external reference (Task 4.3, audit A1.3) is also AlreadyExists, but its
+// own distinct case: a different request reusing someone else's reference,
+// not a retried request under the same idempotency key.
 func toStatus(err error) error {
 	// A *domain.PolicyViolationError (Task 2.4b, audit A3.4) is checked via
 	// errors.As, before the switch below, so its Error() message (naming the
@@ -43,6 +46,8 @@ func toStatus(err error) error {
 		return status.Error(codes.NotFound, "idempotency key not found")
 	case errors.Is(err, domain.ErrDuplicateTransaction):
 		return status.Error(codes.AlreadyExists, "transaction already exists")
+	case errors.Is(err, domain.ErrDuplicateReference):
+		return status.Error(codes.AlreadyExists, "reference already exists for this tenant")
 	case errors.Is(err, domain.ErrIdempotencyConflict):
 		return status.Error(codes.AlreadyExists, "idempotency key was reused with a different request body")
 	case errors.Is(err, domain.ErrConflict):
@@ -63,6 +68,10 @@ func toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, "invalid currency code (expected three uppercase letters)")
 	case errors.Is(err, domain.ErrDescriptionTooLong):
 		return status.Error(codes.InvalidArgument, "posting description is too long")
+	case errors.Is(err, domain.ErrInvalidReference):
+		return status.Error(codes.InvalidArgument, "reference must not be empty when present")
+	case errors.Is(err, domain.ErrReferenceTooLong):
+		return status.Error(codes.InvalidArgument, "reference is too long")
 	case errors.Is(err, domain.ErrOverflow):
 		return status.Error(codes.InvalidArgument, "amount is out of range")
 	case errors.Is(err, domain.ErrConversionDust):

@@ -105,8 +105,17 @@ type Transaction struct {
 	// reversal (Task 4.2, audit A1.2): the id of the transaction it reverses.
 	// Empty for an ordinary post or convert.
 	ReversesTransactionId string `protobuf:"bytes,4,opt,name=reverses_transaction_id,json=reversesTransactionId,proto3" json:"reverses_transaction_id,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// reference is the caller's optional external id for reconciliation (Task
+	// 4.3, audit A1.3), unique per tenant when present. Empty when the
+	// transaction was posted without one.
+	Reference string `protobuf:"bytes,5,opt,name=reference,proto3" json:"reference,omitempty"`
+	// effective_at is the value date (Task 4.3, audit A1.3): when the
+	// transaction is considered to have happened economically. Always set,
+	// even when the caller supplied none: it then falls back to when the
+	// transaction was actually posted. RFC3339 timestamp.
+	EffectiveAt   string `protobuf:"bytes,6,opt,name=effective_at,json=effectiveAt,proto3" json:"effective_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Transaction) Reset() {
@@ -156,6 +165,20 @@ func (x *Transaction) GetPostings() []*Posting {
 func (x *Transaction) GetReversesTransactionId() string {
 	if x != nil {
 		return x.ReversesTransactionId
+	}
+	return ""
+}
+
+func (x *Transaction) GetReference() string {
+	if x != nil {
+		return x.Reference
+	}
+	return ""
+}
+
+func (x *Transaction) GetEffectiveAt() string {
+	if x != nil {
+		return x.EffectiveAt
 	}
 	return ""
 }
@@ -828,9 +851,17 @@ func (x *GetStatementResponse) GetNextCursor() string {
 // when supplied, travels in the gRPC metadata key "idempotency-key", mirroring
 // the REST Idempotency-Key header, not in this message.
 type PostTransactionRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Currency      string                 `protobuf:"bytes,1,opt,name=currency,proto3" json:"currency,omitempty"`
-	Postings      []*Posting             `protobuf:"bytes,2,rep,name=postings,proto3" json:"postings,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Currency string                 `protobuf:"bytes,1,opt,name=currency,proto3" json:"currency,omitempty"`
+	Postings []*Posting             `protobuf:"bytes,2,rep,name=postings,proto3" json:"postings,omitempty"`
+	// reference is an optional external id for reconciliation (Task 4.3, audit
+	// A1.3), unique per tenant when supplied. Reusing one already in use
+	// returns ALREADY_EXISTS.
+	Reference string `protobuf:"bytes,3,opt,name=reference,proto3" json:"reference,omitempty"`
+	// effective_at is an optional value date (Task 4.3, audit A1.3), distinct
+	// from when the row is actually written. Empty defaults to the post time.
+	// RFC3339 timestamp.
+	EffectiveAt   string `protobuf:"bytes,4,opt,name=effective_at,json=effectiveAt,proto3" json:"effective_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -877,6 +908,20 @@ func (x *PostTransactionRequest) GetPostings() []*Posting {
 		return x.Postings
 	}
 	return nil
+}
+
+func (x *PostTransactionRequest) GetReference() string {
+	if x != nil {
+		return x.Reference
+	}
+	return ""
+}
+
+func (x *PostTransactionRequest) GetEffectiveAt() string {
+	if x != nil {
+		return x.EffectiveAt
+	}
+	return ""
 }
 
 type PostTransactionResponse struct {
@@ -1651,11 +1696,13 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x16\n" +
 	"\x06amount\x18\x02 \x01(\x03R\x06amount\x12 \n" +
 	"\vdescription\x18\x03 \x01(\tR\vdescription\x12\x1a\n" +
-	"\bcurrency\x18\x04 \x01(\tR\bcurrency\"\x95\x01\n" +
+	"\bcurrency\x18\x04 \x01(\tR\bcurrency\"\xd6\x01\n" +
 	"\vTransaction\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12.\n" +
 	"\bpostings\x18\x03 \x03(\v2\x12.ledger.v1.PostingR\bpostings\x126\n" +
-	"\x17reverses_transaction_id\x18\x04 \x01(\tR\x15reversesTransactionIdJ\x04\b\x02\x10\x03R\bcurrency\"]\n" +
+	"\x17reverses_transaction_id\x18\x04 \x01(\tR\x15reversesTransactionId\x12\x1c\n" +
+	"\treference\x18\x05 \x01(\tR\treference\x12!\n" +
+	"\feffective_at\x18\x06 \x01(\tR\veffectiveAtJ\x04\b\x02\x10\x03R\bcurrency\"]\n" +
 	"\aAccount\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -1702,10 +1749,12 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\bcurrency\x18\x02 \x01(\tR\bcurrency\x123\n" +
 	"\aentries\x18\x03 \x03(\v2\x19.ledger.v1.StatementEntryR\aentries\x12\x1f\n" +
 	"\vnext_cursor\x18\x04 \x01(\tR\n" +
-	"nextCursor\"d\n" +
+	"nextCursor\"\xa5\x01\n" +
 	"\x16PostTransactionRequest\x12\x1a\n" +
 	"\bcurrency\x18\x01 \x01(\tR\bcurrency\x12.\n" +
-	"\bpostings\x18\x02 \x03(\v2\x12.ledger.v1.PostingR\bpostings\"o\n" +
+	"\bpostings\x18\x02 \x03(\v2\x12.ledger.v1.PostingR\bpostings\x12\x1c\n" +
+	"\treference\x18\x03 \x01(\tR\treference\x12!\n" +
+	"\feffective_at\x18\x04 \x01(\tR\veffectiveAt\"o\n" +
 	"\x17PostTransactionResponse\x128\n" +
 	"\vtransaction\x18\x01 \x01(\v2\x16.ledger.v1.TransactionR\vtransaction\x12\x1a\n" +
 	"\breplayed\x18\x02 \x01(\bR\breplayed\"'\n" +
