@@ -35,6 +35,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 	"github.com/sohag-pro/go-ledger/internal/observability"
+	"github.com/sohag-pro/go-ledger/internal/opsmetrics"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 	"github.com/sohag-pro/go-ledger/internal/seed"
 	"github.com/sohag-pro/go-ledger/internal/web"
@@ -46,6 +47,15 @@ const ledgerTracerName = "github.com/sohag-pro/go-ledger/internal/ledger"
 // defaultTenantID is the tenant every request acts as until an auth layer
 // resolves a real one. Override with DEFAULT_TENANT_ID.
 const defaultTenantID = "00000000-0000-0000-0000-000000000001"
+
+// buildRevision is the git short SHA the running binary was built from,
+// stamped in by `make build` and the Dockerfile via
+// `-ldflags "-X main.buildRevision=..."` (Task 5.6a, audit A6.1). It stays
+// "dev" for `go run`/`go test`, where no ldflags are passed. Surfaced on GET
+// /healthz (additively; the deploy health check's "ok" status contract is
+// unchanged) and as the build_info{revision=...} 1 Prometheus gauge, so an
+// operator can always tell which build is actually serving.
+var buildRevision = "dev"
 
 func main() {
 	logger := slog.New(observability.NewTraceHandler(slog.NewJSONHandler(os.Stdout, nil)))
@@ -110,6 +120,7 @@ type config struct {
 	webhooksEnabled          bool
 	webhookMaxAttempts       int
 	webhookDeliveryInterval  time.Duration
+	metricsCollectInterval   time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -196,6 +207,14 @@ func loadConfig() (config, error) {
 		webhooksEnabled:         getenvBool("WEBHOOKS_ENABLED", true),
 		webhookMaxAttempts:      getenvInt("WEBHOOK_MAX_ATTEMPTS", webhook.DefaultMaxAttempts),
 		webhookDeliveryInterval: getenvDuration("WEBHOOK_DELIVERY_INTERVAL", webhook.DefaultInterval),
+		// METRICS_COLLECT_INTERVAL (Task 5.6a, audit A6.1): how often the
+		// operational-gauge collector (internal/opsmetrics) refreshes the
+		// audit outbox backlog/lag, webhook delivery backlog, and
+		// balance-invariant canary gauges from the database. Unlike the
+		// chainer/webhook/anchor intervals above, this has no enable flag:
+		// every instance runs one unconditionally (see opsmetrics's own doc
+		// comment for why no leader election is needed here).
+		metricsCollectInterval: getenvDuration("METRICS_COLLECT_INTERVAL", opsmetrics.DefaultInterval),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -367,7 +386,9 @@ func run(logger *slog.Logger) error {
 		Auth:             resolver,
 		RateLimiter:      limiter,
 		NegativeThrottle: negativeThrottle,
+		Revision:         buildRevision,
 	}
+	metrics.BuildInfo.WithLabelValues(buildRevision).Set(1)
 
 	// Demo seeder: reset and repopulate the demo ledger on startup and on an
 	// interval, so the public demo always has fresh, realistic data. Stops on
@@ -425,6 +446,18 @@ func run(logger *slog.Logger) error {
 		})
 		go webhookWorker.Run(webhookCtx)
 	}
+
+	// The operational-gauge collector (Task 5.6a, audit A6.1): every
+	// instance runs one unconditionally, unlike the chainer, anchor job, and
+	// webhook worker above, since it only reads cross-tenant aggregates and
+	// sets a handful of gauges, never writes to the database (see
+	// internal/opsmetrics's own doc comment for why leader election is not
+	// needed here). It keeps the audit outbox backlog/lag, webhook delivery
+	// backlog, and balance-invariant canary gauges fresh on /metrics.
+	collectorCtx, cancelCollector := context.WithCancel(context.Background())
+	defer cancelCollector()
+	collector := opsmetrics.NewCollector(pool, logger)
+	go collector.Run(collectorCtx, cfg.metricsCollectInterval)
 
 	// The idempotency key sweep (Task 4.5, audit A1.4): every deployment runs
 	// one unconditionally (unlike the seeder and chainer, there is no

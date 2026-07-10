@@ -9,8 +9,10 @@ MIGRATIONS  := internal/postgres/migrations
 run: ## Run the server
 	go run $(CMD)
 
+REVISION    := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+
 build: ## Build the server binary
-	CGO_ENABLED=0 go build -o $(BUILD_DIR)/$(BINARY) $(CMD)
+	CGO_ENABLED=0 go build -ldflags "-X main.buildRevision=$(REVISION)" -o $(BUILD_DIR)/$(BINARY) $(CMD)
 
 test: ## Run all tests
 	go test -race -cover ./...
@@ -54,7 +56,7 @@ jaeger: ## Start Jaeger all-in-one for local tracing (UI on :16686)
 	docker compose up -d jaeger
 
 docker-build: ## Build the Docker image
-	DOCKER_BUILDKIT=1 docker build -t $(BINARY):latest .
+	DOCKER_BUILDKIT=1 docker build --build-arg BUILD_REVISION=$(REVISION) -t $(BINARY):latest .
 
 image-size: docker-build ## Build the image and fail if it exceeds 20MB
 	@bytes=$$(docker image inspect $(BINARY):latest --format '{{.Size}}'); \

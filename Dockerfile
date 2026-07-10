@@ -5,6 +5,14 @@
 # go.mod so the dependency layer is pinned and reproducible.
 FROM golang:1.26 AS build
 
+# BUILD_REVISION (Task 5.6a, audit A6.1): the git short SHA to stamp into the
+# binary via -X, passed with --build-arg rather than run from .git inside the
+# container (the build context need not include .git at all this way).
+# `make docker-build` passes the caller's actual git revision; it defaults to
+# "dev" so a plain `docker build .` still produces a working, just
+# unattributed, binary.
+ARG BUILD_REVISION=dev
+
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -13,7 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/go-ledger ./cmd/server
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.buildRevision=${BUILD_REVISION}" -o /out/go-ledger ./cmd/server
 
 # Runtime stage: distroless static, pinned by digest, non-root. This image is
 # for local dev and CI only. Production runs the bare binary under systemd

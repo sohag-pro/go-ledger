@@ -34,8 +34,10 @@ func TestHealthOperation(t *testing.T) {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 
-	// Body must be exactly {"status":"ok"} with no extra keys (e.g. no $schema),
-	// since the deploy health check and uptime monitors depend on this contract.
+	// Body must be exactly {"status":"ok","revision":...}, no other keys
+	// (e.g. no $schema): the deploy health check and uptime monitors depend
+	// on "status" staying exactly "ok", and revision (Task 5.6a) is the one
+	// deliberate addition to that contract.
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("body is not JSON: %v (%q)", err, rec.Body.String())
@@ -43,8 +45,30 @@ func TestHealthOperation(t *testing.T) {
 	if body["status"] != "ok" {
 		t.Errorf("status = %v, want ok", body["status"])
 	}
-	if len(body) != 1 {
-		t.Errorf("body has extra keys: %v", body)
+	if _, ok := body["revision"]; !ok {
+		t.Errorf("body missing revision field: %v", body)
+	}
+	if len(body) != 2 {
+		t.Errorf("body has unexpected keys: %v", body)
+	}
+}
+
+// TestHealthOperationRevision proves Deps.Revision is threaded through to
+// the served response, not just present as an empty string.
+func TestHealthOperationRevision(t *testing.T) {
+	router := chi.NewRouter()
+	New(router, Deps{Revision: "abc1234"})
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v (%q)", err, rec.Body.String())
+	}
+	if body["revision"] != "abc1234" {
+		t.Errorf("revision = %v, want abc1234", body["revision"])
 	}
 }
 

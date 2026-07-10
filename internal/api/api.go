@@ -72,6 +72,12 @@ type Deps struct {
 	// the same reason RateLimiter is: a nil value skips the gate entirely
 	// rather than failing closed.
 	NegativeThrottle *auth.NegativeThrottle
+	// Revision is the running binary's build revision (git short SHA; "dev"
+	// outside a real build), surfaced additively on GET /healthz (Task
+	// 5.6a). A zero value (spec generation, and tests that never care) just
+	// serializes as an empty string; it never affects the "ok" status the
+	// deploy health check depends on.
+	Revision string
 }
 
 // tenantFromCtx reads the tenant HumaMiddleware resolved from the caller's API
@@ -175,7 +181,7 @@ func New(router chi.Router, deps Deps) huma.API {
 // registerOperations wires every API operation. New endpoints get added here and
 // show up in the spec and playground automatically.
 func registerOperations(api huma.API, deps Deps) {
-	registerHealth(api)
+	registerHealth(api, deps.Revision)
 	registerAccounts(api, deps)
 	registerTransactions(api, deps)
 	registerAudit(api, deps)

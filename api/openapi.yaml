@@ -357,6 +357,11 @@ components:
     HealthOutputBody:
       additionalProperties: false
       properties:
+        revision:
+          description: Build revision (git short SHA) the running binary was built from; "dev" outside a real build
+          examples:
+            - a1b2c3d
+          type: string
         status:
           description: Liveness status, "ok" while the service is serving
           examples:
@@ -364,6 +369,7 @@ components:
           type: string
       required:
         - status
+        - revision
       type: object
     IssueKeyInputBody:
       additionalProperties: false
@@ -822,7 +828,7 @@ openapi: 3.1.0
 paths:
   /healthz:
     get:
-      description: Returns 200 with {"status":"ok"} while the service is up. Used by the deploy pipeline and uptime monitoring.
+      description: Returns 200 with {"status":"ok","revision":"<build revision>"} while the service is up. Used by the deploy pipeline and uptime monitoring.
       operationId: health-check
       responses:
         "200":
