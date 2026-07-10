@@ -13,6 +13,34 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getAuditHead = `-- name: GetAuditHead :one
+SELECT chain_seq, row_hash FROM audit_log
+WHERE tenant_id = $1
+ORDER BY chain_seq DESC
+LIMIT 1
+`
+
+type GetAuditHeadRow struct {
+	ChainSeq int64
+	RowHash  pgtype.Text
+}
+
+// The tenant's current head: chain_seq and row_hash of its latest audit_log
+// row (Task 5.3). See GetLastAuditHash's own comment (ADR-017) for why
+// chain_seq, not id or created_at, is the correct "latest" order; this is
+// the same lookup, just also returning chain_seq, which GetLastAuditHash's
+// only caller (the chainer) never needed since it only ever extends the
+// chain from a row_hash. Used to surface the live head alongside the last
+// off-box anchor (the verify-audit-chain endpoint, internal/api/audit.go)
+// and by VerifyFromLatestAnchor to fall back to a full verify when no
+// anchor exists yet. ErrNoRows means the tenant has no audit rows at all.
+func (q *Queries) GetAuditHead(ctx context.Context, tenantID uuid.UUID) (GetAuditHeadRow, error) {
+	row := q.db.QueryRow(ctx, getAuditHead, tenantID)
+	var i GetAuditHeadRow
+	err := row.Scan(&i.ChainSeq, &i.RowHash)
+	return i, err
+}
+
 const getLastAuditHash = `-- name: GetLastAuditHash :one
 SELECT row_hash FROM audit_log
 WHERE tenant_id = $1
@@ -41,6 +69,58 @@ func (q *Queries) GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgt
 	var row_hash pgtype.Text
 	err := row.Scan(&row_hash)
 	return row_hash, err
+}
+
+const getLatestAuditAnchor = `-- name: GetLatestAuditAnchor :one
+SELECT tenant_id, chain_seq, row_hash, created_at FROM audit_anchors
+WHERE tenant_id = $1
+ORDER BY chain_seq DESC
+LIMIT 1
+`
+
+type GetLatestAuditAnchorRow struct {
+	TenantID  uuid.UUID
+	ChainSeq  int64
+	RowHash   string
+	CreatedAt time.Time
+}
+
+// The tenant's most recently recorded anchor (Task 5.3): the chain_seq,
+// row_hash, and timestamp the anchor job last logged off-box for this
+// tenant. ErrNoRows means no anchor has ever been recorded (a brand-new
+// tenant, or one that posted before the anchor job's first tick).
+func (q *Queries) GetLatestAuditAnchor(ctx context.Context, tenantID uuid.UUID) (GetLatestAuditAnchorRow, error) {
+	row := q.db.QueryRow(ctx, getLatestAuditAnchor, tenantID)
+	var i GetLatestAuditAnchorRow
+	err := row.Scan(
+		&i.TenantID,
+		&i.ChainSeq,
+		&i.RowHash,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertAuditAnchor = `-- name: InsertAuditAnchor :exec
+INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash)
+VALUES ($1, $2, $3)
+`
+
+type InsertAuditAnchorParams struct {
+	TenantID uuid.UUID
+	ChainSeq int64
+	RowHash  string
+}
+
+// Records tenantID's current chain head as a new off-box-anchored
+// checkpoint (Task 5.3, migration 0025). Called only by the periodic
+// anchor job (internal/audit.AnchorJob), never the request path: the job
+// runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
+// insert is not scoped through withTenant the way a request-path write
+// would be.
+func (q *Queries) InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error {
+	_, err := q.db.Exec(ctx, insertAuditAnchor, arg.TenantID, arg.ChainSeq, arg.RowHash)
+	return err
 }
 
 const insertAuditLog = `-- name: InsertAuditLog :exec
@@ -268,6 +348,115 @@ func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([
 			&i.PrevHash,
 			&i.RowHash,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditForVerifyPage = `-- name: ListAuditForVerifyPage :many
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq
+FROM audit_log
+WHERE tenant_id = $1 AND chain_seq > $2
+ORDER BY chain_seq
+LIMIT $3
+`
+
+type ListAuditForVerifyPageParams struct {
+	TenantID      uuid.UUID
+	AfterChainSeq int64
+	PageLimit     int32
+}
+
+type ListAuditForVerifyPageRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
+	ChainSeq      int64
+}
+
+// A bounded page of the tenant's audit rows in true chain order, strictly
+// after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
+// ListAuditForVerify above, which loads the entire chain into memory at
+// once. AuditService.Verify calls this in a loop, advancing
+// after_chain_seq to the last row's chain_seq on each page, until a page
+// comes back with fewer than page_limit rows, so memory use is bounded by
+// page_limit regardless of how long the chain has grown. Includes
+// chain_seq (unlike ListAuditForVerify) precisely so the caller can advance
+// the cursor without a second round trip. after_chain_seq is 0 to start
+// from genesis, or an anchor's chain_seq to start from a trusted checkpoint
+// (VerifyFromLatestAnchor).
+func (q *Queries) ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error) {
+	rows, err := q.db.Query(ctx, listAuditForVerifyPage, arg.TenantID, arg.AfterChainSeq, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAuditForVerifyPageRow
+	for rows.Next() {
+		var i ListAuditForVerifyPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Action,
+			&i.TransactionID,
+			&i.Actor,
+			&i.Before,
+			&i.After,
+			&i.CreatedAt,
+			&i.PrevHash,
+			&i.RowHash,
+			&i.ChainSeq,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditHeads = `-- name: ListAuditHeads :many
+SELECT DISTINCT ON (tenant_id) tenant_id, chain_seq, row_hash
+FROM audit_log
+ORDER BY tenant_id, chain_seq DESC
+`
+
+type ListAuditHeadsRow struct {
+	TenantID uuid.UUID
+	ChainSeq int64
+	RowHash  pgtype.Text
+}
+
+// One row per tenant with at least one audit_log entry: that tenant's
+// current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
+// this once per tick rather than enumerating tenants and calling
+// GetAuditHead once per tenant (an N+1 round trip): it inserts one
+// audit_anchors row and emits one structured log line per tenant returned
+// here.
+func (q *Queries) ListAuditHeads(ctx context.Context) ([]ListAuditHeadsRow, error) {
+	rows, err := q.db.Query(ctx, listAuditHeads)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAuditHeadsRow
+	for rows.Next() {
+		var i ListAuditHeadsRow
+		if err := rows.Scan(&i.TenantID, &i.ChainSeq, &i.RowHash); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

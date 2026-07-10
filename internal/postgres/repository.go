@@ -1131,6 +1131,96 @@ func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([
 	return out, nil
 }
 
+// ListAuditForVerifyPage returns up to limit of the tenant's audit rows with
+// ChainSeq strictly greater than afterChainSeq, in chain order, including
+// ChainSeq (Task 5.3, audit A2.4): the bounded-memory counterpart to
+// ListAuditForVerify, which AuditService.Verify calls in a loop instead of
+// loading the whole chain at once. Runs through withTenant, exactly like
+// every other tenant-scoped audit read here: paging must keep working with
+// migration 0024's RLS in force for the tenant being verified (Task 5.4b).
+func (r *Repository) ListAuditForVerifyPage(ctx context.Context, tenantID string, afterChainSeq int64, limit int) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var rows []sqlc.ListAuditForVerifyPageRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditForVerifyPage(ctx, sqlc.ListAuditForVerifyPageParams{
+			TenantID:      tid,
+			AfterChainSeq: afterChainSeq,
+			PageLimit:     int32(limit), //nolint:gosec // limit is an application-configured page size, not user input
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit for verify page: %w", err)
+	}
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+			ChainSeq:      row.ChainSeq,
+		})
+	}
+	return out, nil
+}
+
+// GetAuditHead returns the tenant's current chain head: the chain_seq and
+// row_hash of its latest audit_log row (Task 5.3). ok is false when the
+// tenant has no audit rows yet (pgx.ErrNoRows), not an error: an empty chain
+// simply has no head to report.
+func (r *Repository) GetAuditHead(ctx context.Context, tenantID string) (chainSeq int64, rowHash string, ok bool, err error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, "", false, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var row sqlc.GetAuditHeadRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetAuditHead(ctx, tid)
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, fmt.Errorf("postgres: get audit head: %w", err)
+	}
+	return row.ChainSeq, row.RowHash.String, true, nil
+}
+
+// LatestAuditAnchor returns the tenant's most recently recorded off-box
+// anchor (Task 5.3, migration 0025). ok is false when no anchor has ever
+// been recorded for this tenant (pgx.ErrNoRows), not an error.
+func (r *Repository) LatestAuditAnchor(ctx context.Context, tenantID string) (domain.AuditAnchor, bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.AuditAnchor{}, false, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var row sqlc.GetLatestAuditAnchorRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetLatestAuditAnchor(ctx, tid)
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AuditAnchor{}, false, nil
+	}
+	if err != nil {
+		return domain.AuditAnchor{}, false, fmt.Errorf("postgres: get latest audit anchor: %w", err)
+	}
+	return domain.AuditAnchor{ChainSeq: row.ChainSeq, RowHash: row.RowHash, CreatedAt: row.CreatedAt}, true, nil
+}
+
 // CountPendingOutbox returns the number of tenantID's audit_outbox rows the
 // chainer has not yet processed (ADR-017): the audit chain's lag, surfaced by
 // audit verify alongside the chained head.

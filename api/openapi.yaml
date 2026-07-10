@@ -58,6 +58,22 @@ components:
       required:
         - accounts
       type: object
+    AuditAnchorBody:
+      additionalProperties: false
+      properties:
+        chain_seq:
+          format: int64
+          type: integer
+        created_at:
+          format: date-time
+          type: string
+        row_hash:
+          type: string
+      required:
+        - chain_seq
+        - row_hash
+        - created_at
+      type: object
     AuditEntryBody:
       additionalProperties: false
       properties:
@@ -81,6 +97,18 @@ components:
         - actor
         - after
         - created_at
+      type: object
+    AuditHeadBody:
+      additionalProperties: false
+      properties:
+        chain_seq:
+          format: int64
+          type: integer
+        row_hash:
+          type: string
+      required:
+        - chain_seq
+        - row_hash
       type: object
     AuditListOutputBody:
       additionalProperties: false
@@ -704,6 +732,9 @@ components:
     VerifyAuditOutputBody:
       additionalProperties: false
       properties:
+        anchor:
+          $ref: "#/components/schemas/AuditAnchorBody"
+          description: The tenant's most recently recorded off-box anchor, or null if none has been recorded yet
         checked:
           format: int64
           type: integer
@@ -712,6 +743,9 @@ components:
           type:
             - string
             - "null"
+        head:
+          $ref: "#/components/schemas/AuditHeadBody"
+          description: The tenant's current chain head (chain_seq + row_hash), or null for an empty chain
         pending:
           description: "Posted events not yet reflected in the chain (ADR-017): the chain is built asynchronously, so this lags briefly behind posting"
           format: int64
@@ -723,6 +757,8 @@ components:
         - checked
         - first_break_id
         - pending
+        - head
+        - anchor
       type: object
     WebhookSubscriptionBody:
       additionalProperties: false
@@ -1373,6 +1409,14 @@ paths:
     get:
       description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012). The chain itself is built asynchronously by a single background chainer (ADR-017), so `pending` reports how many posted events are not yet reflected in it; a nonzero, non-growing pending count is normal lag, not a fault.
       operationId: verify-audit-chain
+      parameters:
+        - description: "When true, verify only from the tenant's latest off-box anchor (bounded cost) instead of from genesis (complete but O(chain length)). Falls back to a full verify when the tenant has no anchor yet. See the response's anchor field and ADR-012's Task 5.3 addendum for the trust model this trades: the anchored prefix is trusted as a checkpoint, not re-proven."
+          explode: false
+          in: query
+          name: fast
+          schema:
+            description: "When true, verify only from the tenant's latest off-box anchor (bounded cost) instead of from genesis (complete but O(chain length)). Falls back to a full verify when the tenant has no anchor yet. See the response's anchor field and ADR-012's Task 5.3 addendum for the trust model this trades: the anchored prefix is trusted as a checkpoint, not re-proven."
+            type: boolean
       responses:
         "200":
           content:

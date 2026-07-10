@@ -36,6 +36,13 @@ const AuditGenesisHash = ""
 // the single background chainer, not by the transaction that posts the event:
 // a post writes an AuditEvent to the outbox instead, and the chainer is what
 // eventually produces the AuditEntry these two fields describe.
+// ChainSeq is populated only by ListAuditForVerifyPage (Task 5.3): the row's
+// position in true chain-insertion order (ADR-017, migration 0016), used to
+// page and to resume a walk from a trusted checkpoint
+// (VerifyFromLatestAnchor). It is never hashed (ComputeAuditRowHash does not
+// read it) and is left zero on every other read of an AuditEntry
+// (ByTransaction, ByAccount, and ListAuditForVerify, which predates paging
+// and has no need to advance a cursor).
 type AuditEntry struct {
 	ID            string
 	Action        string
@@ -46,6 +53,17 @@ type AuditEntry struct {
 	CreatedAt     time.Time
 	PrevHash      string
 	RowHash       string
+	ChainSeq      int64
+}
+
+// AuditAnchor is one recorded off-box checkpoint of a tenant's chain head
+// (Task 5.3, migration 0025): the chain_seq and row_hash the anchor job read
+// and logged at CreatedAt. See internal/audit.AnchorJob and
+// AuditService.VerifyFromLatestAnchor for how it is produced and consumed.
+type AuditAnchor struct {
+	ChainSeq  int64
+	RowHash   string
+	CreatedAt time.Time
 }
 
 // AuditEvent is the payload a post or convert writes to the audit outbox

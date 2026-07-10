@@ -103,6 +103,8 @@ type config struct {
 	chainerEnabled           bool
 	chainerInterval          time.Duration
 	chainerBatch             int
+	anchorEnabled            bool
+	anchorInterval           time.Duration
 	idempotencyTTL           time.Duration
 	idempotencySweepInterval time.Duration
 	webhooksEnabled          bool
@@ -157,6 +159,20 @@ func loadConfig() (config, error) {
 		chainerEnabled:  getenvBool("CHAINER_ENABLED", true),
 		chainerInterval: getenvDuration("CHAINER_INTERVAL", audit.DefaultInterval),
 		chainerBatch:    getenvInt("CHAINER_BATCH", audit.DefaultBatch),
+		// The audit anchor job (Task 5.3, audit A2.4): on by default, like the
+		// chainer and webhook worker, since every deployment benefits from an
+		// off-box, tamper-evident checkpoint of each tenant's chain head (see
+		// migration 0025 and internal/audit.AnchorJob's own doc comments for
+		// why a hash chain alone cannot catch a privileged, internally
+		// consistent rewrite of its own history). AUDIT_ANCHOR_ENABLED exists
+		// for the same reasons CHAINER_ENABLED does: tests, and a
+		// deliberately job-less instance in a multi-instance rollout (leader
+		// election picks exactly one active job regardless). The hour default
+		// mirrors audit.DefaultAnchorInterval: an anchor's value is that it
+		// outlives any single rewrite attempt once shipped off-box, not tight
+		// recency, so a coarse cadence is the right default.
+		anchorEnabled:  getenvBool("AUDIT_ANCHOR_ENABLED", true),
+		anchorInterval: getenvDuration("AUDIT_ANCHOR_INTERVAL", audit.DefaultAnchorInterval),
 		// IDEMPOTENCY_TTL bounds how long a stored idempotency key blocks
 		// reuse before it is treated as absent (Task 4.5, audit A1.4): the
 		// default matches ledger.DefaultIdempotencyTTL and migration 0019's
@@ -376,6 +392,21 @@ func run(logger *slog.Logger) error {
 		defer cancelChainer()
 		chainer := audit.NewChainer(pool, logger, cfg.chainerInterval, cfg.chainerBatch)
 		go chainer.Run(chainerCtx)
+	}
+
+	// The audit anchor job (Task 5.3, audit A2.4): every instance runs one,
+	// and leader election (a THIRD, distinct Postgres advisory lock key,
+	// alongside the chainer's and the webhook worker's own) guarantees
+	// exactly one is ever active, the same reasoning that makes starting the
+	// chainer unconditionally on every instance safe above. It records, and
+	// logs off-box, every tenant's current chain head on an interval; see
+	// internal/audit.AnchorJob's own doc comment for why that off-box copy is
+	// what makes a rewrite of already-anchored history detectable at all.
+	if cfg.anchorEnabled {
+		anchorCtx, cancelAnchor := context.WithCancel(context.Background())
+		defer cancelAnchor()
+		anchorJob := audit.NewAnchorJob(pool, logger, cfg.anchorInterval)
+		go anchorJob.Run(anchorCtx)
 	}
 
 	// The webhook worker (Task 4.1, audit A7.1): fans posted transactions out

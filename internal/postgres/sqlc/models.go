@@ -36,6 +36,14 @@ type ApiKey struct {
 	LastUsedAt   pgtype.Timestamptz
 }
 
+type AuditAnchor struct {
+	ID        int64
+	TenantID  uuid.UUID
+	ChainSeq  int64
+	RowHash   string
+	CreatedAt time.Time
+}
+
 type AuditLog struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID

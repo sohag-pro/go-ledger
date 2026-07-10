@@ -104,6 +104,16 @@ type Querier interface {
 	// it up separately via GetTenant.
 	GetAPIKeyByID(ctx context.Context, id uuid.UUID) (GetAPIKeyByIDRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
+	// The tenant's current head: chain_seq and row_hash of its latest audit_log
+	// row (Task 5.3). See GetLastAuditHash's own comment (ADR-017) for why
+	// chain_seq, not id or created_at, is the correct "latest" order; this is
+	// the same lookup, just also returning chain_seq, which GetLastAuditHash's
+	// only caller (the chainer) never needed since it only ever extends the
+	// chain from a row_hash. Used to surface the live head alongside the last
+	// off-box anchor (the verify-audit-chain endpoint, internal/api/audit.go)
+	// and by VerifyFromLatestAnchor to fall back to a full verify when no
+	// anchor exists yet. ErrNoRows means the tenant has no audit rows at all.
+	GetAuditHead(ctx context.Context, tenantID uuid.UUID) (GetAuditHeadRow, error)
 	// An expired row is treated as absent (Task 4.5, audit A1.4): the "AND
 	// expires_at > now()" filter is what makes a key whose replay window has
 	// passed behave exactly like a key that was never written, from the caller's
@@ -127,6 +137,11 @@ type Querier interface {
 	// pgx.ErrNoRows; the caller treats that as the chain's genesis
 	// (domain.AuditGenesisHash).
 	GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error)
+	// The tenant's most recently recorded anchor (Task 5.3): the chain_seq,
+	// row_hash, and timestamp the anchor job last logged off-box for this
+	// tenant. ErrNoRows means no anchor has ever been recorded (a brand-new
+	// tenant, or one that posted before the anchor job's first tick).
+	GetLatestAuditAnchor(ctx context.Context, tenantID uuid.UUID) (GetLatestAuditAnchorRow, error)
 	// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
 	// created lazily on first use. Keyed by (tenant_id, name): name is the
 	// reserved, deterministic "fx.clearing.<CURRENCY>" string the caller builds,
@@ -175,6 +190,13 @@ type Querier interface {
 	// defaults an empty Scopes slice to {read,post} before it ever reaches this
 	// query, the same default the api_keys.scopes column itself carries.
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
+	// Records tenantID's current chain head as a new off-box-anchored
+	// checkpoint (Task 5.3, migration 0025). Called only by the periodic
+	// anchor job (internal/audit.AnchorJob), never the request path: the job
+	// runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
+	// insert is not scoped through withTenant the way a request-path write
+	// would be.
+	InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error
 	// outbox_id is the source audit_outbox row this audit_log row was chained
 	// from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a
 	// second attempt to chain the same outbox row fails this insert with a
@@ -268,6 +290,25 @@ type Querier interface {
 	// migration 0016) for why chain_seq, not id, is the failover-safe chain
 	// order.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
+	// A bounded page of the tenant's audit rows in true chain order, strictly
+	// after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
+	// ListAuditForVerify above, which loads the entire chain into memory at
+	// once. AuditService.Verify calls this in a loop, advancing
+	// after_chain_seq to the last row's chain_seq on each page, until a page
+	// comes back with fewer than page_limit rows, so memory use is bounded by
+	// page_limit regardless of how long the chain has grown. Includes
+	// chain_seq (unlike ListAuditForVerify) precisely so the caller can advance
+	// the cursor without a second round trip. after_chain_seq is 0 to start
+	// from genesis, or an anchor's chain_seq to start from a trusted checkpoint
+	// (VerifyFromLatestAnchor).
+	ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error)
+	// One row per tenant with at least one audit_log entry: that tenant's
+	// current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
+	// this once per tick rather than enumerating tenants and calling
+	// GetAuditHead once per tenant (an N+1 round trip): it inserts one
+	// audit_anchors row and emits one structured log line per tenant returned
+	// here.
+	ListAuditHeads(ctx context.Context) ([]ListAuditHeadsRow, error)
 	// The fan-out step's source read: every chained audit_log event past the
 	// cursor, oldest first, up to batch_limit. Reads chain_seq (ADR-017's
 	// failover-safe, skew-proof linearization key), not id or created_at, for

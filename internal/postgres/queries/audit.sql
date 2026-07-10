@@ -70,3 +70,67 @@ SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, 
 FROM audit_log
 WHERE tenant_id = sqlc.arg(tenant_id)
 ORDER BY chain_seq;
+
+-- name: ListAuditForVerifyPage :many
+-- A bounded page of the tenant's audit rows in true chain order, strictly
+-- after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
+-- ListAuditForVerify above, which loads the entire chain into memory at
+-- once. AuditService.Verify calls this in a loop, advancing
+-- after_chain_seq to the last row's chain_seq on each page, until a page
+-- comes back with fewer than page_limit rows, so memory use is bounded by
+-- page_limit regardless of how long the chain has grown. Includes
+-- chain_seq (unlike ListAuditForVerify) precisely so the caller can advance
+-- the cursor without a second round trip. after_chain_seq is 0 to start
+-- from genesis, or an anchor's chain_seq to start from a trusted checkpoint
+-- (VerifyFromLatestAnchor).
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq
+FROM audit_log
+WHERE tenant_id = sqlc.arg(tenant_id) AND chain_seq > sqlc.arg(after_chain_seq)
+ORDER BY chain_seq
+LIMIT sqlc.arg(page_limit);
+
+-- name: GetAuditHead :one
+-- The tenant's current head: chain_seq and row_hash of its latest audit_log
+-- row (Task 5.3). See GetLastAuditHash's own comment (ADR-017) for why
+-- chain_seq, not id or created_at, is the correct "latest" order; this is
+-- the same lookup, just also returning chain_seq, which GetLastAuditHash's
+-- only caller (the chainer) never needed since it only ever extends the
+-- chain from a row_hash. Used to surface the live head alongside the last
+-- off-box anchor (the verify-audit-chain endpoint, internal/api/audit.go)
+-- and by VerifyFromLatestAnchor to fall back to a full verify when no
+-- anchor exists yet. ErrNoRows means the tenant has no audit rows at all.
+SELECT chain_seq, row_hash FROM audit_log
+WHERE tenant_id = sqlc.arg(tenant_id)
+ORDER BY chain_seq DESC
+LIMIT 1;
+
+-- name: InsertAuditAnchor :exec
+-- Records tenantID's current chain head as a new off-box-anchored
+-- checkpoint (Task 5.3, migration 0025). Called only by the periodic
+-- anchor job (internal/audit.AnchorJob), never the request path: the job
+-- runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
+-- insert is not scoped through withTenant the way a request-path write
+-- would be.
+INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash)
+VALUES (sqlc.arg(tenant_id), sqlc.arg(chain_seq), sqlc.arg(row_hash));
+
+-- name: GetLatestAuditAnchor :one
+-- The tenant's most recently recorded anchor (Task 5.3): the chain_seq,
+-- row_hash, and timestamp the anchor job last logged off-box for this
+-- tenant. ErrNoRows means no anchor has ever been recorded (a brand-new
+-- tenant, or one that posted before the anchor job's first tick).
+SELECT tenant_id, chain_seq, row_hash, created_at FROM audit_anchors
+WHERE tenant_id = sqlc.arg(tenant_id)
+ORDER BY chain_seq DESC
+LIMIT 1;
+
+-- name: ListAuditHeads :many
+-- One row per tenant with at least one audit_log entry: that tenant's
+-- current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
+-- this once per tick rather than enumerating tenants and calling
+-- GetAuditHead once per tenant (an N+1 round trip): it inserts one
+-- audit_anchors row and emits one structured log line per tenant returned
+-- here.
+SELECT DISTINCT ON (tenant_id) tenant_id, chain_seq, row_hash
+FROM audit_log
+ORDER BY tenant_id, chain_seq DESC;

@@ -378,6 +378,11 @@ func (f *fakeRepo) AppendAuditOutbox(_ context.Context, tenantID string, ev doma
 	}
 	e.PrevHash = prev
 	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prev)
+	// ChainSeq mirrors the real chainer's chain_seq: a plain 1-based
+	// insertion-order sequence (Task 5.3), so ListAuditForVerifyPage above
+	// can page this fake's audit slice the same way the real adapter pages
+	// audit_log by chain_seq.
+	e.ChainSeq = int64(len(f.audit) + 1)
 	f.audit = append(f.audit, e)
 	return nil
 }
@@ -395,6 +400,43 @@ func (f *fakeRepo) ListAuditForVerify(_ context.Context, _ string) ([]domain.Aud
 	out := make([]domain.AuditEntry, len(f.audit))
 	copy(out, f.audit)
 	return out, nil
+}
+
+// ListAuditForVerifyPage is ListAuditForVerify's paged counterpart (Task
+// 5.3): f.audit is assigned ChainSeq 1, 2, 3... in append order (see
+// AppendAuditOutbox below), so "chain_seq > afterChainSeq" is simply a slice
+// index, and "up to limit rows" a slice bound. fakeRepo is single-tenant in
+// these handler tests, so tenantID is not filtered on, matching
+// ListAuditForVerify's own behavior above.
+func (f *fakeRepo) ListAuditForVerifyPage(_ context.Context, _ string, afterChainSeq int64, limit int) ([]domain.AuditEntry, error) {
+	var out []domain.AuditEntry
+	for _, e := range f.audit {
+		if e.ChainSeq <= afterChainSeq {
+			continue
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// GetAuditHead returns the last entry AppendAuditOutbox appended, or ok=false
+// for an empty chain.
+func (f *fakeRepo) GetAuditHead(_ context.Context, _ string) (chainSeq int64, rowHash string, ok bool, err error) {
+	if len(f.audit) == 0 {
+		return 0, "", false, nil
+	}
+	last := f.audit[len(f.audit)-1]
+	return last.ChainSeq, last.RowHash, true, nil
+}
+
+// LatestAuditAnchor always reports no anchor: no handler test in this
+// package exercises the anchor job (it is covered by internal/audit's own
+// Postgres-backed integration tests), so this fake never has one to return.
+func (f *fakeRepo) LatestAuditAnchor(_ context.Context, _ string) (domain.AuditAnchor, bool, error) {
+	return domain.AuditAnchor{}, false, nil
 }
 
 // GetIdempotencyKey treats an expired entry as absent (Task 4.5, audit

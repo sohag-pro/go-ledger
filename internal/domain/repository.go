@@ -229,6 +229,28 @@ type Repository interface {
 	// chain end to end, not a paged read for display.
 	ListAuditForVerify(ctx context.Context, tenantID string) ([]AuditEntry, error)
 
+	// ListAuditForVerifyPage returns up to limit audit rows for the tenant
+	// with ChainSeq strictly greater than afterChainSeq, in chain order,
+	// including ChainSeq (Task 5.3, audit A2.4). It is the bounded-memory
+	// counterpart to ListAuditForVerify: AuditService.Verify pages through
+	// the whole chain in batches of this size, rather than loading every row
+	// into memory at once, by repeatedly calling this with afterChainSeq
+	// advanced to the last row's ChainSeq.
+	ListAuditForVerifyPage(ctx context.Context, tenantID string, afterChainSeq int64, limit int) ([]AuditEntry, error)
+
+	// GetAuditHead returns the tenant's current chain head: the chain_seq and
+	// row_hash of its latest audit_log row (Task 5.3). ok is false when the
+	// tenant has no audit rows yet. Used to surface the live head alongside
+	// the last off-box anchor (verify-audit-chain, internal/api/audit.go).
+	GetAuditHead(ctx context.Context, tenantID string) (chainSeq int64, rowHash string, ok bool, err error)
+
+	// LatestAuditAnchor returns the tenant's most recently recorded off-box
+	// anchor (Task 5.3): the chain_seq and row_hash of the head at the time
+	// the anchor job last ran for this tenant, and when it ran. ok is false
+	// when no anchor has ever been recorded for this tenant (a brand-new
+	// tenant, or one that posted before the anchor job's first tick).
+	LatestAuditAnchor(ctx context.Context, tenantID string) (anchor AuditAnchor, ok bool, err error)
+
 	// Balance returns the derived balance of an account: the sum of its postings'
 	// signed amounts. It returns ErrAccountNotFound if the account does not exist.
 	//
