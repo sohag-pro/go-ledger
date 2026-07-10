@@ -39,6 +39,12 @@ func TestToHumaErr(t *testing.T) {
 		// domain.ErrConflict.
 		{"screening rejected", &ledger.ScreeningRejectedError{Reason: "sanctions match"}, 422, false},
 		{"screening unavailable", ledger.ErrScreeningUnavailable, 503, false},
+		// Task 6.1, audit A9.1 fix: the party-length sentinels had no case
+		// here and fell through to the default 500; both are validation
+		// failures over otherwise well-formed requests, so they map to 422
+		// like ErrDescriptionTooLong and ErrReferenceTooLong above.
+		{"party reference too long", domain.ErrPartyReferenceTooLong, 422, false},
+		{"party type too long", domain.ErrPartyTypeTooLong, 422, false},
 	}
 
 	for _, tt := range tests {

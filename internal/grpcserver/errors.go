@@ -99,6 +99,18 @@ func toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, "reference must not be empty when present")
 	case errors.Is(err, domain.ErrReferenceTooLong):
 		return status.Error(codes.InvalidArgument, "reference is too long")
+	// domain.ErrPartyReferenceTooLong and domain.ErrPartyTypeTooLong (Task
+	// 6.1, audit A9.1): unlike REST, where the maxLength JSON schema tag on
+	// PartyReference/PartyType (internal/api/accounts.go) rejects an
+	// over-length value before it reaches the domain, the gRPC proto has no
+	// equivalent length constraint on these fields, so this is the only thing
+	// that catches an over-length party_reference/party_type over gRPC.
+	// InvalidArgument, the same class as ErrDescriptionTooLong and
+	// ErrReferenceTooLong above.
+	case errors.Is(err, domain.ErrPartyReferenceTooLong):
+		return status.Error(codes.InvalidArgument, "account party reference is too long")
+	case errors.Is(err, domain.ErrPartyTypeTooLong):
+		return status.Error(codes.InvalidArgument, "account party type is too long")
 	case errors.Is(err, domain.ErrOverflow):
 		return status.Error(codes.InvalidArgument, "amount is out of range")
 	case errors.Is(err, domain.ErrConversionDust):

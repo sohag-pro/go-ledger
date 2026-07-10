@@ -11,6 +11,7 @@ package grpcserver_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,6 +212,63 @@ func TestGRPCAccountPartyFields(t *testing.T) {
 	}
 	if got.Account.PartyType != "business" {
 		t.Errorf("GetAccount party_type = %q, want %q", got.Account.PartyType, "business")
+	}
+}
+
+// TestGRPCCreateAccountPartyFieldTooLong is the fix for a gap in Task 6.1
+// (audit A9.1): domain.ErrPartyReferenceTooLong and domain.ErrPartyTypeTooLong
+// had no case in toStatus, so an over-length party field fell through to the
+// default codes.Internal instead of a client validation error. The REST layer
+// catches an over-length value earlier via its maxLength JSON schema tag
+// (internal/api/accounts.go), but the gRPC proto has no equivalent length
+// constraint on party_reference/party_type, so this path is reachable only
+// over gRPC. Both fields must map to InvalidArgument, and, critically, the
+// account must not be created: CreateAccount returning an error alone is not
+// enough proof, since the pre-fix bug also returned an error (just the wrong
+// code) while still rejecting the write; this confirms no account with the
+// attempted name exists afterward.
+func TestGRPCCreateAccountPartyFieldTooLong(t *testing.T) {
+	client := dialClient(t)
+	ctx := authedCtx(context.Background())
+	tooLong := strings.Repeat("x", domain.MaxPartyReferenceLen+1)
+
+	tests := []struct {
+		name string
+		req  *ledgerv1.CreateAccountRequest
+	}{
+		{
+			name: "party reference too long",
+			req: &ledgerv1.CreateAccountRequest{
+				Name: "Party Ref Guard " + tooLong[:8], Type: "asset", Currency: "USD",
+				PartyReference: tooLong,
+			},
+		},
+		{
+			name: "party type too long",
+			req: &ledgerv1.CreateAccountRequest{
+				Name: "Party Type Guard " + tooLong[:8], Type: "asset", Currency: "USD",
+				PartyType: tooLong,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.CreateAccount(ctx, tc.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("code = %v, want InvalidArgument", status.Code(err))
+			}
+
+			list, err := client.ListAccounts(ctx, &ledgerv1.ListAccountsRequest{})
+			if err != nil {
+				t.Fatalf("list accounts: %v", err)
+			}
+			for _, a := range list.Accounts {
+				if a.Name == tc.req.Name {
+					t.Fatalf("account %q was created despite a rejected over-length party field, want nothing persisted", tc.req.Name)
+				}
+			}
+		})
 	}
 }
 

@@ -32,6 +32,11 @@ func TestToStatus(t *testing.T) {
 		{"invalid account type", domain.ErrInvalidAccountType, codes.InvalidArgument},
 		{"invalid currency", domain.ErrInvalidCurrency, codes.InvalidArgument},
 		{"description too long", domain.ErrDescriptionTooLong, codes.InvalidArgument},
+		// Task 6.1, audit A9.1 fix: these sentinels had no case here and fell
+		// through to the default Internal; both are validation failures, so
+		// they map to InvalidArgument like the other too-long cases.
+		{"party reference too long", domain.ErrPartyReferenceTooLong, codes.InvalidArgument},
+		{"party type too long", domain.ErrPartyTypeTooLong, codes.InvalidArgument},
 		{"overflow", domain.ErrOverflow, codes.InvalidArgument},
 		{"write conflict", domain.ErrConflict, codes.Unavailable},
 		{"policy violation", &domain.PolicyViolationError{Rule: domain.PolicyRuleMaxTransactionAmount, Currency: "USD", Amount: 100, Limit: 50}, codes.FailedPrecondition},

@@ -154,6 +154,18 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("reference must not be empty when present")
 	case errors.Is(err, domain.ErrReferenceTooLong):
 		return huma.Error422UnprocessableEntity("reference is too long")
+	// domain.ErrPartyReferenceTooLong and domain.ErrPartyTypeTooLong (Task
+	// 6.1, audit A9.1) are checked over gRPC as well as REST: the REST layer's
+	// maxLength JSON schema tag (internal/api/accounts.go) rejects an
+	// over-length party field before it ever reaches the domain, but the gRPC
+	// proto has no equivalent length constraint, so these two cases are what
+	// actually catches an over-length party_reference/party_type there.
+	// Mapped to 422 like ErrDescriptionTooLong and ErrReferenceTooLong above:
+	// the request is otherwise well-formed, one field is just too long.
+	case errors.Is(err, domain.ErrPartyReferenceTooLong):
+		return huma.Error422UnprocessableEntity("account party reference is too long")
+	case errors.Is(err, domain.ErrPartyTypeTooLong):
+		return huma.Error422UnprocessableEntity("account party type is too long")
 	case errors.Is(err, domain.ErrOverflow):
 		return huma.Error422UnprocessableEntity("amount is out of range")
 	case errors.Is(err, domain.ErrConversionDust):
