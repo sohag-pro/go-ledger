@@ -218,6 +218,25 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, err
 	}
 
+	// Encrypt-once, same as Post (Task 6.2, audit A9.3): see Post's own doc
+	// comment at its matching call site in service.go for the full
+	// same-ciphertext-in-the-audit-snapshot argument. t.Postings is
+	// reassigned to a new, ciphertext slice for the duration of RunInTx
+	// (which both persists the postings and builds the audit snapshot from
+	// this same *t), then restored to the caller's plaintext legs
+	// immediately after, so the transaction Convert returns still shows
+	// readable labels ("convert: debit source account", ...), never
+	// ciphertext.
+	originalPostings := t.Postings
+	if s.cipher != nil {
+		encrypted, err := encryptPostings(ctx, s.cipher, tenantID, t.Postings)
+		if err != nil {
+			span.RecordError(err)
+			return nil, false, err
+		}
+		t.Postings = encrypted
+	}
+
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		// Policy is checked over the FULL set of legs Convert built above
 		// (source debit, both clearing legs, destination credit), so the
@@ -256,6 +275,13 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 			After:         after,
 		})
 	})
+	// Restore the caller's plaintext legs regardless of outcome; see Post's
+	// matching restore in service.go for why this is safe even on the
+	// idempotency-conflict replay branch just below (convertReplay overwrites
+	// the returned *domain.Transaction entirely from a fresh, decrypted
+	// fetch, discarding this local t).
+	t.Postings = originalPostings
+
 	if runErr != nil {
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
 			// A concurrent convert for this tenant and key committed between
@@ -301,7 +327,7 @@ func (s *TransactionService) convertReplay(ctx context.Context, tenantID, key st
 		metrics.IdempotencyConflicts.Inc()
 		return nil, false, domain.ErrIdempotencyConflict
 	}
-	existing, err := s.repo.GetTransaction(ctx, tenantID, rec.TransactionID)
+	existing, err := s.getDecrypted(ctx, tenantID, rec.TransactionID)
 	if err != nil {
 		return nil, false, err
 	}

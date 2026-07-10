@@ -75,7 +75,7 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 	// Idempotency precheck, mirroring Convert's idempotency-key precheck
 	// before RunInTx (see convertReplay's sibling doc comment): a hit here
 	// returns the existing reversal without ever attempting a second post.
-	existing, err := s.repo.GetReversalOf(ctx, tenantID, originalID)
+	existing, err := s.getReversalOfDecrypted(ctx, tenantID, originalID)
 	switch {
 	case err == nil:
 		s.log.InfoContext(ctx, "reversal already exists",
@@ -112,6 +112,23 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 		return nil, false, err
 	}
 
+	// Encrypt-once, same as Post and Convert (Task 6.2, audit A9.3): see
+	// Post's own doc comment at its matching call site in service.go. The
+	// reversal's narration ("reversal of <original id>", see BuildReversal)
+	// is not free-text a caller supplied, but it is still encrypted
+	// uniformly with every other posting description, so a read of a
+	// reversal's history behaves identically whether or not its own
+	// narration happens to be caller-supplied text.
+	originalPostings := t.Postings
+	if s.cipher != nil {
+		encrypted, err := encryptPostings(ctx, s.cipher, tenantID, t.Postings)
+		if err != nil {
+			span.RecordError(err)
+			return nil, false, err
+		}
+		t.Postings = encrypted
+	}
+
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		if err := tx.CreateTransaction(ctx, tenantID, &t); err != nil {
 			return err
@@ -127,13 +144,19 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 			After:         after,
 		})
 	})
+	// Restore the caller's plaintext narration regardless of outcome; see
+	// Post's matching restore in service.go for why this is safe even on the
+	// already-reversed race-guard branch just below, which overwrites the
+	// returned *domain.Transaction entirely from a fresh, decrypted fetch.
+	t.Postings = originalPostings
+
 	if runErr != nil {
 		if errors.Is(runErr, domain.ErrTransactionAlreadyReversed) {
 			// A concurrent reverse for this original committed between our
 			// precheck and this attempt's insert: transactions_one_reversal_idx
 			// is what caught it. Read back the winner's reversal exactly as
 			// the precheck above would have.
-			existing, err := s.repo.GetReversalOf(ctx, tenantID, originalID)
+			existing, err := s.getReversalOfDecrypted(ctx, tenantID, originalID)
 			if err != nil {
 				span.RecordError(err)
 				return nil, false, err
@@ -150,4 +173,19 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 	s.log.InfoContext(ctx, "transaction reversed",
 		"tenant_id", tenantID, "original_id", originalID, "reversal_id", t.ID)
 	return &t, false, nil
+}
+
+// getReversalOfDecrypted fetches originalID's reversal and decrypts its
+// postings' descriptions (Task 6.2, audit A9.3), the GetReversalOf
+// counterpart to TransactionService.getDecrypted (service.go). err is
+// returned unchanged when the fetch itself fails (in particular,
+// domain.ErrTransactionNotFound passes through exactly as
+// s.repo.GetReversalOf would report it), so callers that switch on
+// errors.Is(err, domain.ErrTransactionNotFound) keep working unmodified.
+func (s *TransactionService) getReversalOfDecrypted(ctx context.Context, tenantID, originalID string) (domain.Transaction, error) {
+	t, err := s.repo.GetReversalOf(ctx, tenantID, originalID)
+	if err != nil {
+		return domain.Transaction{}, err
+	}
+	return s.decryptTransaction(ctx, tenantID, t)
 }

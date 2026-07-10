@@ -19,12 +19,35 @@ const DefaultVerifyPageSize = 1000
 type AuditService struct {
 	repo     domain.Repository
 	pageSize int
+	cipher   DescriptionCipher
+}
+
+// AuditServiceOption configures an optional AuditService dependency, mirroring
+// TransactionService's ServiceOption and AccountService's AccountOption:
+// existing callers and tests that never pass one keep compiling and behaving
+// unchanged.
+type AuditServiceOption func(*AuditService)
+
+// WithAuditCipher sets the DescriptionCipher ByTransaction and ByAccount use
+// to decrypt a posting description embedded in an audit snapshot's "after"
+// (Task 6.2, audit A9.3), FOR DISPLAY ONLY: Verify and VerifyFromLatestAnchor
+// never use it, since the tamper-evident hash chain must always be
+// recomputed over the exact stored (ciphertext) bytes; see
+// decryptAuditEntries's own doc comment (crypto.go). Without this option the
+// cipher is nil, so ByTransaction/ByAccount return the raw stored bytes
+// unchanged, exactly as before Task 6.2.
+func WithAuditCipher(c DescriptionCipher) AuditServiceOption {
+	return func(s *AuditService) { s.cipher = c }
 }
 
 // NewAuditService returns an AuditService backed by repo, paging Verify and
 // VerifyFromLatestAnchor at DefaultVerifyPageSize.
-func NewAuditService(repo domain.Repository) *AuditService {
-	return &AuditService{repo: repo, pageSize: DefaultVerifyPageSize}
+func NewAuditService(repo domain.Repository, opts ...AuditServiceOption) *AuditService {
+	s := &AuditService{repo: repo, pageSize: DefaultVerifyPageSize}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // NewAuditServiceWithPageSize is NewAuditService with an explicit page size
@@ -36,16 +59,28 @@ func NewAuditService(repo domain.Repository) *AuditService {
 // can force paging to span many small pages instead of one page covering an
 // entire small chain, proving no page-boundary row is ever skipped or
 // double-checked.
-func NewAuditServiceWithPageSize(repo domain.Repository, pageSize int) *AuditService {
+func NewAuditServiceWithPageSize(repo domain.Repository, pageSize int, opts ...AuditServiceOption) *AuditService {
 	if pageSize <= 0 {
 		pageSize = DefaultVerifyPageSize
 	}
-	return &AuditService{repo: repo, pageSize: pageSize}
+	s := &AuditService{repo: repo, pageSize: pageSize}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
-// ByTransaction returns the audit rows for a transaction, oldest first.
+// ByTransaction returns the audit rows for a transaction, oldest first. Each
+// row's embedded posting descriptions are decrypted (Task 6.2, audit A9.3)
+// when a cipher is configured; see decryptAuditEntries for what "decrypted"
+// means for a legacy plaintext row or a shredded tenant's ciphertext, and why
+// this never touches PrevHash/RowHash.
 func (s *AuditService) ByTransaction(ctx context.Context, tenantID, transactionID string) ([]domain.AuditEntry, error) {
-	return s.repo.ListAuditByTransaction(ctx, tenantID, transactionID)
+	entries, err := s.repo.ListAuditByTransaction(ctx, tenantID, transactionID)
+	if err != nil {
+		return nil, err
+	}
+	return decryptAuditEntries(ctx, s.cipher, tenantID, entries)
 }
 
 // Head returns tenantID's current chain head (chain_seq, row_hash). ok is
@@ -67,9 +102,15 @@ func (s *AuditService) LatestAnchor(ctx context.Context, tenantID string) (domai
 }
 
 // ByAccount returns one keyset page of audit rows for every transaction
-// touching the account, newest first.
+// touching the account, newest first. Each row's embedded posting
+// descriptions are decrypted (Task 6.2, audit A9.3) exactly like
+// ByTransaction above.
 func (s *AuditService) ByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
-	return s.repo.ListAuditByAccount(ctx, tenantID, accountID, after, limit)
+	entries, err := s.repo.ListAuditByAccount(ctx, tenantID, accountID, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return decryptAuditEntries(ctx, s.cipher, tenantID, entries)
 }
 
 // VerifyResult is the outcome of walking a tenant's audit hash chain

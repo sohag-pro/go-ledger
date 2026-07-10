@@ -37,6 +37,7 @@ type TransactionService struct {
 	fxProvider     fx.Provider
 	idempotencyTTL time.Duration
 	prePostHook    PrePostHook
+	cipher         DescriptionCipher
 }
 
 // ServiceOption configures optional TransactionService dependencies that most
@@ -73,6 +74,18 @@ func WithIdempotencyTTL(ttl time.Duration) ServiceOption {
 // unchanged for every existing caller and test that never wires one in.
 func WithPrePostHook(h PrePostHook) ServiceOption {
 	return func(s *TransactionService) { s.prePostHook = h }
+}
+
+// WithCipher sets the DescriptionCipher Post, Convert, and ReverseTransaction
+// use to encrypt posting descriptions before they are stored, and Get,
+// ListTransactions, and ExportTransactions use to decrypt them back on read
+// (Task 6.2, audit A9.3). A TransactionService constructed without this
+// option has a nil cipher, meaning encryption is disabled: descriptions are
+// stored and returned as plain strings, exactly as before Task 6.2 existed
+// (see cmd/server's config loading for when this option is actually wired
+// in: only when LEDGER_MASTER_KEY is set).
+func WithCipher(c DescriptionCipher) ServiceOption {
+	return func(s *TransactionService) { s.cipher = c }
 }
 
 // NewTransactionService returns a TransactionService backed by repo. If log is
@@ -209,6 +222,31 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		return false, err
 	}
 
+	// Encrypt-once (Task 6.2, audit A9.3): each posting's Description is
+	// encrypted here, ONCE, after screening (which must see plaintext) and
+	// before RunInTx ever opens a transaction, into a NEW slice (t.Postings
+	// is reassigned, never mutated in place). auditSnapshot below, called
+	// from inside RunInTx on this same *t, therefore captures the IDENTICAL
+	// ciphertext string CreateTransaction persists into postings.description:
+	// the audit row_hash (ComputeAuditRowHash) ends up covering that
+	// ciphertext, and stays verifiable after a shred (crypto-shredding
+	// destroys the key, never the stored bytes; see internal/crypto's
+	// package doc comment). t.Postings is restored to the caller's original,
+	// plaintext slice immediately after RunInTx returns, so the transaction
+	// this call hands back (and the transport layer echoes to the caller)
+	// still shows the plaintext the caller just submitted, not ciphertext.
+	// A nil cipher (encryption disabled) makes this whole block a no-op.
+	originalPostings := t.Postings
+	if s.cipher != nil {
+		encrypted, err := encryptPostings(ctx, s.cipher, tenantID, t.Postings)
+		if err != nil {
+			span.RecordError(err)
+			metrics.PostDuration.WithLabelValues("failed").Observe(0)
+			return false, err
+		}
+		t.Postings = encrypted
+	}
+
 	start := time.Now()
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
@@ -237,6 +275,14 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		})
 	})
 	elapsed := time.Since(start).Seconds()
+	// Restore the caller's plaintext Postings regardless of outcome: on the
+	// idempotency-conflict replay path just below, replay() overwrites *t
+	// entirely from a freshly (decrypted) fetch anyway, so this restore is
+	// belt-and-suspenders there; on every other path (including a genuine
+	// failure the caller inspects t after) it is what keeps t showing
+	// plaintext, never the ciphertext this call briefly swapped in for
+	// storage.
+	t.Postings = originalPostings
 
 	if runErr != nil {
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
@@ -282,7 +328,7 @@ func (s *TransactionService) replay(ctx context.Context, tenantID, key string, b
 		metrics.IdempotencyConflicts.Inc()
 		return false, domain.ErrIdempotencyConflict
 	}
-	existing, err := s.repo.GetTransaction(ctx, tenantID, rec.TransactionID)
+	existing, err := s.getDecrypted(ctx, tenantID, rec.TransactionID)
 	if err != nil {
 		return false, err
 	}
@@ -361,8 +407,57 @@ func auditSnapshot(t *domain.Transaction) map[string]any {
 }
 
 // Get returns a transaction and its postings, or domain.ErrTransactionNotFound.
+// A posting's Description is decrypted (Task 6.2, audit A9.3) via
+// getDecrypted when a cipher is configured; a shredded tenant's descriptions
+// come back as crypto.RedactedMarker rather than an error.
 func (s *TransactionService) Get(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
-	return s.repo.GetTransaction(ctx, tenantID, id)
+	return s.getDecrypted(ctx, tenantID, id)
+}
+
+// getDecrypted fetches a transaction and decrypts its postings' descriptions
+// (Task 6.2, audit A9.3): the one place both Get and replay's idempotent-hit
+// path read a transaction back from storage, so decryption is applied
+// exactly once, consistently, regardless of which caller triggered the read.
+func (s *TransactionService) getDecrypted(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
+	t, err := s.repo.GetTransaction(ctx, tenantID, id)
+	if err != nil {
+		return domain.Transaction{}, err
+	}
+	return s.decryptTransaction(ctx, tenantID, t)
+}
+
+// decryptTransaction decrypts t's postings' descriptions in place (returning
+// a copy with a new Postings slice; t itself, and whatever slice it holds,
+// is never mutated). A nil cipher (encryption disabled) returns t completely
+// unchanged.
+func (s *TransactionService) decryptTransaction(ctx context.Context, tenantID string, t domain.Transaction) (domain.Transaction, error) {
+	if s.cipher == nil {
+		return t, nil
+	}
+	decrypted, err := decryptPostings(ctx, s.cipher, tenantID, t.Postings)
+	if err != nil {
+		return domain.Transaction{}, err
+	}
+	t.Postings = decrypted
+	return t, nil
+}
+
+// decryptItems decrypts every item's postings' descriptions (Task 6.2, audit
+// A9.3): the shared tail of ListTransactions and ExportTransactions, both of
+// which read a page of transactions back from storage the same way Get does
+// for a single one.
+func (s *TransactionService) decryptItems(ctx context.Context, tenantID string, items []domain.TransactionListItem) ([]domain.TransactionListItem, error) {
+	if s.cipher == nil {
+		return items, nil
+	}
+	for i := range items {
+		decrypted, err := decryptPostings(ctx, s.cipher, tenantID, items[i].Transaction.Postings)
+		if err != nil {
+			return nil, err
+		}
+		items[i].Transaction.Postings = decrypted
+	}
+	return items, nil
 }
 
 // MaxExportRows bounds ExportTransactions (Task 4.4, audit A7.2): an export is
@@ -379,7 +474,11 @@ const MaxExportRows = 10000
 // and AccountService.Statement already use: no cross-cutting logic belongs
 // here beyond the pass-through itself.
 func (s *TransactionService) ListTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
-	return s.repo.ListTransactions(ctx, tenantID, filter, after, limit)
+	items, err := s.repo.ListTransactions(ctx, tenantID, filter, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.decryptItems(ctx, tenantID, items)
 }
 
 // ExportTransactions returns every one of tenantID's transactions matching
@@ -400,7 +499,15 @@ func (s *TransactionService) ExportTransactions(ctx context.Context, tenantID st
 	if len(rows) > MaxExportRows {
 		s.log.WarnContext(ctx, "transaction export truncated",
 			"tenant_id", tenantID, "max_export_rows", MaxExportRows)
-		return rows[:MaxExportRows], true, nil
+		decrypted, err := s.decryptItems(ctx, tenantID, rows[:MaxExportRows])
+		if err != nil {
+			return nil, false, err
+		}
+		return decrypted, true, nil
 	}
-	return rows, false, nil
+	decrypted, err := s.decryptItems(ctx, tenantID, rows)
+	if err != nil {
+		return nil, false, err
+	}
+	return decrypted, false, nil
 }

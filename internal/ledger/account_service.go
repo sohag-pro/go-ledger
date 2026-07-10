@@ -12,6 +12,7 @@ import (
 type AccountService struct {
 	repo            domain.Repository
 	defaultCurrency domain.Currency
+	cipher          DescriptionCipher
 }
 
 // AccountOption configures optional AccountService dependencies, mirroring
@@ -26,6 +27,14 @@ type AccountOption func(*AccountService)
 // same behavior as before this option existed.
 func WithDefaultCurrency(c domain.Currency) AccountOption {
 	return func(s *AccountService) { s.defaultCurrency = c }
+}
+
+// WithAccountCipher sets the DescriptionCipher Statement uses to decrypt a
+// posting's description on read (Task 6.2, audit A9.3). Without this option
+// the cipher is nil (encryption disabled), so Statement returns descriptions
+// exactly as stored, matching behavior before Task 6.2.
+func WithAccountCipher(c DescriptionCipher) AccountOption {
+	return func(s *AccountService) { s.cipher = c }
 }
 
 // NewAccountService returns an AccountService backed by repo.
@@ -92,6 +101,20 @@ func (s *AccountService) Statement(ctx context.Context, tenantID, id string, aft
 	entries, err := s.repo.Statement(ctx, tenantID, id, acct.Currency, after, limit)
 	if err != nil {
 		return domain.Account{}, nil, err
+	}
+	// Decrypt each entry's Description (Task 6.2, audit A9.3): a nil cipher
+	// (encryption disabled) leaves entries completely unchanged.
+	if s.cipher != nil {
+		for i := range entries {
+			if entries[i].Description == "" {
+				continue
+			}
+			plaintext, err := s.cipher.Decrypt(ctx, tenantID, entries[i].Description)
+			if err != nil {
+				return domain.Account{}, nil, err
+			}
+			entries[i].Description = plaintext
+		}
 	}
 	return acct, entries, nil
 }
