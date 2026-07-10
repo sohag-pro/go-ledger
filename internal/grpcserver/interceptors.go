@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/domain"
 )
 
 // healthMethodPrefix is the gRPC health service's method prefix
@@ -35,10 +36,13 @@ func tenantFrom(ctx context.Context) string {
 // itself into the context (auth.WithTenant, auth.WithKey) before calling the
 // handler. A missing token or an auth.ErrUnauthorized from resolver (an
 // unknown or empty key) is rejected with codes.Unauthenticated before the
-// handler ever runs, with nothing logged. Any other resolver error is an
-// unexpected infra failure (e.g. the key-lookup datastore is down): it is
-// logged at error level with the method and the underlying cause, then
-// rejected with codes.Internal, mirroring the REST auth middleware
+// handler ever runs, with nothing logged. A *domain.TenantNotActiveError (the
+// key is valid but its tenant is suspended or closed, ADR-015/Task 2.1) is
+// rejected with codes.PermissionDenied instead, naming the reason, since the
+// credential itself was fine. Any other resolver error is an unexpected infra
+// failure (e.g. the key-lookup datastore is down): it is logged at error
+// level with the method and the underlying cause, then rejected with
+// codes.Internal, mirroring the REST auth middleware
 // (internal/auth/middleware.go) so a backend outage does not read as "bad
 // key". The token itself is never logged in either branch.
 func authUnaryInterceptor(resolver *auth.Resolver, log *slog.Logger) grpc.UnaryServerInterceptor {
@@ -56,6 +60,10 @@ func authUnaryInterceptor(resolver *auth.Resolver, log *slog.Logger) grpc.UnaryS
 
 		key, err := resolver.Resolve(ctx, bearer)
 		if err != nil {
+			var tenantErr *domain.TenantNotActiveError
+			if errors.As(err, &tenantErr) {
+				return nil, status.Error(codes.PermissionDenied, tenantErr.Reason())
+			}
 			if errors.Is(err, auth.ErrUnauthorized) {
 				return nil, status.Error(codes.Unauthenticated, "missing or invalid API key")
 			}

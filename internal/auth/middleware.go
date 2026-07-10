@@ -1,12 +1,15 @@
 package auth
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
+
+	"github.com/sohag-pro/go-ledger/internal/domain"
 )
 
 // authHeader is the header a bearer token is read from. Handlers and this
@@ -62,6 +65,11 @@ func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(hum
 
 		key, err := resolver.Resolve(ctx.Context(), ctx.Header(authHeader))
 		if err != nil {
+			var tenantErr *domain.TenantNotActiveError
+			if errors.As(err, &tenantErr) {
+				_ = huma.WriteErr(api, ctx, http.StatusForbidden, tenantErr.Reason())
+				return
+			}
 			if errors.Is(err, ErrUnauthorized) {
 				_ = huma.WriteErr(api, ctx, http.StatusUnauthorized, "")
 				return
@@ -94,6 +102,11 @@ func Middleware(resolver *Resolver, log *slog.Logger) func(http.Handler) http.Ha
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key, err := resolver.Resolve(r.Context(), r.Header.Get(authHeader))
 			if err != nil {
+				var tenantErr *domain.TenantNotActiveError
+				if errors.As(err, &tenantErr) {
+					writeForbidden(w, tenantErr.Reason())
+					return
+				}
 				if !errors.Is(err, ErrUnauthorized) {
 					log.LogAttrs(r.Context(), slog.LevelError, "auth: resolve failed",
 						slog.String("path", r.URL.Path), slog.String("error", err.Error()))
@@ -115,4 +128,16 @@ func writeUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write([]byte(`{"status":401,"title":"Unauthorized"}`))
+}
+
+// writeForbidden writes a 403 problem+json body naming reason (e.g. "tenant
+// is suspended"), for the net/http fallback path which has no huma.API to
+// negotiate content through. Unlike writeUnauthorized this includes a detail
+// field: the credential was valid, so naming why the tenant is gated does not
+// help an attacker enumerate keys the way distinguishing 401 causes would.
+func writeForbidden(w http.ResponseWriter, reason string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusForbidden)
+	body, _ := json.Marshal(map[string]any{"status": http.StatusForbidden, "title": "Forbidden", "detail": reason})
+	_, _ = w.Write(body)
 }

@@ -80,7 +80,12 @@ func NewResolver(lookup keyLookup, ttl time.Duration) *Resolver {
 
 // Resolve strips an optional "Bearer " prefix from bearer, hashes the
 // remaining token, and resolves it to a domain.APIKey, preferring the cache.
-// It returns ErrUnauthorized for an empty token or a hash with no live key.
+// It returns ErrUnauthorized for an empty token or a hash with no live key,
+// and a *domain.TenantNotActiveError (matched via errors.Is(err,
+// domain.ErrTenantNotActive)) when the key is valid but its tenant is
+// suspended or closed (ADR-015, Task 2.1): the credential itself is fine, so
+// this is a distinct failure from ErrUnauthorized, and a transport layer
+// should map it to 403 / PermissionDenied rather than 401 / Unauthenticated.
 func (r *Resolver) Resolve(ctx context.Context, bearer string) (domain.APIKey, error) {
 	token := strings.TrimSpace(bearer)
 	if isBearerScheme(token) {
@@ -94,7 +99,7 @@ func (r *Resolver) Resolve(ctx context.Context, bearer string) (domain.APIKey, e
 	now := r.now
 
 	if key, ok := r.cacheGet(hash, now()); ok {
-		return key, nil
+		return gateTenantStatus(key)
 	}
 
 	key, err := r.lookup.GetAPIKeyByHash(ctx, hash)
@@ -105,7 +110,26 @@ func (r *Resolver) Resolve(ctx context.Context, bearer string) (domain.APIKey, e
 		return domain.APIKey{}, fmt.Errorf("auth: resolve key: %w", err)
 	}
 
+	// Cache the resolved key (and the tenant status alongside it) regardless
+	// of whether the gate below passes: a cached "suspended" entry is what
+	// makes the cache-hit path above re-check status on every call instead of
+	// only on a cold miss, and a re-fetch after the entry's TTL expires is
+	// what picks up a tenant getting reactivated (or newly gated) within one
+	// AUTH_CACHE_TTL window, with no extra database round trip beyond the key
+	// lookup itself.
 	r.cachePut(hash, key, now())
+	return gateTenantStatus(key)
+}
+
+// gateTenantStatus returns key unchanged if its tenant is active, or a
+// *domain.TenantNotActiveError if not. It is the single place Resolve checks
+// tenant status, run identically on a cache hit and a fresh lookup, so a
+// suspended or closed tenant is rejected on every call, not just the first
+// one that misses the cache.
+func gateTenantStatus(key domain.APIKey) (domain.APIKey, error) {
+	if key.TenantStatus != domain.TenantActive {
+		return domain.APIKey{}, &domain.TenantNotActiveError{TenantID: key.TenantID, Status: key.TenantStatus}
+	}
 	return key, nil
 }
 
