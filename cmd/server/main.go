@@ -29,6 +29,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/audit"
 	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/fx"
 	grpcserver "github.com/sohag-pro/go-ledger/internal/grpcserver"
@@ -138,6 +139,7 @@ type config struct {
 	authNegativeWindow       time.Duration
 	defaultCurrency          string
 	fxRates                  string
+	masterKey                string
 	chainerEnabled           bool
 	chainerInterval          time.Duration
 	chainerBatch             int
@@ -188,6 +190,17 @@ func loadConfig() (config, error) {
 		authNegativeWindow:      getenvDuration("AUTH_NEGATIVE_WINDOW", auth.DefaultNegativeThrottleWindow),
 		defaultCurrency:         getenv("DEFAULT_CURRENCY", "USD"),
 		fxRates:                 os.Getenv("FX_RATES"),
+		// LEDGER_MASTER_KEY (Task 6.2, audit A9.3): a 32-byte, base64-encoded
+		// master key for envelope-encrypting posting descriptions at rest
+		// (internal/crypto.Cipher). Left empty by default (getenv's fallback
+		// is deliberately "", not a generated or placeholder value): PII
+		// encryption is a feature that turns ITSELF on only when this is
+		// set, so existing dev/CI environments that never set it keep
+		// storing descriptions in plaintext exactly as before Task 6.2, with
+		// no other config flag required. A value that IS set but malformed
+		// fails fast below, before the server ever starts accepting
+		// requests, rather than surfacing lazily on the first real post.
+		masterKey: os.Getenv("LEDGER_MASTER_KEY"),
 		// The audit chainer (ADR-017): on by default, since every deployment
 		// (single instance or a fleet) needs it to turn posted audit_outbox
 		// rows into the tamper-evident chain. CHAINER_ENABLED exists mainly
@@ -261,9 +274,22 @@ func loadConfig() (config, error) {
 	if err := domain.Currency(cfg.defaultCurrency).Validate(); err != nil {
 		return config{}, fmt.Errorf("DEFAULT_CURRENCY %q is invalid: %w", cfg.defaultCurrency, err)
 	}
+	// A SET-but-malformed LEDGER_MASTER_KEY (Task 6.2, audit A9.3) fails the
+	// server's boot immediately, before anything else is constructed, rather
+	// than being discovered lazily on the first real post: crypto.ParseMasterKey
+	// is the exact same check crypto.NewCipher runs internally, so this is a
+	// clean, early error with the same message a later construction would
+	// produce. An EMPTY value is not an error here: it means PII encryption is
+	// simply disabled (see cfg.masterKey's own doc comment above), which is a
+	// valid, working configuration outside production.
+	if cfg.masterKey != "" {
+		if _, err := crypto.ParseMasterKey(cfg.masterKey); err != nil {
+			return config{}, err
+		}
+	}
 	// Safe-by-default deployment (ADR-015): a plain deployment must be
 	// production-safe without an operator having to remember to turn
-	// demo-shaped defaults off. These two checks only fire when APP_ENV is
+	// demo-shaped defaults off. These checks only fire when APP_ENV is
 	// exactly "production", so go.sohag.pro (which keeps DEMO_MODE=true and
 	// does not set APP_ENV=production) is unaffected.
 	if cfg.env == "production" {
@@ -272,6 +298,15 @@ func loadConfig() (config, error) {
 		}
 		if cfg.demoAPIKey == defaultDemoAPIKey {
 			return config{}, errors.New("refusing to boot in production with the published public demo api key; set DEMO_API_KEY to a real value")
+		}
+		// PII crypto-shredding (Task 6.2, audit A9.3) is mandatory in
+		// production: every posting description a production deployment
+		// stores must be encrypted and shreddable on a data-subject erasure
+		// request, per docs/ops/retention-and-erasure.md. This does not
+		// affect go.sohag.pro, which does not set APP_ENV=production (see
+		// this block's own opening comment).
+		if cfg.masterKey == "" {
+			return config{}, errors.New("LEDGER_MASTER_KEY must be set when APP_ENV=production (PII crypto-shredding, Task 6.2, is mandatory in production)")
 		}
 	}
 	return cfg, nil
@@ -408,6 +443,26 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("seed fx rates: %w", err)
 	}
 
+	// PII crypto-shredding (Task 6.2, audit A9.3): a nil cipher (the default
+	// when LEDGER_MASTER_KEY is unset) leaves encryption disabled everywhere
+	// it is wired below, so posting descriptions are stored and returned as
+	// plain strings exactly as before this feature existed. loadConfig
+	// already fail-fast validated cfg.masterKey if it was set (and refuses to
+	// boot at all with it unset when APP_ENV=production), so
+	// crypto.NewCipher below cannot fail on a malformed key; repo satisfies
+	// crypto.KeyStore directly (internal/postgres/crypto_keys.go), the same
+	// *Repository value postgres.NewRepository already returned above.
+	var cipher ledger.DescriptionCipher
+	if cfg.masterKey != "" {
+		c, err := crypto.NewCipher(cfg.masterKey, repo)
+		if err != nil {
+			return fmt.Errorf("construct pii cipher: %w", err)
+		}
+		cipher = c
+	} else {
+		logger.Warn("PII encryption is disabled: LEDGER_MASTER_KEY is not set, posting descriptions are stored in plaintext")
+	}
+
 	// Per-key rate limiter, wired AFTER the auth middleware inside api.New so
 	// the key auth resolved into the context is present when it runs (see
 	// ADR-012, "Per-key rate limiting", and internal/api/api.go).
@@ -419,7 +474,9 @@ func run(logger *slog.Logger) error {
 	// for the full reasoning and the bounded-map design.
 	negativeThrottle := auth.NewNegativeThrottle(cfg.authNegativeMaxFailures, cfg.authNegativeWindow)
 	deps := api.Deps{
-		Accounts: ledger.NewAccountService(repo, ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency))),
+		Accounts: ledger.NewAccountService(repo,
+			ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency)),
+			ledger.WithAccountCipher(cipher)),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
 			ledger.WithFXProvider(fx.NewDBProvider(pool)),
 			ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
@@ -430,8 +487,9 @@ func run(logger *slog.Logger) error {
 			// exactly as it did before this hook existed. A real screening
 			// integration replaces this one line with its own PrePostHook
 			// implementation; nothing else in the posting path needs to change.
-			ledger.WithPrePostHook(ledger.NoopPrePostHook{})),
-		Audit:            ledger.NewAuditService(repo),
+			ledger.WithPrePostHook(ledger.NoopPrePostHook{}),
+			ledger.WithCipher(cipher)),
+		Audit:            ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher)),
 		Admin:            admin.NewService(repo),
 		Auth:             resolver,
 		RateLimiter:      limiter,

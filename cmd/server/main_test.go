@@ -130,6 +130,41 @@ func TestLoadConfig_ValidatesDefaultCurrency(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_ValidatesMasterKey proves LEDGER_MASTER_KEY (Task 6.2,
+// audit A9.3) is validated at config-load time, fail-fast, before the server
+// or any dependent component is constructed: an unset key is a valid
+// configuration (PII encryption simply disabled), but a SET, malformed key
+// (not base64, or not exactly 32 bytes once decoded) is rejected immediately,
+// with the same error crypto.NewCipher would produce later.
+func TestLoadConfig_ValidatesMasterKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		masterKey string
+		wantErr   bool
+	}{
+		{name: "unset: PII encryption disabled, not an error", masterKey: "", wantErr: false},
+		{name: "valid 32-byte base64 key", masterKey: testMasterKeyB64, wantErr: false},
+		{name: "not valid base64 rejected", masterKey: "not-valid-base64!!!", wantErr: true},
+		{name: "too short once decoded rejected", masterKey: "c2hvcnQ=", wantErr: true}, // base64("short")
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("DEFAULT_CURRENCY", "")
+			t.Setenv("LEDGER_MASTER_KEY", tt.masterKey)
+
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Fatalf("loadConfig() with LEDGER_MASTER_KEY=%q: got nil error, want an error", tt.masterKey)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("loadConfig() with LEDGER_MASTER_KEY=%q: got error %v, want nil", tt.masterKey, err)
+			}
+		})
+	}
+}
+
 // TestLoadConfig_GRPCAddrDefaultsToLoopback proves GRPC_ADDR defaults to
 // loopback-only (Task 5.1, audit A2.2, ADR-015 Phase 5): the gRPC server
 // ships with no TLS of its own, so binding every interface by default (the
@@ -213,19 +248,27 @@ func TestLoadConfig_IdempotencyTTL(t *testing.T) {
 // start with either DEMO_MODE=true or the published public demo api key,
 // while a production boot with a real DEMO_API_KEY and demo mode off
 // succeeds.
+// testMasterKeyB64 is a fixed, valid 32-byte LEDGER_MASTER_KEY (Task 6.2,
+// audit A9.3), base64-encoded, used wherever a test needs loadConfig to see
+// a well-formed key (for example a production boot, which requires one) but
+// does not care about its actual bytes.
+const testMasterKeyB64 = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=" // base64("01234567890123456789012345678901")
+
 func TestLoadConfig_SafeByDefault(t *testing.T) {
 	tests := []struct {
 		name            string
 		appEnv          string
 		demoMode        string
 		demoAPIKey      string
+		masterKey       string
 		wantErr         bool
 		wantDemoMode    bool
 		wantSeedEnabled bool
 	}{
 		{
 			name: "development boot with no DEMO_MODE set stays fully off by default",
-			// appEnv, demoMode, demoAPIKey all left unset (empty).
+			// appEnv, demoMode, demoAPIKey, masterKey all left unset (empty):
+			// PII encryption is optional outside production (Task 6.2).
 			wantDemoMode:    false,
 			wantSeedEnabled: false,
 		},
@@ -234,18 +277,29 @@ func TestLoadConfig_SafeByDefault(t *testing.T) {
 			appEnv:     "production",
 			demoMode:   "true",
 			demoAPIKey: "glk_real_production_key",
+			masterKey:  testMasterKeyB64,
 			wantErr:    true,
 		},
 		{
-			name:   "production refuses the published public demo api key",
-			appEnv: "production",
+			name:      "production refuses the published public demo api key",
+			appEnv:    "production",
+			masterKey: testMasterKeyB64,
 			// demoAPIKey left unset so it defaults to the public constant.
 			wantErr: true,
 		},
 		{ //nolint:gosec // demoAPIKey below is a test fixture, not a real credential
-			name:            "production boots with a real demo api key and demo mode off",
+			name:       "production refuses an unset LEDGER_MASTER_KEY",
+			appEnv:     "production",
+			demoAPIKey: "glk_real_production_key",
+			// masterKey left unset: PII crypto-shredding is mandatory in
+			// production (Task 6.2, audit A9.3).
+			wantErr: true,
+		},
+		{ //nolint:gosec // demoAPIKey below is a test fixture, not a real credential
+			name:            "production boots with a real demo api key, demo mode off, and a master key",
 			appEnv:          "production",
 			demoAPIKey:      "glk_real_production_key",
+			masterKey:       testMasterKeyB64,
 			wantDemoMode:    false,
 			wantSeedEnabled: false,
 		},
@@ -262,6 +316,7 @@ func TestLoadConfig_SafeByDefault(t *testing.T) {
 			t.Setenv("APP_ENV", tt.appEnv)
 			t.Setenv("DEMO_MODE", tt.demoMode)
 			t.Setenv("DEMO_API_KEY", tt.demoAPIKey)
+			t.Setenv("LEDGER_MASTER_KEY", tt.masterKey)
 			t.Setenv("SEED_ENABLED", "")
 
 			cfg, err := loadConfig()
