@@ -8,6 +8,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 
 	"github.com/sohag-pro/go-ledger/internal/admin"
+	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
@@ -182,6 +183,20 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("from_account and to_account must differ")
 	case errors.Is(err, domain.ErrSameCurrencyConversion):
 		return huma.Error422UnprocessableEntity("from_account and to_account must have different currencies")
+	// crypto.ErrTenantKeyShredded (Task 6.2, audit A9.3 review; ADR-018): with
+	// per-tenant DEKs now versioned, Encrypt no longer fails closed just
+	// because a tenant's PII was erased, it mints a fresh version and keeps
+	// posting/converting/reversing, so this should be unreachable on any
+	// normal path. It is still mapped defensively, to the same 422 class as
+	// the other "well-formed request, fails a check" cases above (not 409,
+	// since nothing here is a duplicate or an already-existing resource):
+	// the one case it can still surface in is an adversarial run of
+	// concurrent shreds each racing and winning against every version Encrypt
+	// tries to mint (internal/crypto.Cipher's own doc comment), which is not
+	// a conflict to retry, just a tenant whose PII churn currently outpaces
+	// its own writes.
+	case errors.Is(err, crypto.ErrTenantKeyShredded):
+		return huma.Error422UnprocessableEntity("tenant PII encryption key is unavailable, please retry")
 	default:
 		return huma.Error500InternalServerError("internal error")
 	}

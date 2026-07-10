@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
@@ -46,6 +47,12 @@ func TestToStatus(t *testing.T) {
 		// closed but is Unavailable, the same class as a write conflict.
 		{"screening rejected", &ledger.ScreeningRejectedError{Reason: "sanctions match"}, codes.FailedPrecondition},
 		{"screening unavailable", ledger.ErrScreeningUnavailable, codes.Unavailable},
+		// Task 6.2 fix (audit remediation review, ADR-018): ErrTenantKeyShredded
+		// had no case here and fell through to the default Internal; it is a
+		// well-formed request that fails an operational precondition on its
+		// tenant's key, so it maps to FailedPrecondition like the other typed
+		// errors above.
+		{"tenant key shredded", crypto.ErrTenantKeyShredded, codes.FailedPrecondition},
 		{"unknown", errors.New("boom"), codes.Internal},
 	}
 	for _, tc := range cases {

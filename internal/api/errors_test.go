@@ -7,6 +7,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 
+	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
@@ -45,6 +46,11 @@ func TestToHumaErr(t *testing.T) {
 		// like ErrDescriptionTooLong and ErrReferenceTooLong above.
 		{"party reference too long", domain.ErrPartyReferenceTooLong, 422, false},
 		{"party type too long", domain.ErrPartyTypeTooLong, 422, false},
+		// Task 6.2 fix (audit remediation review, ADR-018): ErrTenantKeyShredded
+		// had no case here and fell through to the default 500; it is a
+		// well-formed request that fails an operational precondition on its
+		// tenant's key, so it maps to 422 like the other typed errors above.
+		{"tenant key shredded", crypto.ErrTenantKeyShredded, 422, false},
 	}
 
 	for _, tt := range tests {

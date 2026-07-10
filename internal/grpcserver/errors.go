@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
@@ -127,6 +128,16 @@ func toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, "from_account and to_account must differ")
 	case errors.Is(err, domain.ErrSameCurrencyConversion):
 		return status.Error(codes.InvalidArgument, "from_account and to_account must have different currencies")
+	// crypto.ErrTenantKeyShredded (Task 6.2, audit A9.3 review; ADR-018): see
+	// toHumaErr's identical case (internal/api/errors.go) for the full
+	// reasoning. FailedPrecondition, the same class as
+	// PolicyViolationError/AccountNotActiveError/ScreeningRejectedError
+	// above, not AlreadyExists: this is not a duplicate or an
+	// already-existing resource, just a well-formed request that (in the one
+	// adversarial case this can still occur) fails an operational
+	// precondition on its tenant's encryption key.
+	case errors.Is(err, crypto.ErrTenantKeyShredded):
+		return status.Error(codes.FailedPrecondition, "tenant PII encryption key is unavailable, please retry")
 	default:
 		return status.Error(codes.Internal, "internal error")
 	}
