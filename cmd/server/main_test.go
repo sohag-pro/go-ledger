@@ -239,6 +239,13 @@ func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash 
 	if k.ID == "" {
 		k.ID = "id-" + keyHash
 	}
+	if len(k.Scopes) == 0 {
+		// Mirrors the real api_keys.scopes column default (migration 0012):
+		// provisionAPIKeys never sets Scopes explicitly, so a real insert
+		// picks up {read,post} from the DB default. This in-memory fake has
+		// no DB default to fall back on, so it applies the same one here.
+		k.Scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	}
 	s.byHash[keyHash] = k
 	return nil
 }
@@ -257,6 +264,12 @@ func (s *fakeKeyStore) GetAPIKeyByHash(_ context.Context, hash string) (domain.A
 		k.TenantStatus = domain.TenantActive
 	}
 	return k, nil
+}
+
+// TouchAPIKeyLastUsed is a no-op: these provisioning tests do not assert on
+// last_used_at, which is covered in internal/auth's own tests.
+func (s *fakeKeyStore) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
+	return nil
 }
 
 // TestProvisionAPIKeysIsIdempotent proves provisionAPIKeys is safe to run on

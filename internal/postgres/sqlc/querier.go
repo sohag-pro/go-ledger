@@ -37,7 +37,9 @@ type Querier interface {
 	// the key in the same round trip (Task 2.1, ADR-015): gating needs no extra
 	// query. The join is safe against a dangling reference: api_keys_tenant_fk
 	// (migration 0011) guarantees every api_keys row's tenant_id has a tenants
-	// row.
+	// row. scopes, expires_at, and last_used_at (Task 2.2) are returned as-is:
+	// expiry and scope enforcement happen in the resolver and the transport
+	// middleware, not in this query.
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
@@ -90,6 +92,10 @@ type Querier interface {
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
 	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
+	// Updates last_used_at for a single key by id. Called best-effort and
+	// throttled from the auth resolver (Task 2.2): not every request, so this is
+	// not a write on the hot path of every authenticated call.
+	TouchAPIKeyLastUsed(ctx context.Context, arg TouchAPIKeyLastUsedParams) error
 }
 
 var _ Querier = (*Queries)(nil)

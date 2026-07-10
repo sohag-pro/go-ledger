@@ -15,6 +15,7 @@ import (
 
 const getAPIKeyByHash = `-- name: GetAPIKeyByHash :one
 SELECT api_keys.id, api_keys.tenant_id, api_keys.name, api_keys.rate_limit_rpm, api_keys.created_at, api_keys.revoked_at,
+       api_keys.scopes, api_keys.expires_at, api_keys.last_used_at,
        tenants.status AS tenant_status
 FROM api_keys
 JOIN tenants ON tenants.id = api_keys.tenant_id
@@ -28,6 +29,9 @@ type GetAPIKeyByHashRow struct {
 	RateLimitRpm pgtype.Int4
 	CreatedAt    time.Time
 	RevokedAt    pgtype.Timestamptz
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
 	TenantStatus string
 }
 
@@ -35,7 +39,9 @@ type GetAPIKeyByHashRow struct {
 // the key in the same round trip (Task 2.1, ADR-015): gating needs no extra
 // query. The join is safe against a dangling reference: api_keys_tenant_fk
 // (migration 0011) guarantees every api_keys row's tenant_id has a tenants
-// row.
+// row. scopes, expires_at, and last_used_at (Task 2.2) are returned as-is:
+// expiry and scope enforcement happen in the resolver and the transport
+// middleware, not in this query.
 func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error) {
 	row := q.db.QueryRow(ctx, getAPIKeyByHash, keyHash)
 	var i GetAPIKeyByHashRow
@@ -46,6 +52,9 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKe
 		&i.RateLimitRpm,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.Scopes,
+		&i.ExpiresAt,
+		&i.LastUsedAt,
 		&i.TenantStatus,
 	)
 	return i, err
@@ -72,5 +81,22 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) erro
 		arg.KeyHash,
 		arg.RateLimitRpm,
 	)
+	return err
+}
+
+const touchAPIKeyLastUsed = `-- name: TouchAPIKeyLastUsed :exec
+UPDATE api_keys SET last_used_at = $2 WHERE id = $1
+`
+
+type TouchAPIKeyLastUsedParams struct {
+	ID         uuid.UUID
+	LastUsedAt pgtype.Timestamptz
+}
+
+// Updates last_used_at for a single key by id. Called best-effort and
+// throttled from the auth resolver (Task 2.2): not every request, so this is
+// not a write on the hot path of every authenticated call.
+func (q *Queries) TouchAPIKeyLastUsed(ctx context.Context, arg TouchAPIKeyLastUsedParams) error {
+	_, err := q.db.Exec(ctx, touchAPIKeyLastUsed, arg.ID, arg.LastUsedAt)
 	return err
 }

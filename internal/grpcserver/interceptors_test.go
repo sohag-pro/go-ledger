@@ -41,11 +41,24 @@ func (f *fakeLookup) GetAPIKeyByHash(_ context.Context, hash string) (domain.API
 	return k, nil
 }
 
+// TouchAPIKeyLastUsed is a no-op: these interceptor tests exercise auth and
+// scope enforcement, not the last-used throttle, which is covered in
+// internal/auth's own tests.
+func (f *fakeLookup) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
+	return nil
+}
+
 const testPlaintextKey = "glk_interceptor-test-key" //nolint:gosec // test fixture key, not a real credential
+
+// testKeyScopes is what an ordinary (pre-2.2b-admin) key carries: read and
+// post, matching the demo and load-test keys' DB-default scopes (migration
+// 0012). Tests that specifically exercise scope enforcement build their own
+// key with a narrower or wider set instead of using this helper.
+var testKeyScopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
 
 func newTestResolver() *auth.Resolver {
 	lookup := &fakeLookup{keys: map[string]domain.APIKey{
-		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: domain.TenantActive},
+		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: domain.TenantActive, Scopes: testKeyScopes},
 	}}
 	return auth.NewResolver(lookup, time.Minute)
 }
@@ -55,7 +68,17 @@ func newTestResolver() *auth.Resolver {
 // (Task 2.1, ADR-015).
 func newTestResolverWithStatus(status domain.TenantStatus) *auth.Resolver {
 	lookup := &fakeLookup{keys: map[string]domain.APIKey{
-		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: status},
+		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: status, Scopes: testKeyScopes},
+	}}
+	return auth.NewResolver(lookup, time.Minute)
+}
+
+// newTestResolverWithScopes returns a resolver whose sole key carries exactly
+// scopes, so scope-enforcement tests can build a read-only, post-only, or
+// admin key and exercise authUnaryInterceptor against it directly.
+func newTestResolverWithScopes(scopes ...domain.Scope) *auth.Resolver {
+	lookup := &fakeLookup{keys: map[string]domain.APIKey{
+		domain.HashAPIKey(testPlaintextKey): {ID: "key-1", TenantID: "tenant-xyz", Name: "test", TenantStatus: domain.TenantActive, Scopes: scopes},
 	}}
 	return auth.NewResolver(lookup, time.Minute)
 }
@@ -246,5 +269,115 @@ func TestLoggingInterceptorPassesThrough(t *testing.T) {
 	resp, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/x/Y"}, handler)
 	if resp != "ok" || !errors.Is(err, want) {
 		t.Fatalf("logging interceptor altered the call: resp=%v err=%v", resp, err)
+	}
+}
+
+// --- Scope enforcement (Task 2.2): these exercise authUnaryInterceptor
+// itself, not just requiredGRPCScope in isolation. ---
+
+func TestRequiredGRPCScope(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		method string
+		want   domain.Scope
+	}{
+		{"/ledger.v1.LedgerService/CreateAccount", domain.ScopePost},
+		{"/ledger.v1.LedgerService/GetAccount", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/ListAccounts", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/GetBalance", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/GetStatement", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/PostTransaction", domain.ScopePost},
+		{"/ledger.v1.LedgerService/Convert", domain.ScopePost},
+		{"/ledger.v1.LedgerService/GetTransaction", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/GetTransactionAudit", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/GetAccountAudit", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/SomeFutureRPCNotYetMapped", domain.ScopePost},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			t.Parallel()
+			if got := requiredGRPCScope(tt.method); got != tt.want {
+				t.Errorf("requiredGRPCScope(%q) = %q, want %q", tt.method, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAuthInterceptorReadOnlyKeyAllowedOnReadRPCRejectedOnWriteRPC proves the
+// scope gate runs inside the real interceptor, not just requiredGRPCScope in
+// isolation: a read-only key can call a read RPC (GetAccount) but is rejected
+// with PermissionDenied on a write RPC (PostTransaction).
+func TestAuthInterceptorReadOnlyKeyAllowedOnReadRPCRejectedOnWriteRPC(t *testing.T) {
+	resolver := newTestResolverWithScopes(domain.ScopeRead)
+	interceptor := authUnaryInterceptor(resolver, discardLogger())
+	ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
+
+	called := false
+	handler := func(_ context.Context, _ any) (any, error) {
+		called = true
+		return nil, nil
+	}
+
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/GetAccount"}, handler)
+	if err != nil {
+		t.Fatalf("read-only key on a read RPC: err = %v, want nil", err)
+	}
+	if !called {
+		t.Error("handler should have run for a read-only key on a read RPC")
+	}
+
+	called = false
+	_, err = interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/PostTransaction"}, handler)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("read-only key on a write RPC: code = %v, want PermissionDenied", status.Code(err))
+	}
+	if called {
+		t.Error("handler should not run for a read-only key on a write RPC")
+	}
+	if !strings.Contains(err.Error(), "post") {
+		t.Errorf("error = %v, want it to name the missing scope (post)", err)
+	}
+}
+
+// TestAuthInterceptorPostScopedKeyAllowedOnWriteRPC proves a post-scoped key
+// (no read) can still call a write RPC.
+func TestAuthInterceptorPostScopedKeyAllowedOnWriteRPC(t *testing.T) {
+	resolver := newTestResolverWithScopes(domain.ScopePost)
+	interceptor := authUnaryInterceptor(resolver, discardLogger())
+	ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
+
+	called := false
+	handler := func(_ context.Context, _ any) (any, error) {
+		called = true
+		return nil, nil
+	}
+
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/ledger.v1.LedgerService/PostTransaction"}, handler)
+	if err != nil {
+		t.Fatalf("post-scoped key on a write RPC: err = %v, want nil", err)
+	}
+	if !called {
+		t.Error("handler should have run for a post-scoped key on a write RPC")
+	}
+}
+
+// TestAuthInterceptorAdminKeyAllowedOnAnyRPC proves ScopeAdmin is a superset
+// (Task 2.2): a key carrying only ScopeAdmin can call both a read and a write
+// RPC without also listing read/post.
+func TestAuthInterceptorAdminKeyAllowedOnAnyRPC(t *testing.T) {
+	resolver := newTestResolverWithScopes(domain.ScopeAdmin)
+	interceptor := authUnaryInterceptor(resolver, discardLogger())
+	ctx := ctxWithAuthMetadata("Bearer " + testPlaintextKey)
+
+	handler := func(_ context.Context, _ any) (any, error) { return nil, nil }
+
+	for _, method := range []string{
+		"/ledger.v1.LedgerService/GetAccount",
+		"/ledger.v1.LedgerService/PostTransaction",
+	} {
+		if _, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method}, handler); err != nil {
+			t.Errorf("admin key on %s: err = %v, want nil", method, err)
+		}
 	}
 }

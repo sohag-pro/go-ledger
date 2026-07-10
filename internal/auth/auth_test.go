@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,11 +15,37 @@ import (
 
 // fakeLookup is a keyLookup that serves a fixed set of hash to APIKey
 // mappings and counts how many times it was called, so tests can assert the
-// cache avoided (or did not avoid) a repository round trip.
+// cache avoided (or did not avoid) a repository round trip. It also records
+// every TouchAPIKeyLastUsed call, so tests can assert the last-used throttle
+// fires at most once per window instead of once per request.
 type fakeLookup struct {
-	mu    sync.Mutex
-	keys  map[string]domain.APIKey
-	calls int32
+	mu         sync.Mutex
+	keys       map[string]domain.APIKey
+	calls      int32
+	touches    []touchCall
+	touchErr   error
+	touchCalls int32
+	// touchNotify, when non-nil, receives one value per TouchAPIKeyLastUsed
+	// call: since Resolve fires the touch from a detached goroutine, a test
+	// asserting on touchCount needs a deterministic way to wait for it rather
+	// than sleeping and hoping the goroutine has run.
+	touchNotify chan struct{}
+}
+
+// touchCall records one TouchAPIKeyLastUsed invocation.
+type touchCall struct {
+	id   string
+	when time.Time
+}
+
+// keyEqualIgnoringLastUsed reports whether a and b are equal except for
+// LastUsedAt: a successful Resolve may populate LastUsedAt via the
+// best-effort throttled touch (Task 2.2), which most of these tests are not
+// about.
+func keyEqualIgnoringLastUsed(a, b domain.APIKey) bool {
+	a.LastUsedAt = nil
+	b.LastUsedAt = nil
+	return reflect.DeepEqual(a, b)
 }
 
 func newFakeLookup(keys map[string]domain.APIKey) *fakeLookup {
@@ -36,8 +63,41 @@ func (f *fakeLookup) GetAPIKeyByHash(_ context.Context, hash string) (domain.API
 	return domain.APIKey{}, domain.ErrAPIKeyNotFound
 }
 
+func (f *fakeLookup) TouchAPIKeyLastUsed(_ context.Context, id string, when time.Time) error {
+	atomic.AddInt32(&f.touchCalls, 1)
+
+	f.mu.Lock()
+	f.touches = append(f.touches, touchCall{id: id, when: when})
+	notify := f.touchNotify
+	err := f.touchErr
+	f.mu.Unlock()
+
+	if notify != nil {
+		notify <- struct{}{}
+	}
+	return err
+}
+
+// waitForTouch blocks until at least one TouchAPIKeyLastUsed call has been
+// recorded, or fails the test after a generous timeout: f must have been
+// constructed with a buffered touchNotify channel.
+func (f *fakeLookup) waitForTouch(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.touchNotify:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for an asynchronous TouchAPIKeyLastUsed call")
+	}
+}
+
 func (f *fakeLookup) callCount() int {
 	return int(atomic.LoadInt32(&f.calls))
+}
+
+// touchCount returns how many times TouchAPIKeyLastUsed was called,
+// synchronized the same way callCount is.
+func (f *fakeLookup) touchCount() int {
+	return int(atomic.LoadInt32(&f.touchCalls))
 }
 
 // setKey replaces the stored key for hash, simulating a tenant's status
@@ -69,7 +129,7 @@ func TestResolve_CacheHitAvoidsSecondLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Resolve error = %v, want nil", err)
 	}
-	if first != key {
+	if !keyEqualIgnoringLastUsed(first, key) {
 		t.Fatalf("first Resolve = %+v, want %+v", first, key)
 	}
 
@@ -77,7 +137,7 @@ func TestResolve_CacheHitAvoidsSecondLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Resolve error = %v, want nil", err)
 	}
-	if second != key {
+	if !keyEqualIgnoringLastUsed(second, key) {
 		t.Fatalf("second Resolve = %+v, want %+v", second, key)
 	}
 
@@ -207,6 +267,10 @@ func (e errLookup) GetAPIKeyByHash(_ context.Context, _ string) (domain.APIKey, 
 	return domain.APIKey{}, e.err
 }
 
+func (errLookup) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
+	return nil
+}
+
 func TestResolve_PrefixOptional(t *testing.T) {
 	t.Parallel()
 
@@ -218,7 +282,7 @@ func TestResolve_PrefixOptional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve with Bearer prefix error = %v, want nil", err)
 	}
-	if withPrefix != key {
+	if !keyEqualIgnoringLastUsed(withPrefix, key) {
 		t.Fatalf("Resolve with Bearer prefix = %+v, want %+v", withPrefix, key)
 	}
 
@@ -226,7 +290,7 @@ func TestResolve_PrefixOptional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve with bare token error = %v, want nil", err)
 	}
-	if bare != key {
+	if !keyEqualIgnoringLastUsed(bare, key) {
 		t.Fatalf("Resolve with bare token = %+v, want %+v", bare, key)
 	}
 }
@@ -295,7 +359,7 @@ func TestResolve_ActiveTenantPasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve error = %v, want nil", err)
 	}
-	if got != key {
+	if !keyEqualIgnoringLastUsed(got, key) {
 		t.Fatalf("Resolve = %+v, want %+v", got, key)
 	}
 }
@@ -408,4 +472,173 @@ func TestResolve_SuspensionIsPickedUpWithinOneTTL(t *testing.T) {
 	if got := lookup.callCount(); got != 2 {
 		t.Fatalf("lookup call count for cached suspended entry = %d, want 2 (no extra refetch)", got)
 	}
+}
+
+// --- Expiry (Task 2.2). ---
+
+// TestResolve_ExpiredKeyIsUnauthorized proves an expired key is rejected the
+// same way as an unknown or revoked one: ErrUnauthorized, revealing nothing
+// more to the caller. domain.ErrAPIKeyExpired is also reachable via
+// errors.Is for logging/tests, but the transport layers never distinguish it
+// in the response body.
+func TestResolve_ExpiredKeyIsUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	expiredAt := time.Now().Add(-time.Minute)
+	key := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "expired key", TenantStatus: domain.TenantActive, ExpiresAt: &expiredAt}
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(testPlaintext): key})
+	r := NewResolver(lookup, time.Minute)
+
+	_, err := r.Resolve(context.Background(), "Bearer "+testPlaintext)
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("Resolve error = %v, want ErrUnauthorized (expired key)", err)
+	}
+	if !errors.Is(err, domain.ErrAPIKeyExpired) {
+		t.Fatalf("Resolve error = %v, want it to also match domain.ErrAPIKeyExpired", err)
+	}
+}
+
+// TestResolve_LiveKeyWithFutureExpiryResolves proves a key with an expiry
+// still in the future resolves exactly like a key with no expiry at all.
+func TestResolve_LiveKeyWithFutureExpiryResolves(t *testing.T) {
+	t.Parallel()
+
+	future := time.Now().Add(time.Hour)
+	key := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "test", TenantStatus: domain.TenantActive, ExpiresAt: &future}
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(testPlaintext): key})
+	r := NewResolver(lookup, time.Minute)
+
+	got, err := r.Resolve(context.Background(), "Bearer "+testPlaintext)
+	if err != nil {
+		t.Fatalf("Resolve error = %v, want nil", err)
+	}
+	if got.ID != key.ID {
+		t.Fatalf("Resolve = %+v, want %+v", got, key)
+	}
+}
+
+// TestResolve_KeyExpiresWhileCached proves the cache never trusts a key past
+// its own ExpiresAt, even when that is sooner than the resolver's TTL:
+// cachePut caps the cache entry's expiry at min(ttl, key.ExpiresAt), so the
+// entry stops being served the instant the key itself expires rather than
+// only at the end of the (much longer) TTL window.
+func TestResolve_KeyExpiresWhileCached(t *testing.T) {
+	t.Parallel()
+
+	current := time.Now()
+	expiresAt := current.Add(500 * time.Millisecond)
+	key := domain.APIKey{ID: "key-1", TenantID: "tenant-1", Name: "test", TenantStatus: domain.TenantActive, ExpiresAt: &expiresAt}
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(testPlaintext): key})
+	r := NewResolver(lookup, time.Minute) // TTL far longer than the key's own expiry
+	r.now = func() time.Time { return current }
+
+	if _, err := r.Resolve(context.Background(), testPlaintext); err != nil {
+		t.Fatalf("first Resolve (before expiry) error = %v, want nil", err)
+	}
+	if got := lookup.callCount(); got != 1 {
+		t.Fatalf("lookup call count = %d, want 1", got)
+	}
+
+	// Advance past the key's own expiry, but nowhere near the (much longer)
+	// cache TTL: if the cache entry were not capped, this would still be
+	// served from cache as if the key were valid.
+	current = current.Add(time.Second)
+
+	_, err := r.Resolve(context.Background(), testPlaintext)
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("Resolve after key expiry error = %v, want ErrUnauthorized", err)
+	}
+	if got := lookup.callCount(); got != 2 {
+		t.Fatalf("lookup call count after key expiry = %d, want 2 (the capped cache entry should have forced a refetch)", got)
+	}
+}
+
+// --- last_used_at touch, throttled (Task 2.2). ---
+
+// TestResolve_TouchesLastUsedOnceWithinThrottleWindow proves a successful
+// Resolve fires exactly one TouchAPIKeyLastUsed for a burst of calls within
+// the throttle window, not one per call.
+func TestResolve_TouchesLastUsedOnceWithinThrottleWindow(t *testing.T) {
+	t.Parallel()
+
+	key, plaintext := testKey()
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key})
+	lookup.touchNotify = make(chan struct{}, 10)
+	r := NewResolver(lookup, time.Minute)
+
+	if _, err := r.Resolve(context.Background(), "Bearer "+plaintext); err != nil {
+		t.Fatalf("first Resolve error = %v, want nil", err)
+	}
+	lookup.waitForTouch(t)
+
+	for i := 0; i < 5; i++ {
+		if _, err := r.Resolve(context.Background(), "Bearer "+plaintext); err != nil {
+			t.Fatalf("Resolve #%d error = %v, want nil", i, err)
+		}
+	}
+
+	// Give any (incorrect) extra touch a moment to arrive before asserting it
+	// didn't: the throttle window (60s) dwarfs this test's real wall-clock
+	// runtime, so a second touch here would be a bug, not a timing fluke.
+	select {
+	case <-lookup.touchNotify:
+		t.Fatal("a Resolve within the throttle window fired a second touch")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if got := lookup.touchCount(); got != 1 {
+		t.Errorf("touch count = %d, want 1", got)
+	}
+}
+
+// TestResolve_TouchFiresAgainAfterThrottleWindow proves the throttle is a
+// window, not a permanent latch: once touchThrottle has elapsed, the next
+// successful Resolve touches last_used_at again.
+func TestResolve_TouchFiresAgainAfterThrottleWindow(t *testing.T) {
+	t.Parallel()
+
+	key, plaintext := testKey()
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key})
+	lookup.touchNotify = make(chan struct{}, 10)
+	r := NewResolver(lookup, time.Hour) // cache TTL long enough to isolate the throttle from cache expiry
+	current := time.Now()
+	r.now = func() time.Time { return current }
+
+	if _, err := r.Resolve(context.Background(), plaintext); err != nil {
+		t.Fatalf("first Resolve error = %v, want nil", err)
+	}
+	lookup.waitForTouch(t)
+
+	current = current.Add(2 * time.Minute) // past the throttle window
+
+	if _, err := r.Resolve(context.Background(), plaintext); err != nil {
+		t.Fatalf("second Resolve error = %v, want nil", err)
+	}
+	lookup.waitForTouch(t)
+
+	if got := lookup.touchCount(); got != 2 {
+		t.Errorf("touch count = %d, want 2 (throttle window elapsed)", got)
+	}
+}
+
+// TestResolve_TouchErrorDoesNotFailTheRequest proves a failing
+// TouchAPIKeyLastUsed (e.g. the database is briefly unavailable) never
+// surfaces as a Resolve error: the touch is best-effort.
+func TestResolve_TouchErrorDoesNotFailTheRequest(t *testing.T) {
+	t.Parallel()
+
+	key, plaintext := testKey()
+	lookup := newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key})
+	lookup.touchErr = errors.New("touch failed")
+	lookup.touchNotify = make(chan struct{}, 10)
+	r := NewResolver(lookup, time.Minute)
+
+	got, err := r.Resolve(context.Background(), "Bearer "+plaintext)
+	if err != nil {
+		t.Fatalf("Resolve error = %v, want nil even though the touch fails", err)
+	}
+	if !keyEqualIgnoringLastUsed(got, key) {
+		t.Fatalf("Resolve = %+v, want %+v", got, key)
+	}
+	lookup.waitForTouch(t) // the touch was still attempted despite failing
 }

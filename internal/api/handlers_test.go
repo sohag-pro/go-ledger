@@ -306,7 +306,20 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 	if k.ID == "" {
 		k.ID = uuid.NewString()
 	}
+	if len(k.Scopes) == 0 {
+		// Mirrors the real api_keys.scopes column default (migration 0012): a
+		// caller that does not set Scopes explicitly (every existing handler
+		// test) gets the same {read,post} a real insert would pick up from
+		// the DB default.
+		k.Scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	}
 	f.apiKeys[keyHash] = k
+	return nil
+}
+
+// TouchAPIKeyLastUsed is a no-op: handler tests do not assert on
+// last_used_at, which is covered in internal/auth's own tests.
+func (f *fakeRepo) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
 	return nil
 }
 

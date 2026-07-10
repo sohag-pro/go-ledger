@@ -29,6 +29,9 @@ type ApiKey struct {
 	RateLimitRpm pgtype.Int4
 	CreatedAt    time.Time
 	RevokedAt    pgtype.Timestamptz
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
 }
 
 type AuditLog struct {

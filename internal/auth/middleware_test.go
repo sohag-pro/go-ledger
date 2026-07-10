@@ -40,25 +40,42 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newTestAPI builds a huma test API with HumaMiddleware installed, one
-// operation under /v1 that echoes the resolved tenant, and one operation
-// outside /v1 (standing in for /healthz) that requires nothing.
+// newTestAPI builds a huma test API with HumaMiddleware installed: one GET
+// and one POST operation under /v1 (both echo the resolved tenant, so scope
+// enforcement tests can tell a 200 apart from a rejection), one operation
+// under /v1/admin/ (Task 2.2: no real admin routes exist yet, but the scope
+// rule is wired and needs something to exercise it against), and one
+// operation outside /v1 (standing in for /healthz) that requires nothing.
 func newTestAPI(t *testing.T, resolver *Resolver) (http.Handler, humatest.TestAPI) {
 	t.Helper()
 
 	mux, api := humatest.New(t)
 	api.UseMiddleware(HumaMiddleware(api, resolver, discardLogger()))
 
-	huma.Register(api, huma.Operation{
-		OperationID: "v1-echo-tenant",
-		Method:      http.MethodGet,
-		Path:        "/v1/thing",
-	}, func(ctx context.Context, _ *struct{}) (*tenantEchoOutput, error) {
+	echoTenant := func(ctx context.Context, _ *struct{}) (*tenantEchoOutput, error) {
 		tenant, _ := TenantFromContext(ctx)
 		out := &tenantEchoOutput{}
 		out.Body.Tenant = tenant
 		return out, nil
-	})
+	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "v1-echo-tenant-get",
+		Method:      http.MethodGet,
+		Path:        "/v1/thing",
+	}, echoTenant)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "v1-echo-tenant-post",
+		Method:      http.MethodPost,
+		Path:        "/v1/thing",
+	}, echoTenant)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "v1-admin-thing-get",
+		Method:      http.MethodGet,
+		Path:        "/v1/admin/thing",
+	}, echoTenant)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "open-health",
@@ -119,7 +136,7 @@ func TestHumaMiddleware_ValidKeyInjectsTenantAndCallsNext(t *testing.T) {
 	t.Parallel()
 
 	const plaintext = "glk_middleware-test-key"
-	key := domain.APIKey{ID: "key-1", TenantID: "tenant-xyz", Name: "test key", TenantStatus: domain.TenantActive}
+	key := domain.APIKey{ID: "key-1", TenantID: "tenant-xyz", Name: "test key", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeRead, domain.ScopePost}}
 	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
 	mux, _ := newTestAPI(t, resolver)
 
@@ -246,7 +263,7 @@ func TestMiddleware_NetHTTPFallback(t *testing.T) {
 	t.Parallel()
 
 	const plaintext = "glk_nethttp-test-key"
-	key := domain.APIKey{ID: "key-2", TenantID: "tenant-abc", Name: "test key", TenantStatus: domain.TenantActive}
+	key := domain.APIKey{ID: "key-2", TenantID: "tenant-abc", Name: "test key", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeRead, domain.ScopePost}}
 	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
 
 	var sawTenant string
@@ -310,4 +327,127 @@ func TestMiddleware_NetHTTPFallback(t *testing.T) {
 			t.Errorf("body detail = %v, want %q", body["detail"], "tenant is suspended")
 		}
 	})
+}
+
+// --- Scope enforcement (Task 2.2): these exercise HumaMiddleware itself, not
+// just RequiredHTTPScope/CheckScope in isolation. ---
+
+// resolverWithScopedKey returns a resolver whose single key, reachable with
+// plaintext, carries exactly scopes.
+func resolverWithScopedKey(plaintext string, scopes ...domain.Scope) *Resolver {
+	key := domain.APIKey{ID: "key-scoped", TenantID: "tenant-scoped", Name: "scoped test key", TenantStatus: domain.TenantActive, Scopes: scopes}
+	return NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
+}
+
+func TestHumaMiddleware_ReadOnlyKeyAllowedOnGetRejectedOnPost(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_scope-read-only-key"
+	resolver := resolverWithScopedKey(plaintext, domain.ScopeRead)
+	mux, _ := newTestAPI(t, resolver)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	getReq.Header.Set(authHeader, "Bearer "+plaintext)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET with read-only key: status = %d, want 200 (%s)", getRec.Code, getRec.Body.String())
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/thing", nil)
+	postReq.Header.Set(authHeader, "Bearer "+plaintext)
+	postRec := httptest.NewRecorder()
+	mux.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusForbidden {
+		t.Fatalf("POST with read-only key: status = %d, want 403 (%s)", postRec.Code, postRec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(postRec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body not JSON: %v (%q)", err, postRec.Body.String())
+	}
+	if body["detail"] != "missing required scope: post" {
+		t.Errorf("body detail = %v, want %q", body["detail"], "missing required scope: post")
+	}
+}
+
+func TestHumaMiddleware_PostScopedKeyAllowedOnPostRejectedOnGet(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_scope-post-only-key"
+	resolver := resolverWithScopedKey(plaintext, domain.ScopePost)
+	mux, _ := newTestAPI(t, resolver)
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/thing", nil)
+	postReq.Header.Set(authHeader, "Bearer "+plaintext)
+	postRec := httptest.NewRecorder()
+	mux.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusOK {
+		t.Fatalf("POST with post-only key: status = %d, want 200 (%s)", postRec.Code, postRec.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	getReq.Header.Set(authHeader, "Bearer "+plaintext)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusForbidden {
+		t.Fatalf("GET with post-only key: status = %d, want 403 (%s)", getRec.Code, getRec.Body.String())
+	}
+}
+
+// TestHumaMiddleware_AdminKeyAllowedEverywhere proves ScopeAdmin is a
+// superset (the chosen model, Task 2.2): a key carrying only ScopeAdmin can
+// call GET, POST, and the /v1/admin/ path without also listing read/post.
+func TestHumaMiddleware_AdminKeyAllowedEverywhere(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_scope-admin-key"
+	resolver := resolverWithScopedKey(plaintext, domain.ScopeAdmin)
+	mux, _ := newTestAPI(t, resolver)
+
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"get", http.MethodGet, "/v1/thing"},
+		{"post", http.MethodPost, "/v1/thing"},
+		{"admin path", http.MethodGet, "/v1/admin/thing"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req.Header.Set(authHeader, "Bearer "+plaintext)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s %s with admin key: status = %d, want 200 (%s)", tt.method, tt.path, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHumaMiddleware_AdminPathRequiresAdminScope proves a path under
+// /v1/admin/ requires ScopeAdmin regardless of method, so a key with read and
+// post (but not admin) still cannot reach it, even via GET.
+func TestHumaMiddleware_AdminPathRequiresAdminScope(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_scope-read-post-not-admin-key"
+	resolver := resolverWithScopedKey(plaintext, domain.ScopeRead, domain.ScopePost)
+	mux, _ := newTestAPI(t, resolver)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/thing", nil)
+	req.Header.Set(authHeader, "Bearer "+plaintext)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (a read+post key must not reach /v1/admin/) (%s)", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body not JSON: %v (%q)", err, rec.Body.String())
+	}
+	if body["detail"] != "missing required scope: admin" {
+		t.Errorf("body detail = %v, want %q", body["detail"], "missing required scope: admin")
+	}
 }

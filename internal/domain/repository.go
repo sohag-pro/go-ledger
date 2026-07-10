@@ -150,6 +150,12 @@ type Repository interface {
 	// hash is ever written; the plaintext is never stored.
 	InsertAPIKey(ctx context.Context, k APIKey, keyHash string) error
 
+	// TouchAPIKeyLastUsed sets the last_used_at timestamp for the key
+	// identified by id (Task 2.2). Called best-effort and throttled from the
+	// auth resolver: not on every request, and its error is never allowed to
+	// fail the request that triggered it.
+	TouchAPIKeyLastUsed(ctx context.Context, id string, when time.Time) error
+
 	// CreateTenant inserts a new tenant row, active by default. It returns
 	// ErrTenantAlreadyExists if tenantID already has a row.
 	CreateTenant(ctx context.Context, tenantID, name string) error

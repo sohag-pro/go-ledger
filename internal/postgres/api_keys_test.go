@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -132,5 +133,92 @@ func TestAPIKeyUnknownHashNotFound(t *testing.T) {
 	_, err := repo.GetAPIKeyByHash(ctx, domain.HashAPIKey("glk_never-issued"))
 	if !errors.Is(err, domain.ErrAPIKeyNotFound) {
 		t.Errorf("get api key by unknown hash: err = %v, want ErrAPIKeyNotFound", err)
+	}
+}
+
+// TestAPIKeyDefaultScopesAndNullLifecycleFields covers Task 2.2's schema
+// defaults: InsertAPIKey does not accept Scopes, ExpiresAt, or LastUsedAt
+// (the admin surface that sets them is a separate follow-up task), so every
+// key it inserts picks up the api_keys.scopes column default ({read,post})
+// and NULL expires_at/last_used_at, and GetAPIKeyByHash must surface exactly
+// that: a pre-2.2-shaped key keeps working unchanged.
+func TestAPIKeyDefaultScopesAndNullLifecycleFields(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "default scopes test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	_, hash, err := domain.GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("generate api key: %v", err)
+	}
+	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenant, Name: "default scopes key"}, hash); err != nil {
+		t.Fatalf("insert api key: %v", err)
+	}
+
+	got, err := repo.GetAPIKeyByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("get api key by hash: %v", err)
+	}
+	wantScopes := []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	if len(got.Scopes) != len(wantScopes) || got.Scopes[0] != wantScopes[0] || got.Scopes[1] != wantScopes[1] {
+		t.Errorf("Scopes = %v, want %v (the api_keys.scopes column default)", got.Scopes, wantScopes)
+	}
+	if got.ExpiresAt != nil {
+		t.Errorf("ExpiresAt = %v, want nil", *got.ExpiresAt)
+	}
+	if got.LastUsedAt != nil {
+		t.Errorf("LastUsedAt = %v, want nil", *got.LastUsedAt)
+	}
+}
+
+// TestAPIKeyTouchLastUsed covers the repository half of Task 2.2's
+// last_used_at throttle: TouchAPIKeyLastUsed sets the column, and a
+// subsequent GetAPIKeyByHash surfaces exactly the timestamp given, truncated
+// to Postgres's microsecond timestamptz precision.
+func TestAPIKeyTouchLastUsed(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "touch last used test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	_, hash, err := domain.GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("generate api key: %v", err)
+	}
+	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenant, Name: "touch test key"}, hash); err != nil {
+		t.Fatalf("insert api key: %v", err)
+	}
+
+	before, err := repo.GetAPIKeyByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("get api key by hash before touch: %v", err)
+	}
+	if before.LastUsedAt != nil {
+		t.Fatalf("LastUsedAt before any touch = %v, want nil", *before.LastUsedAt)
+	}
+
+	when := time.Now().UTC().Truncate(time.Microsecond)
+	if err := repo.TouchAPIKeyLastUsed(ctx, before.ID, when); err != nil {
+		t.Fatalf("touch api key last used: %v", err)
+	}
+
+	after, err := repo.GetAPIKeyByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("get api key by hash after touch: %v", err)
+	}
+	if after.LastUsedAt == nil {
+		t.Fatal("LastUsedAt after touch = nil, want the touched timestamp")
+	}
+	if !after.LastUsedAt.Equal(when) {
+		t.Errorf("LastUsedAt after touch = %v, want %v", *after.LastUsedAt, when)
 	}
 }

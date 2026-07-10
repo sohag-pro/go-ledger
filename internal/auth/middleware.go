@@ -36,12 +36,16 @@ func isV1Path(path string) bool {
 // API as the rest of /v1, so this middleware scopes itself by the matched
 // operation's path rather than relying on chi-level routing.
 //
-// On success it derives the tenant from the resolved key and injects both the
-// tenant id and the key into the request context (WithTenant, WithKey) so
-// downstream handlers read the tenant with TenantFromContext instead of
-// trusting any request field: the tenant comes only from the key. On failure
-// it writes a 401 problem+json body ({"status":401,"title":"Unauthorized"})
-// and never calls next, so the handler body never runs.
+// On success it also enforces the resolved key's scope (Task 2.2), via
+// RequiredHTTPScope and CheckScope: a key missing the scope its operation's
+// method or path requires is rejected with 403, the same shape as the
+// tenant-status gate below, since the credential itself is valid, it just
+// lacks the scope. Only once both gates pass does it derive the tenant from
+// the resolved key and inject both the tenant id and the key into the request
+// context (WithTenant, WithKey) so downstream handlers read the tenant with
+// TenantFromContext instead of trusting any request field: the tenant comes
+// only from the key. On any failure it writes a problem+json body and never
+// calls next, so the handler body never runs.
 //
 // api is the same huma.API this middleware is registered on; huma.WriteErr
 // needs it for content negotiation when writing the error body.
@@ -80,6 +84,14 @@ func HumaMiddleware(api huma.API, resolver *Resolver, log *slog.Logger) func(hum
 			return
 		}
 
+		required := RequiredHTTPScope(op.Method, op.Path)
+		if scopeErr := CheckScope(key, required); scopeErr != nil {
+			var insufficientErr *domain.InsufficientScopeError
+			errors.As(scopeErr, &insufficientErr)
+			_ = huma.WriteErr(api, ctx, http.StatusForbidden, insufficientErr.Reason())
+			return
+		}
+
 		newCtx := WithKey(WithTenant(ctx.Context(), key.TenantID), key)
 		next(huma.WithContext(ctx, newCtx))
 	}
@@ -112,6 +124,14 @@ func Middleware(resolver *Resolver, log *slog.Logger) func(http.Handler) http.Ha
 						slog.String("path", r.URL.Path), slog.String("error", err.Error()))
 				}
 				writeUnauthorized(w)
+				return
+			}
+
+			required := RequiredHTTPScope(r.Method, r.URL.Path)
+			if scopeErr := CheckScope(key, required); scopeErr != nil {
+				var insufficientErr *domain.InsufficientScopeError
+				errors.As(scopeErr, &insufficientErr)
+				writeForbidden(w, insufficientErr.Reason())
 				return
 			}
 

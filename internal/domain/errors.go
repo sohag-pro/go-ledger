@@ -86,4 +86,16 @@ var (
 	// ErrTenantAlreadyExists is returned when CreateTenant is called with an
 	// id that already has a tenant row.
 	ErrTenantAlreadyExists = errors.New("domain: tenant already exists")
+	// ErrAPIKeyExpired is the sentinel an auth resolver wraps alongside
+	// ErrUnauthorized when a key's ExpiresAt has passed (Task 2.2): an expired
+	// key is a dead credential, the same class as an unknown or revoked one,
+	// and a transport layer maps it to 401 like any other ErrUnauthorized
+	// without revealing that it was specifically expiry that failed.
+	ErrAPIKeyExpired = errors.New("domain: api key expired")
+	// ErrInsufficientScope is the sentinel matched via errors.Is for any
+	// *InsufficientScopeError, regardless of which scope was required (Task
+	// 2.2). A transport layer maps it to 403 Forbidden (REST) or
+	// codes.PermissionDenied (gRPC): the credential itself is valid, it just
+	// lacks the scope the operation needs.
+	ErrInsufficientScope = errors.New("domain: insufficient scope")
 )

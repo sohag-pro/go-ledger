@@ -826,7 +826,54 @@ func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.A
 		Name:         row.Name,
 		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
 		TenantStatus: domain.TenantStatus(row.TenantStatus),
+		Scopes:       scopesFromStrings(row.Scopes),
+		ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
+		LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
 	}, nil
+}
+
+// TouchAPIKeyLastUsed sets api_keys.last_used_at for the key identified by
+// id. Called best-effort and throttled from the auth resolver (Task 2.2), so
+// its caller (internal/auth.Resolver) fires it asynchronously and ignores its
+// error beyond a debug log: a failed touch must never fail the request it
+// rode in on.
+func (r *Repository) TouchAPIKeyLastUsed(ctx context.Context, id string, when time.Time) error {
+	keyID, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	if err := r.q.TouchAPIKeyLastUsed(ctx, sqlc.TouchAPIKeyLastUsedParams{
+		ID:         keyID,
+		LastUsedAt: pgtype.Timestamptz{Time: when, Valid: true},
+	}); err != nil {
+		return fmt.Errorf("postgres: touch api key last used: %w", err)
+	}
+	return nil
+}
+
+// scopesFromStrings converts the raw text[] scopes column to []domain.Scope.
+// It does not validate each element against Scope.Valid(): the
+// api_keys_scopes_valid CHECK constraint (migration 0012) already guarantees
+// every stored value is one of the three known scopes.
+func scopesFromStrings(scopes []string) []domain.Scope {
+	if scopes == nil {
+		return nil
+	}
+	out := make([]domain.Scope, len(scopes))
+	for i, s := range scopes {
+		out[i] = domain.Scope(s)
+	}
+	return out
+}
+
+// timestamptzToPtr converts a nullable Postgres timestamptz to *time.Time,
+// nil when the column is NULL (never expires, or never yet used).
+func timestamptzToPtr(v pgtype.Timestamptz) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := v.Time
+	return &t
 }
 
 // InsertAPIKey assigns an identity if k.ID is empty and inserts k with keyHash
