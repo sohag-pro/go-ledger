@@ -123,6 +123,24 @@ message GetTransactionResponse {
   Transaction transaction = 1;
 }
 
+// ListTransactionsRequest lists the tenant's transactions, newest first,
+// keyset paged by cursor, optionally filtered by a from/to created_at range
+// and/or an exact reference match (Task 4.4, audit A7.2), mirroring GET
+// /v1/transactions. from and to are RFC3339 timestamps; from is inclusive,
+// to is exclusive. Export has no gRPC equivalent: a streaming CSV export
+// does not fit gRPC's single-response model, so it stays REST-only.
+message ListTransactionsRequest {
+  string from = 1;
+  string to = 2;
+  string reference = 3;
+  int32 limit = 4;
+  string cursor = 5;
+}
+message ListTransactionsResponse {
+  repeated Transaction transactions = 1;
+  string next_cursor = 2;
+}
+
 // ReverseTransactionRequest posts the negated legs of original_transaction_id
 // as a new, linked transaction (Task 4.2, audit A1.2). Idempotent: a
 // transaction can be reversed at most once, so calling this again for the
@@ -201,6 +219,7 @@ service LedgerService {
   rpc PostTransaction(PostTransactionRequest) returns (PostTransactionResponse);
   rpc Convert(ConvertRequest) returns (ConvertResponse);
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+  rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
   rpc ReverseTransaction(ReverseTransactionRequest) returns (ReverseTransactionResponse);
   rpc GetTransactionAudit(GetTransactionAuditRequest) returns (GetTransactionAuditResponse);
   rpc GetAccountAudit(GetAccountAuditRequest) returns (GetAccountAuditResponse);

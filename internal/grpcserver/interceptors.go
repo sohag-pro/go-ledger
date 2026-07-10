@@ -44,6 +44,7 @@ var grpcMethodScopes = map[string]domain.Scope{
 	ledgerServiceMethodPrefix + "PostTransaction":     domain.ScopePost,
 	ledgerServiceMethodPrefix + "Convert":             domain.ScopePost,
 	ledgerServiceMethodPrefix + "GetTransaction":      domain.ScopeRead,
+	ledgerServiceMethodPrefix + "ListTransactions":    domain.ScopeRead,
 	ledgerServiceMethodPrefix + "ReverseTransaction":  domain.ScopePost,
 	ledgerServiceMethodPrefix + "GetTransactionAudit": domain.ScopeRead,
 	ledgerServiceMethodPrefix + "GetAccountAudit":     domain.ScopeRead,

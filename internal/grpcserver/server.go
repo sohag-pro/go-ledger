@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -329,6 +330,72 @@ func (s *Server) GetTransaction(ctx context.Context, req *ledgerv1.GetTransactio
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.GetTransactionResponse{Transaction: toProtoTransaction(txn)}, nil
+}
+
+// parseTransactionFilter builds a domain.TransactionFilter from
+// ListTransactionsRequest's from/to/reference fields (Task 4.4, audit A7.2).
+// from and to are optional RFC3339 timestamps; an empty string leaves that
+// side of the filter unset, mirroring the REST layer's identical helper
+// (internal/api/transactions.go's parseTransactionFilter): kept as its own
+// small copy here rather than shared, the same as this package's page-limit
+// constants above, since a proto string field and a huma query tag are not
+// worth threading one shared helper through.
+func parseTransactionFilter(from, to, reference string) (domain.TransactionFilter, error) {
+	var filter domain.TransactionFilter
+	if from != "" {
+		t, err := time.Parse(time.RFC3339Nano, from)
+		if err != nil {
+			return filter, errors.New("from must be an RFC3339 timestamp")
+		}
+		filter.From = &t
+	}
+	if to != "" {
+		t, err := time.Parse(time.RFC3339Nano, to)
+		if err != nil {
+			return filter, errors.New("to must be an RFC3339 timestamp")
+		}
+		filter.To = &t
+	}
+	if reference != "" {
+		filter.Reference = &reference
+	}
+	return filter, nil
+}
+
+// ListTransactions returns a page of the tenant's transactions, newest
+// first, keyset paged by cursor, optionally filtered by a from/to
+// created_at range and/or an exact reference match (Task 4.4, audit A7.2),
+// mirroring GET /v1/transactions. Export has no gRPC equivalent: a
+// streaming CSV export does not fit gRPC's single-response model, so it
+// stays REST-only (see internal/api/transactions.go's export handler).
+func (s *Server) ListTransactions(ctx context.Context, req *ledgerv1.ListTransactionsRequest) (*ledgerv1.ListTransactionsResponse, error) {
+	filter, err := parseTransactionFilter(req.From, req.To, req.Reference)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	after, err := paging.DecodeCursor(req.Cursor)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	limit := clampLimit(int(req.Limit), defaultPageLimit, maxPageLimit)
+	// Requested as limit+1, not limit: see paging.Page's doc comment for why
+	// that is what lets hasMore below detect a next page without a second
+	// round trip.
+	rows, err := s.txns.ListTransactions(ctx, tenantFrom(ctx), filter, after, limit+1)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	page, hasMore := paging.Page(rows, limit)
+	out := make([]*ledgerv1.Transaction, 0, len(page))
+	for _, item := range page {
+		out = append(out, toProtoTransaction(item.Transaction))
+	}
+	resp := &ledgerv1.ListTransactionsResponse{Transactions: out}
+	if hasMore {
+		last := page[len(page)-1]
+		resp.NextCursor = paging.EncodeCursor(last.CreatedAt, last.Transaction.ID)
+	}
+	return resp, nil
 }
 
 // ReverseTransaction posts the negated legs of the transaction named by

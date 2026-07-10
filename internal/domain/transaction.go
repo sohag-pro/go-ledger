@@ -22,6 +22,13 @@ type Posting struct {
 	AccountID   string
 	Amount      Money
 	Description string
+	// ID is the posting's own persisted id. Empty on a Posting a caller
+	// builds for CreateTransaction (the adapter assigns one at insert time,
+	// mirroring Transaction.ID); populated on a Posting read back from
+	// storage, for example by GetTransaction or ListTransactions (Task 4.4,
+	// audit A7.2), which needs a posting's own id for its flattened,
+	// posting-level CSV export.
+	ID string
 }
 
 // Validate checks that the posting names an account and that its description is

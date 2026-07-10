@@ -39,3 +39,20 @@ func DecodeCursor(token string) (*domain.StatementCursor, error) {
 	}
 	return &domain.StatementCursor{CreatedAt: createdAt, ID: id}, nil
 }
+
+// Page trims rows to at most limit, reporting whether there is a next page.
+// The caller is expected to have requested limit+1 rows from the repository
+// (Task 4.4, audit A7.2): getting back more than limit rows means there is a
+// next page, detected without a second round trip. This is more precise than
+// the older "a full page implies more" heuristic AccountStatement and
+// ListAuditByAccount still use (see internal/api/accounts.go,
+// internal/api/audit.go): that heuristic occasionally hands back a
+// next_cursor for what turns out to be the very last page, costing the
+// caller one extra, empty request; requesting limit+1 up front avoids that
+// edge case entirely.
+func Page[T any](rows []T, limit int) (page []T, hasMore bool) {
+	if limit > 0 && len(rows) > limit {
+		return rows[:limit], true
+	}
+	return rows, false
+}

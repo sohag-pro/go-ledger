@@ -185,6 +185,67 @@ func (q *Queries) ListPostingsByTransaction(ctx context.Context, arg ListPosting
 	return items, nil
 }
 
+const listPostingsByTransactionIDs = `-- name: ListPostingsByTransactionIDs :many
+SELECT id, tenant_id, transaction_id, account_id, amount, currency, description, created_at
+FROM postings
+WHERE tenant_id = $1 AND transaction_id = ANY($2::uuid[])
+ORDER BY transaction_id, created_at, id
+`
+
+type ListPostingsByTransactionIDsParams struct {
+	TenantID       uuid.UUID
+	TransactionIds []uuid.UUID
+}
+
+type ListPostingsByTransactionIDsRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	TransactionID uuid.UUID
+	AccountID     uuid.UUID
+	Amount        int64
+	Currency      string
+	Description   string
+	CreatedAt     time.Time
+}
+
+// Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
+// ListTransactions returns up to a page's worth of transaction rows, and
+// assembling each one's postings via ListPostingsByTransaction one at a time
+// would be N+1 queries for a full page. This fetches every posting for every
+// transaction id in the page in a single round trip; the caller groups rows
+// back by transaction_id (see Repository.ListTransactions). Ordered by
+// transaction_id then (created_at, id), matching ListPostingsByTransaction's
+// own per-transaction order, so grouping by transaction_id yields each
+// transaction's postings already in that transaction's insertion order.
+func (q *Queries) ListPostingsByTransactionIDs(ctx context.Context, arg ListPostingsByTransactionIDsParams) ([]ListPostingsByTransactionIDsRow, error) {
+	rows, err := q.db.Query(ctx, listPostingsByTransactionIDs, arg.TenantID, arg.TransactionIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPostingsByTransactionIDsRow
+	for rows.Next() {
+		var i ListPostingsByTransactionIDsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.TransactionID,
+			&i.AccountID,
+			&i.Amount,
+			&i.Currency,
+			&i.Description,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const tenantDailyDebits = `-- name: TenantDailyDebits :many
 SELECT currency, SUM(amount)::bigint AS total
 FROM postings

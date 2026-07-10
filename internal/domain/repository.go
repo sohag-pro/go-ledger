@@ -28,6 +28,29 @@ type StatementCursor struct {
 	ID        string
 }
 
+// TransactionFilter narrows ListTransactions to a date range and/or an exact
+// reference match (Task 4.4, audit A7.2). A nil field means "no filter on
+// that dimension". From is inclusive (created_at >= From); To is exclusive
+// (created_at < To), the half-open window a caller expects from a from/to
+// range, so a transaction landing exactly on the To boundary is never
+// double-counted across two adjacent calls that tile the same range.
+type TransactionFilter struct {
+	From      *time.Time
+	To        *time.Time
+	Reference *string
+}
+
+// TransactionListItem is one row of a keyset-paged transaction list (Task
+// 4.4, audit A7.2): the transaction itself plus CreatedAt, the row's actual
+// insert time. CreatedAt is not a Transaction field (EffectiveAt is a
+// different, caller-supplied concept: the value date, which may not even be
+// set), but it is exactly what the keyset cursor pages by, the same
+// (CreatedAt, ID) shape StatementEntry already pages a statement by.
+type TransactionListItem struct {
+	Transaction Transaction
+	CreatedAt   time.Time
+}
+
 // Tx is a unit of work bound to a single database transaction. The service
 // layer composes one or more writes inside RunInTx; everything done through a Tx
 // commits together or not at all.
@@ -128,6 +151,15 @@ type Repository interface {
 	// reversal) and as the race guard's read-back after a concurrent
 	// double-reverse loses the insert.
 	GetReversalOf(ctx context.Context, tenantID, originalID string) (Transaction, error)
+
+	// ListTransactions returns up to limit of the tenant's transactions
+	// matching filter, newest first, keyset paged the same way Statement
+	// pages postings (Task 4.4, audit A7.2): after is the keyset position to
+	// page from, nil starts at the newest transaction. filter's From, To, and
+	// Reference are each optional; nil disables that dimension. Every
+	// returned transaction includes its own postings, fetched for the whole
+	// page in one extra round trip rather than one query per transaction.
+	ListTransactions(ctx context.Context, tenantID string, filter TransactionFilter, after *StatementCursor, limit int) ([]TransactionListItem, error)
 
 	// GetOrCreateClearingAccount returns the tenant's per-currency FX clearing
 	// system account (ADR-014), creating it on first use. name is reserved and

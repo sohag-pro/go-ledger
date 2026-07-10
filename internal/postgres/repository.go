@@ -587,31 +587,54 @@ func (r *Repository) GetReversalOf(ctx context.Context, tenantID, originalID str
 // transactionFromRow loads tid's postings and assembles the full
 // domain.Transaction from a sqlc.Transaction row already fetched by
 // GetTransaction or GetReversalOf: both queries select the identical column
-// set, so the postings fetch, FX snapshot, and ReversesTransactionID
-// assembly below are shared rather than duplicated per query.
+// set, so the postings fetch and the rest of the assembly (shared with
+// ListTransactions, see assembleTransaction) are not duplicated per query.
 func (r *Repository) transactionFromRow(ctx context.Context, tid uuid.UUID, row sqlc.Transaction) (domain.Transaction, error) {
-	postings, err := r.q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
+	rows, err := r.q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
 		TenantID:      tid,
 		TransactionID: row.ID,
 	})
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: list postings: %w", err)
 	}
-	out := domain.Transaction{ID: row.ID.String(), Postings: make([]domain.Posting, 0, len(postings))}
-	for _, p := range postings {
-		// Each posting carries its own currency (ADR-014): an FX transaction has
-		// two currencies in play, so Money is rebuilt per row, never from one
-		// transaction-wide currency.
-		money, err := domain.NewMoney(p.Amount, domain.Currency(p.Currency))
+	postings := make([]domain.Posting, 0, len(rows))
+	for _, p := range rows {
+		posting, err := postingFromRow(p.ID, p.AccountID, p.Amount, p.Currency, p.Description)
 		if err != nil {
-			return domain.Transaction{}, fmt.Errorf("postgres: build posting money: %w", err)
+			return domain.Transaction{}, err
 		}
-		out.Postings = append(out.Postings, domain.Posting{
-			AccountID:   p.AccountID.String(),
-			Amount:      money,
-			Description: p.Description,
-		})
+		postings = append(postings, posting)
 	}
+	return assembleTransaction(row, postings), nil
+}
+
+// postingFromRow builds a domain.Posting from a posting row's columns,
+// shared by transactionFromRow (one transaction's postings) and
+// ListTransactions (a batch of many transactions' postings), so the
+// currency-to-Money conversion is not duplicated per call site. Each posting
+// carries its own currency (ADR-014): an FX transaction has two currencies in
+// play, so Money is rebuilt per row, never from one transaction-wide
+// currency.
+func postingFromRow(id, accountID uuid.UUID, amount int64, currency, description string) (domain.Posting, error) {
+	money, err := domain.NewMoney(amount, domain.Currency(currency))
+	if err != nil {
+		return domain.Posting{}, fmt.Errorf("postgres: build posting money: %w", err)
+	}
+	return domain.Posting{
+		ID:          id.String(),
+		AccountID:   accountID.String(),
+		Amount:      money,
+		Description: description,
+	}, nil
+}
+
+// assembleTransaction builds a domain.Transaction from a sqlc.Transaction row
+// and its already-loaded postings, shared by transactionFromRow (a single
+// transaction) and ListTransactions (a page of many), so the FX snapshot,
+// ReversesTransactionID, reference, and effective_at assembly is not
+// duplicated per call site.
+func assembleTransaction(row sqlc.Transaction, postings []domain.Posting) domain.Transaction {
+	out := domain.Transaction{ID: row.ID.String(), Postings: postings}
 	// fx_mid_rate_e8 is only ever NULL together with the other seven fx_*
 	// columns (all written in the same CreateTransaction call, see txRepo);
 	// its validity is enough to tell an FX transaction from a plain one.
@@ -647,7 +670,84 @@ func (r *Repository) transactionFromRow(ctx context.Context, tid uuid.UUID, row 
 		effectiveAt = row.EffectiveAt.Time
 	}
 	out.EffectiveAt = &effectiveAt
-	return out, nil
+	return out
+}
+
+// ListTransactions returns up to limit of tenantID's transactions matching
+// filter, newest first, keyset paged by (created_at, id) descending, the
+// same cursor shape Statement uses (Task 4.4, audit A7.2). after is the
+// keyset position to page from; nil starts at the newest transaction.
+//
+// Postings for the whole returned page are fetched in one extra batched round
+// trip (ListPostingsByTransactionIDs) rather than one query per transaction,
+// so this stays O(1) queries regardless of how many transactions the page
+// contains, not O(n).
+func (r *Repository) ListTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+
+	// First page: a sentinel that is strictly greater than any real
+	// (created_at, id). Subsequent pages: the cursor handed back from the
+	// previous page.
+	afterTime, afterID := statementFirstPageTime, uuid.Max
+	if after != nil {
+		afterTime = after.CreatedAt
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+
+	var reference pgtype.Text
+	if filter.Reference != nil {
+		reference = pgtype.Text{String: *filter.Reference, Valid: true}
+	}
+
+	rows, err := r.q.ListTransactions(ctx, sqlc.ListTransactionsParams{
+		TenantID:       tid,
+		FromTs:         ptrToTimestamptz(filter.From),
+		ToTs:           ptrToTimestamptz(filter.To),
+		Reference:      reference,
+		AfterCreatedAt: afterTime,
+		AfterID:        afterID,
+		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list transactions: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]uuid.UUID, len(rows))
+	for i, row := range rows {
+		ids[i] = row.ID
+	}
+	postingRows, err := r.q.ListPostingsByTransactionIDs(ctx, sqlc.ListPostingsByTransactionIDsParams{
+		TenantID:       tid,
+		TransactionIds: ids,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: batch list postings: %w", err)
+	}
+	byTransaction := make(map[uuid.UUID][]domain.Posting, len(rows))
+	for _, p := range postingRows {
+		posting, err := postingFromRow(p.ID, p.AccountID, p.Amount, p.Currency, p.Description)
+		if err != nil {
+			return nil, err
+		}
+		byTransaction[p.TransactionID] = append(byTransaction[p.TransactionID], posting)
+	}
+
+	items := make([]domain.TransactionListItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, domain.TransactionListItem{
+			Transaction: assembleTransaction(row, byTransaction[row.ID]),
+			CreatedAt:   row.CreatedAt,
+		})
+	}
+	return items, nil
 }
 
 // GetIdempotencyKey returns the stored record for (tenantID, key), or

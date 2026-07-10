@@ -8,6 +8,21 @@ FROM postings
 WHERE tenant_id = $1 AND transaction_id = $2
 ORDER BY created_at, id;
 
+-- name: ListPostingsByTransactionIDs :many
+-- Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
+-- ListTransactions returns up to a page's worth of transaction rows, and
+-- assembling each one's postings via ListPostingsByTransaction one at a time
+-- would be N+1 queries for a full page. This fetches every posting for every
+-- transaction id in the page in a single round trip; the caller groups rows
+-- back by transaction_id (see Repository.ListTransactions). Ordered by
+-- transaction_id then (created_at, id), matching ListPostingsByTransaction's
+-- own per-transaction order, so grouping by transaction_id yields each
+-- transaction's postings already in that transaction's insertion order.
+SELECT id, tenant_id, transaction_id, account_id, amount, currency, description, created_at
+FROM postings
+WHERE tenant_id = sqlc.arg(tenant_id) AND transaction_id = ANY(sqlc.arg(transaction_ids)::uuid[])
+ORDER BY transaction_id, created_at, id;
+
 -- name: AccountBalance :one
 SELECT COALESCE(SUM(amount), 0)::bigint AS balance
 FROM postings

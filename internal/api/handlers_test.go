@@ -3,12 +3,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -37,12 +39,18 @@ const testAPIKeyPlaintext = "glk_handlers-test-default-key" //nolint:gosec // te
 type fakeRepo struct {
 	accounts map[string]domain.Account
 	txns     map[string]domain.Transaction
-	postings []postingRec
-	clock    int64
-	idem     map[string]fakeIdemEntry // key -> record + expiry (Task 4.5, audit A1.4)
-	audit    []domain.AuditEntry
-	apiKeys  map[string]domain.APIKey // key_hash -> resolved key
-	tenants  map[string]domain.Tenant // tenant id -> tenant row
+	// txnCreatedAt is each transaction's own created_at (Task 4.4, audit
+	// A7.2), keyed by transaction id: the fake's stand-in for the real
+	// adapter's transactions.created_at column, which domain.Transaction
+	// itself does not carry (see domain.TransactionListItem's doc comment).
+	// ListTransactions pages and filters by this.
+	txnCreatedAt map[string]time.Time
+	postings     []postingRec
+	clock        int64
+	idem         map[string]fakeIdemEntry // key -> record + expiry (Task 4.5, audit A1.4)
+	audit        []domain.AuditEntry
+	apiKeys      map[string]domain.APIKey // key_hash -> resolved key
+	tenants      map[string]domain.Tenant // tenant id -> tenant row
 }
 
 type postingRec struct {
@@ -63,11 +71,12 @@ type fakeIdemEntry struct {
 
 func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
-		accounts: map[string]domain.Account{},
-		txns:     map[string]domain.Transaction{},
-		idem:     map[string]fakeIdemEntry{},
-		apiKeys:  map[string]domain.APIKey{},
-		tenants:  map[string]domain.Tenant{},
+		accounts:     map[string]domain.Account{},
+		txns:         map[string]domain.Transaction{},
+		txnCreatedAt: map[string]time.Time{},
+		idem:         map[string]fakeIdemEntry{},
+		apiKeys:      map[string]domain.APIKey{},
+		tenants:      map[string]domain.Tenant{},
 	}
 }
 
@@ -118,12 +127,17 @@ func (f *fakeRepo) CreateTransaction(_ context.Context, _ string, t *domain.Tran
 	if t.ID == "" {
 		t.ID = uuid.NewString()
 	}
-	// effective_at falls back to created_at when the caller supplied none
-	// (Task 4.3, audit A1.3), mirroring postgres.txRepo.CreateTransaction /
-	// Repository.transactionFromRow: f.clock is this fake's stand-in clock.
+	// createdAt is the transaction row's own created_at (Task 4.4, audit
+	// A7.2, f.txnCreatedAt), ticked before any posting's: mirrors the real
+	// adapter, which inserts the transaction row (stamping created_at) before
+	// any posting row. effective_at falls back to it when the caller
+	// supplied none (Task 4.3, audit A1.3), mirroring
+	// postgres.txRepo.CreateTransaction / Repository.assembleTransaction;
+	// f.clock is this fake's stand-in clock.
+	f.clock++
+	createdAt := time.Unix(f.clock, 0).UTC()
+	f.txnCreatedAt[t.ID] = createdAt
 	if t.EffectiveAt == nil {
-		f.clock++
-		createdAt := time.Unix(f.clock, 0).UTC()
 		t.EffectiveAt = &createdAt
 	}
 	f.txns[t.ID] = *t
@@ -139,6 +153,78 @@ func (f *fakeRepo) CreateTransaction(_ context.Context, _ string, t *domain.Tran
 		})
 	}
 	return nil
+}
+
+// ListTransactions filters and keyset-pages f.txns (Task 4.4, audit A7.2),
+// mirroring the same "collect, sort ascending, then walk from the newest
+// applying the cursor" style Statement and ListAuditByAccount above already
+// use for their own in-memory paging. Each returned transaction's postings
+// are rebuilt from f.postings, in insertion order, rather than read straight
+// off f.txns: f.postings is where this fake's synthesized posting ids live
+// (postingRec.id), and CreateTransaction never writes an id back onto the
+// domain.Posting values it stores in f.txns itself.
+func (f *fakeRepo) ListTransactions(_ context.Context, _ string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
+	items := make([]domain.TransactionListItem, 0, len(f.txns))
+	for id, t := range f.txns {
+		createdAt := f.txnCreatedAt[id]
+		if filter.From != nil && createdAt.Before(*filter.From) {
+			continue
+		}
+		if filter.To != nil && !createdAt.Before(*filter.To) {
+			continue
+		}
+		if filter.Reference != nil && (t.Reference == nil || *t.Reference != *filter.Reference) {
+			continue
+		}
+		t.Postings = f.postingsFor(id, t.Postings)
+		items = append(items, domain.TransactionListItem{Transaction: t, CreatedAt: createdAt})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].CreatedAt.Before(items[j].CreatedAt)
+		}
+		return items[i].Transaction.ID < items[j].Transaction.ID
+	})
+	// newest first
+	out := make([]domain.TransactionListItem, 0, len(items))
+	for i := len(items) - 1; i >= 0; i-- {
+		it := items[i]
+		if after != nil {
+			if it.CreatedAt.After(after.CreatedAt) || (it.CreatedAt.Equal(after.CreatedAt) && it.Transaction.ID >= after.ID) {
+				continue
+			}
+		}
+		out = append(out, it)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// postingsFor rebuilds txnID's postings with each one's fake-assigned id
+// (postingRec.id) filled in, keeping original's currency and description
+// exactly as CreateTransaction stored them on the domain.Transaction itself
+// (f.postings does not carry currency, so it cannot be the source of truth
+// for the whole Posting). It assumes f.postings holds exactly len(original)
+// entries for txnID, in the same order CreateTransaction appended them,
+// which is always true for a transaction this fake wrote.
+func (f *fakeRepo) postingsFor(txnID string, original []domain.Posting) []domain.Posting {
+	var ids []string
+	for _, p := range f.postings {
+		if p.txnID == txnID {
+			ids = append(ids, p.id)
+		}
+	}
+	if len(ids) != len(original) {
+		return original
+	}
+	out := make([]domain.Posting, len(original))
+	copy(out, original)
+	for i := range out {
+		out[i].ID = ids[i]
+	}
+	return out
 }
 
 func (f *fakeRepo) GetTransaction(_ context.Context, _, id string) (domain.Transaction, error) {
@@ -1399,6 +1485,257 @@ func TestMalformedCursorRejected(t *testing.T) {
 		rec := do(t, router, http.MethodGet, "/v1/accounts/"+a.ID+"/audit?cursor=garbage", nil)
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("list-transactions cursor", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/transactions?cursor=garbage", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("list-transactions from", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/transactions?from=not-a-timestamp", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("export-transactions to", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/transactions/export?to=not-a-timestamp", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// seedListTransactionsHTTP posts n balanced transactions over the REST API,
+// each carrying a distinct reference ("http-list-ref-<i>") and a small sleep
+// between posts so fakeRepo's created_at ordering (a real wall-clock
+// time.Unix tick per transaction, see fakeRepo.CreateTransaction) is
+// unambiguous, mirroring seedListTransactions in
+// internal/postgres/list_transactions_test.go. It returns the posted ids in
+// posting order (oldest first).
+func seedListTransactionsHTTP(t *testing.T, r chi.Router, cash, other string, n int) []string {
+	t.Helper()
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 100 + i, "description": "seed"},
+				{"account_id": other, "amount": -(100 + i)},
+			},
+			"reference": fmt.Sprintf("http-list-ref-%d", i),
+		}, map[string]string{"Idempotency-Key": fmt.Sprintf("http-list-seed-%d", i)})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("seed post %d: %d (%s)", i, rec.Code, rec.Body.String())
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode seed post %d: %v", i, err)
+		}
+		ids[i] = out.ID
+	}
+	return ids
+}
+
+type transactionListResponse struct {
+	Transactions []struct {
+		ID        string  `json:"id"`
+		Reference *string `json:"reference,omitempty"`
+	} `json:"transactions"`
+	NextCursor *string `json:"next_cursor"`
+}
+
+// TestListTransactions covers GET /v1/transactions end to end over the fake
+// repo (Task 4.4, audit A7.2): the default page returns every seeded
+// transaction newest first, an exact reference filter narrows to one, and
+// keyset pagination with a small limit walks every transaction exactly once,
+// with no gap or overlap, stopping (next_cursor null) at the end.
+func TestListTransactions(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	other := createAccount(t, r, "Other", "asset")
+
+	const n = 5
+	ids := seedListTransactionsHTTP(t, r, cash, other, n)
+
+	t.Run("default page lists all, newest first", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out transactionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Transactions) != n {
+			t.Fatalf("got %d transactions, want %d", len(out.Transactions), n)
+		}
+		for i, txn := range out.Transactions {
+			wantID := ids[n-1-i]
+			if txn.ID != wantID {
+				t.Errorf("transactions[%d].ID = %s, want %s (newest first)", i, txn.ID, wantID)
+			}
+		}
+		if out.NextCursor != nil {
+			t.Errorf("expected no next_cursor when everything fits on one page, got %q", *out.NextCursor)
+		}
+	})
+
+	t.Run("reference filter narrows to exact match", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions?reference=http-list-ref-2", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out transactionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Transactions) != 1 || out.Transactions[0].ID != ids[2] {
+			t.Fatalf("reference filter = %+v, want exactly transaction %s", out.Transactions, ids[2])
+		}
+	})
+
+	t.Run("pagination walks every transaction with no gap or overlap", func(t *testing.T) {
+		const pageSize = 2
+		seen := map[string]bool{}
+		var walked []string
+		cursor := ""
+		for pages := 0; ; pages++ {
+			if pages > n {
+				t.Fatalf("pagination did not terminate after %d pages", pages)
+			}
+			path := fmt.Sprintf("/v1/transactions?limit=%d", pageSize)
+			if cursor != "" {
+				path += "&cursor=" + cursor
+			}
+			rec := do(t, r, http.MethodGet, path, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("page %d status %d (%s)", pages, rec.Code, rec.Body.String())
+			}
+			var out transactionListResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode page %d: %v", pages, err)
+			}
+			for _, txn := range out.Transactions {
+				if seen[txn.ID] {
+					t.Fatalf("transaction %s returned twice across pages (overlap)", txn.ID)
+				}
+				seen[txn.ID] = true
+				walked = append(walked, txn.ID)
+			}
+			if out.NextCursor == nil {
+				break
+			}
+			cursor = *out.NextCursor
+		}
+		wantOrder := make([]string, n)
+		for i := 0; i < n; i++ {
+			wantOrder[i] = ids[n-1-i]
+		}
+		if !reflect.DeepEqual(walked, wantOrder) {
+			t.Fatalf("walked order = %v, want %v (no gap, no overlap, newest first)", walked, wantOrder)
+		}
+	})
+}
+
+// TestExportTransactions covers GET /v1/transactions/export end to end over
+// the fake repo (Task 4.4, audit A7.2): csv gets a header row plus one row
+// per posting with the right content type and attachment disposition, and
+// json gets the same transaction bodies the list endpoint returns.
+func TestExportTransactions(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	other := createAccount(t, r, "Other", "asset")
+	const n = 3
+	ids := seedListTransactionsHTTP(t, r, cash, other, n)
+
+	t.Run("csv: header, one row per posting, content type and disposition", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "text/csv" {
+			t.Errorf("Content-Type = %q, want text/csv", ct)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != `attachment; filename="transactions.csv"` {
+			t.Errorf("Content-Disposition = %q", cd)
+		}
+		if trunc := rec.Header().Get("Export-Truncated"); trunc != "false" {
+			t.Errorf("Export-Truncated = %q, want false", trunc)
+		}
+		reader := csv.NewReader(strings.NewReader(rec.Body.String()))
+		rows, err := reader.ReadAll()
+		if err != nil {
+			t.Fatalf("parse csv: %v", err)
+		}
+		wantHeader := []string{
+			"transaction_id", "posting_id", "account_id", "amount", "currency",
+			"description", "reference", "created_at", "effective_at",
+		}
+		if len(rows) == 0 || !reflect.DeepEqual(rows[0], wantHeader) {
+			t.Fatalf("header = %v, want %v", rows[0], wantHeader)
+		}
+		// n transactions x 2 postings each, plus the header row.
+		if len(rows) != n*2+1 {
+			t.Fatalf("got %d csv rows (incl. header), want %d", len(rows), n*2+1)
+		}
+		seenTxnIDs := map[string]bool{}
+		for _, row := range rows[1:] {
+			seenTxnIDs[row[0]] = true
+			if row[1] == "" {
+				t.Errorf("row %v: posting_id is empty", row)
+			}
+			if row[2] == "" {
+				t.Errorf("row %v: account_id is empty", row)
+			}
+			if row[4] != "USD" {
+				t.Errorf("row %v: currency = %q, want USD", row, row[4])
+			}
+		}
+		for _, id := range ids {
+			if !seenTxnIDs[id] {
+				t.Errorf("transaction %s missing from csv export", id)
+			}
+		}
+	})
+
+	t.Run("json: same shape as the list endpoint", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export?format=json", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", ct)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != "" {
+			t.Errorf("Content-Disposition = %q, want empty for json", cd)
+		}
+		var bodies []TransactionBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &bodies); err != nil {
+			t.Fatalf("decode json export: %v (%s)", err, rec.Body.String())
+		}
+		if len(bodies) != n {
+			t.Fatalf("got %d transactions, want %d", len(bodies), n)
+		}
+	})
+
+	t.Run("reference filter applies to export too", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export?format=json&reference=http-list-ref-1", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var bodies []TransactionBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &bodies); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(bodies) != 1 || bodies[0].ID != ids[1] {
+			t.Fatalf("filtered export = %+v, want exactly transaction %s", bodies, ids[1])
 		}
 	})
 }

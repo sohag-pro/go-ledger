@@ -205,7 +205,32 @@ type Querier interface {
 	// order.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
+	// Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
+	// ListTransactions returns up to a page's worth of transaction rows, and
+	// assembling each one's postings via ListPostingsByTransaction one at a time
+	// would be N+1 queries for a full page. This fetches every posting for every
+	// transaction id in the page in a single round trip; the caller groups rows
+	// back by transaction_id (see Repository.ListTransactions). Ordered by
+	// transaction_id then (created_at, id), matching ListPostingsByTransaction's
+	// own per-transaction order, so grouping by transaction_id yields each
+	// transaction's postings already in that transaction's insertion order.
+	ListPostingsByTransactionIDs(ctx context.Context, arg ListPostingsByTransactionIDsParams) ([]ListPostingsByTransactionIDsRow, error)
 	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
+	// Filtered, keyset-paged list of a tenant's transactions, newest first (Task
+	// 4.4, audit A7.2). from_ts/to_ts/reference are optional filters via
+	// sqlc.narg: NULL disables that filter's clause (it becomes a no-op OR),
+	// so this single query serves every filter combination rather than one
+	// built dynamically per request. from_ts is inclusive (created_at >=),
+	// to_ts is exclusive (created_at <): a half-open [from, to) window.
+	//
+	// Keyset paged by (created_at, id) descending, the identical cursor shape
+	// AccountStatement already uses: after_created_at/after_id are the keyset
+	// position, a far-future timestamp and the max uuid for the first page.
+	// page_limit is requested by the caller as one more than the page size it
+	// actually wants, so a next page can be detected without a second round
+	// trip; this query itself just returns up to page_limit rows in whatever
+	// amount it is asked for.
+	ListTransactions(ctx context.Context, arg ListTransactionsParams) ([]Transaction, error)
 	// Sets processed_at for one outbox row. The chainer calls this in the same
 	// transaction as the audit_log insert it produced, so a crash between the two
 	// is impossible: either both happen or neither does.

@@ -325,3 +325,43 @@ func auditSnapshot(t *domain.Transaction) map[string]any {
 func (s *TransactionService) Get(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
 	return s.repo.GetTransaction(ctx, tenantID, id)
 }
+
+// MaxExportRows bounds ExportTransactions (Task 4.4, audit A7.2): an export is
+// a single unpaged call, unlike ListTransactions, so it needs its own ceiling
+// rather than trusting a caller-supplied limit. 10000 rows is generous for the
+// reconciliation exports this endpoint is for, while still ruling out an
+// unbounded scan that could OOM the process on a tenant with a very long
+// history.
+const MaxExportRows = 10000
+
+// ListTransactions returns up to limit of tenantID's transactions matching
+// filter, newest first, keyset paged from after (Task 4.4, audit A7.2). It is
+// a thin read-through to the repository, the same shape AuditService.ByAccount
+// and AccountService.Statement already use: no cross-cutting logic belongs
+// here beyond the pass-through itself.
+func (s *TransactionService) ListTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
+	return s.repo.ListTransactions(ctx, tenantID, filter, after, limit)
+}
+
+// ExportTransactions returns every one of tenantID's transactions matching
+// filter, newest first, up to MaxExportRows (Task 4.4, audit A7.2). Unlike
+// ListTransactions this is not paged: it is the single bounded read behind
+// GET /v1/transactions/export, REST-only (a streaming CSV export does not fit
+// gRPC's single-response model well). truncated is true when the tenant's
+// matching history is larger than MaxExportRows, in which case the export
+// silently contains only the newest MaxExportRows rows rather than growing
+// unbounded; a truncated export is logged at warn level so an operator can
+// see it happened, and the caller surfaces it too (see the REST handler's
+// Export-Truncated response header).
+func (s *TransactionService) ExportTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter) (items []domain.TransactionListItem, truncated bool, err error) {
+	rows, err := s.repo.ListTransactions(ctx, tenantID, filter, nil, MaxExportRows+1)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) > MaxExportRows {
+		s.log.WarnContext(ctx, "transaction export truncated",
+			"tenant_id", tenantID, "max_export_rows", MaxExportRows)
+		return rows[:MaxExportRows], true, nil
+	}
+	return rows, false, nil
+}

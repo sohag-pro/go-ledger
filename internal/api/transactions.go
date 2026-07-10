@@ -1,14 +1,19 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
+	"github.com/sohag-pro/go-ledger/internal/paging"
 )
 
 // PostingInput is one leg of a transaction in the request body.
@@ -99,6 +104,120 @@ type transactionIDInput struct {
 type ReverseTransactionOutput struct {
 	AlreadyReversed bool `header:"Already-Reversed"`
 	Body            TransactionBody
+}
+
+// TransactionListInput is the list-transactions request: optional date-range
+// and reference filters, plus keyset paging (Task 4.4, audit A7.2). From and
+// To follow the same half-open convention as domain.TransactionFilter: From
+// is inclusive, To is exclusive.
+type TransactionListInput struct {
+	From      string `query:"from" doc:"RFC3339 timestamp. Only transactions created at or after this time."`
+	To        string `query:"to" doc:"RFC3339 timestamp. Only transactions created strictly before this time."`
+	Reference string `query:"reference" doc:"Exact match on the transaction's reference."`
+	Limit     int    `query:"limit" default:"50" minimum:"1" maximum:"200" doc:"Max transactions per page"`
+	Cursor    string `query:"cursor" doc:"Opaque cursor from a previous page's next_cursor"`
+}
+
+// TransactionListOutput is one page of a tenant's transactions.
+type TransactionListOutput struct {
+	Body struct {
+		Transactions []TransactionBody `json:"transactions"`
+		NextCursor   *string           `json:"next_cursor" doc:"Cursor for the next page, or null if this is the last page"`
+	}
+}
+
+// TransactionExportInput is the export-transactions request: the same
+// from/to/reference filters as TransactionListInput, plus format (Task 4.4,
+// audit A7.2). Unlike the list endpoint this is not paged: it returns every
+// matching transaction up to ledger.MaxExportRows in a single response.
+type TransactionExportInput struct {
+	From      string `query:"from" doc:"RFC3339 timestamp. Only transactions created at or after this time."`
+	To        string `query:"to" doc:"RFC3339 timestamp. Only transactions created strictly before this time."`
+	Reference string `query:"reference" doc:"Exact match on the transaction's reference."`
+	Format    string `query:"format" default:"csv" enum:"csv,json" doc:"csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."`
+}
+
+// TransactionExportOutput is a raw csv or json export body (Task 4.4, audit
+// A7.2). Body is a []byte, which huma writes out verbatim instead of
+// JSON-encoding it (see huma's ContentTypeFilter / raw-body handling), so
+// ContentType and, for csv, ContentDisposition are set explicitly here
+// rather than inferred from a struct tag.
+type TransactionExportOutput struct {
+	ContentType        string `header:"Content-Type"`
+	ContentDisposition string `header:"Content-Disposition" doc:"Set to attachment for csv; unset for json"`
+	Truncated          bool   `header:"Export-Truncated" doc:"true if the tenant's matching history exceeds the export row cap and this export contains only the newest rows up to it"`
+	Body               []byte
+}
+
+// parseTransactionFilter builds a domain.TransactionFilter from the list and
+// export endpoints' shared from/to/reference query params (Task 4.4, audit
+// A7.2). from and to are optional RFC3339 timestamps; an empty string leaves
+// that side of the filter unset. reference is an exact-match filter, also
+// optional: an empty string leaves it unset too, since Transaction.Validate
+// already rejects an empty, non-nil reference, so "" can never be a real
+// reference to match against.
+func parseTransactionFilter(from, to, reference string) (domain.TransactionFilter, error) {
+	var filter domain.TransactionFilter
+	if from != "" {
+		t, err := time.Parse(time.RFC3339Nano, from)
+		if err != nil {
+			return filter, huma.Error422UnprocessableEntity("from must be an RFC3339 timestamp")
+		}
+		filter.From = &t
+	}
+	if to != "" {
+		t, err := time.Parse(time.RFC3339Nano, to)
+		if err != nil {
+			return filter, huma.Error422UnprocessableEntity("to must be an RFC3339 timestamp")
+		}
+		filter.To = &t
+	}
+	if reference != "" {
+		filter.Reference = &reference
+	}
+	return filter, nil
+}
+
+// transactionsCSV renders items as a flattened, posting-level CSV (Task 4.4,
+// audit A7.2): one row per posting, not per transaction, since a transaction
+// spans a variable number of postings and a csv needs one fixed row shape
+// throughout. The header matches the brief exactly: transaction_id,
+// posting_id, account_id, amount, currency, description, reference,
+// created_at, effective_at.
+func transactionsCSV(items []domain.TransactionListItem) []byte {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{
+		"transaction_id", "posting_id", "account_id", "amount", "currency",
+		"description", "reference", "created_at", "effective_at",
+	})
+	for _, item := range items {
+		t := item.Transaction
+		reference := ""
+		if t.Reference != nil {
+			reference = *t.Reference
+		}
+		effectiveAt := ""
+		if t.EffectiveAt != nil {
+			effectiveAt = t.EffectiveAt.UTC().Format(time.RFC3339Nano)
+		}
+		createdAt := item.CreatedAt.UTC().Format(time.RFC3339Nano)
+		for _, p := range t.Postings {
+			_ = w.Write([]string{
+				t.ID,
+				p.ID,
+				p.AccountID,
+				strconv.FormatInt(p.Amount.Amount(), 10),
+				string(p.Amount.Currency()),
+				p.Description,
+				reference,
+				createdAt,
+				effectiveAt,
+			})
+		}
+	}
+	w.Flush()
+	return buf.Bytes()
 }
 
 func toTransactionBody(t domain.Transaction) TransactionBody {
@@ -305,5 +424,90 @@ func registerTransactions(api huma.API, deps Deps) {
 			return nil, toHumaErr(err)
 		}
 		return &ReverseTransactionOutput{AlreadyReversed: alreadyReversed, Body: toTransactionBody(*reversal)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-transactions",
+		Method:      http.MethodGet,
+		Path:        "/v1/transactions",
+		Summary:     "List transactions",
+		Description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive) and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page.",
+		Tags:        []string{"transactions"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, in *TransactionListInput) (*TransactionListOutput, error) {
+		filter, err := parseTransactionFilter(in.From, in.To, in.Reference)
+		if err != nil {
+			return nil, err
+		}
+		after, err := decodeCursor(in.Cursor)
+		if err != nil {
+			return nil, huma.Error422UnprocessableEntity(err.Error())
+		}
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// Requested as limit+1, not limit: getting more rows back than the
+		// caller asked for is how hasMore below detects a next page exists
+		// without a second round trip (paging.Page's doc comment).
+		rows, err := deps.Transactions.ListTransactions(ctx, tenant, filter, after, in.Limit+1)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		page, hasMore := paging.Page(rows, in.Limit)
+
+		out := &TransactionListOutput{}
+		out.Body.Transactions = make([]TransactionBody, 0, len(page))
+		for _, item := range page {
+			out.Body.Transactions = append(out.Body.Transactions, toTransactionBody(item.Transaction))
+		}
+		if hasMore {
+			last := page[len(page)-1]
+			c := encodeCursor(last.CreatedAt, last.Transaction.ID)
+			out.Body.NextCursor = &c
+		}
+		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "export-transactions",
+		Method:      http.MethodGet,
+		Path:        "/v1/transactions/export",
+		Summary:     "Export transactions",
+		Description: "Exports the tenant's transactions matching the same from/to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only.",
+		Tags:        []string{"transactions"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, in *TransactionExportInput) (*TransactionExportOutput, error) {
+		filter, err := parseTransactionFilter(in.From, in.To, in.Reference)
+		if err != nil {
+			return nil, err
+		}
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		items, truncated, err := deps.Transactions.ExportTransactions(ctx, tenant, filter)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+
+		out := &TransactionExportOutput{Truncated: truncated}
+		if in.Format == "json" {
+			bodies := make([]TransactionBody, 0, len(items))
+			for _, item := range items {
+				bodies = append(bodies, toTransactionBody(item.Transaction))
+			}
+			b, err := json.Marshal(bodies)
+			if err != nil {
+				return nil, huma.Error500InternalServerError("marshal export")
+			}
+			out.ContentType = "application/json"
+			out.Body = b
+			return out, nil
+		}
+		out.ContentType = "text/csv"
+		out.ContentDisposition = `attachment; filename="transactions.csv"`
+		out.Body = transactionsCSV(items)
+		return out, nil
 	})
 }

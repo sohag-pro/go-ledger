@@ -27,6 +27,7 @@ const (
 	LedgerService_PostTransaction_FullMethodName     = "/ledger.v1.LedgerService/PostTransaction"
 	LedgerService_Convert_FullMethodName             = "/ledger.v1.LedgerService/Convert"
 	LedgerService_GetTransaction_FullMethodName      = "/ledger.v1.LedgerService/GetTransaction"
+	LedgerService_ListTransactions_FullMethodName    = "/ledger.v1.LedgerService/ListTransactions"
 	LedgerService_ReverseTransaction_FullMethodName  = "/ledger.v1.LedgerService/ReverseTransaction"
 	LedgerService_GetTransactionAudit_FullMethodName = "/ledger.v1.LedgerService/GetTransactionAudit"
 	LedgerService_GetAccountAudit_FullMethodName     = "/ledger.v1.LedgerService/GetAccountAudit"
@@ -44,6 +45,7 @@ type LedgerServiceClient interface {
 	PostTransaction(ctx context.Context, in *PostTransactionRequest, opts ...grpc.CallOption) (*PostTransactionResponse, error)
 	Convert(ctx context.Context, in *ConvertRequest, opts ...grpc.CallOption) (*ConvertResponse, error)
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error)
+	ListTransactions(ctx context.Context, in *ListTransactionsRequest, opts ...grpc.CallOption) (*ListTransactionsResponse, error)
 	ReverseTransaction(ctx context.Context, in *ReverseTransactionRequest, opts ...grpc.CallOption) (*ReverseTransactionResponse, error)
 	GetTransactionAudit(ctx context.Context, in *GetTransactionAuditRequest, opts ...grpc.CallOption) (*GetTransactionAuditResponse, error)
 	GetAccountAudit(ctx context.Context, in *GetAccountAuditRequest, opts ...grpc.CallOption) (*GetAccountAuditResponse, error)
@@ -137,6 +139,16 @@ func (c *ledgerServiceClient) GetTransaction(ctx context.Context, in *GetTransac
 	return out, nil
 }
 
+func (c *ledgerServiceClient) ListTransactions(ctx context.Context, in *ListTransactionsRequest, opts ...grpc.CallOption) (*ListTransactionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTransactionsResponse)
+	err := c.cc.Invoke(ctx, LedgerService_ListTransactions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *ledgerServiceClient) ReverseTransaction(ctx context.Context, in *ReverseTransactionRequest, opts ...grpc.CallOption) (*ReverseTransactionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReverseTransactionResponse)
@@ -179,6 +191,7 @@ type LedgerServiceServer interface {
 	PostTransaction(context.Context, *PostTransactionRequest) (*PostTransactionResponse, error)
 	Convert(context.Context, *ConvertRequest) (*ConvertResponse, error)
 	GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error)
+	ListTransactions(context.Context, *ListTransactionsRequest) (*ListTransactionsResponse, error)
 	ReverseTransaction(context.Context, *ReverseTransactionRequest) (*ReverseTransactionResponse, error)
 	GetTransactionAudit(context.Context, *GetTransactionAuditRequest) (*GetTransactionAuditResponse, error)
 	GetAccountAudit(context.Context, *GetAccountAuditRequest) (*GetAccountAuditResponse, error)
@@ -215,6 +228,9 @@ func (UnimplementedLedgerServiceServer) Convert(context.Context, *ConvertRequest
 }
 func (UnimplementedLedgerServiceServer) GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTransaction not implemented")
+}
+func (UnimplementedLedgerServiceServer) ListTransactions(context.Context, *ListTransactionsRequest) (*ListTransactionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListTransactions not implemented")
 }
 func (UnimplementedLedgerServiceServer) ReverseTransaction(context.Context, *ReverseTransactionRequest) (*ReverseTransactionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReverseTransaction not implemented")
@@ -390,6 +406,24 @@ func _LedgerService_GetTransaction_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LedgerService_ListTransactions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTransactionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LedgerServiceServer).ListTransactions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LedgerService_ListTransactions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LedgerServiceServer).ListTransactions(ctx, req.(*ListTransactionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LedgerService_ReverseTransaction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReverseTransactionRequest)
 	if err := dec(in); err != nil {
@@ -482,6 +516,10 @@ var LedgerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTransaction",
 			Handler:    _LedgerService_GetTransaction_Handler,
+		},
+		{
+			MethodName: "ListTransactions",
+			Handler:    _LedgerService_ListTransactions_Handler,
 		},
 		{
 			MethodName: "ReverseTransaction",

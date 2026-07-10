@@ -600,6 +600,24 @@ components:
         - postings
         - effective_at
       type: object
+    TransactionListOutputBody:
+      additionalProperties: false
+      properties:
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+        transactions:
+          items:
+            $ref: "#/components/schemas/TransactionBody"
+          type:
+            - array
+            - "null"
+      required:
+        - transactions
+        - next_cursor
+      type: object
     VerifyAuditOutputBody:
       additionalProperties: false
       properties:
@@ -1139,6 +1157,67 @@ paths:
       tags:
         - audit
   /v1/transactions:
+    get:
+      description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive) and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
+      operationId: list-transactions
+      parameters:
+        - description: RFC3339 timestamp. Only transactions created at or after this time.
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: RFC3339 timestamp. Only transactions created at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions created strictly before this time.
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: RFC3339 timestamp. Only transactions created strictly before this time.
+            type: string
+        - description: Exact match on the transaction's reference.
+          explode: false
+          in: query
+          name: reference
+          schema:
+            description: Exact match on the transaction's reference.
+            type: string
+        - description: Max transactions per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max transactions per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionListOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List transactions
+      tags:
+        - transactions
     post:
       description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. A key's replay window is bounded (server-configured IDEMPOTENCY_TTL, default 24h): after that window a reused key is treated as never having been used, so the same header value posts a new transaction instead of replaying or conflicting; retry within the window if you need the original guarantee. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time."
       operationId: create-transaction
@@ -1216,6 +1295,74 @@ paths:
       security:
         - bearerAuth: []
       summary: Convert between currencies
+      tags:
+        - transactions
+  /v1/transactions/export:
+    get:
+      description: "Exports the tenant's transactions matching the same from/to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only."
+      operationId: export-transactions
+      parameters:
+        - description: RFC3339 timestamp. Only transactions created at or after this time.
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: RFC3339 timestamp. Only transactions created at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions created strictly before this time.
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: RFC3339 timestamp. Only transactions created strictly before this time.
+            type: string
+        - description: Exact match on the transaction's reference.
+          explode: false
+          in: query
+          name: reference
+          schema:
+            description: Exact match on the transaction's reference.
+            type: string
+        - description: "csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."
+          explode: false
+          in: query
+          name: format
+          schema:
+            default: csv
+            description: "csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."
+            enum:
+              - csv
+              - json
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                contentEncoding: base64
+                type: string
+          description: OK
+          headers:
+            Content-Disposition:
+              schema:
+                description: Set to attachment for csv; unset for json
+                type: string
+            Content-Type:
+              schema:
+                type: string
+            Export-Truncated:
+              schema:
+                description: true if the tenant's matching history exceeds the export row cap and this export contains only the newest rows up to it
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Export transactions
       tags:
         - transactions
   /v1/transactions/{id}:
