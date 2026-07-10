@@ -33,7 +33,7 @@ func TestGRPCPostTransactionReferenceAndEffectiveAt(t *testing.T) {
 
 	// Stamp a couple seconds in the past, the convention this repo's tests
 	// use for a backdated effective_at.
-	past := time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
+	past := time.Now().Add(-2 * time.Second).UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
 	req := &ledgerv1.PostTransactionRequest{
 		Currency: "USD",
 		Postings: []*ledgerv1.Posting{

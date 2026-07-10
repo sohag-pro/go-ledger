@@ -54,7 +54,7 @@ func TestCreateTransaction_ReferenceAndEffectiveAtRoundTrip(t *testing.T) {
 	debit, credit := newReferenceAccounts(t, repo, tenant)
 
 	ref := "PG-INV-1001"
-	past := time.Now().Add(-2 * time.Second).UTC()
+	past := time.Now().Add(-2 * time.Second).UTC().Truncate(time.Microsecond)
 	txn := refTxn(t, debit.ID, credit.ID)
 	txn.Reference = &ref
 	txn.EffectiveAt = &past

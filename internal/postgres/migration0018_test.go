@@ -74,7 +74,7 @@ func TestMigration0018_ReferenceAndEffectiveAt(t *testing.T) {
 	}
 
 	first := uuid.NewString()
-	past := time.Now().Add(-2 * time.Second).UTC()
+	past := time.Now().Add(-2 * time.Second).UTC().Truncate(time.Microsecond)
 	mustExecDB(t, sqlDB,
 		`INSERT INTO transactions (id, tenant_id, reference, effective_at) VALUES ($1, $2, $3, $4)`,
 		first, tenantA, "INV-1001", past)
