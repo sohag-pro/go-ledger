@@ -34,8 +34,8 @@ type ConvertRequest struct {
 // the to account's currency at the tenant's current FX rate, and posts the
 // four resulting legs (debit the from account, credit the source-currency FX
 // clearing account, debit the destination-currency FX clearing account,
-// credit the to account) atomically, inside the same SERIALIZABLE,
-// per-tenant-serialized transaction Post uses (RunInTx, see ADR-012).
+// credit the to account) atomically, inside the same kind of SERIALIZABLE
+// transaction Post uses (RunInTx).
 //
 // Convert deliberately does NOT call Post. Post computes its idempotency
 // fingerprint from the built postings (Transaction.Fingerprint), and has no
@@ -211,7 +211,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		if err != nil {
 			return err
 		}
-		return tx.AppendAudit(ctx, tenantID, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: t.ID,
 			Actor:         tenantID,
@@ -221,9 +221,12 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 	if runErr != nil {
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
 			// A concurrent convert for this tenant and key committed between
-			// our precheck and this attempt's insert (the per-tenant RunInTx
-			// mutex makes this a narrow, defense-in-depth window rather than
-			// the common case). Replay it exactly as the precheck would have.
+			// our precheck and this attempt's insert. Since ADR-017 removed
+			// RunInTx's per-tenant mutex (same-tenant calls now run fully
+			// concurrently), this window is no longer a narrow edge case, so
+			// this path is expected to be hit under real concurrent retries,
+			// not just a defense-in-depth fallback. Replay it exactly as the
+			// precheck would have.
 			rec, err := s.repo.GetIdempotencyKey(ctx, tenantID, idem.Key)
 			if err != nil {
 				span.RecordError(err)

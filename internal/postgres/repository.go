@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,55 +44,15 @@ func retryBackoff(attempt int) time.Duration {
 	return time.Duration(rand.Int64N(int64(exp) + 1)) //nolint:gosec // jitter, not crypto
 }
 
-// keyedMutex is a set of independent mutexes, one per key, created lazily on
-// first use. It serializes callers that share a key while leaving callers
-// with different keys fully concurrent, without ever touching a database
-// connection: waiters block on ordinary Go scheduling, not on anything held
-// against Postgres.
-//
-// Each key's mutex is a capacity-1 channel rather than a sync.Mutex so that a
-// waiter can give up: acquiring it is a select between sending on the channel
-// and the caller's context being done, so a cancelled or timed-out caller
-// stops waiting immediately instead of blocking until the current holder
-// releases.
-//
-// The underlying sync.Map grows by one entry per distinct key ever seen and
-// is never evicted. That is deliberate: keys here are tenant ids, bounded by
-// the number of tenants the service has, not by request volume, so the map
-// stays small for the life of the process and eviction would add complexity
-// for no real memory benefit at this scale.
-type keyedMutex struct{ m sync.Map }
-
-// lock blocks until key's mutex is free or ctx is done, whichever comes
-// first. On success it returns a func that releases the mutex; the caller is
-// expected to defer it. On cancellation it returns ctx.Err() and a nil func;
-// the mutex is left exactly as it was, since this caller never acquired it.
-func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
-	chAny, _ := k.m.LoadOrStore(key, make(chan struct{}, 1))
-	ch := chAny.(chan struct{}) //nolint:forcetypeassert // this map only ever stores chan struct{}, set two lines up
-	select {
-	case ch <- struct{}{}:
-		return func() { <-ch }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 // Repository is a domain.Repository backed by a pgx connection pool.
 type Repository struct {
 	pool *pgxpool.Pool
 	q    *sqlc.Queries
-	// tenantLocks serializes RunInTx calls per tenant (see RunInTx's doc
-	// comment for why). Its zero value is ready to use, since sync.Map needs
-	// no initialization, but the field is spelled out explicitly here rather
-	// than left implicit so the serialization mechanism is visible on the
-	// struct, not just inside RunInTx.
-	tenantLocks keyedMutex
 }
 
 // NewRepository returns a Repository that uses pool for all queries.
 func NewRepository(pool *pgxpool.Pool) *Repository {
-	return &Repository{pool: pool, q: sqlc.New(pool), tenantLocks: keyedMutex{}}
+	return &Repository{pool: pool, q: sqlc.New(pool)}
 }
 
 // compile-time check that Repository satisfies the domain port.
@@ -238,47 +197,32 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // replayed up to maxPostAttempts times. fn must therefore be safe to run more
 // than once. Each attempt acquires its own connection from the pool via
 // BeginTx and releases it (Commit or Rollback) before the next attempt's
-// backoff wait, exactly as if RunInTx had no notion of tenants at all: no
-// connection is ever held across a backoff or across attempts.
+// backoff wait: no connection is ever held across a backoff or across
+// attempts.
 //
-// Before any of that, RunInTx acquires tenantID's lock from an in-process
-// keyed mutex and holds it for every attempt, releasing it only when the
-// whole call returns. This serializes same-tenant calls one at a time while
-// leaving different tenants (different keys) fully concurrent. It exists
-// because of the per-tenant audit hash chain (ADR-012): each attempt reads
-// the tenant's latest audit row_hash and then inserts the next one, and two
-// concurrent same-tenant attempts reading the same chain tail is a genuine
-// read-write antidependency that SERIALIZABLE must abort. Under high
-// same-tenant concurrency that repeated abort can exhaust the retry budget
-// and surface as a 503.
+// Until ADR-017, RunInTx also acquired tenantID's lock from an in-process
+// keyed mutex before opening any transaction, and held it for every attempt:
+// each post read the tenant's latest audit row_hash and then inserted the
+// next one (ADR-012), and two concurrent same-tenant attempts racing on that
+// read were a genuine read-write antidependency that SERIALIZABLE would
+// abort, which under high same-tenant concurrency could repeatedly exhaust
+// the retry budget and surface as a 503. Worse, that mutex lived in one
+// process's memory: with more than one instance, two instances could still
+// post the same tenant concurrently, both read the same chain head, and fork
+// the chain, since SERIALIZABLE is not guaranteed to see every such conflict
+// across processes (ADR-017's Context).
 //
-// The lock is a channel-backed in-process mutex, not a database lock, and
-// that is the point (see ADR-012). A waiter blocks on Go's scheduler; it has
-// not acquired a database connection and never will until it is its turn to
-// run an attempt, so a burst of same-tenant callers cannot exhaust the
-// connection pool or starve other tenants of connections the way a lock held
-// on a checked-out connection can. It also means Postgres's lock_timeout,
-// which bounds how long a session will wait on a database-level lock, never
-// applies here: there is no database lock wait to time out. Unlike a plain
-// sync.Mutex, the wait itself respects ctx: if the caller's context is
-// cancelled or times out while parked waiting for the tenant lock, lock
-// returns ctx.Err() immediately instead of leaving the goroutine parked until
-// the current holder finishes, so a pile of abandoned client requests cannot
-// accumulate blocked goroutines under sustained same-tenant overload.
-//
-// This only serializes same-tenant posting within one process. go-ledger runs
-// as a single instance (a VPS, not a fleet), so that is a complete fix today.
-// If the service ever runs as more than one instance, two different
-// instances could still race on the same tenant; the SERIALIZABLE retry loop
-// above remains in place as the backstop for that case; it would simply see
-// same-tenant conflicts occasionally instead of never.
+// ADR-017 removes the audit chain read from the posting transaction
+// entirely: a post now writes an append-only outbox row (see
+// domain.Tx.AppendAuditOutbox), and a single background chainer
+// (internal/audit.Chainer) builds the chain asynchronously, so no posting
+// transaction ever reads or extends a chain head. That removes the reason
+// for the mutex, so RunInTx no longer takes one: same-tenant calls, from any
+// number of instances, now run fully concurrently, serialized only by
+// whatever SERIALIZABLE itself detects (the balance invariant and the
+// idempotency primary key, both still enforced in-transaction) and retried
+// exactly as any other serialization conflict is.
 func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error {
-	unlock, err := r.tenantLocks.lock(ctx, tenantID)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
 	var lastErr error
 	for attempt := 0; attempt < maxPostAttempts; attempt++ {
 		if attempt > 0 {
@@ -481,25 +425,19 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 	return nil
 }
 
-// AppendAudit writes one audit row inside the surrounding transaction,
-// extending that tenant's tamper-evident hash chain (ADR-012). The id is a
-// fresh UUIDv7 so rows sort by creation time.
+// AppendAuditOutbox writes one append-only audit_outbox row inside the
+// surrounding transaction (ADR-017): the event is durable if and only if the
+// caller's transaction commits. Unlike the old AppendAudit, it never reads
+// the tenant's chain head and never computes a hash: it is a plain insert
+// with no read dependency on any other row, tenant or otherwise, so it
+// cannot conflict with a concurrent same-tenant (or same-anything) insert
+// under SERIALIZABLE. occurred_at, txid, and created_at are all left to
+// their column defaults (migration 0015); the database server's clock and
+// current transaction id stamp them, not this process's.
 //
-// The chain extension happens entirely within this call, inside the caller's
-// transaction: it reads the tenant's current latest row_hash (GetLastAuditHash;
-// no rows yet means this is the tenant's first row, so prev is
-// domain.AuditGenesisHash), stamps CreatedAt with the application clock (not a
-// database default, so the exact value hashed is the exact value stored),
-// computes RowHash over that content plus prev, and inserts all of it
-// together. Because the read and the write are in the same SERIALIZABLE
-// transaction, two concurrent posts for the same tenant would conflict on
-// this read (one sees the other's insert as a predicate change) were they
-// allowed to race at all. RunInTx prevents the race up front instead: it
-// holds tenantID's in-process mutex for the whole call, so only one posting
-// transaction per tenant is ever open at a time, and this read always sees
-// the tenant's true latest row. See RunInTx's doc comment and ADR-012 for why
-// an in-process mutex, not a database lock, is what makes that true.
-func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.AuditEntry) error {
+// The single background chainer (internal/audit.Chainer) is what later reads
+// this row back and extends the tenant's tamper-evident hash chain.
+func (tr txRepo) AppendAuditOutbox(ctx context.Context, tenantID string, e domain.AuditEvent) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -508,57 +446,15 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	if err != nil {
 		return fmt.Errorf("postgres: parse audit transaction id: %w", err)
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return fmt.Errorf("postgres: generate audit id: %w", err)
-	}
-
-	prevHash := domain.AuditGenesisHash
-	last, err := tr.q.GetLastAuditHash(ctx, tid)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// No prior row for this tenant: genesis.
-	case err != nil:
-		return fmt.Errorf("postgres: get last audit hash: %w", err)
-	default:
-		// A pre-migration legacy row has a NULL row_hash, which surfaces here
-		// as an invalid pgtype.Text. Those rows predate the hash chain and are
-		// cleared by the seeder's reset within four hours, so treating them as
-		// an unchained starting point (genesis) is the only meaningful choice.
-		// Made explicit rather than relying on the zero-value .String of an
-		// invalid pgtype.Text happening to equal genesis ("").
-		if last.Valid {
-			prevHash = last.String
-		} else {
-			prevHash = domain.AuditGenesisHash
-		}
-	}
-
-	e.ID = id.String()
-	// Truncated to microseconds: Postgres timestamptz only stores microsecond
-	// precision, so a nanosecond-precision time.Now() would silently lose its
-	// last three digits on the round trip through the column. Truncating here,
-	// before it is both hashed and stored, guarantees the value fed to
-	// ComputeAuditRowHash is bit-for-bit the same value a later read (and thus
-	// a later recompute, for the verify walk) will see; skipping this step
-	// would make every stored row_hash permanently unrecomputable.
-	e.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
-	e.PrevHash = prevHash
-	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prevHash)
-
-	if err := tr.q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
-		ID:            id,
+	if err := tr.q.InsertAuditOutbox(ctx, sqlc.InsertAuditOutboxParams{
 		TenantID:      tid,
 		Action:        e.Action,
 		TransactionID: txID,
 		Actor:         e.Actor,
 		Before:        e.Before,
 		After:         e.After,
-		CreatedAt:     e.CreatedAt,
-		PrevHash:      pgtype.Text{String: e.PrevHash, Valid: true},
-		RowHash:       pgtype.Text{String: e.RowHash, Valid: true},
 	}); err != nil {
-		return fmt.Errorf("postgres: insert audit log: %w", err)
+		return fmt.Errorf("postgres: insert audit outbox: %w", err)
 	}
 	return nil
 }
@@ -683,6 +579,15 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 
 // ListAuditByAccount returns one keyset page of audit rows for every
 // transaction with a posting touching the account, newest first.
+//
+// Paging keys on id alone, not (created_at, id) (ADR-017): id is the
+// chainer's true chain-insertion order, and created_at (copied from the
+// originating event's post time) is not guaranteed monotonic with that order
+// under concurrent posts (see GetLastAuditHash's doc comment in
+// internal/postgres/queries/audit.sql). after.CreatedAt is accepted (the
+// domain.StatementCursor type is shared with Statement's own, unrelated
+// posting pagination) but not used here beyond round-tripping through the
+// cursor: only after.ID drives the query.
 func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -693,22 +598,20 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 		return nil, fmt.Errorf("postgres: parse account id: %w", err)
 	}
 
-	// First page: a sentinel that is strictly greater than any real (created_at,
-	// id). Subsequent pages: the cursor handed back from the previous page.
-	afterTime, afterID := statementFirstPageTime, uuid.Max
+	// First page: a sentinel strictly greater than any real id. Subsequent
+	// pages: the cursor handed back from the previous page.
+	afterID := uuid.Max
 	if after != nil {
-		afterTime = after.CreatedAt
 		if afterID, err = uuid.Parse(after.ID); err != nil {
 			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
 		}
 	}
 
 	rows, err := r.q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{
-		TenantID:       tid,
-		AccountID:      aid,
-		AfterCreatedAt: afterTime,
-		AfterID:        afterID,
-		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+		TenantID:  tid,
+		AccountID: aid,
+		AfterID:   afterID,
+		PageLimit: int32(limit), //nolint:gosec // limit is bounded by the API layer
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
@@ -729,6 +632,21 @@ func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([
 		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
 	}
 	return auditEntriesFromRows(rows), nil
+}
+
+// CountPendingOutbox returns the number of tenantID's audit_outbox rows the
+// chainer has not yet processed (ADR-017): the audit chain's lag, surfaced by
+// audit verify alongside the chained head.
+func (r *Repository) CountPendingOutbox(ctx context.Context, tenantID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	n, err := r.q.CountPendingOutbox(ctx, tid)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: count pending outbox: %w", err)
+	}
+	return int(n), nil
 }
 
 // auditEntriesFromRows converts sqlc audit rows to domain entries. Before/After

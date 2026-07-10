@@ -64,7 +64,11 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 // records the idempotency key and, if the same key was already used, replays the
 // original transaction instead of writing a new one (returning replayed=true). A
 // key reused with a different request body returns domain.ErrIdempotencyConflict.
-// Every real post also writes one append-only audit row in the same transaction.
+// Every real post also writes one append-only audit_outbox row in the same
+// transaction (ADR-017): the tamper-evident audit chain itself is built
+// asynchronously by a single background chainer, not inside this call, so a
+// transaction just posted is durable immediately but its audit-chain link
+// appears a short time later (see internal/audit.Chainer).
 // Before any of that, t's postings are checked against tenantID's optional
 // TenantPolicy guardrails (Task 2.4b, audit A3.4: max transaction amount, daily
 // volume, currency allowlist); a tripped guardrail returns a
@@ -114,7 +118,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		if err != nil {
 			return err
 		}
-		return tx.AppendAudit(ctx, tenantID, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: t.ID,
 			Actor:         tenantID,

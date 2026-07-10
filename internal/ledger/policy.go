@@ -10,9 +10,12 @@ import (
 // enforceTenantPolicy checks postings against policy (Task 2.4b, audit
 // A3.4). It is called from inside RunInTx, in both Post and Convert, before
 // CreateTransaction: the daily-volume check needs a read that is consistent
-// with the write that follows it, and the per-tenant in-process
-// serialization RunInTx already provides (ADR-012) is what makes that read
-// race free.
+// with the write that follows it, and RunInTx's SERIALIZABLE transaction is
+// what makes that read race free (two concurrent same-tenant posts that
+// would both cross the cap are a genuine read-write antidependency
+// SERIALIZABLE detects and aborts one of; see RunInTx's own doc comment,
+// which since ADR-017 no longer also serializes same-tenant calls with an
+// in-process mutex).
 //
 // policy itself is NOT resolved in here: it must be resolved by the caller
 // BEFORE RunInTx is ever invoked (see tenantPolicy), using the top-level
