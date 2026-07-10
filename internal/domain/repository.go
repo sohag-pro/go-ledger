@@ -40,9 +40,20 @@ type Tx interface {
 	// InsertIdempotencyKey records key with the request fingerprint, the
 	// scheme that fingerprint was computed under (see
 	// CurrentFingerprintScheme), and the transaction it produced, within the
-	// surrounding transaction. It returns ErrDuplicateIdempotencyKey if
-	// (tenantID, key) already exists.
-	InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string) error
+	// surrounding transaction. expires_at is stamped as the DATABASE SERVER's
+	// now() + ttl, never this process's clock (Task 4.5, audit A1.4,
+	// consistent with the fx effective_at server-side stamping), so ttl
+	// bounds how long the key blocks reuse before GetIdempotencyKey starts
+	// treating it as absent.
+	//
+	// It returns ErrDuplicateIdempotencyKey if (tenantID, key) already
+	// exists AND has not yet expired. If a row for (tenantID, key) exists
+	// but HAS expired, this call transparently replaces it (an upsert, not
+	// a plain insert) with the new fingerprint, scheme, transaction, and
+	// expiry: an expired key is absent from the caller's point of view, so
+	// the row it left behind must not cause a spurious duplicate on the
+	// very next post that reuses the same key.
+	InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string, ttl time.Duration) error
 
 	// AppendAuditOutbox writes one append-only audit_outbox row within the
 	// surrounding transaction (ADR-017): the event is durable if and only if
@@ -129,7 +140,11 @@ type Repository interface {
 
 	// GetIdempotencyKey returns the stored record for (tenantID, key),
 	// including the fingerprint scheme it was stored under (IdempotencyRecord.
-	// Scheme), or ErrIdempotencyKeyNotFound if none exists.
+	// Scheme), or ErrIdempotencyKeyNotFound if none exists. A row whose
+	// expires_at has passed is treated exactly like no row at all (Task 4.5,
+	// audit A1.4): it returns ErrIdempotencyKeyNotFound, whether or not the
+	// background sweep (SweepExpiredIdempotencyKeys) has physically deleted
+	// it yet, so an expired key behaves like a brand-new one to a caller.
 	GetIdempotencyKey(ctx context.Context, tenantID, key string) (IdempotencyRecord, error)
 
 	// ListAuditByTransaction returns the audit rows for a transaction, oldest
@@ -194,6 +209,18 @@ type Repository interface {
 	// whether the chain is current or behind. Zero means every event this
 	// tenant has posted is already reflected in audit_log.
 	CountPendingOutbox(ctx context.Context, tenantID string) (int, error)
+
+	// SweepExpiredIdempotencyKeys deletes every idempotency_keys row whose
+	// expires_at has passed, across every tenant, and returns how many rows
+	// it deleted (Task 4.5, audit A1.4). It is not scoped to one tenant and
+	// is never called from inside RunInTx: it is a plain maintenance
+	// statement a background goroutine calls on an interval (see
+	// cmd/server's idempotency sweeper), independent of any request's unit
+	// of work. GetIdempotencyKey already treats an expired row as absent, so
+	// this sweep is purely about reclaiming space, not correctness: a
+	// deployment that never ran it would behave identically from a caller's
+	// point of view, just with an ever-growing table.
+	SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error)
 
 	// GetAPIKeyByHash resolves an unrevoked api_keys row by the SHA-256 hex hash
 	// of a presented key, or ErrAPIKeyNotFound if no such unrevoked key exists.

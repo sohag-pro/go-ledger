@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -282,8 +283,9 @@ func TestCreateTransactionPostingAccountMissing(t *testing.T) {
 // TestInsertIdempotencyKeyEdges drives InsertIdempotencyKey's malformed-id and
 // generic-error branches: a bad tenant id, a bad transaction id, and a
 // well-formed but nonexistent transaction id (a foreign-key violation, the
-// fallback branch below the idempotency_keys_pkey mapping already covered by
-// TestIdempotencyKeyInsertAndDuplicate in idempotency_audit_test.go).
+// fallback branch below the pgx.ErrNoRows-on-a-still-live-conflict mapping
+// (Task 4.5, audit A1.4) already covered by TestIdempotencyKeyInsertAndDuplicate
+// in idempotency_audit_test.go).
 func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -293,7 +295,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", "v1", uuid.NewString())
+			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", "v1", uuid.NewString(), time.Hour)
 		})
 		if err == nil {
 			t.Fatal("expected error, got nil")
@@ -303,7 +305,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", "not-a-uuid")
+			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", "not-a-uuid", time.Hour)
 		})
 		if err == nil {
 			t.Fatal("expected error, got nil")
@@ -313,7 +315,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", uuid.NewString())
+			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", uuid.NewString(), time.Hour)
 		})
 		if err == nil {
 			t.Fatal("expected a foreign-key error, got nil")

@@ -80,26 +80,28 @@ const (
 const loadTestTenantBase = 200
 
 type config struct {
-	port            string
-	metricsAddr     string
-	grpcAddr        string
-	databaseURL     string
-	defaultTenant   string
-	env             string
-	serviceName     string
-	demoMode        bool
-	seedEnabled     bool
-	seedInterval    time.Duration
-	demoAPIKey      string
-	loadTestKey     string
-	loadTestTenants int
-	rateLimitRPM    int
-	authCacheTTL    time.Duration
-	defaultCurrency string
-	fxRates         string
-	chainerEnabled  bool
-	chainerInterval time.Duration
-	chainerBatch    int
+	port                     string
+	metricsAddr              string
+	grpcAddr                 string
+	databaseURL              string
+	defaultTenant            string
+	env                      string
+	serviceName              string
+	demoMode                 bool
+	seedEnabled              bool
+	seedInterval             time.Duration
+	demoAPIKey               string
+	loadTestKey              string
+	loadTestTenants          int
+	rateLimitRPM             int
+	authCacheTTL             time.Duration
+	defaultCurrency          string
+	fxRates                  string
+	chainerEnabled           bool
+	chainerInterval          time.Duration
+	chainerBatch             int
+	idempotencyTTL           time.Duration
+	idempotencySweepInterval time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -131,9 +133,29 @@ func loadConfig() (config, error) {
 		chainerEnabled:  getenvBool("CHAINER_ENABLED", true),
 		chainerInterval: getenvDuration("CHAINER_INTERVAL", audit.DefaultInterval),
 		chainerBatch:    getenvInt("CHAINER_BATCH", audit.DefaultBatch),
+		// IDEMPOTENCY_TTL bounds how long a stored idempotency key blocks
+		// reuse before it is treated as absent (Task 4.5, audit A1.4): the
+		// default matches ledger.DefaultIdempotencyTTL and migration 0019's
+		// own backfill window, and a deployment can widen it (say, to 7d)
+		// for a slower-retrying client population, or narrow it, without a
+		// code change.
+		idempotencyTTL: getenvDuration("IDEMPOTENCY_TTL", ledger.DefaultIdempotencyTTL),
+		// IDEMPOTENCY_SWEEP_INTERVAL is how often the background sweep
+		// deletes expired idempotency_keys rows; it is purely a maintenance
+		// cadence (GetIdempotencyKey already treats an expired row as
+		// absent regardless of whether it has been physically deleted yet),
+		// so a slower or faster cadence is never a correctness concern.
+		idempotencySweepInterval: getenvDuration("IDEMPOTENCY_SWEEP_INTERVAL", time.Hour),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
+	}
+	// A zero or negative ttl would stamp every idempotency key pre-expired,
+	// silently disabling replay protection for every retry: fail fast at
+	// boot instead of leaking that into a per-request behavior nobody asked
+	// for.
+	if cfg.idempotencyTTL <= 0 {
+		return config{}, fmt.Errorf("IDEMPOTENCY_TTL must be positive, got %s", cfg.idempotencyTTL)
 	}
 	// Fail fast on a malformed DEFAULT_CURRENCY (for example "usd", "US", or
 	// "DOLLARS") rather than booting successfully and only surfacing the
@@ -282,7 +304,8 @@ func run(logger *slog.Logger) error {
 	deps := api.Deps{
 		Accounts: ledger.NewAccountService(repo, ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency))),
 		Transactions: ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
-			ledger.WithFXProvider(fx.NewDBProvider(pool))),
+			ledger.WithFXProvider(fx.NewDBProvider(pool)),
+			ledger.WithIdempotencyTTL(cfg.idempotencyTTL)),
 		Audit:       ledger.NewAuditService(repo),
 		Admin:       admin.NewService(repo),
 		Auth:        resolver,
@@ -313,6 +336,18 @@ func run(logger *slog.Logger) error {
 		chainer := audit.NewChainer(pool, logger, cfg.chainerInterval, cfg.chainerBatch)
 		go chainer.Run(chainerCtx)
 	}
+
+	// The idempotency key sweep (Task 4.5, audit A1.4): every deployment runs
+	// one unconditionally (unlike the seeder and chainer, there is no
+	// enable/disable flag, since deleting rows already past their expiry is
+	// never wrong and never a deployment-shaped choice the way the demo
+	// seeder or a multi-instance chainer topology is). It only reclaims
+	// space; GetIdempotencyKey already treats an expired row as absent
+	// regardless of whether this has run yet, so its cadence is a pure
+	// maintenance concern, not a correctness one.
+	sweepCtx, cancelSweep := context.WithCancel(context.Background())
+	defer cancelSweep()
+	go runIdempotencySweep(sweepCtx, logger, repo, cfg.idempotencySweepInterval)
 
 	router := chi.NewRouter()
 	// No RealIP middleware: it trusts client-set forwarding headers and is
@@ -551,6 +586,47 @@ func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, ten
 			return
 		case <-ticker.C:
 			doSeed()
+		}
+	}
+}
+
+// idempotencySweeper is the slice of the repository the background sweep
+// needs: a plain, best-effort maintenance delete, not a business transaction
+// (see domain.Repository.SweepExpiredIdempotencyKeys). A fake in
+// main_test.go exercises runIdempotencySweep without a real database.
+type idempotencySweeper interface {
+	SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error)
+}
+
+// runIdempotencySweep deletes expired idempotency_keys rows once immediately,
+// then every interval, until ctx is cancelled (Task 4.5, audit A1.4). It
+// mirrors runSeeder's shape: a failed sweep is logged and the loop continues
+// rather than exiting, since this is pure housekeeping (GetIdempotencyKey
+// already treats an expired row as absent whether or not it has been
+// physically deleted), never something a request is waiting on.
+func runIdempotencySweep(ctx context.Context, logger *slog.Logger, sweeper idempotencySweeper, interval time.Duration) {
+	doSweep := func() {
+		n, err := sweeper.SweepExpiredIdempotencyKeys(ctx)
+		if err != nil {
+			logger.Error("idempotency key sweep failed", "error", err)
+			return
+		}
+		if n > 0 {
+			logger.Info("idempotency keys swept", "deleted", n)
+		} else {
+			logger.Debug("idempotency key sweep found nothing to delete")
+		}
+	}
+
+	doSweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			doSweep()
 		}
 	}
 }

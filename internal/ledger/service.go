@@ -22,13 +22,20 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 )
 
+// DefaultIdempotencyTTL is how long an idempotency key blocks reuse when the
+// service is constructed without WithIdempotencyTTL (Task 4.5, audit A1.4):
+// generous enough that existing tests' within-test retries still replay, and
+// the same default cmd/server falls back to for IDEMPOTENCY_TTL.
+const DefaultIdempotencyTTL = 24 * time.Hour
+
 // TransactionService posts transactions to the ledger. It is the single entry
 // point both the REST and gRPC layers will call to move money.
 type TransactionService struct {
-	repo       domain.Repository
-	log        *slog.Logger
-	tracer     oteltrace.Tracer
-	fxProvider fx.Provider
+	repo           domain.Repository
+	log            *slog.Logger
+	tracer         oteltrace.Tracer
+	fxProvider     fx.Provider
+	idempotencyTTL time.Duration
 }
 
 // ServiceOption configures optional TransactionService dependencies that most
@@ -44,6 +51,19 @@ func WithFXProvider(p fx.Provider) ServiceOption {
 	return func(s *TransactionService) { s.fxProvider = p }
 }
 
+// WithIdempotencyTTL sets how long a stored idempotency key blocks reuse
+// before GetIdempotencyKey starts treating it as absent (Task 4.5, audit
+// A1.4). A TransactionService constructed without this option uses
+// DefaultIdempotencyTTL. ttl <= 0 is ignored (falls back to the default)
+// rather than stamping every key pre-expired.
+func WithIdempotencyTTL(ttl time.Duration) ServiceOption {
+	return func(s *TransactionService) {
+		if ttl > 0 {
+			s.idempotencyTTL = ttl
+		}
+	}
+}
+
 // NewTransactionService returns a TransactionService backed by repo. If log is
 // nil the default slog logger is used; if tracer is nil the global tracer is used.
 func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer oteltrace.Tracer, opts ...ServiceOption) *TransactionService {
@@ -53,7 +73,7 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 	if tracer == nil {
 		tracer = otel.Tracer("github.com/sohag-pro/go-ledger/internal/ledger")
 	}
-	s := &TransactionService{repo: repo, log: log, tracer: tracer}
+	s := &TransactionService{repo: repo, log: log, tracer: tracer, idempotencyTTL: DefaultIdempotencyTTL}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -162,7 +182,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 			return err
 		}
 		if idem != nil {
-			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID); err != nil {
+			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID, s.idempotencyTTL); err != nil {
 				return err
 			}
 		}

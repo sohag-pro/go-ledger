@@ -39,7 +39,7 @@ type fakeRepo struct {
 	txns     map[string]domain.Transaction
 	postings []postingRec
 	clock    int64
-	idem     map[string]domain.IdempotencyRecord // key -> record
+	idem     map[string]fakeIdemEntry // key -> record + expiry (Task 4.5, audit A1.4)
 	audit    []domain.AuditEntry
 	apiKeys  map[string]domain.APIKey // key_hash -> resolved key
 	tenants  map[string]domain.Tenant // tenant id -> tenant row
@@ -51,11 +51,21 @@ type postingRec struct {
 	createdAt                         time.Time
 }
 
+// fakeIdemEntry is a stored idempotency record plus the wall-clock instant it
+// expires at (Task 4.5, audit A1.4): fakeRepo uses real time.Now() rather than
+// its own fake clock (f.clock) since ttl is a real time.Duration, not a step
+// count, and no handler test exercises expiry timing precisely enough to need
+// a controllable clock here.
+type fakeIdemEntry struct {
+	record    domain.IdempotencyRecord
+	expiresAt time.Time
+}
+
 func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
 		accounts: map[string]domain.Account{},
 		txns:     map[string]domain.Transaction{},
-		idem:     map[string]domain.IdempotencyRecord{},
+		idem:     map[string]fakeIdemEntry{},
 		apiKeys:  map[string]domain.APIKey{},
 		tenants:  map[string]domain.Tenant{},
 	}
@@ -167,12 +177,34 @@ func (f *fakeRepo) GetOrCreateClearingAccount(_ context.Context, _ string, curre
 	return a, nil
 }
 
-func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, scheme, transactionID string) error {
-	if _, ok := f.idem[key]; ok {
+// InsertIdempotencyKey mirrors the real adapter's upsert-on-expired behavior
+// (Task 4.5, audit A1.4): a still-live existing entry is a genuine duplicate,
+// but an expired one is silently replaced rather than treated as a conflict.
+func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, scheme, transactionID string, ttl time.Duration) error {
+	if existing, ok := f.idem[key]; ok && time.Now().Before(existing.expiresAt) {
 		return domain.ErrDuplicateIdempotencyKey
 	}
-	f.idem[key] = domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, Scheme: scheme, TransactionID: transactionID}
+	f.idem[key] = fakeIdemEntry{
+		record:    domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, Scheme: scheme, TransactionID: transactionID},
+		expiresAt: time.Now().Add(ttl),
+	}
 	return nil
+}
+
+// SweepExpiredIdempotencyKeys deletes every expired entry and reports how
+// many it removed, mirroring the real adapter's maintenance sweep (Task 4.5,
+// audit A1.4). No handler test currently exercises it directly; it exists so
+// fakeRepo keeps satisfying domain.Repository in full.
+func (f *fakeRepo) SweepExpiredIdempotencyKeys(_ context.Context) (int64, error) {
+	now := time.Now()
+	var n int64
+	for k, v := range f.idem {
+		if now.After(v.expiresAt) {
+			delete(f.idem, k)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // AppendAuditOutbox mirrors the real chainer's job synchronously, right here
@@ -219,12 +251,14 @@ func (f *fakeRepo) ListAuditForVerify(_ context.Context, _ string) ([]domain.Aud
 	return out, nil
 }
 
+// GetIdempotencyKey treats an expired entry as absent (Task 4.5, audit
+// A1.4), mirroring the real adapter's "expires_at > now()" filter.
 func (f *fakeRepo) GetIdempotencyKey(_ context.Context, _, key string) (domain.IdempotencyRecord, error) {
-	rec, ok := f.idem[key]
-	if !ok {
+	entry, ok := f.idem[key]
+	if !ok || !time.Now().Before(entry.expiresAt) {
 		return domain.IdempotencyRecord{}, domain.ErrIdempotencyKeyNotFound
 	}
-	return rec, nil
+	return entry.record, nil
 }
 
 func (f *fakeRepo) ListAuditByTransaction(_ context.Context, _, transactionID string) ([]domain.AuditEntry, error) {

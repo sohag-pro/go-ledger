@@ -217,7 +217,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 			return err
 		}
 		if idem != nil {
-			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID); err != nil {
+			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID, s.idempotencyTTL); err != nil {
 				return err
 			}
 		}

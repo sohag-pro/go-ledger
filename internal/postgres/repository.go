@@ -444,14 +444,20 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 	return nil
 }
 
-// InsertIdempotencyKey records the key inside the surrounding transaction. A
-// primary-key collision means the key already exists: it is mapped to
-// ErrDuplicateIdempotencyKey so the service can replay the original response.
-// scheme is stored alongside fingerprint (see domain.CurrentFingerprintScheme)
-// so a future fingerprint-scheme change can recompute this row's fingerprint
-// under the scheme that produced it instead of the scheme current at replay
-// time.
-func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string) error {
+// InsertIdempotencyKey records the key inside the surrounding transaction,
+// with expires_at stamped as the DATABASE SERVER's now() + ttl (see
+// idempotency.sql's InsertIdempotencyKey query), never this process's clock
+// (Task 4.5, audit A1.4). The underlying query is an upsert: a conflict
+// against an EXPIRED existing row for (tenantID, key) is replaced in place
+// (RETURNING yields the row), while a conflict against a still-LIVE row
+// leaves it untouched and RETURNING yields nothing, which pgx surfaces as
+// pgx.ErrNoRows here; that case is mapped to ErrDuplicateIdempotencyKey so
+// the service replays the original response exactly as it would for a plain
+// unique-violation. scheme is stored alongside fingerprint (see
+// domain.CurrentFingerprintScheme) so a future fingerprint-scheme change can
+// recompute this row's fingerprint under the scheme that produced it instead
+// of the scheme current at replay time.
+func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string, ttl time.Duration) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -460,14 +466,15 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 	if err != nil {
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	if err := tr.q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
+	if _, err := tr.q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
 		TenantID:          tid,
 		IdempotencyKey:    key,
 		Fingerprint:       fingerprint,
 		FingerprintScheme: scheme,
 		TransactionID:     txID,
+		TtlSeconds:        ttl.Seconds(),
 	}); err != nil {
-		if pgConstraint(err) == "idempotency_keys_pkey" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrDuplicateIdempotencyKey
 		}
 		return fmt.Errorf("postgres: insert idempotency key: %w", err)
@@ -794,6 +801,19 @@ func (r *Repository) CountPendingOutbox(ctx context.Context, tenantID string) (i
 		return 0, fmt.Errorf("postgres: count pending outbox: %w", err)
 	}
 	return int(n), nil
+}
+
+// SweepExpiredIdempotencyKeys deletes every idempotency_keys row whose
+// expires_at has passed, across every tenant, and returns how many rows it
+// deleted (Task 4.5, audit A1.4). It runs directly against the pool, not
+// inside RunInTx: it is a plain maintenance statement, never part of a
+// request's unit of work.
+func (r *Repository) SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error) {
+	n, err := r.q.SweepExpiredIdempotencyKeys(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: sweep expired idempotency keys: %w", err)
+	}
+	return n, nil
 }
 
 // Balance returns the derived balance of an account in the account's currency.

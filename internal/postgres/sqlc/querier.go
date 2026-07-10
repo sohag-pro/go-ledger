@@ -69,6 +69,11 @@ type Querier interface {
 	// it up separately via GetTenant.
 	GetAPIKeyByID(ctx context.Context, id uuid.UUID) (GetAPIKeyByIDRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
+	// An expired row is treated as absent (Task 4.5, audit A1.4): the "AND
+	// expires_at > now()" filter is what makes a key whose replay window has
+	// passed behave exactly like a key that was never written, from the caller's
+	// point of view, whether or not the background sweep has physically deleted
+	// the row yet.
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (GetIdempotencyKeyRow, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
 	// Ordered by chain_seq, not id (ADR-017 IMPORTANT 2, migration 0016): id is a
@@ -157,7 +162,24 @@ type Querier interface {
 	// unscheduled case; an explicit future effective_at (a scheduled rate) is
 	// unaffected, since the caller still supplies it directly.
 	InsertFXRate(ctx context.Context, arg InsertFXRateParams) (FxRate, error)
-	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
+	// Inserts a fresh idempotency key with a server-computed expires_at (now() +
+	// ttl_seconds, never the calling process's clock: Task 4.5, audit A1.4,
+	// consistent with fx_rates.effective_at's own server-side stamping).
+	//
+	// ON CONFLICT upserts rather than plain-inserts because a row for
+	// (tenant_id, idempotency_key) can already be present and EXPIRED: the
+	// lookup path (GetIdempotencyKey) treats an expired row as absent, so the
+	// caller proceeds to post a brand-new transaction and lands here again with
+	// the same key. Without the upsert that would hit the primary key and be
+	// misread as a genuine duplicate (replaying a stale, no-longer-relevant
+	// transaction). The "WHERE idempotency_keys.expires_at <= now()" guard on
+	// the DO UPDATE means the replace only happens when the existing row has, in
+	// fact, expired; a conflict against a still-live row leaves it untouched and
+	// the update affects zero rows, so RETURNING yields no row and the caller
+	// (postgres.txRepo.InsertIdempotencyKey) maps pgx.ErrNoRows to
+	// domain.ErrDuplicateIdempotencyKey exactly as a plain unique-violation used
+	// to, preserving replay-on-duplicate for the still-live case.
+	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (uuid.UUID, error)
 	// Every key for a tenant, oldest first, including revoked ones: the admin
 	// surface's list view (Task 2.2b) is meant to show a tenant's full key
 	// history, not just its live keys. Never selects key_hash: plaintext is
@@ -203,6 +225,12 @@ type Querier interface {
 	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
 	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)
 	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
+	// Deletes every idempotency key whose replay window has passed, across all
+	// tenants (Task 4.5, audit A1.4): this is what keeps the table from growing
+	// forever. Not tenant-scoped and not run inside RunInTx: it is a plain
+	// maintenance statement a background goroutine calls on an interval (see
+	// cmd/server's idempotency sweeper), not part of any request's unit of work.
+	SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error)
 	// Task 2.4b (audit A3.4): each currency's already-posted debit total for
 	// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
 	// up with the same clock that stamped created_at on every posting). Read

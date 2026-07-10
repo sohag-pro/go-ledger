@@ -82,6 +82,7 @@ type IdempotencyKey struct {
 	TransactionID     uuid.UUID
 	CreatedAt         time.Time
 	FingerprintScheme string
+	ExpiresAt         time.Time
 }
 
 type Posting struct {

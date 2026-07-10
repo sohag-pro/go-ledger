@@ -186,9 +186,13 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 		t.Fatalf("find seeded transaction: %v", err)
 	}
 
+	// expires_at (Task 4.5, audit A1.4) is NOT NULL as of migration 0019, so
+	// this fabricated row must supply one, the same as the real application
+	// insert path does; a comfortably future value keeps it live for the
+	// rest of this test regardless of how long the reset takes.
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, transaction_id)
-		 VALUES ($1, 'test-key', 'test-fingerprint', $2)`, tenant, txnID); err != nil {
+		`INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, transaction_id, expires_at)
+		 VALUES ($1, 'test-key', 'test-fingerprint', $2, now() + interval '1 hour')`, tenant, txnID); err != nil {
 		t.Fatalf("insert idempotency key: %v", err)
 	}
 	if _, err := pool.Exec(ctx,

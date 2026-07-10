@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 // TestMaxBodyBytes exercises the router-level body-size middleware directly
@@ -123,6 +125,47 @@ func TestLoadConfig_ValidatesDefaultCurrency(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("loadConfig() with DEFAULT_CURRENCY=%q: got error %v, want nil", tt.defaultCurrency, err)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_IdempotencyTTL proves IDEMPOTENCY_TTL (Task 4.5, audit
+// A1.4) defaults to ledger.DefaultIdempotencyTTL (24h) when unset, accepts a
+// widened or narrowed override (a week, a minute), and fails loadConfig fast
+// on a zero or negative duration rather than silently stamping every
+// idempotency key pre-expired.
+func TestLoadConfig_IdempotencyTTL(t *testing.T) {
+	tests := []struct {
+		name           string
+		idempotencyTTL string
+		wantErr        bool
+		wantTTL        time.Duration
+	}{
+		{name: "unset falls back to the 24h default", idempotencyTTL: "", wantErr: false, wantTTL: ledger.DefaultIdempotencyTTL},
+		{name: "widened to a week", idempotencyTTL: "168h", wantErr: false, wantTTL: 168 * time.Hour},
+		{name: "narrowed to a minute", idempotencyTTL: "1m", wantErr: false, wantTTL: time.Minute},
+		{name: "zero rejected", idempotencyTTL: "0s", wantErr: true},
+		{name: "negative rejected", idempotencyTTL: "-1h", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("IDEMPOTENCY_TTL", tt.idempotencyTTL)
+
+			cfg, err := loadConfig()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("loadConfig() with IDEMPOTENCY_TTL=%q: got nil error, want an error", tt.idempotencyTTL)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() with IDEMPOTENCY_TTL=%q: got error %v, want nil", tt.idempotencyTTL, err)
+			}
+			if cfg.idempotencyTTL != tt.wantTTL {
+				t.Errorf("idempotencyTTL = %s, want %s", cfg.idempotencyTTL, tt.wantTTL)
 			}
 		})
 	}
@@ -397,5 +440,77 @@ func TestProvisionAPIKeysDemoModeGate(t *testing.T) {
 
 	if strings.Contains(strings.ToLower(logBuf.String()), "demo") {
 		t.Errorf("log mentions a demo key when demo mode is off: %q", logBuf.String())
+	}
+}
+
+// fakeSweeper is an in-memory idempotencySweeper: each call to
+// SweepExpiredIdempotencyKeys pops the next queued result (or reports an
+// error) and signals a buffered channel so a test can wait for a specific
+// number of calls without a real database or a sleep-based race.
+type fakeSweeper struct {
+	mu      sync.Mutex
+	results []int64 // -1 means "return an error instead"
+	calls   chan int64
+}
+
+func newFakeSweeper(results ...int64) *fakeSweeper {
+	return &fakeSweeper{results: results, calls: make(chan int64, len(results)+8)}
+}
+
+func (s *fakeSweeper) SweepExpiredIdempotencyKeys(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	if len(s.results) > 0 {
+		n = s.results[0]
+		s.results = s.results[1:]
+	}
+	if n == -1 {
+		s.calls <- -1
+		return 0, errors.New("fake sweep failure")
+	}
+	s.calls <- n
+	return n, nil
+}
+
+// TestRunIdempotencySweep proves the background sweep (Task 4.5, audit A1.4)
+// runs once immediately (not waiting a full interval first), keeps running
+// on the ticker until its context is cancelled, and survives a failed sweep
+// (logged, not fatal) rather than exiting the loop.
+func TestRunIdempotencySweep(t *testing.T) {
+	sweeper := newFakeSweeper(3, -1, 0, 5)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runIdempotencySweep(ctx, logger, sweeper, time.Millisecond)
+		close(done)
+	}()
+
+	// Wait for all four queued results to have been consumed: the immediate
+	// call plus three ticks.
+	for i := 0; i < 4; i++ {
+		select {
+		case <-sweeper.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for sweep call %d", i+1)
+		}
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runIdempotencySweep did not return after its context was cancelled")
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "idempotency key sweep failed") {
+		t.Errorf("log missing the failed-sweep error line: %q", logs)
+	}
+	if !strings.Contains(logs, "idempotency keys swept") {
+		t.Errorf("log missing a successful non-zero sweep line: %q", logs)
 	}
 }

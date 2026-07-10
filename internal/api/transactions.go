@@ -57,7 +57,7 @@ type CreateTransactionInput struct {
 	// The schema field is left optional (not required:"true") so a missing
 	// header fails our explicit 400 check below with a clear message,
 	// rather than huma's generic schema-validation 422.
-	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409."`
+	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new transaction instead of replaying or conflicting."`
 	Body           struct {
 		Currency string         `json:"currency" pattern:"^[A-Z]{3}$" doc:"ISO 4217 code shared by every posting"`
 		Postings []PostingInput `json:"postings" minItems:"2" maxItems:"100" doc:"Two or more legs that must sum to zero"`
@@ -165,7 +165,7 @@ type ConvertInput struct {
 	// See CreateTransactionInput's IdempotencyKey field for why this is not
 	// required:"true": a missing header should fail our explicit 400 check
 	// below with a clear message, not huma's generic 422.
-	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409."`
+	IdempotencyKey string `header:"Idempotency-Key" maxLength:"255" doc:"Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new conversion instead of replaying or conflicting."`
 	Body           struct {
 		FromAccount  string `json:"from_account" format:"uuid" doc:"Account to debit, in its own currency"`
 		ToAccount    string `json:"to_account" format:"uuid" doc:"Account to credit; its currency is the conversion's destination currency"`
@@ -195,7 +195,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/transactions",
 		Summary:       "Post a transaction",
-		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time.",
+		Description:   "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. A key's replay window is bounded (server-configured IDEMPOTENCY_TTL, default 24h): after that window a reused key is treated as never having been used, so the same header value posts a new transaction instead of replaying or conflicting; retry within the window if you need the original guarantee. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time.",
 		Tags:          []string{"transactions"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
@@ -254,7 +254,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/transactions/convert",
 		Summary:       "Convert between currencies",
-		Description:   "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict.",
+		Description:   "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict. The same bounded replay window applies (server-configured IDEMPOTENCY_TTL, default 24h): past it, a reused key is treated as never having been used and converts again instead of replaying or conflicting.",
 		Tags:          []string{"transactions"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,

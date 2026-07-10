@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -123,5 +124,83 @@ func TestPostIdempotentConflict(t *testing.T) {
 	}}
 	if _, err := svc.Post(ctx, tenant, other, idem); !errors.Is(err, domain.ErrIdempotencyConflict) {
 		t.Fatalf("mismatched body: got %v, want ErrIdempotencyConflict", err)
+	}
+}
+
+// TestPostIdempotencyKeyExpires proves the TTL end to end through the service
+// (Task 4.5, audit A1.4): a service constructed with a tiny
+// WithIdempotencyTTL replays a retry submitted before expiry, but once the
+// key has expired, a request reusing the same key and a DIFFERENT body is no
+// longer a conflict: the expired key is treated as absent, so it proceeds as
+// a brand-new post instead of returning ErrIdempotencyConflict.
+func TestPostIdempotencyKeyExpires(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	const tinyTTL = 50 * time.Millisecond
+	svc := ledger.NewTransactionService(repo, nil, nil, ledger.WithIdempotencyTTL(tinyTTL))
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "idempotency ttl test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
+	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
+	if err := repo.CreateAccount(ctx, tenant, debit); err != nil {
+		t.Fatalf("create debit: %v", err)
+	}
+	if err := repo.CreateAccount(ctx, tenant, credit); err != nil {
+		t.Fatalf("create credit: %v", err)
+	}
+
+	idem := &domain.Idempotency{Key: "ttl-key"}
+	first := mkTxn(t, debit.ID, credit.ID)
+	if _, err := svc.Post(ctx, tenant, first, idem); err != nil {
+		t.Fatalf("first post: %v", err)
+	}
+
+	// Immediately retrying with the SAME body, before the ttl elapses,
+	// still replays.
+	retryBeforeExpiry := mkTxn(t, debit.ID, credit.ID)
+	replayed, err := svc.Post(ctx, tenant, retryBeforeExpiry, idem)
+	if err != nil {
+		t.Fatalf("retry before expiry: %v", err)
+	}
+	if !replayed || retryBeforeExpiry.ID != first.ID {
+		t.Fatalf("retry before expiry: replayed=%v id=%s, want replayed=true id=%s", replayed, retryBeforeExpiry.ID, first.ID)
+	}
+
+	time.Sleep(4 * tinyTTL)
+
+	// Past the ttl, the SAME key with a DIFFERENT body (a different amount)
+	// is no longer a conflict: the expired key reads back as absent, so this
+	// posts as a brand-new transaction instead of returning
+	// ErrIdempotencyConflict.
+	d, _ := domain.NewMoney(999, "USD")
+	c, _ := domain.NewMoney(-999, "USD")
+	afterExpiry := &domain.Transaction{Postings: []domain.Posting{
+		{AccountID: debit.ID, Amount: d},
+		{AccountID: credit.ID, Amount: c},
+	}}
+	replayed, err = svc.Post(ctx, tenant, afterExpiry, idem)
+	if err != nil {
+		t.Fatalf("post after expiry: got %v, want nil (expired key must not conflict)", err)
+	}
+	if replayed {
+		t.Error("post after expiry: replayed = true, want false (a new transaction, not a replay)")
+	}
+	if afterExpiry.ID == first.ID {
+		t.Error("post after expiry produced the SAME transaction id as the original: expected a new transaction")
+	}
+
+	// The original transaction is untouched: expiry replaces the KEY's
+	// binding, never rewrites history.
+	original, err := repo.GetTransaction(ctx, tenant, first.ID)
+	if err != nil {
+		t.Fatalf("get original transaction: %v", err)
+	}
+	if len(original.Postings) != 2 || original.Postings[0].Amount.Amount() != 250 {
+		t.Errorf("original transaction changed: %+v", original)
 	}
 }

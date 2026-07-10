@@ -315,7 +315,7 @@ func TestPost_LegacyV1SchemeKeyStillReplays(t *testing.T) {
 	legacyKey := "legacy-v1-key"
 	legacyFingerprint := original.Fingerprint() // the "v1" scheme's own method, deliberately not fingerprintV2
 	if err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
-		return tx.InsertIdempotencyKey(ctx, tenant, legacyKey, legacyFingerprint, "v1", original.ID)
+		return tx.InsertIdempotencyKey(ctx, tenant, legacyKey, legacyFingerprint, "v1", original.ID, time.Hour)
 	}); err != nil {
 		t.Fatalf("insert legacy v1 idempotency key: %v", err)
 	}

@@ -1140,14 +1140,14 @@ paths:
         - audit
   /v1/transactions:
     post:
-      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time."
+      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. A key's replay window is bounded (server-configured IDEMPOTENCY_TTL, default 24h): after that window a reused key is treated as never having been used, so the same header value posts a new transaction instead of replaying or conflicting; retry within the window if you need the original guarantee. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time."
       operationId: create-transaction
       parameters:
-        - description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+        - description: "Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new transaction instead of replaying or conflicting."
           in: header
           name: Idempotency-Key
           schema:
-            description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+            description: "Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new transaction instead of replaying or conflicting."
             maxLength: 255
             type: string
       requestBody:
@@ -1180,14 +1180,14 @@ paths:
         - transactions
   /v1/transactions/convert:
     post:
-      description: "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict."
+      description: "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict. The same bounded replay window applies (server-configured IDEMPOTENCY_TTL, default 24h): past it, a reused key is treated as never having been used and converts again instead of replaying or conflicting."
       operationId: convert-transaction
       parameters:
-        - description: Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409.
+        - description: "Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new conversion instead of replaying or conflicting."
           in: header
           name: Idempotency-Key
           schema:
-            description: Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409.
+            description: "Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new conversion instead of replaying or conflicting."
             maxLength: 255
             type: string
       requestBody:
