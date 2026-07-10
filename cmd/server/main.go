@@ -38,6 +38,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 	"github.com/sohag-pro/go-ledger/internal/seed"
 	"github.com/sohag-pro/go-ledger/internal/web"
+	"github.com/sohag-pro/go-ledger/internal/webhook"
 )
 
 const ledgerTracerName = "github.com/sohag-pro/go-ledger/internal/ledger"
@@ -102,6 +103,9 @@ type config struct {
 	chainerBatch             int
 	idempotencyTTL           time.Duration
 	idempotencySweepInterval time.Duration
+	webhooksEnabled          bool
+	webhookMaxAttempts       int
+	webhookDeliveryInterval  time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -146,6 +150,16 @@ func loadConfig() (config, error) {
 		// absent regardless of whether it has been physically deleted yet),
 		// so a slower or faster cadence is never a correctness concern.
 		idempotencySweepInterval: getenvDuration("IDEMPOTENCY_SWEEP_INTERVAL", time.Hour),
+		// The webhook worker (Task 4.1, audit A7.1): on by default, like the
+		// chainer, since every deployment needs it to fan tenant-subscribed
+		// events out and delivered. WEBHOOKS_ENABLED exists for the same
+		// reasons CHAINER_ENABLED does (tests, and a deliberately
+		// worker-less instance in a multi-instance rollout): leader election
+		// picks exactly one active worker regardless, so disabling it here
+		// is never required for correctness.
+		webhooksEnabled:         getenvBool("WEBHOOKS_ENABLED", true),
+		webhookMaxAttempts:      getenvInt("WEBHOOK_MAX_ATTEMPTS", webhook.DefaultMaxAttempts),
+		webhookDeliveryInterval: getenvDuration("WEBHOOK_DELIVERY_INTERVAL", webhook.DefaultInterval),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -335,6 +349,23 @@ func run(logger *slog.Logger) error {
 		defer cancelChainer()
 		chainer := audit.NewChainer(pool, logger, cfg.chainerInterval, cfg.chainerBatch)
 		go chainer.Run(chainerCtx)
+	}
+
+	// The webhook worker (Task 4.1, audit A7.1): fans posted transactions out
+	// to tenant-subscribed callback URLs, signed and retried, driven off the
+	// same audit_log stream the chainer produces. Every instance runs one;
+	// leader election (a DIFFERENT Postgres advisory lock key than the
+	// chainer's) guarantees exactly one is ever active, the same reasoning
+	// that makes starting the chainer unconditionally on every instance
+	// safe above.
+	if cfg.webhooksEnabled {
+		webhookCtx, cancelWebhook := context.WithCancel(context.Background())
+		defer cancelWebhook()
+		webhookWorker := webhook.NewWorker(pool, logger, webhook.Config{
+			Interval:    cfg.webhookDeliveryInterval,
+			MaxAttempts: cfg.webhookMaxAttempts,
+		})
+		go webhookWorker.Run(webhookCtx)
 	}
 
 	// The idempotency key sweep (Task 4.5, audit A1.4): every deployment runs
