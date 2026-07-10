@@ -99,6 +99,24 @@ func Convert(source Money, quote Currency, midE8 int64, spreadBps int32) (Money,
 	// converted = round_half_even( source * factor / (RateScale * bpsScale) )
 	num := new(big.Int).Mul(big.NewInt(source.amount), factor)
 	den := new(big.Int).Mul(bigRateScale, bigBpsScale) // 1e8 * 1e4 = 1e12
+
+	// mid_rate_e8 is a major-unit ratio (quote major per base major), but
+	// source and converted are minor units, so a differing minor-unit
+	// exponent between the two currencies must be folded in as a power of
+	// ten: converted_minor = source_minor * mid * spread_factor *
+	// 10^(exp(quote)-exp(base)). This stays inside the same big.Int rounding
+	// step (multiplying num or den, never rounding first) so there is still
+	// exactly one rounding step overall.
+	if diff := quote.MinorUnits() - source.currency.MinorUnits(); diff != 0 {
+		if diff > 0 {
+			pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(diff)), nil)
+			num.Mul(num, pow)
+		} else {
+			pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-diff)), nil)
+			den.Mul(den, pow)
+		}
+	}
+
 	converted, ok := bankersDiv(num, den)
 	if !ok {
 		return Money{}, 0, ErrOverflow // result does not fit int64 minor units

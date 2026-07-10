@@ -25,6 +25,43 @@ func (c Currency) Validate() error {
 	return nil
 }
 
+// minorUnitsOverrides holds the currency codes whose minor-unit exponent is
+// not the ISO 4217 default of 2 decimal places. Zero-decimal currencies (whole
+// major units only) and three-decimal currencies are the two common
+// exceptions; every code absent from this map defaults to 2 in MinorUnits.
+var minorUnitsOverrides = map[Currency]int{
+	// 0 decimals
+	"JPY": 0,
+	"KRW": 0,
+	"VND": 0,
+	"CLP": 0,
+	"ISK": 0,
+	"XOF": 0,
+	"XAF": 0,
+	"PYG": 0,
+	"RWF": 0,
+	"UGX": 0,
+	// 3 decimals
+	"BHD": 3,
+	"KWD": 3,
+	"OMR": 3,
+	"TND": 3,
+	"JOD": 3,
+	"LYD": 3,
+	"IQD": 3,
+}
+
+// MinorUnits returns the number of minor-unit decimal places for the currency
+// (USD 2, JPY 0, BHD 3). Codes not in the registry default to 2, matching the
+// ISO 4217 default and the ledger's pre-registry behavior; FX and formatting
+// stay correct for the common set and degrade to the 2-dp default otherwise.
+func (c Currency) MinorUnits() int {
+	if n, ok := minorUnitsOverrides[c]; ok {
+		return n
+	}
+	return 2
+}
+
 // Money is an immutable amount of a single currency, stored as a signed count
 // of the currency's smallest unit (minor units; cents for USD). A positive
 // amount is a debit, a negative amount a credit, by the convention documented
@@ -88,9 +125,10 @@ func (m Money) Neg() (Money, error) {
 	return Money{amount: -m.amount, currency: m.currency}, nil
 }
 
-// String renders the amount with two decimal places and the currency code, for
-// example "10.50 USD". v1 assumes a two-decimal currency; revisit when
-// multi-currency lands (out of scope, see ADR-002).
+// String renders the amount with the currency's minor-unit decimal places
+// (via Currency.MinorUnits) and the currency code, for example "10.50 USD"
+// for a two-decimal currency, "15000 JPY" for a zero-decimal currency, or
+// "10.500 BHD" for a three-decimal currency.
 func (m Money) String() string {
 	sign := ""
 	a := uint64(m.amount) //nolint:gosec // intentional signed-to-unsigned reinterpretation for abs value
@@ -98,5 +136,13 @@ func (m Money) String() string {
 		sign = "-"
 		a = -a // unsigned negation yields the correct magnitude, even for MinInt64
 	}
-	return fmt.Sprintf("%s%d.%02d %s", sign, a/100, a%100, m.currency)
+	exp := m.currency.MinorUnits()
+	if exp == 0 {
+		return fmt.Sprintf("%s%d %s", sign, a, m.currency)
+	}
+	scale := uint64(1)
+	for i := 0; i < exp; i++ {
+		scale *= 10
+	}
+	return fmt.Sprintf("%s%d.%0*d %s", sign, a/scale, exp, a%scale, m.currency)
 }
