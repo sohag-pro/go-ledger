@@ -21,17 +21,26 @@
 // ciphertext from a legacy (pre-6.2) plaintext description: see Decrypt.
 //
 // SHREDDING a tenant's PII (the crypto-shredding technique, ADR-012's
-// complement) is destroying its DEK: crypto_keys.wrapped_dek is set NULL and
-// shredded_at is stamped (domain.Repository.ShredTenantCryptoKey). This
-// package's Decrypt treats a shredded tenant's ciphertext as
-// RedactedMarker, not an error, so reads keep working; it never needs the
-// plaintext or the destroyed key again. Shredding never touches
-// postings.description or audit_log.after: those bytes are unchanged, so the
-// audit chain's row_hash (computed over those exact stored bytes,
-// domain.ComputeAuditRowHash) still recomputes identically and the chain
-// still verifies after a shred. This is the money-critical property the
-// whole package exists to preserve; see AuditService.Verify's own doc
-// comment for why it never decrypts.
+// complement) is destroying its CURRENT DEK version: crypto_keys.wrapped_dek
+// for that version is set NULL and shredded_at is stamped
+// (domain.Repository.ShredTenantCryptoKey). This package's Decrypt treats a
+// shredded version's ciphertext as RedactedMarker, not an error, so reads
+// keep working; it never needs the plaintext or the destroyed key again.
+// Shredding never touches postings.description or audit_log.after: those
+// bytes are unchanged, so the audit chain's row_hash (computed over those
+// exact stored bytes, domain.ComputeAuditRowHash) still recomputes
+// identically and the chain still verifies after a shred. This is the
+// money-critical property the whole package exists to preserve; see
+// AuditService.Verify's own doc comment for why it never decrypts.
+//
+// DEKs are VERSIONED (ADR-018): a tenant can hold a sequence of versions
+// over time, keyed on (tenant_id, version) in crypto_keys (migration 0028).
+// A shred destroys only the CURRENT (highest) version; the tenant's very
+// next Encrypt call mints a fresh, forward version and keeps working, so an
+// erasure request erases PAST PII without bricking the tenant's ability to
+// post, convert, or reverse (those write system-generated narration, not
+// personal data, and must keep succeeding after a shred). See Encrypt and
+// ErrTenantKeyShredded's own doc comments for the exact mechanics.
 package crypto
 
 import (
@@ -42,6 +51,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -56,57 +66,78 @@ const dekSize = 32
 // its presence to distinguish ciphertext from a legacy, pre-Task-6.2
 // plaintext description (backward compatibility: a description stored before
 // this feature existed carries no prefix and is returned as-is, unchanged).
-// The "v1" tag leaves room for a future encoding change the same way
+// The "v1" tag names the SCHEME (nonce||ciphertext under AES-256-GCM), not
+// the DEK version: a stored value looks like "enc:v1:<version>:<base64>",
+// where <version> is the tenant's DEK version this exact ciphertext was
+// sealed under (ADR-018), so a later Decrypt always knows which version's
+// key to unwrap, even after the tenant has moved on to a newer version. The
+// "v1" scheme tag leaves room for a future encoding change the same way
 // domain.CurrentFingerprintScheme does for the idempotency fingerprint: a
 // reader that knows only "v1" can still fail closed on an unrecognized future
-// prefix instead of misinterpreting its bytes.
+// prefix instead of misinterpreting its bytes. See parseVersionedCiphertext
+// for exactly how the version segment is parsed, including its handling of
+// a body with no version segment at all.
 const EncodingPrefix = "enc:v1:"
 
 // RedactedMarker is what Decrypt returns, with no error, for a ciphertext
-// description belonging to a tenant whose key has been shredded (Task 6.2,
-// audit A9.3): the whole point of crypto-shredding is that reads keep
-// working after an erasure request, they just can no longer recover the
+// description whose DEK version has been shredded (Task 6.2, audit A9.3;
+// versioned per ADR-018): the whole point of crypto-shredding is that reads
+// keep working after an erasure request, they just can no longer recover the
 // original content.
 const RedactedMarker = "[redacted: erased]"
 
-// ErrTenantKeyShredded is returned by Encrypt when asked to encrypt new
-// content for a tenant whose key has already been shredded. Shredding is
-// documented as irreversible (see domain.Repository.ShredTenantCryptoKey):
-// silently minting a fresh DEK here would let new data quietly become
-// encryptable (and so, eventually, erasable) again for a tenant an operator
-// deliberately cut off, undermining that guarantee. A tenant that needs to
-// keep posting after an erasure request is an operational decision outside
-// this package (see docs/ops/retention-and-erasure.md): typically the tenant
-// is also suspended around the same time PII is shredded.
+// ErrTenantKeyShredded is a defensive sentinel: since ADR-018 versioned
+// per-tenant DEKs, Encrypt no longer fails closed just because a tenant's
+// CURRENT key version has been shredded, it mints a fresh, forward version
+// and keeps going (see Encrypt's own doc comment), so this should no longer
+// be reachable on any normal post/convert/reverse path. It remains exported,
+// and is still returned in the one adversarial case currentOrMintedDEK
+// cannot resolve (every version it tries to mint, up to mintRetryLimit
+// attempts, loses a race to a concurrent shred targeting that exact
+// version): callers (internal/api's toHumaErr, internal/grpcserver's
+// toStatus) still map it to a clear client error rather than a generic 500,
+// in case this ever surfaces.
 var ErrTenantKeyShredded = errors.New("crypto: tenant key has been shredded")
 
-// KeyStore is the persistence port for per-tenant Data Encryption Keys
-// (Task 6.2, audit A9.3): the crypto_keys table (migration 0027) behind it.
-// internal/postgres.Repository implements this directly, alongside
-// domain.Repository, so cmd/server can hand the same *postgres.Repository
-// value to both NewCipher and postgres.NewRepository.
+// KeyStore is the persistence port for per-tenant, VERSIONED Data
+// Encryption Keys (Task 6.2, audit A9.3; versioned per ADR-018): the
+// crypto_keys table (migrations 0027, 0028) behind it, keyed on
+// (tenant_id, version). internal/postgres.Repository implements this
+// directly, alongside domain.Repository, so cmd/server can hand the same
+// *postgres.Repository value to both NewCipher and postgres.NewRepository.
 type KeyStore interface {
-	// GetOrCreateWrappedDEK returns tenantID's wrapped DEK, atomically
-	// creating one from candidateWrappedDEK if the tenant has none yet (an
-	// INSERT ... ON CONFLICT DO UPDATE that forces RETURNING to yield
-	// whichever row wins a race between concurrent callers, the same
-	// "GetOrCreateClearingAccount" pattern internal/postgres/queries/accounts.sql
-	// already established). candidateWrappedDEK is generated and wrapped by
-	// the CALLER (Cipher), not the store, since only Cipher holds the master
-	// key: the store's job is purely to persist bytes, never to know what
-	// they mean.
-	//
-	// If the tenant's key has already been shredded, shredded is true and
-	// wrappedDEK is nil, regardless of candidateWrappedDEK: a shredded
-	// tenant's row is never revived by this call (see ErrTenantKeyShredded).
-	GetOrCreateWrappedDEK(ctx context.Context, tenantID string, candidateWrappedDEK []byte) (wrappedDEK []byte, shredded bool, err error)
+	// CurrentTenantDEK returns tenantID's CURRENT (highest-version) key row,
+	// whatever its shredded state, so Encrypt can decide whether to reuse it
+	// or mint a fresh, forward version (see currentOrMintedDEK). found is
+	// false if the tenant has never encrypted anything and was never
+	// shredded either: version is meaningless in that case (Encrypt treats
+	// it as "the next version to mint is 1").
+	CurrentTenantDEK(ctx context.Context, tenantID string) (wrappedDEK []byte, version int, shredded, found bool, err error)
 
-	// GetWrappedDEK returns tenantID's wrapped DEK for a decrypt, without
-	// ever creating one: a description already carrying EncodingPrefix
-	// implies a DEK was created at encrypt time, so a decrypt that finds none
-	// (found is false) is a genuine inconsistency, not the normal
-	// first-use case GetOrCreateWrappedDEK handles.
-	GetWrappedDEK(ctx context.Context, tenantID string) (wrappedDEK []byte, shredded, found bool, err error)
+	// MintTenantDEKVersion atomically creates tenantID's crypto_keys row at
+	// exactly version, wrapping candidateWrappedDEK (an INSERT ... ON
+	// CONFLICT DO UPDATE that forces RETURNING to yield whichever row wins a
+	// race between concurrent callers targeting the SAME version, the same
+	// "GetOrCreateClearingAccount" pattern
+	// internal/postgres/queries/accounts.sql already established).
+	// candidateWrappedDEK is generated and wrapped by the CALLER (Cipher),
+	// not the store, since only Cipher holds the master key: the store's job
+	// is purely to persist bytes, never to know what they mean.
+	//
+	// shredded is true if the row this call ends up returning (whoever's
+	// candidate won the race) is already shredded: an extremely unlikely
+	// race against a shred call that targeted this exact version concurrently.
+	// The caller must handle that by minting the NEXT version rather than
+	// assuming a mint always yields a usable key.
+	MintTenantDEKVersion(ctx context.Context, tenantID string, version int, candidateWrappedDEK []byte) (wrappedDEK []byte, shredded bool, err error)
+
+	// TenantDEKVersion returns tenantID's key at exactly the given version,
+	// for a decrypt whose stored ciphertext names that version, without ever
+	// creating one: a description already carrying EncodingPrefix implies a
+	// DEK existed for that exact version at encrypt time, so found being
+	// false is a genuine inconsistency, not the normal first-use case
+	// CurrentTenantDEK/MintTenantDEKVersion handle.
+	TenantDEKVersion(ctx context.Context, tenantID string, version int) (wrappedDEK []byte, shredded, found bool, err error)
 }
 
 // Cipher encrypts and decrypts posting descriptions with per-tenant data
@@ -153,33 +184,40 @@ func ParseMasterKey(masterKeyB64 string) ([dekSize]byte, error) {
 	return out, nil
 }
 
-// Encrypt returns plaintext encrypted under tenantID's data key, as a
-// self-describing string a later Decrypt call can recognize (EncodingPrefix +
-// base64(nonce || ciphertext)). An empty plaintext is returned unchanged
-// ("" in, "" out): there is nothing to protect in an absent description, and
-// encrypting it would turn "no description" into indistinguishable-from-real
-// ciphertext on read back, breaking the "empty stays empty" contract
-// internal/ledger's write path documents.
+// mintRetryLimit bounds currentOrMintedDEK's retry loop when a freshly
+// minted version keeps losing a race to a concurrent shred targeting the
+// exact same version number: an adversarial scenario this defensively caps
+// rather than loops on forever. See ErrTenantKeyShredded's own doc comment.
+const mintRetryLimit = 5
+
+// Encrypt returns plaintext encrypted under tenantID's CURRENT data key
+// version, as a self-describing string a later Decrypt call can recognize
+// (EncodingPrefix + the DEK version + base64(nonce || ciphertext); see
+// EncodingPrefix's own doc comment for the exact shape). An empty plaintext
+// is returned unchanged ("" in, "" out): there is nothing to protect in an
+// absent description, and encrypting it would turn "no description" into
+// indistinguishable-from-real ciphertext on read back, breaking the "empty
+// stays empty" contract internal/ledger's write path documents.
 //
-// It returns ErrTenantKeyShredded if tenantID's key has already been
-// shredded: see ErrTenantKeyShredded's own doc comment for why this fails
-// closed instead of silently minting a new key.
+// Per ADR-018, Encrypt never fails closed just because tenantID's current
+// key version has been shredded: it mints a fresh, forward version and uses
+// that instead (see currentOrMintedDEK), so a data-subject erasure request
+// erases that tenant's PAST descriptions without bricking its ability to
+// post, convert, or reverse afterward. See ErrTenantKeyShredded's own doc
+// comment for the one adversarial case this can still surface in.
 func (c *Cipher) Encrypt(ctx context.Context, tenantID, plaintext string) (string, error) {
 	if plaintext == "" {
 		return "", nil
 	}
-	dek, shredded, err := c.tenantDEK(ctx, tenantID)
+	dek, version, err := c.currentOrMintedDEK(ctx, tenantID)
 	if err != nil {
 		return "", err
-	}
-	if shredded {
-		return "", ErrTenantKeyShredded
 	}
 	sealed, err := seal(dek, []byte(plaintext))
 	if err != nil {
 		return "", fmt.Errorf("crypto: encrypt: %w", err)
 	}
-	return EncodingPrefix + base64.StdEncoding.EncodeToString(sealed), nil
+	return fmt.Sprintf("%s%d:%s", EncodingPrefix, version, base64.StdEncoding.EncodeToString(sealed)), nil
 }
 
 // Decrypt returns stored's plaintext content, or a well-defined non-error
@@ -189,16 +227,19 @@ func (c *Cipher) Encrypt(ctx context.Context, tenantID, plaintext string) (strin
 //     plaintext (or already empty), returned unchanged. This is the backward
 //     compatibility guarantee: every posting description written before this
 //     feature existed reads back exactly as it always did.
-//   - tenantID's key has been shredded: RedactedMarker is returned, not an
-//     error, so a read of a crypto-shredded tenant's history keeps working
-//     (Task 6.2, audit A9.3's core requirement) instead of failing every
+//   - the DEK version stored's ciphertext names has been shredded:
+//     RedactedMarker is returned, not an error, so a read of a
+//     crypto-shredded tenant's history keeps working (Task 6.2, audit
+//     A9.3's core requirement) instead of failing every
 //     GetTransaction/ListTransactions/Statement/audit-read call for that
-//     tenant forever.
+//     tenant forever. A LATER version, if the tenant has since posted again
+//     (ADR-018), decrypts normally: shredding is scoped to the version it
+//     targeted, never to every version a tenant has ever held.
 //
-// Any other failure (no key material at all for a tenant whose data is
-// nonetheless ciphertext, a corrupt or tampered ciphertext, an unwrap
-// failure) is a genuine error: Decrypt only ever silently substitutes for the
-// two well-understood, expected cases above.
+// Any other failure (no key material at all for the named version, a
+// corrupt or tampered ciphertext, an unwrap failure) is a genuine error:
+// Decrypt only ever silently substitutes for the two well-understood,
+// expected cases above.
 func (c *Cipher) Decrypt(ctx context.Context, tenantID, stored string) (string, error) {
 	if stored == "" {
 		return "", nil
@@ -206,12 +247,13 @@ func (c *Cipher) Decrypt(ctx context.Context, tenantID, stored string) (string, 
 	if !strings.HasPrefix(stored, EncodingPrefix) {
 		return stored, nil
 	}
-	wrapped, shredded, found, err := c.store.GetWrappedDEK(ctx, tenantID)
+	version, encoded := parseVersionedCiphertext(stored)
+	wrapped, shredded, found, err := c.store.TenantDEKVersion(ctx, tenantID, version)
 	if err != nil {
-		return "", fmt.Errorf("crypto: look up tenant key: %w", err)
+		return "", fmt.Errorf("crypto: look up tenant key version %d: %w", version, err)
 	}
 	if !found {
-		return "", fmt.Errorf("crypto: tenant %s has no key material, but stored value is ciphertext", tenantID)
+		return "", fmt.Errorf("crypto: tenant %s has no key material for version %d, but stored value is ciphertext", tenantID, version)
 	}
 	if shredded {
 		return RedactedMarker, nil
@@ -220,7 +262,7 @@ func (c *Cipher) Decrypt(ctx context.Context, tenantID, stored string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("crypto: unwrap tenant key: %w", err)
 	}
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, EncodingPrefix))
+	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return "", fmt.Errorf("crypto: decode ciphertext: %w", err)
 	}
@@ -231,35 +273,77 @@ func (c *Cipher) Decrypt(ctx context.Context, tenantID, stored string) (string, 
 	return string(plaintext), nil
 }
 
-// tenantDEK returns tenantID's unwrapped DEK, generating and persisting a
-// fresh one on first use. It always generates a candidate key and wraps it
-// before calling the store, even when a key likely already exists (the same
-// "build it anyway, let ON CONFLICT decide" shape
+// parseVersionedCiphertext splits stored's body (everything after
+// EncodingPrefix) into the DEK version it names and the remaining
+// base64(nonce||ciphertext). A body with no ":" separator, or one whose
+// segment before the first ":" is not a positive integer, is treated as a
+// pre-versioning "enc:v1:<base64>" value and given an implicit version of 1:
+// this feature had not shipped outside this branch's own tests before
+// ADR-018 added versioning, so no such value is known to actually exist, but
+// Decrypt handles it defensively rather than erroring on it.
+func parseVersionedCiphertext(stored string) (version int, encoded string) {
+	body := strings.TrimPrefix(stored, EncodingPrefix)
+	if idx := strings.IndexByte(body, ':'); idx >= 0 {
+		if v, err := strconv.Atoi(body[:idx]); err == nil && v > 0 {
+			return v, body[idx+1:]
+		}
+	}
+	return 1, body
+}
+
+// currentOrMintedDEK returns tenantID's unwrapped CURRENT DEK and the
+// version it belongs to, minting a fresh, forward version whenever there is
+// no current one yet (first use) or the current one has been shredded
+// (ADR-018): a shred destroys a tenant's ability to encrypt under the
+// version it targeted, never its ability to encrypt at all. It always
+// generates a candidate key and wraps it before calling the store when
+// minting, even though a concurrent caller might already be minting the
+// same version (the same "build it anyway, let ON CONFLICT decide" shape
 // GetOrCreateClearingAccount's own doc comment describes): a wasted key
-// generation is cheap, and it is what lets GetOrCreateWrappedDEK resolve a
-// race between two concurrent first-use callers, even across processes, to
-// exactly one winning DEK in a single round trip.
-func (c *Cipher) tenantDEK(ctx context.Context, tenantID string) (dek []byte, shredded bool, err error) {
-	candidate := make([]byte, dekSize)
-	if _, err := rand.Read(candidate); err != nil {
-		return nil, false, fmt.Errorf("crypto: generate candidate dek: %w", err)
-	}
-	wrappedCandidate, err := wrap(c.masterKey[:], candidate)
+// generation is cheap, and it is what lets MintTenantDEKVersion resolve a
+// race between two concurrent callers targeting the same version, even
+// across processes, to exactly one winning DEK in a single round trip.
+//
+// The mint loop only ever advances past mintRetryLimit attempts in the
+// adversarial case of a shred call racing this exact version repeatedly;
+// see ErrTenantKeyShredded's own doc comment.
+func (c *Cipher) currentOrMintedDEK(ctx context.Context, tenantID string) (dek []byte, version int, err error) {
+	wrapped, currentVersion, shredded, found, err := c.store.CurrentTenantDEK(ctx, tenantID)
 	if err != nil {
-		return nil, false, fmt.Errorf("crypto: wrap candidate dek: %w", err)
+		return nil, 0, fmt.Errorf("crypto: get current tenant key: %w", err)
 	}
-	wrapped, shredded, err := c.store.GetOrCreateWrappedDEK(ctx, tenantID, wrappedCandidate)
-	if err != nil {
-		return nil, false, fmt.Errorf("crypto: get or create tenant key: %w", err)
+	if found && !shredded {
+		unwrapped, err := unwrap(c.masterKey[:], wrapped)
+		if err != nil {
+			return nil, 0, fmt.Errorf("crypto: unwrap tenant key: %w", err)
+		}
+		return unwrapped, currentVersion, nil
 	}
-	if shredded {
-		return nil, true, nil
+
+	nextVersion := currentVersion + 1 // currentVersion is 0 when !found, so this is 1.
+	for attempt := 0; attempt < mintRetryLimit; attempt++ {
+		candidate := make([]byte, dekSize)
+		if _, err := rand.Read(candidate); err != nil {
+			return nil, 0, fmt.Errorf("crypto: generate candidate dek: %w", err)
+		}
+		wrappedCandidate, err := wrap(c.masterKey[:], candidate)
+		if err != nil {
+			return nil, 0, fmt.Errorf("crypto: wrap candidate dek: %w", err)
+		}
+		minted, mintedShredded, err := c.store.MintTenantDEKVersion(ctx, tenantID, nextVersion, wrappedCandidate)
+		if err != nil {
+			return nil, 0, fmt.Errorf("crypto: mint tenant key version %d: %w", nextVersion, err)
+		}
+		if !mintedShredded {
+			unwrapped, err := unwrap(c.masterKey[:], minted)
+			if err != nil {
+				return nil, 0, fmt.Errorf("crypto: unwrap freshly minted tenant key: %w", err)
+			}
+			return unwrapped, nextVersion, nil
+		}
+		nextVersion++
 	}
-	unwrapped, err := unwrap(c.masterKey[:], wrapped)
-	if err != nil {
-		return nil, false, fmt.Errorf("crypto: unwrap tenant key: %w", err)
-	}
-	return unwrapped, false, nil
+	return nil, 0, ErrTenantKeyShredded
 }
 
 // wrap is seal under the master key: how a tenant's DEK is protected at rest

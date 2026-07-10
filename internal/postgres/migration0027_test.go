@@ -133,6 +133,10 @@ func TestMigration0027_RowLevelSecurity(t *testing.T) {
 	if err := goose.SetDialect("postgres"); err != nil {
 		t.Fatalf("set dialect: %v", err)
 	}
+	// goose.Up runs every migration, including 0028 (ADR-018's versioned
+	// crypto_keys): the raw INSERTs below name the version column
+	// explicitly (version 1) to match that later schema, even though this
+	// test is otherwise scoped to 0027's own RLS shape.
 	if err := goose.Up(sqlDB, "migrations"); err != nil {
 		t.Fatalf("migrate up: %v", err)
 	}
@@ -179,12 +183,12 @@ func TestMigration0027_RowLevelSecurity(t *testing.T) {
 	// this test is about crypto_keys' own RLS policy, not the cipher's
 	// wrapping logic, which internal/crypto's own tests already cover.
 	if err := rawExecAsTenant(ctx, appPool, tenantA,
-		`INSERT INTO crypto_keys (tenant_id, wrapped_dek) VALUES ($1::uuid, $2)`, tenantA, []byte("wrapped-a"),
+		`INSERT INTO crypto_keys (tenant_id, version, wrapped_dek) VALUES ($1::uuid, 1, $2)`, tenantA, []byte("wrapped-a"),
 	); err != nil {
 		t.Fatalf("insert tenant A crypto key: %v", err)
 	}
 	if err := rawExecAsTenant(ctx, appPool, tenantB,
-		`INSERT INTO crypto_keys (tenant_id, wrapped_dek) VALUES ($1::uuid, $2)`, tenantB, []byte("wrapped-b"),
+		`INSERT INTO crypto_keys (tenant_id, version, wrapped_dek) VALUES ($1::uuid, 1, $2)`, tenantB, []byte("wrapped-b"),
 	); err != nil {
 		t.Fatalf("insert tenant B crypto key: %v", err)
 	}
@@ -203,7 +207,7 @@ func TestMigration0027_RowLevelSecurity(t *testing.T) {
 	tenantC := uuid.NewString()
 	mustExecDB(t, sqlDB, `INSERT INTO tenants (id, name) VALUES ($1, 'tenant c')`, tenantC)
 	if err := rawExecAsTenant(ctx, appPool, tenantA,
-		`INSERT INTO crypto_keys (tenant_id, wrapped_dek) VALUES ($1::uuid, $2)`, tenantC, []byte("cross-tenant"),
+		`INSERT INTO crypto_keys (tenant_id, version, wrapped_dek) VALUES ($1::uuid, 1, $2)`, tenantC, []byte("cross-tenant"),
 	); err == nil {
 		t.Error("WITH CHECK: insert of a tenant C row while app.tenant_id=A was accepted, want a row-level security violation")
 	}

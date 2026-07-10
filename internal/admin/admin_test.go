@@ -905,34 +905,36 @@ func TestShredTenantPIILeavesATombstoneAndIsIdempotent(t *testing.T) {
 		t.Fatalf("create tenant: %v", err)
 	}
 
-	// No crypto_keys row exists yet: GetWrappedDEK reports found=false.
-	if _, _, found, err := repo.GetWrappedDEK(ctx, tenant.ID); err != nil {
-		t.Fatalf("GetWrappedDEK before shred: %v", err)
+	// No crypto_keys row exists yet: CurrentTenantDEK reports found=false.
+	if _, _, _, found, err := repo.CurrentTenantDEK(ctx, tenant.ID); err != nil {
+		t.Fatalf("CurrentTenantDEK before shred: %v", err)
 	} else if found {
-		t.Fatal("GetWrappedDEK before shred: found = true, want false (no key created yet)")
+		t.Fatal("CurrentTenantDEK before shred: found = true, want false (no key created yet)")
 	}
 
 	if err := svc.ShredTenantPII(ctx, tenant.ID); err != nil {
 		t.Fatalf("ShredTenantPII: %v", err)
 	}
 
-	// A permanent tombstone now exists, even though nothing was ever
-	// encrypted: a later Encrypt for this tenant must see it as shredded,
-	// never silently mint a fresh, live key.
-	_, shredded, found, err := repo.GetWrappedDEK(ctx, tenant.ID)
+	// A permanent version-1 tombstone now exists, even though nothing was
+	// ever encrypted: a later Encrypt for this tenant must see it as
+	// shredded, and mint version 2 rather than reviving version 1
+	// (ADR-018).
+	_, version, shredded, found, err := repo.CurrentTenantDEK(ctx, tenant.ID)
 	if err != nil {
-		t.Fatalf("GetWrappedDEK after shred: %v", err)
+		t.Fatalf("CurrentTenantDEK after shred: %v", err)
 	}
-	if !found || !shredded {
-		t.Errorf("GetWrappedDEK after shred: found=%v shredded=%v, want found=true shredded=true", found, shredded)
+	if !found || !shredded || version != 1 {
+		t.Errorf("CurrentTenantDEK after shred: found=%v shredded=%v version=%d, want found=true shredded=true version=1", found, shredded, version)
 	}
 
-	// GetOrCreateWrappedDEK (what Encrypt calls internally) must also report
-	// shredded, never revive the tenant with a fresh DEK.
-	if _, shredded, err := repo.GetOrCreateWrappedDEK(ctx, tenant.ID, []byte("candidate")); err != nil {
-		t.Fatalf("GetOrCreateWrappedDEK after shred: %v", err)
+	// MintTenantDEKVersion for that SAME (already-shredded) version must
+	// also report shredded, never revive it: version 1 is permanently dead,
+	// even to a caller that tries to mint it again.
+	if _, shredded, err := repo.MintTenantDEKVersion(ctx, tenant.ID, 1, []byte("candidate")); err != nil {
+		t.Fatalf("MintTenantDEKVersion after shred: %v", err)
 	} else if !shredded {
-		t.Error("GetOrCreateWrappedDEK after shred: shredded = false, want true (must not revive a shredded tenant)")
+		t.Error("MintTenantDEKVersion for the already-shredded version after shred: shredded = false, want true (must not revive a shredded version)")
 	}
 
 	// Idempotent: shredding again succeeds with no error.

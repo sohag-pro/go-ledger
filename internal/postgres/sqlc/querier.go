@@ -116,12 +116,21 @@ type Querier interface {
 	// and by VerifyFromLatestAnchor to fall back to a full verify when no
 	// anchor exists yet. ErrNoRows means the tenant has no audit rows at all.
 	GetAuditHead(ctx context.Context, tenantID uuid.UUID) (GetAuditHeadRow, error)
-	// Read-only lookup for a decrypt (Task 6.2, audit A9.3): unlike
-	// GetOrCreateCryptoKey, this never creates a row. A description already
-	// carrying internal/crypto.EncodingPrefix implies a key was created at
-	// encrypt time, so pgx.ErrNoRows here is a genuine inconsistency for the
-	// caller to surface as an error, not the ordinary first-use case.
-	GetCryptoKey(ctx context.Context, tenantID uuid.UUID) (GetCryptoKeyRow, error)
+	// Read-only lookup of ONE SPECIFIC DEK version, for a decrypt whose stored
+	// ciphertext names the version it was sealed under (ADR-018). Never
+	// creates a row: a description already carrying internal/crypto.EncodingPrefix
+	// implies a key existed for that exact version at encrypt time, so
+	// pgx.ErrNoRows here is a genuine inconsistency for the caller to surface as
+	// an error, not the ordinary first-use case.
+	GetCryptoKeyVersion(ctx context.Context, arg GetCryptoKeyVersionParams) (GetCryptoKeyVersionRow, error)
+	// ADR-018 (Task 6.2 fix): tenant_id's CURRENT (highest-version) key row,
+	// whatever its shredded state. internal/crypto.Cipher.Encrypt uses this to
+	// decide whether to reuse it (found && not shredded) or mint a fresh,
+	// forward version (not found at all, or the current one is shredded): see
+	// MintCryptoKeyVersion below. pgx.ErrNoRows here means the tenant has never
+	// encrypted anything and never been shredded: a genuine first-use case, not
+	// an error, for the caller to handle.
+	GetCurrentCryptoKey(ctx context.Context, tenantID uuid.UUID) (GetCurrentCryptoKeyRow, error)
 	// An expired row is treated as absent (Task 4.5, audit A1.4): the "AND
 	// expires_at > now()" filter is what makes a key whose replay window has
 	// passed behave exactly like a key that was never written, from the caller's
@@ -175,21 +184,6 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
-	// Task 6.2 (audit A9.3): returns tenant_id's wrapped DEK, creating a fresh
-	// row wrapping the CALLER-GENERATED candidate wrapped_dek on first use. The
-	// ON CONFLICT DO UPDATE is a no-op write (tenant_id set to its own current
-	// value) purely to force RETURNING to yield the current row: the same
-	// "GetOrCreateClearingAccount" trick internal/postgres/queries/accounts.sql
-	// documents in depth, which resolves two callers racing to create the same
-	// tenant's first key, even across processes, to exactly one winning DEK in a
-	// single round trip.
-	//
-	// A tenant whose key was already shredded (wrapped_dek NULL, shredded_at
-	// set) is NOT revived by this call: the no-op update leaves both columns
-	// untouched, so the existing (shredded) row comes back unchanged, and the
-	// caller (internal/crypto.Cipher) must check shredded_at itself rather than
-	// assume wrapped_dek is ever non-NULL just because a row was returned.
-	GetOrCreateCryptoKey(ctx context.Context, arg GetOrCreateCryptoKeyParams) (GetOrCreateCryptoKeyRow, error)
 	// The reversal of a given original, if one exists (Task 4.2, audit A1.2):
 	// transactions_one_reversal_idx (migration 0017) guarantees at most one row
 	// can ever match, so this is a plain :one lookup, not a list.
@@ -406,6 +400,34 @@ type Querier interface {
 	// max-attempts cap are application config, not schema), and this query just
 	// persists that decision.
 	MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) error
+	// Atomically creates tenant_id's crypto_keys row at the given version,
+	// wrapping the CALLER-GENERATED candidate_wrapped_dek (ADR-018: only
+	// internal/crypto.Cipher ever holds the master key needed to produce one).
+	// pg_advisory_xact_lock serializes this against ShredCurrentCryptoKey for
+	// the SAME tenant (both take the identical hashtextextended(tenant_id, 0)
+	// key), so a version this call is in the middle of minting can never be the
+	// exact version a concurrent shred call means to destroy, or vice versa;
+	// the lock is released automatically at the end of this call's transaction
+	// (withTenant's COMMIT/ROLLBACK).
+	//
+	// The ON CONFLICT DO UPDATE is the same "force RETURNING to yield the
+	// winning row" trick migration 0027's original GetOrCreateCryptoKey used at
+	// the single-version grain (see also GetOrCreateClearingAccount): if two
+	// callers race to mint the exact same (tenant_id, version) pair, for example
+	// two concurrent first-use Encrypt calls for a brand-new tenant both
+	// targeting version 1, one wins and the other's own candidate wrapped_dek is
+	// silently discarded; both RETURNING the SAME winning row in one round
+	// trip, so both callers end up using the identical DEK.
+	// sqlc.arg(tenant_id), repeated, names the SAME parameter (one field in the
+	// generated Params struct) at every use; the redundant ::uuid cast at each
+	// use (not just the ::text one hashtextextended needs) is deliberate, not
+	// decorative: Postgres assigns an untyped placeholder's type by unifying
+	// every one of its uses in the statement, and the ::text cast below would
+	// otherwise make the planner infer the WHOLE parameter as text, including
+	// the INSERT's tenant_id (uuid) column, which then fails to bind ("column
+	// tenant_id is of type uuid but expression is of type text"). Casting to
+	// uuid explicitly at each use pins its type regardless of statement order.
+	MintCryptoKeyVersion(ctx context.Context, arg MintCryptoKeyVersionParams) (MintCryptoKeyVersionRow, error)
 	// COALESCE makes this idempotent: revoking an already-revoked key keeps its
 	// original revoked_at instead of bumping it, and still reports one row
 	// affected (not zero), so the admin service can tell "no such key" (0 rows)
@@ -440,21 +462,35 @@ type Querier interface {
 	// cascade, so deactivating, not deleting, is what "stops future deliveries"
 	// without breaking or discarding delivery history.
 	SetWebhookSubscriptionActive(ctx context.Context, arg SetWebhookSubscriptionActiveParams) (int64, error)
-	// Irreversibly destroys tenant_id's PII encryption key (Task 6.2, audit
-	// A9.3): every posting description ever encrypted under this tenant's DEK
-	// becomes permanently unreadable, while postings.description and
-	// audit_log.after keep their exact stored ciphertext bytes, so the
-	// tamper-evident hash chain (which hashes those bytes, never decrypts them)
-	// stays verifiable. This is an INSERT ... ON CONFLICT, not a plain UPDATE,
-	// so shredding a tenant that has NEVER encrypted anything yet (no
-	// crypto_keys row) still leaves a permanent shredded tombstone: without one,
-	// that tenant's very next encrypt would happily mint a brand-new, live DEK,
-	// silently undoing an operator's already-issued shred request. Idempotent:
-	// shredding an already-shredded tenant leaves shredded_at at its ORIGINAL
-	// value (COALESCE keeps the first shred timestamp), matching
-	// RevokeAPIKey's own idempotent-revoke convention (shredding twice is a
-	// no-op success, not an error, and does not move the erasure timestamp).
-	ShredCryptoKey(ctx context.Context, tenantID uuid.UUID) error
+	// Irreversibly destroys tenant_id's CURRENT (highest-version) DEK (ADR-018):
+	// every posting description ever encrypted under that version becomes
+	// permanently unreadable, while postings.description and audit_log.after
+	// keep their exact stored ciphertext bytes untouched, so the tamper-evident
+	// hash chain (which hashes those bytes, never decrypts them) stays
+	// verifiable. Money data and every OTHER tenant's keys are completely
+	// unaffected. The tenant is NOT bricked: its next Encrypt call
+	// (internal/crypto.Cipher) sees the current version shredded and mints the
+	// next one, so posting, converting, and reversing all keep working.
+	//
+	// Serialized against MintCryptoKeyVersion by the same per-tenant
+	// pg_advisory_xact_lock (see that query's own comment): this can never
+	// target a version a concurrent first-use mint is still in the middle of
+	// creating, and a concurrent mint can never land a version this call has
+	// already decided to shred out from under it.
+	//
+	// A tenant with NO crypto_keys row at all yet (never encrypted anything)
+	// still gets a permanent version-1 shredded tombstone (GREATEST(...,1)
+	// below): without one, that tenant's very next Encrypt would happily mint a
+	// brand-new, LIVE version 1, silently undoing an operator's already-issued
+	// shred request. Idempotent: shredding an already-shredded current version
+	// leaves its shredded_at at its ORIGINAL value (COALESCE), matching
+	// RevokeAPIKey's own idempotent-revoke convention.
+	// Same sqlc.arg(tenant_id), repeated, plus the same explicit ::uuid cast at
+	// every use as MintCryptoKeyVersion, and for the same reason (see that
+	// query's own comment): the ::text cast inside hashtextextended would
+	// otherwise make the planner infer the whole parameter as text, breaking
+	// the uuid comparison/insert below.
+	ShredCurrentCryptoKey(ctx context.Context, tenantID uuid.UUID) error
 	// Deletes up to batch_size idempotency keys whose replay window has passed,
 	// across all tenants (Task 4.5, audit A1.4; batched per the follow-up
 	// review: a plain "DELETE ... WHERE expires_at < now()" has no bound, so a

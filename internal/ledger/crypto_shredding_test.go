@@ -21,6 +21,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
@@ -416,5 +417,113 @@ func TestCrypto_CrossTenantCannotDecrypt(t *testing.T) {
 
 	if pt, err := cipher.Decrypt(ctx, tenantB, ctA); err == nil {
 		t.Errorf("tenant b decrypted tenant a's ciphertext as %q, want a decrypt failure", pt)
+	}
+}
+
+// TestCrypto_PostConvertReverseSucceedAfterShred_FreshVersionMintedOldRedacted
+// is the ADR-018 fix's ledger-level proof, closing the gap the original
+// Task 6.2 review flagged: before versioned DEKs, ShredTenantCryptoKey made
+// EVERY subsequent Encrypt call for that tenant fail closed with
+// crypto.ErrTenantKeyShredded, forever, and Convert and ReverseTransaction
+// both call Encrypt for their own system-generated narration ("convert:
+// debit source account", "reversal of <id>", see convert.go and reverse.go),
+// which is not personal data. A shred should erase a tenant's PAST PII
+// without bricking its ability to keep transacting.
+//
+// After ShredTenantCryptoKey destroys the tenant's CURRENT DEK version:
+//  1. Convert still succeeds (its narration is encrypted under a freshly
+//     minted, forward version).
+//  2. ReverseTransaction, for the transaction posted BEFORE the shred, also
+//     still succeeds (same fresh version).
+//  3. A brand-new Post with a NEW description succeeds too, and that new
+//     description decrypts normally.
+//  4. The description posted BEFORE the shred is STILL crypto.RedactedMarker:
+//     the shred permanently erased that version's PII even though the
+//     tenant kept transacting afterward.
+func TestCrypto_PostConvertReverseSucceedAfterShred_FreshVersionMintedOldRedacted(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	cipher := newTestCipher(t, repo)
+	ctx := context.Background()
+
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "post-convert-reverse after shred test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	accounts := ledger.NewAccountService(repo, ledger.WithAccountCipher(cipher))
+	usd1 := &domain.Account{Name: "USD Cash", Type: domain.Asset, Currency: "USD"}
+	usd2 := &domain.Account{Name: "USD Revenue", Type: domain.Income, Currency: "USD"}
+	eur := &domain.Account{Name: "EUR Cash", Type: domain.Asset, Currency: "EUR"}
+	if err := accounts.Create(ctx, tenant, usd1); err != nil {
+		t.Fatalf("create usd1 account: %v", err)
+	}
+	if err := accounts.Create(ctx, tenant, usd2); err != nil {
+		t.Fatalf("create usd2 account: %v", err)
+	}
+	if err := accounts.Create(ctx, tenant, eur); err != nil {
+		t.Fatalf("create eur account: %v", err)
+	}
+
+	txns := ledger.NewTransactionService(repo, discardLogger(), nil,
+		ledger.WithCipher(cipher),
+		ledger.WithFXProvider(fx.NewDBProvider(pool)),
+	)
+
+	const preShredPlaintext = "pre-shred secret description"
+	preShredTxn := mkTxnWithDescription(t, usd1.ID, usd2.ID, preShredPlaintext)
+	if _, err := txns.Post(ctx, tenant, preShredTxn, nil); err != nil {
+		t.Fatalf("post before shred: %v", err)
+	}
+
+	// A tenant-scoped fx rate (Task 2.4) so Convert below has a pair to
+	// resolve; the exact rate is an arbitrary fixture value, unrelated to
+	// this test's actual point.
+	seedTenantConvertRate(t, pool, tenant, "USD", "EUR", 90_000_000, 25)
+
+	// The money-critical operation: destroy this tenant's CURRENT DEK
+	// version. Nothing about postings, transactions, or the audit log is
+	// touched by this call.
+	if err := repo.ShredTenantCryptoKey(ctx, tenant); err != nil {
+		t.Fatalf("shred tenant crypto key: %v", err)
+	}
+
+	// 1. Convert still succeeds after the shred.
+	convReq := ledger.ConvertRequest{FromAccountID: usd1.ID, ToAccountID: eur.ID, SourceAmount: 5_000}
+	if _, _, err := txns.Convert(ctx, tenant, convReq, &domain.Idempotency{Key: "convert-after-shred"}); err != nil {
+		t.Fatalf("Convert after shred = %v, want success (ADR-018: a shred must not brick the tenant)", err)
+	}
+
+	// 2. ReverseTransaction, for the PRE-shred transaction, still succeeds.
+	if _, _, err := txns.ReverseTransaction(ctx, tenant, preShredTxn.ID); err != nil {
+		t.Fatalf("ReverseTransaction after shred = %v, want success (ADR-018: a shred must not brick the tenant)", err)
+	}
+
+	// 3. A brand-new Post with a NEW description succeeds, and that
+	// description decrypts normally (it was never touched by the shred: it
+	// is encrypted under the freshly minted version).
+	const postShredPlaintext = "post-shred new description"
+	postShredTxn := mkTxnWithDescription(t, usd1.ID, usd2.ID, postShredPlaintext)
+	if _, err := txns.Post(ctx, tenant, postShredTxn, nil); err != nil {
+		t.Fatalf("post after shred = %v, want success", err)
+	}
+	gotPostShred, err := txns.Get(ctx, tenant, postShredTxn.ID)
+	if err != nil {
+		t.Fatalf("get post-shred transaction: %v", err)
+	}
+	if gotPostShred.Postings[0].Description != postShredPlaintext {
+		t.Errorf("post-shred description = %q, want %q (a freshly minted version must decrypt normally)", gotPostShred.Postings[0].Description, postShredPlaintext)
+	}
+
+	// 4. The PRE-shred description is STILL permanently redacted: the shred
+	// erased that version's PII for good, even though the tenant kept
+	// operating (posting, converting, reversing) afterward.
+	gotPreShred, err := txns.Get(ctx, tenant, preShredTxn.ID)
+	if err != nil {
+		t.Fatalf("get pre-shred transaction: %v", err)
+	}
+	if gotPreShred.Postings[0].Description != crypto.RedactedMarker {
+		t.Errorf("pre-shred description after shred = %q, want %q", gotPreShred.Postings[0].Description, crypto.RedactedMarker)
 	}
 }

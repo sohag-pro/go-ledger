@@ -80,6 +80,7 @@ type CryptoKey struct {
 	WrappedDek []byte
 	CreatedAt  time.Time
 	ShreddedAt pgtype.Timestamptz
+	Version    int32
 }
 
 type FxRate struct {
