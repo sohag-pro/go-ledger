@@ -27,6 +27,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/api"
+	"github.com/sohag-pro/go-ledger/internal/audit"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/fx"
@@ -96,6 +97,9 @@ type config struct {
 	authCacheTTL    time.Duration
 	defaultCurrency string
 	fxRates         string
+	chainerEnabled  bool
+	chainerInterval time.Duration
+	chainerBatch    int
 }
 
 func loadConfig() (config, error) {
@@ -117,6 +121,16 @@ func loadConfig() (config, error) {
 		authCacheTTL:    getenvDuration("AUTH_CACHE_TTL", 30*time.Second),
 		defaultCurrency: getenv("DEFAULT_CURRENCY", "USD"),
 		fxRates:         os.Getenv("FX_RATES"),
+		// The audit chainer (ADR-017): on by default, since every deployment
+		// (single instance or a fleet) needs it to turn posted audit_outbox
+		// rows into the tamper-evident chain. CHAINER_ENABLED exists mainly
+		// for tests and for a deliberately chainer-less instance in a
+		// multi-instance rollout (every instance runs one; leader election
+		// picks exactly one active chainer regardless, so disabling it here
+		// is never required for correctness, only ever a deployment choice).
+		chainerEnabled:  getenvBool("CHAINER_ENABLED", true),
+		chainerInterval: getenvDuration("CHAINER_INTERVAL", audit.DefaultInterval),
+		chainerBatch:    getenvInt("CHAINER_BATCH", audit.DefaultBatch),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -283,6 +297,21 @@ func run(logger *slog.Logger) error {
 		seedCtx, cancelSeed := context.WithCancel(context.Background())
 		defer cancelSeed()
 		go runSeeder(seedCtx, logger, pool, cfg.defaultTenant, cfg.defaultCurrency, cfg.seedInterval, domain.HashAPIKey(cfg.demoAPIKey))
+	}
+
+	// The audit chainer (ADR-017): every instance runs one, and leader
+	// election (a Postgres session advisory lock) guarantees exactly one is
+	// ever active, so this is safe to start unconditionally on every
+	// instance in a multi-instance deployment. Stops on shutdown; releasing
+	// its advisory lock and connection is best-effort (see Chainer.Run), but
+	// even if that races the process exiting, Postgres releases a session
+	// advisory lock the moment its connection closes, so no lock is ever
+	// left stuck held by a dead process.
+	if cfg.chainerEnabled {
+		chainerCtx, cancelChainer := context.WithCancel(context.Background())
+		defer cancelChainer()
+		chainer := audit.NewChainer(pool, logger, cfg.chainerInterval, cfg.chainerBatch)
+		go chainer.Run(chainerCtx)
 	}
 
 	router := chi.NewRouter()
