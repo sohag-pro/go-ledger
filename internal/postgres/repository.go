@@ -222,7 +222,7 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // whatever SERIALIZABLE itself detects (the balance invariant and the
 // idempotency primary key, both still enforced in-transaction) and retried
 // exactly as any other serialization conflict is.
-func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error {
+func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error { //nolint:revive // tenantID is part of domain.Repository's interface signature and kept named for godoc; ADR-017 removed the per-tenant mutex that used to read it here
 	var lastErr error
 	for attempt := 0; attempt < maxPostAttempts; attempt++ {
 		if attempt > 0 {
