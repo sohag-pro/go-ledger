@@ -342,3 +342,32 @@ func TestConvert_ScreeningNotCalledOnReplay(t *testing.T) {
 		t.Errorf("hook.calls after replay = %d, want still 1", len(hook.calls))
 	}
 }
+
+// TestScreeningRejectedError_Error covers both branches of
+// (*ledger.ScreeningRejectedError).Error(): a reason present is appended
+// after the generic message, and an empty reason falls back to the generic
+// message alone, unlike a caller forgetting to set one and getting an
+// empty-looking error string.
+func TestScreeningRejectedError_Error(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{"with reason", "sanctions list match", "ledger: screening rejected post: sanctions list match"},
+		{"empty reason", "", "ledger: screening rejected post"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := &ledger.ScreeningRejectedError{Reason: tt.reason}
+			if got := err.Error(); got != tt.want {
+				t.Errorf("Error() = %q, want %q", got, tt.want)
+			}
+			if !errors.Is(err, ledger.ErrScreeningRejected) {
+				t.Error("errors.Is(err, ErrScreeningRejected) = false, want true (Unwrap must match regardless of Reason)")
+			}
+		})
+	}
+}

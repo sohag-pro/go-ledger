@@ -380,6 +380,42 @@ func TestPost_MinBalanceConcurrentBreach(t *testing.T) {
 	}
 }
 
+// TestAccountService_SetStatus covers ledger.AccountService.SetStatus
+// directly (Task 5.5, audit A1.5): unlike TestSetAccountStatus
+// (internal/postgres), which calls the repository method straight, this
+// exercises the service-layer wrapper that composes SetAccountStatus with a
+// fresh GetAccount to hand back the updated account, both the success path
+// and the not-found path.
+func TestAccountService_SetStatus(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	accounts := ledger.NewAccountService(repo)
+	ctx := context.Background()
+	tenant := newAccountStatusTenant(t, repo)
+
+	acct := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
+	if err := accounts.Create(ctx, tenant, acct); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	got, err := accounts.SetStatus(ctx, tenant, acct.ID, domain.AccountFrozen)
+	if err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	if got.ID != acct.ID {
+		t.Errorf("SetStatus returned account %s, want %s", got.ID, acct.ID)
+	}
+	if got.Status != domain.AccountFrozen {
+		t.Errorf("SetStatus returned status %q, want %q", got.Status, domain.AccountFrozen)
+	}
+
+	// Not found: no account with this id exists.
+	if _, err := accounts.SetStatus(ctx, tenant, uuid.NewString(), domain.AccountClosed); !errors.Is(err, domain.ErrAccountNotFound) {
+		t.Errorf("SetStatus(unknown id): err = %v, want ErrAccountNotFound", err)
+	}
+}
+
 // newConvertService and newConvertAccount are defined in convert_test.go;
 // seedConvertRate is defined there too. discardLogger and newTestPool are
 // defined in stress_test.go. mustCreateAccount and txnOf are defined in

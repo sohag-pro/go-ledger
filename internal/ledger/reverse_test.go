@@ -648,3 +648,103 @@ func TestReverseTransaction_ScreeningNotCalledOnReplay(t *testing.T) {
 		t.Errorf("hook.calls after the already-reversed replay = %d, want still 2 (the replay must not call the hook again)", len(hook.calls))
 	}
 }
+
+// reversalOfErrorRepo wraps a domain.Repository and forces GetReversalOf to
+// return a fixed, non-domain.ErrTransactionNotFound error, standing in for a
+// genuine infrastructure failure (a dropped connection, a query timeout) on
+// ReverseTransaction's idempotency precheck. Every other method delegates to
+// the embedded repository unchanged.
+type reversalOfErrorRepo struct {
+	domain.Repository
+	err error
+}
+
+func (r *reversalOfErrorRepo) GetReversalOf(context.Context, string, string) (domain.Transaction, error) {
+	return domain.Transaction{}, r.err
+}
+
+// TestReverseTransaction_PrecheckGenericErrorPropagates proves that when the
+// idempotency precheck (getReversalOfDecrypted, backed by
+// domain.Repository.GetReversalOf) fails with something OTHER than
+// domain.ErrTransactionNotFound, ReverseTransaction returns that error
+// directly rather than treating it as "no existing reversal, proceed" (which
+// would risk posting a second reversal the precheck simply failed to see).
+func TestReverseTransaction_PrecheckGenericErrorPropagates(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newReverseAccounts(t, repo, tenant)
+
+	original := mkTxn(t, debit.ID, credit.ID)
+	if err := repo.CreateTransaction(ctx, tenant, original); err != nil {
+		t.Fatalf("post original: %v", err)
+	}
+
+	sentinel := errors.New("boom: infrastructure failure")
+	svc := ledger.NewTransactionService(&reversalOfErrorRepo{Repository: repo, err: sentinel}, discardLogger(), nil)
+
+	_, alreadyReversed, err := svc.ReverseTransaction(ctx, tenant, original.ID)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("ReverseTransaction() error = %v, want the sentinel infrastructure error", err)
+	}
+	if alreadyReversed {
+		t.Error("alreadyReversed = true, want false on a genuine precheck failure")
+	}
+}
+
+// erroringCipher is a ledger.DescriptionCipher whose Encrypt always fails,
+// for proving ReverseTransaction's own encrypt-once step (mirroring Post and
+// Convert) fails the whole call rather than silently posting an
+// un-narrated or partially-encrypted reversal.
+type erroringCipher struct{ err error }
+
+func (c erroringCipher) Encrypt(context.Context, string, string) (string, error) {
+	return "", c.err
+}
+
+func (c erroringCipher) Decrypt(_ context.Context, _ string, stored string) (string, error) {
+	return stored, nil
+}
+
+// TestReverseTransaction_EncryptFailureLeavesNoReversal proves that when the
+// configured cipher's Encrypt call fails while building the reversal's own
+// narration, ReverseTransaction returns that error and posts nothing: a
+// later GetReversalOf still reports domain.ErrTransactionNotFound, and the
+// original's balance is untouched.
+func TestReverseTransaction_EncryptFailureLeavesNoReversal(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newReverseAccounts(t, repo, tenant)
+
+	original := mkTxn(t, debit.ID, credit.ID)
+	if err := repo.CreateTransaction(ctx, tenant, original); err != nil {
+		t.Fatalf("post original: %v", err)
+	}
+
+	sentinel := errors.New("boom: encrypt failure")
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil, ledger.WithCipher(erroringCipher{err: sentinel}))
+
+	_, alreadyReversed, err := svc.ReverseTransaction(ctx, tenant, original.ID)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("ReverseTransaction() error = %v, want the sentinel encrypt error", err)
+	}
+	if alreadyReversed {
+		t.Error("alreadyReversed = true, want false")
+	}
+
+	if _, err := repo.GetReversalOf(ctx, tenant, original.ID); !errors.Is(err, domain.ErrTransactionNotFound) {
+		t.Errorf("GetReversalOf after a failed encrypt: err = %v, want ErrTransactionNotFound (nothing posted)", err)
+	}
+	debitBal, err := repo.Balance(ctx, tenant, debit.ID)
+	if err != nil {
+		t.Fatalf("debit balance: %v", err)
+	}
+	if debitBal.Amount() != 250 {
+		t.Errorf("debit balance after a failed reversal encrypt = %d, want 250 (unchanged)", debitBal.Amount())
+	}
+}

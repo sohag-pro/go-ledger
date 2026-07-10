@@ -527,3 +527,92 @@ func TestCrypto_PostConvertReverseSucceedAfterShred_FreshVersionMintedOldRedacte
 		t.Errorf("pre-shred description after shred = %q, want %q", gotPreShred.Postings[0].Description, crypto.RedactedMarker)
 	}
 }
+
+// TestCrypto_ListAndExportTransactionsDecryptDescriptions proves
+// TransactionService.decryptItems (the shared tail of ListTransactions and
+// ExportTransactions) decrypts every returned item's posting descriptions
+// when a cipher is configured (Task 6.2, audit A9.3): Get's own decrypt path
+// is already covered elsewhere in this file, but the list/export path is a
+// separate code path (a different repository read, batched over many rows)
+// that must not leak ciphertext through either.
+func TestCrypto_ListAndExportTransactionsDecryptDescriptions(t *testing.T) {
+	t.Parallel()
+	repo := postgres.NewRepository(newTestPool(t))
+	cipher := newTestCipher(t, repo)
+	_, txns, _, tenant, debitID, creditID := setupCryptoTestTenant(t, cipher)
+	ctx := context.Background()
+
+	const plaintext = "list and export cipher plaintext"
+	txn := mkTxnWithDescription(t, debitID, creditID, plaintext)
+	if _, err := txns.Post(ctx, tenant, txn, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	listed, err := txns.ListTransactions(ctx, tenant, domain.TransactionFilter{}, nil, 10)
+	if err != nil {
+		t.Fatalf("list transactions: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("list transactions = %d items, want 1", len(listed))
+	}
+	if got := descriptionOf(listed[0].Transaction); got != plaintext {
+		t.Errorf("list transactions description = %q, want decrypted %q", got, plaintext)
+	}
+
+	exported, truncated, err := txns.ExportTransactions(ctx, tenant, domain.TransactionFilter{})
+	if err != nil {
+		t.Fatalf("export transactions: %v", err)
+	}
+	if truncated {
+		t.Error("export transactions: truncated = true for a single-transaction tenant, want false")
+	}
+	if len(exported) != 1 {
+		t.Fatalf("export transactions = %d items, want 1", len(exported))
+	}
+	if got := descriptionOf(exported[0].Transaction); got != plaintext {
+		t.Errorf("export transactions description = %q, want decrypted %q", got, plaintext)
+	}
+}
+
+// descriptionOf returns the first non-empty posting description on t, or ""
+// if none. A small helper for the list/export assertions above, which only
+// care about the one leg mkTxnWithDescription actually set.
+func descriptionOf(t domain.Transaction) string {
+	for _, p := range t.Postings {
+		if p.Description != "" {
+			return p.Description
+		}
+	}
+	return ""
+}
+
+// TestCrypto_AccountStatementDecryptsDescription proves
+// AccountService.Statement decrypts each entry's Description when
+// WithAccountCipher is configured (Task 6.2, audit A9.3): unlike Get and
+// ListTransactions/ExportTransactions (TransactionService), this is
+// AccountService's own decrypt-on-read path, reading through
+// domain.Repository.Statement rather than GetTransaction/ListTransactions.
+func TestCrypto_AccountStatementDecryptsDescription(t *testing.T) {
+	t.Parallel()
+	repo := postgres.NewRepository(newTestPool(t))
+	cipher := newTestCipher(t, repo)
+	_, txns, accounts, tenant, debitID, creditID := setupCryptoTestTenant(t, cipher)
+	ctx := context.Background()
+
+	const plaintext = "statement cipher plaintext"
+	txn := mkTxnWithDescription(t, debitID, creditID, plaintext)
+	if _, err := txns.Post(ctx, tenant, txn, nil); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	_, entries, err := accounts.Statement(ctx, tenant, debitID, nil, 10)
+	if err != nil {
+		t.Fatalf("statement: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("statement = %d entries, want 1", len(entries))
+	}
+	if entries[0].Description != plaintext {
+		t.Errorf("statement description = %q, want decrypted %q", entries[0].Description, plaintext)
+	}
+}

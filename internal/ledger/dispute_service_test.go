@@ -185,6 +185,50 @@ func TestDisputeService_OpenUnknownTransaction(t *testing.T) {
 	}
 }
 
+// TestDisputeService_OpenInvalidReason proves Open validates the dispute
+// before ever writing it: an empty reason (or one over
+// domain.MaxDisputeReasonLen) is rejected with a domain validation error,
+// and, since CreateDispute is never reached, no dispute row is left behind
+// for the same transaction (a later Open with a valid reason still
+// succeeds).
+func TestDisputeService_OpenInvalidReason(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	txns := ledger.NewTransactionService(repo, discardLogger(), nil)
+	disputes := ledger.NewDisputeService(repo, txns)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newDisputeAccounts(t, repo, tenant)
+
+	original := mkTxn(t, debit.ID, credit.ID)
+	if _, err := txns.Post(ctx, tenant, original, &domain.Idempotency{Key: "dispute-open-invalid-reason-1"}); err != nil {
+		t.Fatalf("post original: %v", err)
+	}
+
+	if _, err := disputes.Open(ctx, tenant, original.ID, ""); !errors.Is(err, domain.ErrInvalidDispute) {
+		t.Errorf("Open with empty reason: err = %v, want ErrInvalidDispute", err)
+	}
+
+	tooLong := make([]byte, domain.MaxDisputeReasonLen+1)
+	for i := range tooLong {
+		tooLong[i] = 'x'
+	}
+	if _, err := disputes.Open(ctx, tenant, original.ID, string(tooLong)); !errors.Is(err, domain.ErrDisputeReasonTooLong) {
+		t.Errorf("Open with too-long reason: err = %v, want ErrDisputeReasonTooLong", err)
+	}
+
+	// No dispute was ever created for this transaction: a valid Open still
+	// succeeds afterward.
+	d, err := disputes.Open(ctx, tenant, original.ID, "a valid reason")
+	if err != nil {
+		t.Fatalf("Open with a valid reason after two rejected attempts: %v", err)
+	}
+	if d.Status != domain.DisputeOpen {
+		t.Errorf("status = %q, want %q", d.Status, domain.DisputeOpen)
+	}
+}
+
 // TestDisputeService_ResolveTwiceIsRejected checks that resolving an
 // already-resolved dispute (sequentially, not racing) returns
 // ErrDisputeAlreadyResolved and never posts a second reversal.
