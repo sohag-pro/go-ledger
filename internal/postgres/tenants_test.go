@@ -61,6 +61,22 @@ func TestCreateTenantDuplicateID(t *testing.T) {
 	}
 }
 
+// TestCreateTenantInvalidName proves CreateTenant rejects an empty name
+// before ever reaching the database, surfacing domain.ErrInvalidTenant rather
+// than a database constraint violation (there is no NOT NULL/CHECK on
+// tenants.name to catch this: the validation lives entirely in
+// domain.Tenant.Validate, which CreateTenant calls up front).
+func TestCreateTenantInvalidName(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+
+	err := repo.CreateTenant(context.Background(), uuid.NewString(), "")
+	if !errors.Is(err, domain.ErrInvalidTenant) {
+		t.Errorf("CreateTenant with empty name: err = %v, want ErrInvalidTenant", err)
+	}
+}
+
 // TestGetTenantNotFound proves a lookup for an id with no row returns the
 // typed domain.ErrTenantNotFound.
 func TestGetTenantNotFound(t *testing.T) {

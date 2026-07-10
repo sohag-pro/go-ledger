@@ -94,6 +94,18 @@ func TestMalformedIDsReturnErrors(t *testing.T) {
 			_, err := repo.Statement(ctx, uuid.NewString(), uuid.NewString(), "USD", cursor, 10)
 			return err
 		}},
+		{"SetAccountStatus bad tenant", func() error {
+			return repo.SetAccountStatus(ctx, bad, uuid.NewString(), domain.AccountFrozen)
+		}},
+		{"SetAccountStatus bad account id", func() error {
+			return repo.SetAccountStatus(ctx, uuid.NewString(), bad, domain.AccountFrozen)
+		}},
+		{"TouchAPIKeyLastUsed bad id", func() error {
+			return repo.TouchAPIKeyLastUsed(ctx, bad, time.Now())
+		}},
+		{"CreateTenant bad tenant id", func() error {
+			return repo.CreateTenant(ctx, bad, "some tenant")
+		}},
 	}
 
 	for _, tt := range tests {
