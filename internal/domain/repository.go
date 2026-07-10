@@ -107,6 +107,17 @@ type Repository interface {
 	// including all its postings, or ErrTransactionNotFound if none exists.
 	GetTransaction(ctx context.Context, tenantID, id string) (Transaction, error)
 
+	// GetReversalOf returns the transaction that reverses originalID within
+	// tenantID (its ReversesTransactionID equals originalID), including all
+	// its postings, or ErrTransactionNotFound if no reversal exists yet
+	// (Task 4.2, audit A1.2). The transactions_one_reversal_idx unique index
+	// (migration 0017) guarantees there is at most one, so this is a plain
+	// lookup, never a list: TransactionService.ReverseTransaction calls it
+	// both as its idempotency precheck (before ever attempting to post a
+	// reversal) and as the race guard's read-back after a concurrent
+	// double-reverse loses the insert.
+	GetReversalOf(ctx context.Context, tenantID, originalID string) (Transaction, error)
+
 	// GetOrCreateClearingAccount returns the tenant's per-currency FX clearing
 	// system account (ADR-014), creating it on first use. name is reserved and
 	// deterministic ("fx.clearing.<CURRENCY>"), so two callers converting the

@@ -114,4 +114,19 @@ var (
 	// AllowedCurrencies entry that is not a well-formed three-letter
 	// currency code.
 	ErrInvalidTenantPolicy = errors.New("domain: invalid tenant policy")
+	// ErrCannotReverseReversal is returned when ReverseTransaction is asked to
+	// reverse a transaction that is itself a reversal (its
+	// ReversesTransactionID is already set). Reversing a reversal has no
+	// meaning in this model: postings are append-only (ADR-001), so undoing a
+	// correction is itself just a new, forward correction, and only ever of
+	// an ORIGINAL transaction (Task 4.2, audit A1.2).
+	ErrCannotReverseReversal = errors.New("domain: cannot reverse a reversal")
+	// ErrTransactionAlreadyReversed signals that a transaction already has a
+	// reversal linked to it (the transactions_one_reversal_idx unique index,
+	// migration 0017). Like ErrDuplicateIdempotencyKey, it is an internal
+	// control-flow signal: TransactionService.ReverseTransaction catches it
+	// and reads back the existing reversal instead of surfacing it to a
+	// caller, so a concurrent double-reverse resolves to exactly one
+	// reversal, whichever attempt's insert won the race.
+	ErrTransactionAlreadyReversed = errors.New("domain: transaction already reversed")
 )

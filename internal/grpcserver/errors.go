@@ -37,6 +37,8 @@ func toStatus(err error) error {
 		return status.Error(codes.NotFound, "account not found")
 	case errors.Is(err, domain.ErrTransactionNotFound):
 		return status.Error(codes.NotFound, "transaction not found")
+	case errors.Is(err, domain.ErrCannotReverseReversal):
+		return status.Error(codes.FailedPrecondition, "cannot reverse a transaction that is itself a reversal")
 	case errors.Is(err, domain.ErrIdempotencyKeyNotFound):
 		return status.Error(codes.NotFound, "idempotency key not found")
 	case errors.Is(err, domain.ErrDuplicateTransaction):

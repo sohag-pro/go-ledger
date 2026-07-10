@@ -119,6 +119,18 @@ func (f *fakeRepo) GetTransaction(_ context.Context, _, id string) (domain.Trans
 	return t, nil
 }
 
+// GetReversalOf is a linear scan over the in-memory map: fine for a handler
+// test's tiny fixture set, mirroring the "at most one reversal per original"
+// invariant the real transactions_one_reversal_idx enforces in Postgres.
+func (f *fakeRepo) GetReversalOf(_ context.Context, _, originalID string) (domain.Transaction, error) {
+	for _, t := range f.txns {
+		if t.ReversesTransactionID != nil && *t.ReversesTransactionID == originalID {
+			return t, nil
+		}
+	}
+	return domain.Transaction{}, domain.ErrTransactionNotFound
+}
+
 // GetOrCreateClearingAccount is a minimal in-memory stand-in: it looks up the
 // reserved clearing account name in the same accounts map a real user account
 // would live in, creating it (System, Liability) on first use. Handler tests

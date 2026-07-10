@@ -104,15 +104,16 @@ type Tenant struct {
 }
 
 type Transaction struct {
-	ID                uuid.UUID
-	TenantID          uuid.UUID
-	CreatedAt         time.Time
-	FxSourceAmount    pgtype.Int8
-	FxConvertedAmount pgtype.Int8
-	FxMidRateE8       pgtype.Int8
-	FxSpreadBps       pgtype.Int4
-	FxAppliedE8       pgtype.Int8
-	FxRateSource      pgtype.Text
-	FxEffectiveAt     pgtype.Timestamptz
-	FxRateID          pgtype.Int8
+	ID                    uuid.UUID
+	TenantID              uuid.UUID
+	CreatedAt             time.Time
+	FxSourceAmount        pgtype.Int8
+	FxConvertedAmount     pgtype.Int8
+	FxMidRateE8           pgtype.Int8
+	FxSpreadBps           pgtype.Int4
+	FxAppliedE8           pgtype.Int8
+	FxRateSource          pgtype.Text
+	FxEffectiveAt         pgtype.Timestamptz
+	FxRateID              pgtype.Int8
+	ReversesTransactionID pgtype.UUID
 }

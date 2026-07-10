@@ -290,6 +290,7 @@ func TestRequiredGRPCScope(t *testing.T) {
 		{"/ledger.v1.LedgerService/PostTransaction", domain.ScopePost},
 		{"/ledger.v1.LedgerService/Convert", domain.ScopePost},
 		{"/ledger.v1.LedgerService/GetTransaction", domain.ScopeRead},
+		{"/ledger.v1.LedgerService/ReverseTransaction", domain.ScopePost},
 		{"/ledger.v1.LedgerService/GetTransactionAudit", domain.ScopeRead},
 		{"/ledger.v1.LedgerService/GetAccountAudit", domain.ScopeRead},
 		{"/ledger.v1.LedgerService/SomeFutureRPCNotYetMapped", domain.ScopePost},

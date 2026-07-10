@@ -43,6 +43,14 @@ type Transaction struct {
 	// (a convert's idempotency fingerprint is computed over the request, not
 	// the postings; see internal/ledger's Convert).
 	FX *FXDetail
+	// ReversesTransactionID is the id of the transaction this one reverses
+	// (Task 4.2, audit A1.2), or nil for an ordinary post. Postings are
+	// append-only (ADR-001): a reversal is never a mutation of the original,
+	// it is a brand new transaction, built by BuildReversal, whose postings
+	// undo it. A transaction with this set is itself never reversible again
+	// (see ErrCannotReverseReversal): there is no reversal of a reversal in
+	// this model, only forward corrections.
+	ReversesTransactionID *string
 }
 
 // Validate enforces the double-entry invariant. It requires at least two
@@ -92,4 +100,47 @@ func (t Transaction) Validate() error {
 		}
 	}
 	return nil
+}
+
+// reversalDescriptionPrefix narrates a reversal posting: "reversal of
+// <original transaction id>". It is truncated to MaxPostingDescriptionLen
+// if ever combined with an id long enough to exceed it (never true for a
+// UUID today, but BuildReversal enforces the limit rather than assume it).
+const reversalDescriptionPrefix = "reversal of "
+
+// BuildReversal returns the transaction that reverses t: a new transaction
+// with id newID, ReversesTransactionID pointing back at t.ID, and every
+// posting negated (Money.Neg, overflow-checked) on the same account in the
+// same currency, narrated "reversal of <t.ID>". Negating every posting
+// preserves each currency group's zero sum (see Validate): a reversal of a
+// balanced transaction is itself balanced, per currency, without
+// BuildReversal needing to re-derive or re-check that invariant itself.
+//
+// newID is taken as given, not generated here: callers that want storage to
+// assign an id (the normal path, mirroring how Post and Convert leave t.ID
+// empty for CreateTransaction to fill in) pass "", and callers that need a
+// specific id up front (tests, mainly) pass one.
+//
+// The only error BuildReversal can return is domain.ErrOverflow, from
+// Money.Neg on a posting whose amount is math.MinInt64 (the one value with
+// no representable negation); every other posting negates cleanly.
+func (t Transaction) BuildReversal(newID string) (Transaction, error) {
+	originalID := t.ID
+	postings := make([]Posting, len(t.Postings))
+	desc := reversalDescriptionPrefix + originalID
+	if len(desc) > MaxPostingDescriptionLen {
+		desc = desc[:MaxPostingDescriptionLen]
+	}
+	for i, p := range t.Postings {
+		neg, err := p.Amount.Neg()
+		if err != nil {
+			return Transaction{}, err
+		}
+		postings[i] = Posting{AccountID: p.AccountID, Amount: neg, Description: desc}
+	}
+	return Transaction{
+		ID:                    newID,
+		Postings:              postings,
+		ReversesTransactionID: &originalID,
+	}, nil
 }

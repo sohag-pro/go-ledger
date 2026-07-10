@@ -37,6 +37,10 @@ type PostingBody struct {
 type TransactionBody struct {
 	ID       string        `json:"id"`
 	Postings []PostingBody `json:"postings"`
+	// ReversesTransactionID is set only when this transaction is itself a
+	// reversal (Task 4.2, audit A1.2): the id of the transaction it reverses.
+	// Omitted for an ordinary post or convert.
+	ReversesTransactionID *string `json:"reverses_transaction_id,omitempty" doc:"Set only when this transaction is a reversal: the id of the transaction it reverses"`
 }
 
 // CreateTransactionInput is the post-transaction request body.
@@ -68,6 +72,17 @@ type transactionIDInput struct {
 	ID string `path:"id" format:"uuid" doc:"Transaction id"`
 }
 
+// ReverseTransactionOutput is the reverse-transaction response. AlreadyReversed
+// mirrors CreateTransactionOutput's Replayed / ConvertOutput's Replayed: true
+// when the original already had a reversal and the existing one was returned
+// unchanged instead of a new one being posted. The response status is always
+// 201, even when AlreadyReversed is true, the same convention Post and
+// Convert use for their own idempotent replay.
+type ReverseTransactionOutput struct {
+	AlreadyReversed bool `header:"Already-Reversed"`
+	Body            TransactionBody
+}
+
 func toTransactionBody(t domain.Transaction) TransactionBody {
 	postings := make([]PostingBody, 0, len(t.Postings))
 	for _, p := range t.Postings {
@@ -78,7 +93,7 @@ func toTransactionBody(t domain.Transaction) TransactionBody {
 			Description: p.Description,
 		})
 	}
-	return TransactionBody{ID: t.ID, Postings: postings}
+	return TransactionBody{ID: t.ID, Postings: postings, ReversesTransactionID: t.ReversesTransactionID}
 }
 
 // FXDetailBody is the applied-rate detail for a cross-currency convert: the
@@ -241,5 +256,26 @@ func registerTransactions(api huma.API, deps Deps) {
 				FX:          toFXDetailBody(txn.FX),
 			},
 		}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "reverse-transaction",
+		Method:        http.MethodPost,
+		Path:          "/v1/transactions/{id}/reverse",
+		Summary:       "Reverse a transaction",
+		Description:   "Posts the negated legs of the transaction named by id as a new, linked transaction (postings are append-only, ADR-001: this never mutates the original). Idempotent: a transaction can be reversed at most once, so calling this again for the same id returns the SAME reversal, with Already-Reversed: true, instead of posting a second one. Reversing a transaction that is itself a reversal returns 422.",
+		Tags:          []string{"transactions"},
+		DefaultStatus: http.StatusCreated,
+		Security:      bearerSecurity,
+	}, func(ctx context.Context, in *transactionIDInput) (*ReverseTransactionOutput, error) {
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		reversal, alreadyReversed, err := deps.Transactions.ReverseTransaction(ctx, tenant, in.ID)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &ReverseTransactionOutput{AlreadyReversed: alreadyReversed, Body: toTransactionBody(*reversal)}, nil
 	})
 }

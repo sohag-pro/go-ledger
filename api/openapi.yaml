@@ -577,6 +577,9 @@ components:
           type:
             - array
             - "null"
+        reverses_transaction_id:
+          description: "Set only when this transaction is a reversal: the id of the transaction it reverses"
+          type: string
       required:
         - id
         - postings
@@ -1257,6 +1260,41 @@ paths:
       security:
         - bearerAuth: []
       summary: List a transaction's audit log
+      tags:
+        - transactions
+  /v1/transactions/{id}/reverse:
+    post:
+      description: "Posts the negated legs of the transaction named by id as a new, linked transaction (postings are append-only, ADR-001: this never mutates the original). Idempotent: a transaction can be reversed at most once, so calling this again for the same id returns the SAME reversal, with Already-Reversed: true, instead of posting a second one. Reversing a transaction that is itself a reversal returns 422."
+      operationId: reverse-transaction
+      parameters:
+        - description: Transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Transaction id
+            format: uuid
+            type: string
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionBody"
+          description: Created
+          headers:
+            Already-Reversed:
+              schema:
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Reverse a transaction
       tags:
         - transactions
 servers:

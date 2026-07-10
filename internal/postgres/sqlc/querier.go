@@ -35,7 +35,8 @@ type Querier interface {
 	// spans two currencies, so there is no single transaction-level value left to
 	// store. The fx_* columns are the immutable snapshot of the conversion
 	// actually applied; all nullable, since a single-currency transaction (still
-	// the common case) has none of this.
+	// the common case) has none of this. reverses_transaction_id (Task 4.2,
+	// audit A1.2) is likewise nullable: only a reversal carries it.
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
 	// The latest quote for (base, quote) at or before now, preferring a
 	// tenant-specific row over the global default (Task 2.4, audit A3.3):
@@ -106,6 +107,10 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
+	// The reversal of a given original, if one exists (Task 4.2, audit A1.2):
+	// transactions_one_reversal_idx (migration 0017) guarantees at most one row
+	// can ever match, so this is a plain :one lookup, not a list.
+	GetReversalOf(ctx context.Context, arg GetReversalOfParams) (Transaction, error)
 	GetTenant(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
 	// scopes and expires_at (Task 2.2b) are now written on insert: the admin

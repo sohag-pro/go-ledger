@@ -16,29 +16,32 @@ const createTransaction = `-- name: CreateTransaction :exec
 INSERT INTO transactions (
     id, tenant_id,
     fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
-    fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id
+    fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id,
+    reverses_transaction_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 `
 
 type CreateTransactionParams struct {
-	ID                uuid.UUID
-	TenantID          uuid.UUID
-	FxSourceAmount    pgtype.Int8
-	FxConvertedAmount pgtype.Int8
-	FxMidRateE8       pgtype.Int8
-	FxSpreadBps       pgtype.Int4
-	FxAppliedE8       pgtype.Int8
-	FxRateSource      pgtype.Text
-	FxEffectiveAt     pgtype.Timestamptz
-	FxRateID          pgtype.Int8
+	ID                    uuid.UUID
+	TenantID              uuid.UUID
+	FxSourceAmount        pgtype.Int8
+	FxConvertedAmount     pgtype.Int8
+	FxMidRateE8           pgtype.Int8
+	FxSpreadBps           pgtype.Int4
+	FxAppliedE8           pgtype.Int8
+	FxRateSource          pgtype.Text
+	FxEffectiveAt         pgtype.Timestamptz
+	FxRateID              pgtype.Int8
+	ReversesTransactionID pgtype.UUID
 }
 
 // currency lives on each posting now (ADR-014), not here: an FX transaction
 // spans two currencies, so there is no single transaction-level value left to
 // store. The fx_* columns are the immutable snapshot of the conversion
 // actually applied; all nullable, since a single-currency transaction (still
-// the common case) has none of this.
+// the common case) has none of this. reverses_transaction_id (Task 4.2,
+// audit A1.2) is likewise nullable: only a reversal carries it.
 func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionParams) error {
 	_, err := q.db.Exec(ctx, createTransaction,
 		arg.ID,
@@ -51,14 +54,53 @@ func (q *Queries) CreateTransaction(ctx context.Context, arg CreateTransactionPa
 		arg.FxRateSource,
 		arg.FxEffectiveAt,
 		arg.FxRateID,
+		arg.ReversesTransactionID,
 	)
 	return err
+}
+
+const getReversalOf = `-- name: GetReversalOf :one
+SELECT id, tenant_id, created_at,
+       fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
+       fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id,
+       reverses_transaction_id
+FROM transactions
+WHERE tenant_id = $1 AND reverses_transaction_id = $2
+`
+
+type GetReversalOfParams struct {
+	TenantID              uuid.UUID
+	ReversesTransactionID pgtype.UUID
+}
+
+// The reversal of a given original, if one exists (Task 4.2, audit A1.2):
+// transactions_one_reversal_idx (migration 0017) guarantees at most one row
+// can ever match, so this is a plain :one lookup, not a list.
+func (q *Queries) GetReversalOf(ctx context.Context, arg GetReversalOfParams) (Transaction, error) {
+	row := q.db.QueryRow(ctx, getReversalOf, arg.TenantID, arg.ReversesTransactionID)
+	var i Transaction
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CreatedAt,
+		&i.FxSourceAmount,
+		&i.FxConvertedAmount,
+		&i.FxMidRateE8,
+		&i.FxSpreadBps,
+		&i.FxAppliedE8,
+		&i.FxRateSource,
+		&i.FxEffectiveAt,
+		&i.FxRateID,
+		&i.ReversesTransactionID,
+	)
+	return i, err
 }
 
 const getTransaction = `-- name: GetTransaction :one
 SELECT id, tenant_id, created_at,
        fx_source_amount, fx_converted_amount, fx_mid_rate_e8, fx_spread_bps,
-       fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id
+       fx_applied_e8, fx_rate_source, fx_effective_at, fx_rate_id,
+       reverses_transaction_id
 FROM transactions
 WHERE tenant_id = $1 AND id = $2
 `
@@ -83,6 +125,7 @@ func (q *Queries) GetTransaction(ctx context.Context, arg GetTransactionParams) 
 		&i.FxRateSource,
 		&i.FxEffectiveAt,
 		&i.FxRateID,
+		&i.ReversesTransactionID,
 	)
 	return i, err
 }

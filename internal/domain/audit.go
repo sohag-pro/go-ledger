@@ -13,6 +13,13 @@ import (
 // in-place update to record.
 const ActionTransactionCreated = "transaction.created"
 
+// ActionTransactionReversed is the audit action recorded when
+// TransactionService.ReverseTransaction posts a reversal (Task 4.2, audit
+// A1.2). It is recorded once, for the reversal transaction itself, at the
+// moment it is first posted; a replayed (already-reversed) call posts no new
+// audit event, since no new transaction was written.
+const ActionTransactionReversed = "transaction.reversed"
+
 // AuditGenesisHash is the prev_hash of a tenant's first audit row: the empty
 // string. There is no prior row to chain from, so genesis is "nothing", not a
 // fixed magic value that could be mistaken for a real hash.

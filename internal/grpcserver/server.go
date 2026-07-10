@@ -120,7 +120,13 @@ func toProtoTransaction(t domain.Transaction) *ledgerv1.Transaction {
 			Currency:    string(p.Amount.Currency()),
 		})
 	}
-	return &ledgerv1.Transaction{Id: t.ID, Postings: postings}
+	pt := &ledgerv1.Transaction{Id: t.ID, Postings: postings}
+	// reverses_transaction_id (Task 4.2, audit A1.2) is set only when t is
+	// itself a reversal; left at its zero value ("") otherwise.
+	if t.ReversesTransactionID != nil {
+		pt.ReversesTransactionId = *t.ReversesTransactionID
+	}
+	return pt
 }
 
 // toProtoFXDetail translates a domain.FXDetail to its protobuf shape. Nil
@@ -295,6 +301,22 @@ func (s *Server) GetTransaction(ctx context.Context, req *ledgerv1.GetTransactio
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.GetTransactionResponse{Transaction: toProtoTransaction(txn)}, nil
+}
+
+// ReverseTransaction posts the negated legs of the transaction named by
+// req.OriginalTransactionId as a new, linked transaction, mirroring POST
+// /v1/transactions/{id}/reverse (Task 4.2, audit A1.2). Idempotent: a
+// repeat call for the same original returns the SAME reversal, with
+// already_reversed = true, instead of posting a second one.
+func (s *Server) ReverseTransaction(ctx context.Context, req *ledgerv1.ReverseTransactionRequest) (*ledgerv1.ReverseTransactionResponse, error) {
+	reversal, alreadyReversed, err := s.txns.ReverseTransaction(ctx, tenantFrom(ctx), req.OriginalTransactionId)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &ledgerv1.ReverseTransactionResponse{
+		Transaction:     toProtoTransaction(*reversal),
+		AlreadyReversed: alreadyReversed,
+	}, nil
 }
 
 // GetTransactionAudit returns the audit trail entries recorded for a transaction.

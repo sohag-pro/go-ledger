@@ -58,6 +58,8 @@ func toHumaErr(err error) error {
 		return huma.Error404NotFound("account not found")
 	case errors.Is(err, domain.ErrTransactionNotFound):
 		return huma.Error404NotFound("transaction not found")
+	case errors.Is(err, domain.ErrCannotReverseReversal):
+		return huma.Error422UnprocessableEntity("cannot reverse a transaction that is itself a reversal")
 	case errors.Is(err, domain.ErrDuplicateTransaction):
 		return huma.Error409Conflict("transaction already exists")
 	case errors.Is(err, domain.ErrIdempotencyConflict):

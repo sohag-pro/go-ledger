@@ -358,8 +358,25 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 		params.FxEffectiveAt = pgtype.Timestamptz{Time: t.FX.EffectiveAt, Valid: true}
 		params.FxRateID = pgtype.Int8{Int64: t.FX.RateID, Valid: true}
 	}
+	// ReversesTransactionID (Task 4.2, audit A1.2) is nil for an ordinary
+	// post; only BuildReversal ever sets it.
+	if t.ReversesTransactionID != nil {
+		reversesID, err := uuid.Parse(*t.ReversesTransactionID)
+		if err != nil {
+			return fmt.Errorf("postgres: parse reverses transaction id: %w", err)
+		}
+		params.ReversesTransactionID = pgtype.UUID{Bytes: reversesID, Valid: true}
+	}
 	if err := tr.q.CreateTransaction(ctx, params); err != nil {
 		if isUniqueViolation(err) {
+			// transactions_one_reversal_idx (migration 0017): a second
+			// reversal of the same original. Distinguished from an ordinary
+			// id collision (transactions_pkey) so the service can catch it
+			// specifically and read back the existing reversal instead of
+			// treating it as ErrDuplicateTransaction.
+			if pgConstraint(err) == "transactions_one_reversal_idx" {
+				return domain.ErrTransactionAlreadyReversed
+			}
 			return domain.ErrDuplicateTransaction
 		}
 		return fmt.Errorf("postgres: insert transaction: %w", err)
@@ -498,9 +515,44 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: get transaction: %w", err)
 	}
+	return r.transactionFromRow(ctx, tid, row)
+}
+
+// GetReversalOf returns the transaction that reverses originalID within
+// tenantID, or domain.ErrTransactionNotFound if none exists yet (Task 4.2,
+// audit A1.2). transactions_one_reversal_idx (migration 0017) guarantees at
+// most one row can ever match.
+func (r *Repository) GetReversalOf(ctx context.Context, tenantID, originalID string) (domain.Transaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	origID, err := uuid.Parse(originalID)
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: parse original transaction id: %w", err)
+	}
+	row, err := r.q.GetReversalOf(ctx, sqlc.GetReversalOfParams{
+		TenantID:              tid,
+		ReversesTransactionID: pgtype.UUID{Bytes: origID, Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Transaction{}, domain.ErrTransactionNotFound
+	}
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: get reversal: %w", err)
+	}
+	return r.transactionFromRow(ctx, tid, row)
+}
+
+// transactionFromRow loads tid's postings and assembles the full
+// domain.Transaction from a sqlc.Transaction row already fetched by
+// GetTransaction or GetReversalOf: both queries select the identical column
+// set, so the postings fetch, FX snapshot, and ReversesTransactionID
+// assembly below are shared rather than duplicated per query.
+func (r *Repository) transactionFromRow(ctx context.Context, tid uuid.UUID, row sqlc.Transaction) (domain.Transaction, error) {
 	postings, err := r.q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
 		TenantID:      tid,
-		TransactionID: txID,
+		TransactionID: row.ID,
 	})
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: list postings: %w", err)
@@ -534,6 +586,12 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 			EffectiveAt:     row.FxEffectiveAt.Time,
 			RateID:          row.FxRateID.Int64,
 		}
+	}
+	// reverses_transaction_id (Task 4.2, audit A1.2) is NULL for an ordinary
+	// transaction; only a reversal carries it.
+	if row.ReversesTransactionID.Valid {
+		reversesID := uuid.UUID(row.ReversesTransactionID.Bytes).String()
+		out.ReversesTransactionID = &reversesID
 	}
 	return out, nil
 }
