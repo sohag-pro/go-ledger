@@ -59,7 +59,7 @@ point-in-time recovery, and add a scheduled automated restore-and-verify job tha
 restores into a throwaway environment and runs the balance invariant and
 `audit/verify` walks over the restored data. Write RPO and RTO into the runbook.
 Tool and topology (pgBackRest vs WAL-G; DB co-located with WAL shipping vs moving to
-managed Postgres) are decided in the dedicated **ADR-017 (durability and DR)**
+managed Postgres) are decided in the dedicated **ADR-016 (durability and DR)**
 authored at the start of this phase. Default lean: pgBackRest to encrypted S3-
 compatible storage, DB co-located for now, managed Postgres named as the growth
 path. Nothing else in this remediation matters if this is not done.
@@ -94,7 +94,7 @@ in commit order and appends audit rows, so the hot-path posting no longer serial
 on the chain read-then-append and multiple app instances stop fighting over it. The
 detailed design (outbox schema, the chainer's leader-election / single-runner
 guarantee, ordering, backpressure, and how `audit/verify` reads a possibly-lagging
-chain) is recorded in the dedicated **ADR-018 (multi-instance audit chain)** at the
+chain) is recorded in the dedicated **ADR-017 (multi-instance audit chain)** at the
 start of this phase. A two-instance same-tenant contention test (A8.2) is written
 first so the current 40001 / 503 failure mode is measured, not guessed. Migrations
 move to a CI step gated before the binary swap once instance count exceeds one
@@ -198,7 +198,7 @@ white-label bar.
 - The outbox-chainer (Phase 3) is the deepest change: it moves the audit chain off
   the synchronous posting path, which changes `audit/verify` semantics (the chain
   may briefly lag a committed transaction) and requires a single-runner guarantee.
-  ADR-018 records that design; it is not hand-waved here.
+  ADR-017 records that design; it is not hand-waved here.
 - Per-finding severity and file references stay in the audit report; this ADR is the
   decision and sequencing record, and the implementation plan
   (`docs/superpowers/plans/2026-07-10-audit-remediation.md`) maps every finding to a
@@ -214,7 +214,7 @@ white-label bar.
 - **Advisory-lock or per-partition sharding for multi-instance (A3.6):** rejected as
   the primary path in favor of the outbox-chainer, because a database advisory lock
   under SERIALIZABLE was already shown to fail (ADR-012), and sharding the chain
-  complicates verification. Recorded fully in ADR-018.
+  complicates verification. Recorded fully in ADR-017.
 - **Managed Postgres now (A4.1/A4.2):** the cleaner durability answer, deferred as
   the growth path rather than the immediate step, because WAL archiving off the
   current box removes the disqualifying data-loss risk at far lower cost and change;
