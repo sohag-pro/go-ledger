@@ -75,6 +75,13 @@ type AuditOutbox struct {
 	ProcessedAt   pgtype.Timestamptz
 }
 
+type CryptoKey struct {
+	TenantID   uuid.UUID
+	WrappedDek []byte
+	CreatedAt  time.Time
+	ShreddedAt pgtype.Timestamptz
+}
+
 type FxRate struct {
 	ID          int64
 	Base        string

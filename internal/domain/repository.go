@@ -431,4 +431,26 @@ type Repository interface {
 	// intact. It returns domain.ErrWebhookSubscriptionNotFound if no
 	// subscription matches id.
 	SetWebhookSubscriptionActive(ctx context.Context, id string, active bool) error
+
+	// ShredTenantCryptoKey irreversibly destroys tenantID's PII encryption
+	// key (Task 6.2, audit A9.3): the crypto-shredding technique that
+	// resolves the tension between the ledger's immutability and a
+	// data-subject's right to erasure. It sets crypto_keys.wrapped_dek to
+	// NULL and stamps shredded_at, so every posting description ever
+	// encrypted under that tenant's Data Encryption Key becomes permanently
+	// unreadable (internal/crypto.Cipher.Decrypt returns
+	// crypto.RedactedMarker for it afterward), while every money row
+	// (postings, transactions, balances) and the tamper-evident audit hash
+	// chain (ADR-012) are completely untouched: the chain hashes the exact
+	// ciphertext bytes already stored in audit_log.after, never decrypts
+	// them, so it verifies identically before and after a shred.
+	//
+	// This is deliberately irreversible and, unlike RevokeAPIKey, does not
+	// stop at "already done": it leaves a permanent shredded tombstone even
+	// for a tenant that had never encrypted anything yet (no crypto_keys row
+	// at all), so a shred request can never be silently undone by that
+	// tenant's next post minting a fresh, live key. Calling it again for an
+	// already-shredded tenant is a no-op success, not an error, and never
+	// moves the original shredded_at timestamp.
+	ShredTenantCryptoKey(ctx context.Context, tenantID string) error
 }

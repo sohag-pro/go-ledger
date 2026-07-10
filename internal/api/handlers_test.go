@@ -767,6 +767,13 @@ func (f *fakeRepo) SetWebhookSubscriptionActive(_ context.Context, id string, ac
 	return nil
 }
 
+// ShredTenantCryptoKey is a no-op for these handler tests (Task 6.2, audit
+// A9.3): none of them exercise PII crypto-shredding, which has its own
+// integration tests over the real postgres.Repository.
+func (f *fakeRepo) ShredTenantCryptoKey(_ context.Context, _ string) error {
+	return nil
+}
+
 var _ domain.Repository = (*fakeRepo)(nil)
 
 // fakeFXProvider is a fixed-rate fx.Provider for handler tests: it stands in
