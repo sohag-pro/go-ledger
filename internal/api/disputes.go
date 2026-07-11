@@ -152,6 +152,7 @@ func registerDisputes(api huma.API, deps Deps) {
 		Method:      http.MethodGet,
 		Path:        "/v1/disputes/{id}",
 		Summary:     "Get a dispute",
+		Description: "Fetches a single dispute by id, including its resolution details once resolved.",
 		Tags:        []string{"disputes"},
 		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *disputeIDInput) (*DisputeOutput, error) {

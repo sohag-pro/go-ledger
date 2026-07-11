@@ -118,6 +118,10 @@ func New(router chi.Router, deps Deps) huma.API {
 
 	config.Info.Description = "A production-grade payment ledger built on double-entry accounting. " +
 		"Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.\n\n" +
+		"Start here: create a tenant with POST /v1/admin/tenants, issue it a key with POST /v1/admin/keys (scope post, or admin " +
+		"if it will also manage tenants and keys), then use that key to create accounts and post transactions. The admin, " +
+		"reports, and disputes operations are grouped by tag below (admin: tenants, admin: keys, admin: webhooks, reports, " +
+		"disputes) so they are easy to find in this playground.\n\n" +
 		"Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. " +
 		"A transaction's postings must sum to zero.\n\n" +
 		"Authentication: every /v1 endpoint requires a bearer API key, sent as `Authorization: Bearer <api-key>`. " +
@@ -138,6 +142,25 @@ func New(router chi.Router, deps Deps) huma.API {
 	}
 	config.Servers = []*huma.Server{
 		{URL: "https://go.sohag.pro", Description: "production"},
+	}
+
+	// Tags fixes the operation grouping and order the Scalar playground
+	// renders in its sidebar. Without this, Scalar falls back to the order
+	// tags are first seen across registerOperations's registration calls,
+	// which does not put the onboarding flow (admin: tenants, then admin:
+	// keys) ahead of day-to-day usage (accounts, transactions). Listing them
+	// here, in the order a new caller should read them, keeps that fixed
+	// regardless of registration order.
+	config.Tags = []*huma.Tag{
+		{Name: "admin: tenants", Description: "Onboard, suspend, close, or reactivate a tenant, and set its posting guardrails. Start here."},
+		{Name: "admin: keys", Description: "Issue, rotate, revoke, and list a tenant's api keys. Do this right after creating a tenant."},
+		{Name: "admin: webhooks", Description: "Register callback URLs to receive signed webhook deliveries for a tenant's posted transactions."},
+		{Name: "accounts", Description: "Create and manage the ledger accounts money moves between."},
+		{Name: "transactions", Description: "Post and reverse double-entry transactions."},
+		{Name: "reports", Description: "Read-only reporting and analytics over a tenant's ledger."},
+		{Name: "disputes", Description: "Open and resolve disputes (chargebacks) against posted transactions."},
+		{Name: "audit", Description: "Read the tamper-evident audit trail."},
+		{Name: "meta", Description: "Service health and metadata."},
 	}
 
 	// Advertise bearer-key auth in the spec itself, so the Scalar playground
