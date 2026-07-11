@@ -181,6 +181,12 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .gs-text{flex:1}
 .gs-go{font-size:12.5px}
 
+/* feature list */
+.feat-list{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:9px 24px}
+.feat-list li{position:relative;padding-left:20px;color:var(--muted);font-size:13px;line-height:1.5}
+.feat-list li::before{content:"+";position:absolute;left:2px;top:0;color:var(--cyan);font-family:var(--mono);font-weight:600}
+.feat-list li strong{color:var(--text);font-weight:600;margin-right:4px}
+
 /* activity */
 .activity{list-style:none;margin:0;padding:0}
 .activity li{display:flex;align-items:baseline;gap:12px;padding:10px 4px;border-bottom:1px solid var(--line);font-size:13.5px}
@@ -322,14 +328,22 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
         <p class="page-sub">A double-entry ledger for <span id="ovTenant" class="mono"></span>. Every transaction sums to zero.</p>
 
         <div class="card" style="margin:0 0 20px;border-color:rgba(0,173,216,.22)">
-          <p style="margin:0;color:var(--muted);max-width:70ch">
+          <p style="margin:0 0 16px;color:var(--muted)">
             <strong style="color:var(--text)">go-ledger</strong> is an open-source, multi-tenant, double-entry payment ledger written in Go.
             Money moves as balanced transactions: every set of postings sums to zero, so funds are never created or lost, only shifted between accounts.
-            This console is a thin client over the live API. Use it to create accounts, post transactions, manage tenants, keys, webhooks and policy, and read reports.
+            This console is a thin client over the live API.
           </p>
+          <ul class="feat-list">
+            <li><strong>Double-entry core</strong> zero-sum postings, balances derived from history, never edited in place</li>
+            <li><strong>Multi-tenant</strong> isolated ledgers, each with its own accounts, keys and policy</li>
+            <li><strong>Multi-currency</strong> the zero-sum invariant holds per currency, with FX conversion</li>
+            <li><strong>Operator surface</strong> tenants, API keys, webhook subscriptions and guardrail policy</li>
+            <li><strong>Reporting</strong> trial balance proof, transaction search and disputes</li>
+            <li><strong>Tamper-evident</strong> append-only audit chain and idempotent posting</li>
+          </ul>
         </div>
 
-        <div id="gsToggleWrap">
+        <div id="gsToggleWrap" style="margin:8px 0 26px">
           <button class="gs-toggle" id="gsToggle" aria-expanded="false">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="6" stroke="#00ADD8" stroke-width="1.3"/><path d="M7 4.2v5.6M4.2 7h5.6" stroke="#00ADD8" stroke-width="1.3" stroke-linecap="round"/></svg>
             New here? Start here
