@@ -411,13 +411,43 @@ func TestLoadConfig_SafeByDefault(t *testing.T) {
 	}
 }
 
+// TestDemoKeyScopes proves demoKeyScopes (ADR-019, "First-boot admin
+// provisioning") elevates the demo key to admin scope only in demo mode: the
+// public operator console needs the demo key to exercise the admin surface,
+// but a plain (non-demo) deployment's demo key must never carry admin scope.
+func TestDemoKeyScopes(t *testing.T) {
+	if got := demoKeyScopes(true); !hasScope(got, domain.ScopeAdmin) {
+		t.Fatalf("demo mode should include admin scope, got %v", got)
+	}
+	if got := demoKeyScopes(false); hasScope(got, domain.ScopeAdmin) {
+		t.Fatalf("non-demo demo key must NOT have admin scope, got %v", got)
+	}
+}
+
+// hasScope reports whether scopes contains want. A small test helper: unlike
+// domain.APIKey.HasScope, this checks literal membership in a raw
+// []domain.Scope rather than the admin-is-a-superset rule, which is exactly
+// what TestDemoKeyScopes needs to assert on demoKeyScopes' return value
+// directly.
+func hasScope(scopes []domain.Scope, want domain.Scope) bool {
+	for _, s := range scopes {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 // fakeKeyStore is an in-memory api_keys store for the provisioning test. It
 // mirrors the behaviours provisionAPIKeys depends on from the real postgres
 // repository: a second insert of the same key_hash fails with a Postgres
 // unique-violation (23505) rather than overwriting, a second CreateTenant for
 // the same id fails with domain.ErrTenantAlreadyExists rather than
 // overwriting, and a stored key resolves back by hash so the resolver can
-// find it.
+// find it. It also implements ListKeys/IssueKey (the adminKeyIssuer
+// interface) over the same in-memory map, so the provisionAdminKey unit
+// tests below can use one fake for both roles instead of standing up a real
+// admin.Service and database.
 type fakeKeyStore struct {
 	byHash  map[string]domain.APIKey
 	tenants map[string]bool
@@ -475,6 +505,37 @@ func (s *fakeKeyStore) GetAPIKeyByHash(_ context.Context, hash string) (domain.A
 // last_used_at, which is covered in internal/auth's own tests.
 func (s *fakeKeyStore) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
 	return nil
+}
+
+// ListKeys returns every key stored for tenantID, mirroring
+// admin.Service.ListKeys closely enough for provisionAdminKey's own tests:
+// it never returns a key's plaintext (there is none stored here either), and
+// includes revoked keys, matching the real ListAPIKeysByTenant.
+func (s *fakeKeyStore) ListKeys(_ context.Context, tenantID string) ([]domain.APIKey, error) {
+	var out []domain.APIKey
+	for _, k := range s.byHash {
+		if k.TenantID == tenantID {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
+// IssueKey mints and stores a fresh key for tenantID, mirroring
+// admin.Service.IssueKey closely enough for provisionAdminKey's own tests:
+// generates a real plaintext/hash pair via domain.GenerateAPIKey and inserts
+// it through InsertAPIKey above, so a duplicate insert is caught the same
+// way a real one would be.
+func (s *fakeKeyStore) IssueKey(ctx context.Context, tenantID, name string, scopes []domain.Scope, expiresAt *time.Time) (string, domain.APIKey, error) {
+	plaintext, hash, err := domain.GenerateAPIKey()
+	if err != nil {
+		return "", domain.APIKey{}, err
+	}
+	k := domain.APIKey{TenantID: tenantID, Name: name, Scopes: scopes, ExpiresAt: expiresAt}
+	if err := s.InsertAPIKey(ctx, k, hash); err != nil {
+		return "", domain.APIKey{}, err
+	}
+	return plaintext, s.byHash[hash], nil
 }
 
 // TestProvisionAPIKeysIsIdempotent proves provisionAPIKeys is safe to run on
@@ -674,5 +735,91 @@ func TestRunIdempotencySweep(t *testing.T) {
 	}
 	if !strings.Contains(logs, "idempotency keys swept") {
 		t.Errorf("log missing a successful non-zero sweep line: %q", logs)
+	}
+}
+
+// TestProvisionAdminKey_DemoModeIsANoOp proves provisionAdminKey does nothing
+// in demo mode (ADR-019): the demo key itself already carries admin scope
+// there (demoKeyScopes), so a separate bootstrap-admin key would be
+// redundant. No key is minted and nothing is logged.
+func TestProvisionAdminKey_DemoModeIsANoOp(t *testing.T) {
+	const tenant = "00000000-0000-0000-0000-0000000000cc"
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	store := newFakeKeyStore()
+	cfg := config{defaultTenant: tenant, demoMode: true, adminBootstrap: true}
+
+	if err := provisionAdminKey(context.Background(), store, store, cfg, logger); err != nil {
+		t.Fatalf("provisionAdminKey: %v", err)
+	}
+	if got := len(store.byHash); got != 0 {
+		t.Errorf("api key rows = %d, want 0 in demo mode", got)
+	}
+	if logBuf.Len() != 0 {
+		t.Errorf("log = %q, want nothing logged in demo mode", logBuf.String())
+	}
+}
+
+// TestProvisionAdminKey_BootstrapDisabledIsANoOp proves ADMIN_BOOTSTRAP=false
+// suppresses auto-provisioning entirely, even outside demo mode: an operator
+// who wants to mint their own admin key via ledgerctl, with no server-minted
+// key ever appearing in the logs, can opt out this way.
+func TestProvisionAdminKey_BootstrapDisabledIsANoOp(t *testing.T) {
+	const tenant = "00000000-0000-0000-0000-0000000000dd"
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	store := newFakeKeyStore()
+	cfg := config{defaultTenant: tenant, demoMode: false, adminBootstrap: false}
+
+	if err := provisionAdminKey(context.Background(), store, store, cfg, logger); err != nil {
+		t.Fatalf("provisionAdminKey: %v", err)
+	}
+	if got := len(store.byHash); got != 0 {
+		t.Errorf("api key rows = %d, want 0 when ADMIN_BOOTSTRAP=false", got)
+	}
+	if logBuf.Len() != 0 {
+		t.Errorf("log = %q, want nothing logged when ADMIN_BOOTSTRAP=false", logBuf.String())
+	}
+}
+
+// TestProvisionAdminKey_ProdModeProvisionsOnceAndIsIdempotent proves the
+// production auto-provisioning path (ADR-019): with no existing admin key,
+// provisionAdminKey mints one, admin-scoped, and logs its plaintext exactly
+// once; a second call (mirroring a restart) finds the admin key already
+// there and mints nothing further, so the plaintext is never logged again
+// and the key count does not grow.
+func TestProvisionAdminKey_ProdModeProvisionsOnceAndIsIdempotent(t *testing.T) {
+	const tenant = "00000000-0000-0000-0000-0000000000ee"
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	store := newFakeKeyStore()
+	cfg := config{defaultTenant: tenant, demoMode: false, adminBootstrap: true}
+
+	if err := provisionAdminKey(context.Background(), store, store, cfg, logger); err != nil {
+		t.Fatalf("first provisionAdminKey: %v", err)
+	}
+	if got := len(store.byHash); got != 1 {
+		t.Fatalf("api key rows after first boot = %d, want 1", got)
+	}
+	var minted domain.APIKey
+	for _, k := range store.byHash {
+		minted = k
+	}
+	if !minted.HasScope(domain.ScopeAdmin) {
+		t.Errorf("provisioned key scopes = %v, want admin", minted.Scopes)
+	}
+	if !strings.Contains(logBuf.String(), "provisioned bootstrap admin key") {
+		t.Errorf("log missing the one-time bootstrap-admin notice: %q", logBuf.String())
+	}
+
+	logBuf.Reset()
+	if err := provisionAdminKey(context.Background(), store, store, cfg, logger); err != nil {
+		t.Fatalf("second provisionAdminKey (idempotent): %v", err)
+	}
+	if got := len(store.byHash); got != 1 {
+		t.Errorf("api key rows after second boot = %d, want still 1 (idempotent)", got)
+	}
+	if logBuf.Len() != 0 {
+		t.Errorf("log on second boot = %q, want nothing (admin key already exists)", logBuf.String())
 	}
 }

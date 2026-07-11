@@ -151,6 +151,7 @@ type config struct {
 	webhookMaxAttempts       int
 	webhookDeliveryInterval  time.Duration
 	metricsCollectInterval   time.Duration
+	adminBootstrap           bool
 }
 
 func loadConfig() (config, error) {
@@ -256,6 +257,12 @@ func loadConfig() (config, error) {
 		// every instance runs one unconditionally (see opsmetrics's own doc
 		// comment for why no leader election is needed here).
 		metricsCollectInterval: getenvDuration("METRICS_COLLECT_INTERVAL", opsmetrics.DefaultInterval),
+		// ADMIN_BOOTSTRAP (ADR-019, "First-boot admin provisioning"): on by
+		// default, so a self-hoster is never locked out of their own admin
+		// surface on a fresh production deployment. Set to false to opt out
+		// (for example when an operator would rather mint their own admin
+		// key via ledgerctl and never have one printed to the logs).
+		adminBootstrap: getenvBool("ADMIN_BOOTSTRAP", true),
 	}
 	if cfg.databaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
@@ -426,12 +433,25 @@ func run(logger *slog.Logger) error {
 	// resolver's default cache TTL.
 	resolver := auth.NewResolver(repo, cfg.authCacheTTL)
 
+	// Built once here and reused as api.Deps.Admin below (see deps), so
+	// provisionAdminKey and the /v1/admin surface share the same instance
+	// instead of each constructing their own thin wrapper over repo.
+	adminSvc := admin.NewService(repo)
+
 	// Provision the public demo key (and, when configured, a high-limit
 	// load-test key) before serving. Both are idempotent: a row with the same
 	// key_hash already existing is treated as success, so a restart or the
 	// four-hour demo wipe (which clears tenant DATA tables, never api_keys)
 	// leaves the console working with the same key against a fresh ledger.
 	if err := provisionAPIKeys(ctx, repo, cfg, logger); err != nil {
+		return err
+	}
+
+	// First-boot admin provisioning (ADR-019): in demo mode the demo key
+	// above already carries admin scope, so this is a no-op there; in
+	// production, mints and logs a bootstrap admin key exactly once, only if
+	// the default tenant does not already have a live one.
+	if err := provisionAdminKey(ctx, repo, adminSvc, cfg, logger); err != nil {
 		return err
 	}
 
@@ -491,7 +511,7 @@ func run(logger *slog.Logger) error {
 			ledger.WithAccountCipher(cipher)),
 		Transactions: transactions,
 		Audit:        ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher)),
-		Admin:        admin.NewService(repo),
+		Admin:        adminSvc,
 		Reports:      ledger.NewReportService(repo),
 		// Disputes resolves action=reverse through the SAME
 		// TransactionService instance handling POST /v1/transactions: a
@@ -804,6 +824,17 @@ type apiKeyStore interface {
 	CreateTenant(ctx context.Context, tenantID, name string) error
 }
 
+// demoKeyScopes returns the scopes the demo key is provisioned with. In demo
+// mode the demo key carries admin scope so the public operator console can
+// exercise the admin surface (safe: the demo resets every four hours and is
+// rate limited, ADR-019). Outside demo mode it never gets admin scope.
+func demoKeyScopes(demoMode bool) []domain.Scope {
+	if demoMode {
+		return []domain.Scope{domain.ScopeRead, domain.ScopePost, domain.ScopeAdmin}
+	}
+	return []domain.Scope{domain.ScopeRead, domain.ScopePost}
+}
+
 // provisionAPIKeys provisions the public demo key when DEMO_MODE is on (ADR-015,
 // "Safe-by-default deployment": demo behavior is opt-in, so a plain deployment
 // with DEMO_MODE unset provisions and logs nothing about a demo key), and when
@@ -822,6 +853,7 @@ func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger
 			TenantID:     cfg.defaultTenant,
 			Name:         "demo",
 			RateLimitRPM: &demoRPM,
+			Scopes:       demoKeyScopes(cfg.demoMode),
 		}, cfg.demoAPIKey); err != nil {
 			return fmt.Errorf("provision demo api key: %w", err)
 		}
@@ -878,6 +910,68 @@ func provisionKey(ctx context.Context, store apiKeyStore, k domain.APIKey, plain
 	if err != nil && !postgres.IsUniqueViolationError(err) {
 		return err
 	}
+	return nil
+}
+
+// adminKeyIssuer is the slice of *admin.Service that provisionAdminKey needs:
+// list a tenant's existing keys (to check whether a live admin-scoped one
+// already exists) and mint a new one. *admin.Service satisfies it directly;
+// a test uses a fake.
+type adminKeyIssuer interface {
+	ListKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error)
+	IssueKey(ctx context.Context, tenantID, name string, scopes []domain.Scope, expiresAt *time.Time) (string, domain.APIKey, error)
+}
+
+// tenantHasAdminKey reports whether keys already contains a live (non-revoked)
+// key carrying admin scope.
+func tenantHasAdminKey(keys []domain.APIKey) bool {
+	for _, k := range keys {
+		if k.RevokedAt == nil && k.HasScope(domain.ScopeAdmin) {
+			return true
+		}
+	}
+	return false
+}
+
+// provisionAdminKey auto-provisions a production admin credential on first
+// boot (ADR-019, "First-boot admin provisioning"), so a self-hoster is never
+// locked out of their own admin surface. It is a no-op in demo mode (the demo
+// key itself already carries admin scope there, see demoKeyScopes) and when
+// ADMIN_BOOTSTRAP is disabled. It is idempotent: if the default tenant
+// already holds a live admin-scoped key, whether from a previous boot of
+// this function or minted by hand via ledgerctl or the admin API, nothing is
+// generated and nothing is logged. Otherwise it mints one admin-scoped key
+// with no expiry and logs its plaintext exactly once: this is the only place
+// in the codebase permitted to log a key's plaintext (contrast provisionKey,
+// which never does).
+func provisionAdminKey(ctx context.Context, store apiKeyStore, adminSvc adminKeyIssuer, cfg config, logger *slog.Logger) error {
+	if cfg.demoMode || !cfg.adminBootstrap {
+		return nil
+	}
+
+	// Ensure the default tenant row exists before checking or minting keys
+	// against it, mirroring provisionKey's own ordering above: on a
+	// brand-new deployment nothing has created it yet, and admin.Service.IssueKey
+	// requires the tenant to already exist and be active.
+	tenantName := "provisioned-" + cfg.defaultTenant
+	if err := store.CreateTenant(ctx, cfg.defaultTenant, tenantName); err != nil && !errors.Is(err, domain.ErrTenantAlreadyExists) {
+		return fmt.Errorf("provision admin key: create tenant %s: %w", cfg.defaultTenant, err)
+	}
+
+	existing, err := adminSvc.ListKeys(ctx, cfg.defaultTenant)
+	if err != nil {
+		return fmt.Errorf("provision admin key: list existing keys: %w", err)
+	}
+	if tenantHasAdminKey(existing) {
+		return nil
+	}
+
+	plaintext, key, err := adminSvc.IssueKey(ctx, cfg.defaultTenant, "bootstrap-admin", []domain.Scope{domain.ScopeAdmin}, nil)
+	if err != nil {
+		return fmt.Errorf("provision admin key: issue key: %w", err)
+	}
+	logger.Info("provisioned bootstrap admin key: store it now, it will not be shown again",
+		"tenant", cfg.defaultTenant, "key_id", key.ID, "api_key", plaintext)
 	return nil
 }
 
