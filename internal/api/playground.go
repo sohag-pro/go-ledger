@@ -25,6 +25,19 @@ const playgroundHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
   <title>go-ledger API playground</title>
+  <link rel="icon" href="/static/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png" />
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="go-ledger" />
+  <meta property="og:title" content="go-ledger API playground" />
+  <meta property="og:description" content="Interactive API reference for go-ledger, a production-grade double-entry payment ledger in Go." />
+  <meta property="og:url" content="https://go.sohag.pro/playground" />
+  <meta property="og:image" content="https://go.sohag.pro/static/og-image.jpg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://go.sohag.pro/static/og-image.jpg" />
 </head>
 <body>
   <a href="/#book" style="position:fixed; right:16px; bottom:16px; z-index:9999; font-family:system-ui,-apple-system,sans-serif; font-size:13px; color:#E8EDF2; background:#16202E; border:1px solid rgba(0,173,216,0.45); border-radius:999px; padding:8px 15px; text-decoration:none; box-shadow:0 8px 24px rgba(0,0,0,0.45);">Get The Ledger Book &rarr;</a>

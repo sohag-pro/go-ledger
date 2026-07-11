@@ -57,6 +57,20 @@ func Console(w http.ResponseWriter, r *http.Request) {
 	servePage(w, r, consoleHTML, consoleETag)
 }
 
+// Favicon serves the site icon at the conventional /favicon.ico root path, which
+// browsers and link scrapers request directly (in addition to the <link
+// rel="icon"> tags on each page). The bytes come from the embedded static dir.
+func Favicon(w http.ResponseWriter, r *http.Request) {
+	b, err := staticFS.ReadFile("static/favicon.ico")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(b)
+}
+
 func servePage(w http.ResponseWriter, r *http.Request, body []byte, etag string) {
 	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)

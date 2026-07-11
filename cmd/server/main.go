@@ -646,6 +646,7 @@ func run(logger *slog.Logger) error {
 	// observe a request it rejects.
 	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger), maxBodyBytes(api.MaxRequestBodyBytes))
 	router.Get("/", web.Index)
+	router.Get("/favicon.ico", web.Favicon)
 	router.Get("/console", web.Console)
 	router.Get("/console/config", web.ConsoleConfig(web.ConsoleConfigData{
 		DemoMode:        cfg.demoMode,
