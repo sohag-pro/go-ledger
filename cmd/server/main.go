@@ -596,6 +596,10 @@ func run(logger *slog.Logger) error {
 	router.Use(middleware.RequestID, middleware.Recoverer, otelRouteName, slogLogger(logger), maxBodyBytes(api.MaxRequestBodyBytes))
 	router.Get("/", web.Index)
 	router.Get("/console", web.Console)
+	router.Get("/console/config", web.ConsoleConfig(web.ConsoleConfigData{
+		DemoMode:        cfg.demoMode,
+		DefaultTenantID: cfg.defaultTenant,
+	}))
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
 	api.RegisterPlayground(router)
 	api.New(router, deps) // mounts /v1/*, /healthz, /openapi.*, /schemas/
