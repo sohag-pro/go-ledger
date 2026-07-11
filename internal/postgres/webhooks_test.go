@@ -4,12 +4,22 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
+	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
 )
+
+// pgtypeText is a small helper matching MarkWebhookDeliveryFailedParams'
+// LastError field shape, so this file's test does not need to import pgtype
+// at every call site.
+func pgtypeText(s string) pgtype.Text {
+	return pgtype.Text{String: s, Valid: true}
+}
 
 // TestCreateWebhookSubscriptionAssignsIDAndActive proves CreateWebhookSubscription
 // assigns an id when sub.ID is empty, writes it back, and always creates an
@@ -127,6 +137,126 @@ func TestSetWebhookSubscriptionActiveTogglesAndErrorsOnUnknownID(t *testing.T) {
 	err = repo.SetWebhookSubscriptionActive(ctx, uuid.NewString(), false)
 	if !errors.Is(err, domain.ErrWebhookSubscriptionNotFound) {
 		t.Errorf("set active on unknown id: err = %v, want ErrWebhookSubscriptionNotFound", err)
+	}
+}
+
+// TestMarkWebhookDelivery_TerminalStateGuard proves the follow-up F2 fix:
+// MarkWebhookDeliveryDelivered and MarkWebhookDeliveryFailed both guard on
+// "status IN ('pending','failed')", so a delivery already carried to a
+// terminal 'delivered' outcome can never be regressed back to 'failed' by a
+// second, slower worker racing the first over the same row (the two-leader
+// window the doc comments on both queries describe). A genuinely
+// pending/failed row still transitions normally.
+func TestMarkWebhookDelivery_TerminalStateGuard(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	q := sqlc.New(pool)
+	ctx := context.Background()
+
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "webhook mark guard test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	sub := domain.WebhookSubscription{TenantID: tenant, URL: "https://example.com/hooks"}
+	if err := repo.CreateWebhookSubscription(ctx, &sub, "whsec_mark-guard-test"); err != nil {
+		t.Fatalf("create webhook subscription: %v", err)
+	}
+	tenantUUID := uuid.MustParse(tenant)
+	subUUID := uuid.MustParse(sub.ID)
+
+	newDelivery := func(chainSeq int64) uuid.UUID {
+		id := uuid.New()
+		rows, err := q.InsertWebhookDelivery(ctx, sqlc.InsertWebhookDeliveryParams{
+			ID:             id,
+			TenantID:       tenantUUID,
+			SubscriptionID: subUUID,
+			AuditChainSeq:  chainSeq,
+			EventType:      domain.ActionTransactionCreated,
+			Payload:        []byte(`{}`),
+		})
+		if err != nil {
+			t.Fatalf("insert delivery: %v", err)
+		}
+		if rows != 1 {
+			t.Fatalf("insert delivery affected %d rows, want 1", rows)
+		}
+		return id
+	}
+
+	// A delivered row: a late MarkWebhookDeliveryFailed must affect 0 rows
+	// and must NOT move it back to 'failed'.
+	deliveredID := newDelivery(1)
+	deliveredRows, err := q.MarkWebhookDeliveryDelivered(ctx, sqlc.MarkWebhookDeliveryDeliveredParams{
+		ID:       deliveredID,
+		Attempts: 1,
+	})
+	if err != nil {
+		t.Fatalf("mark delivered: %v", err)
+	}
+	if deliveredRows != 1 {
+		t.Fatalf("mark delivered affected %d rows, want 1", deliveredRows)
+	}
+
+	regressRows, err := q.MarkWebhookDeliveryFailed(ctx, sqlc.MarkWebhookDeliveryFailedParams{
+		ID:            deliveredID,
+		Status:        string(domain.WebhookDeliveryFailed),
+		Attempts:      2,
+		NextAttemptAt: time.Now().UTC(),
+		LastError:     pgtypeText("late failure after already delivered"),
+	})
+	if err != nil {
+		t.Fatalf("late mark failed: %v", err)
+	}
+	if regressRows != 0 {
+		t.Fatalf("late MarkWebhookDeliveryFailed on a delivered row affected %d rows, want 0 (no regression)", regressRows)
+	}
+
+	got, err := q.GetWebhookDelivery(ctx, deliveredID)
+	if err != nil {
+		t.Fatalf("get delivery: %v", err)
+	}
+	if got.Status != string(domain.WebhookDeliveryDelivered) {
+		t.Fatalf("delivery status after late MarkWebhookDeliveryFailed = %q, want %q (must stay terminal)", got.Status, domain.WebhookDeliveryDelivered)
+	}
+	if got.Attempts != 1 {
+		t.Fatalf("delivery attempts after late MarkWebhookDeliveryFailed = %d, want 1 (unchanged)", got.Attempts)
+	}
+
+	// A genuinely pending row still transitions to failed normally.
+	pendingID := newDelivery(2)
+	failRows, err := q.MarkWebhookDeliveryFailed(ctx, sqlc.MarkWebhookDeliveryFailedParams{
+		ID:            pendingID,
+		Status:        string(domain.WebhookDeliveryFailed),
+		Attempts:      1,
+		NextAttemptAt: time.Now().UTC(),
+		LastError:     pgtypeText("transport error"),
+	})
+	if err != nil {
+		t.Fatalf("mark pending failed: %v", err)
+	}
+	if failRows != 1 {
+		t.Fatalf("mark pending failed affected %d rows, want 1", failRows)
+	}
+	gotFailed, err := q.GetWebhookDelivery(ctx, pendingID)
+	if err != nil {
+		t.Fatalf("get failed delivery: %v", err)
+	}
+	if gotFailed.Status != string(domain.WebhookDeliveryFailed) {
+		t.Fatalf("delivery status after mark failed = %q, want %q", gotFailed.Status, domain.WebhookDeliveryFailed)
+	}
+
+	// And a failed row still transitions to delivered normally (a retry that
+	// eventually succeeds).
+	deliverAfterFailRows, err := q.MarkWebhookDeliveryDelivered(ctx, sqlc.MarkWebhookDeliveryDeliveredParams{
+		ID:       pendingID,
+		Attempts: 2,
+	})
+	if err != nil {
+		t.Fatalf("mark delivered after failed: %v", err)
+	}
+	if deliverAfterFailRows != 1 {
+		t.Fatalf("mark delivered after failed affected %d rows, want 1", deliverAfterFailRows)
 	}
 }
 

@@ -103,24 +103,35 @@ ORDER BY wd.next_attempt_at
 LIMIT sqlc.arg(batch_limit)
 FOR UPDATE OF wd SKIP LOCKED;
 
--- name: MarkWebhookDeliveryDelivered :exec
+-- name: MarkWebhookDeliveryDelivered :execrows
 -- A 2xx response: terminal success. attempts is set to the total number of
 -- tries this delivery took (including the successful one), the same total
 -- MarkWebhookDeliveryFailed accumulates on the way here, so attempts always
 -- means "how many times this delivery was actually tried", not just "how
--- many times it failed".
-UPDATE webhook_deliveries SET status = 'delivered', delivered_at = now(), attempts = sqlc.arg(attempts) WHERE id = sqlc.arg(id);
+-- many times it failed". "AND status IN ('pending', 'failed')" guards
+-- against a state regression: in a two-leader window (SKIP LOCKED is
+-- defense in depth, not a guarantee, see ListDueWebhookDeliveries) two
+-- workers can pick up the same due row, and without this guard a slower
+-- worker's write could still land after a faster worker already reached a
+-- terminal outcome for it. Once a row is 'delivered' or 'dead', neither mark
+-- query can move it again: this returns 0 affected rows instead, which the
+-- caller (internal/webhook) treats as a no-op, not an error.
+UPDATE webhook_deliveries SET status = 'delivered', delivered_at = now(), attempts = sqlc.arg(attempts)
+WHERE id = sqlc.arg(id) AND status IN ('pending', 'failed');
 
--- name: MarkWebhookDeliveryFailed :exec
+-- name: MarkWebhookDeliveryFailed :execrows
 -- A non-2xx response or transport error: the caller (internal/webhook)
 -- computes the new attempts count, the resulting status ('failed' to retry
 -- again later, or 'dead' once attempts reaches the configured max), the next
 -- backoff deadline, and the error text to record, all in Go (backoff and the
 -- max-attempts cap are application config, not schema), and this query just
--- persists that decision.
+-- persists that decision. "AND status IN ('pending', 'failed')" is the same
+-- terminal-state guard MarkWebhookDeliveryDelivered carries (see its doc
+-- comment): a delivery already 'delivered' (or already 'dead') can never be
+-- regressed by a late failure write from a second worker that raced this one.
 UPDATE webhook_deliveries
 SET status = sqlc.arg(status), attempts = sqlc.arg(attempts), next_attempt_at = sqlc.arg(next_attempt_at), last_error = sqlc.arg(last_error)
-WHERE id = sqlc.arg(id);
+WHERE id = sqlc.arg(id) AND status IN ('pending', 'failed');
 
 -- name: GetWebhookDelivery :one
 -- Raw fetch by id: tests and any future delivery-inspection tooling read a
