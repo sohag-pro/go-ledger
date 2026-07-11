@@ -1,6 +1,7 @@
 go_ledger_build_plan.md
 bin/
 tmp/
+dist/
 *.test
 *.out
 coverage.html
