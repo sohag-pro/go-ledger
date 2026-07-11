@@ -285,7 +285,8 @@ func registerAdmin(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/admin/tenants",
 		Summary:       "Create a tenant",
-		Tags:          []string{"admin"},
+		Description:   "Creates a new tenant with status active. This is the first call in the onboarding flow: create a tenant here, then issue it an api key with POST /v1/admin/keys before any /v1 account or transaction call can use it.",
+		Tags:          []string{"admin: tenants"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
 		Security:      bearerSecurity,
@@ -302,7 +303,8 @@ func registerAdmin(api huma.API, deps Deps) {
 		Method:      http.MethodGet,
 		Path:        "/v1/admin/tenants",
 		Summary:     "List tenants",
-		Tags:        []string{"admin"},
+		Description: "Lists every tenant, regardless of status.",
+		Tags:        []string{"admin: tenants"},
 		Security:    bearerSecurity,
 	}, func(ctx context.Context, _ *struct{}) (*ListTenantsOutput, error) {
 		tenants, err := deps.Admin.ListTenants(ctx)
@@ -322,7 +324,8 @@ func registerAdmin(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/admin/tenants/{id}/status",
 		Summary:       "Suspend, close, or reactivate a tenant",
-		Tags:          []string{"admin"},
+		Description:   "Sets the tenant's status to active, suspended, or closed. Once a tenant is suspended or closed, every one of its api keys is rejected with 401 on any /v1 call, not only posting: reactivate it (set status back to active) to restore access.",
+		Tags:          []string{"admin: tenants"},
 		DefaultStatus: http.StatusNoContent,
 		MaxBodyBytes:  MaxRequestBodyBytes,
 		Security:      bearerSecurity,
@@ -339,7 +342,7 @@ func registerAdmin(api huma.API, deps Deps) {
 		Path:          "/v1/admin/tenants/{id}/policy",
 		Summary:       "Set a tenant's posting guardrails",
 		Description:   "Sets the tenant's optional per-currency guardrails (Task 2.4b): a max transaction amount, a daily volume cap, and a currency allowlist. Writes the full policy the body describes; an omitted field clears (unlimits) that guardrail rather than leaving a previous value in place.",
-		Tags:          []string{"admin"},
+		Tags:          []string{"admin: tenants"},
 		DefaultStatus: http.StatusNoContent,
 		MaxBodyBytes:  MaxRequestBodyBytes,
 		Security:      bearerSecurity,
@@ -365,7 +368,7 @@ func registerAdmin(api huma.API, deps Deps) {
 			"(accounts, transactions, amounts, balances) and the tamper-evident audit hash chain are completely untouched and remain " +
 			"verifiable. THIS CANNOT BE UNDONE: there is no way to recover an erased description, by anyone, once this call succeeds. " +
 			"Requires confirm: true in the body. Idempotent: calling it again for an already-shredded tenant succeeds with no effect.",
-		Tags:          []string{"admin"},
+		Tags:          []string{"admin: tenants"},
 		DefaultStatus: http.StatusNoContent,
 		MaxBodyBytes:  MaxRequestBodyBytes,
 		Security:      bearerSecurity,
@@ -384,8 +387,8 @@ func registerAdmin(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/admin/keys",
 		Summary:       "Issue a new api key",
-		Description:   "Mints a new api key for a tenant. The plaintext is returned exactly once, in this response, and is never stored or recoverable again: store it now.",
-		Tags:          []string{"admin"},
+		Description:   "Mints a new api key for a tenant. The plaintext is returned exactly once, in this response, and is never stored or recoverable again: store it now. This is the second call in the onboarding flow, right after creating a tenant: issue a key with scope post (or admin, for another operator key) before posting accounts or transactions.",
+		Tags:          []string{"admin: keys"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
 		Security:      bearerSecurity,
@@ -403,7 +406,7 @@ func registerAdmin(api huma.API, deps Deps) {
 		Path:          "/v1/admin/keys/{id}/rotate",
 		Summary:       "Rotate an api key",
 		Description:   "Mints a replacement key with the same tenant, name, and scopes as an existing one. The old key is left active (an overlap window for callers to cut over); revoke it explicitly once they have.",
-		Tags:          []string{"admin"},
+		Tags:          []string{"admin: keys"},
 		DefaultStatus: http.StatusCreated,
 		Security:      bearerSecurity,
 	}, func(ctx context.Context, in *keyIDInput) (*IssueKeyOutput, error) {
@@ -419,7 +422,8 @@ func registerAdmin(api huma.API, deps Deps) {
 		Method:        http.MethodPost,
 		Path:          "/v1/admin/keys/{id}/revoke",
 		Summary:       "Revoke an api key",
-		Tags:          []string{"admin"},
+		Description:   "Immediately and permanently invalidates the key. There is no un-revoke; issue a new key instead.",
+		Tags:          []string{"admin: keys"},
 		DefaultStatus: http.StatusNoContent,
 		Security:      bearerSecurity,
 	}, func(ctx context.Context, in *keyIDInput) (*EmptyOutput, error) {
@@ -435,7 +439,7 @@ func registerAdmin(api huma.API, deps Deps) {
 		Path:        "/v1/admin/keys",
 		Summary:     "List a tenant's api keys",
 		Description: "Lists every key for a tenant, live and revoked, oldest first. Never includes a plaintext: that is shown once, at issue or rotate time, and is never recoverable afterward.",
-		Tags:        []string{"admin"},
+		Tags:        []string{"admin: keys"},
 		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *ListKeysInput) (*ListKeysOutput, error) {
 		keys, err := deps.Admin.ListKeys(ctx, in.TenantID)
@@ -456,7 +460,7 @@ func registerAdmin(api huma.API, deps Deps) {
 		Path:          "/v1/admin/webhooks",
 		Summary:       "Create a webhook subscription",
 		Description:   "Registers a callback URL to receive signed, retried, at-least-once webhook deliveries for a tenant's posted transactions (Task 4.1). The signing secret is returned exactly once, in this response, and is never stored anywhere recoverable again: store it now to verify each delivery's X-Ledger-Signature header.",
-		Tags:          []string{"admin"},
+		Tags:          []string{"admin: webhooks"},
 		DefaultStatus: http.StatusCreated,
 		MaxBodyBytes:  MaxRequestBodyBytes,
 		Security:      bearerSecurity,
@@ -474,7 +478,7 @@ func registerAdmin(api huma.API, deps Deps) {
 		Path:        "/v1/admin/webhooks",
 		Summary:     "List a tenant's webhook subscriptions",
 		Description: "Lists every subscription for a tenant, active or not. Never includes the signing secret: that is shown once, at creation time, and is never recoverable afterward.",
-		Tags:        []string{"admin"},
+		Tags:        []string{"admin: webhooks"},
 		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *ListWebhookSubscriptionsInput) (*ListWebhookSubscriptionsOutput, error) {
 		subs, err := deps.Admin.ListWebhookSubscriptions(ctx, in.TenantID)
@@ -495,7 +499,7 @@ func registerAdmin(api huma.API, deps Deps) {
 		Path:          "/v1/admin/webhooks/{id}",
 		Summary:       "Delete a webhook subscription",
 		Description:   "Deactivates the subscription: the fan-out worker stops creating new pending deliveries for it and the delivery worker stops attempting its existing pending ones, but its delivery history is kept, not discarded.",
-		Tags:          []string{"admin"},
+		Tags:          []string{"admin: webhooks"},
 		DefaultStatus: http.StatusNoContent,
 		Security:      bearerSecurity,
 	}, func(ctx context.Context, in *webhookSubscriptionIDInput) (*EmptyOutput, error) {

@@ -205,6 +205,30 @@ func (q *Queries) RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
 	return result.RowsAffected(), nil
 }
 
+const setAPIKeyScopesByHash = `-- name: SetAPIKeyScopesByHash :exec
+UPDATE api_keys SET scopes = $2 WHERE key_hash = $1
+`
+
+type SetAPIKeyScopesByHashParams struct {
+	KeyHash string
+	Scopes  []string
+}
+
+// Reconciles an already-existing key's scopes to exactly the given set, keyed
+// by hash rather than id (ADR-019 follow-up, review fix): InsertAPIKey is
+// insert-or-ignore on the unique key_hash, so a demo key row left over from a
+// previous boot never has its scopes touched by a plain re-insert. cmd/server
+// calls this right after provisioning the demo key, keyed by
+// domain.HashAPIKey of its known plaintext, so the row's scopes always match
+// demoKeyScopes(cfg.demoMode): it gains admin scope when demo mode turns on,
+// and correctly loses it when a deployment flips out of demo mode. A hash
+// with no matching row affects zero rows, which is fine: the INSERT that
+// runs immediately before this in provisioning order creates it first.
+func (q *Queries) SetAPIKeyScopesByHash(ctx context.Context, arg SetAPIKeyScopesByHashParams) error {
+	_, err := q.db.Exec(ctx, setAPIKeyScopesByHash, arg.KeyHash, arg.Scopes)
+	return err
+}
+
 const touchAPIKeyLastUsed = `-- name: TouchAPIKeyLastUsed :exec
 UPDATE api_keys SET last_used_at = $2 WHERE id = $1
 `

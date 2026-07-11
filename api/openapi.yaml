@@ -969,6 +969,8 @@ info:
   description: |-
     A production-grade payment ledger built on double-entry accounting. Every endpoint here is generated from the live Go handlers, so this spec always matches the running service.
 
+    Start here: create a tenant with POST /v1/admin/tenants, issue it a key with POST /v1/admin/keys (scope post, or admin if it will also manage tenants and keys), then use that key to create accounts and post transactions. The admin, reports, and disputes operations are grouped by tag below (admin: tenants, admin: keys, admin: webhooks, reports, disputes) so they are easy to find in this playground.
+
     Amounts are signed integer minor units (e.g. cents) plus an ISO 4217 currency code. A transaction's postings must sum to zero.
 
     Authentication: every /v1 endpoint requires a bearer API key, sent as `Authorization: Bearer <api-key>`. A missing, unknown, or revoked key returns 401. To try the API without provisioning your own key, use the public demo key `glk_demo_public_key_reset_every_4h` (also wired into the try-it console and the Scalar playground below): it is scoped to the demo tenant and rate limited, so it is safe to expose.
@@ -1358,9 +1360,9 @@ paths:
         - bearerAuth: []
       summary: List a tenant's api keys
       tags:
-        - admin
+        - "admin: keys"
     post:
-      description: "Mints a new api key for a tenant. The plaintext is returned exactly once, in this response, and is never stored or recoverable again: store it now."
+      description: "Mints a new api key for a tenant. The plaintext is returned exactly once, in this response, and is never stored or recoverable again: store it now. This is the second call in the onboarding flow, right after creating a tenant: issue a key with scope post (or admin, for another operator key) before posting accounts or transactions."
       operationId: issue-key
       requestBody:
         content:
@@ -1385,9 +1387,10 @@ paths:
         - bearerAuth: []
       summary: Issue a new api key
       tags:
-        - admin
+        - "admin: keys"
   /v1/admin/keys/{id}/revoke:
     post:
+      description: Immediately and permanently invalidates the key. There is no un-revoke; issue a new key instead.
       operationId: revoke-key
       parameters:
         - description: Key id
@@ -1411,7 +1414,7 @@ paths:
         - bearerAuth: []
       summary: Revoke an api key
       tags:
-        - admin
+        - "admin: keys"
   /v1/admin/keys/{id}/rotate:
     post:
       description: Mints a replacement key with the same tenant, name, and scopes as an existing one. The old key is left active (an overlap window for callers to cut over); revoke it explicitly once they have.
@@ -1442,9 +1445,10 @@ paths:
         - bearerAuth: []
       summary: Rotate an api key
       tags:
-        - admin
+        - "admin: keys"
   /v1/admin/tenants:
     get:
+      description: Lists every tenant, regardless of status.
       operationId: list-tenants
       responses:
         "200":
@@ -1463,8 +1467,9 @@ paths:
         - bearerAuth: []
       summary: List tenants
       tags:
-        - admin
+        - "admin: tenants"
     post:
+      description: "Creates a new tenant with status active. This is the first call in the onboarding flow: create a tenant here, then issue it an api key with POST /v1/admin/keys before any /v1 account or transaction call can use it."
       operationId: create-tenant
       requestBody:
         content:
@@ -1489,7 +1494,7 @@ paths:
         - bearerAuth: []
       summary: Create a tenant
       tags:
-        - admin
+        - "admin: tenants"
   /v1/admin/tenants/{id}/policy:
     post:
       description: "Sets the tenant's optional per-currency guardrails (Task 2.4b): a max transaction amount, a daily volume cap, and a currency allowlist. Writes the full policy the body describes; an omitted field clears (unlimits) that guardrail rather than leaving a previous value in place."
@@ -1522,7 +1527,7 @@ paths:
         - bearerAuth: []
       summary: Set a tenant's posting guardrails
       tags:
-        - admin
+        - "admin: tenants"
   /v1/admin/tenants/{id}/shred-pii:
     post:
       description: "Crypto-shredding (Task 6.2): destroys the tenant's Data Encryption Key. Every posting description ever encrypted under it becomes permanently unreadable (a later read returns a redacted marker, not an error); money data (accounts, transactions, amounts, balances) and the tamper-evident audit hash chain are completely untouched and remain verifiable. THIS CANNOT BE UNDONE: there is no way to recover an erased description, by anyone, once this call succeeds. Requires confirm: true in the body. Idempotent: calling it again for an already-shredded tenant succeeds with no effect."
@@ -1555,9 +1560,10 @@ paths:
         - bearerAuth: []
       summary: Irreversibly erase a tenant's PII encryption key
       tags:
-        - admin
+        - "admin: tenants"
   /v1/admin/tenants/{id}/status:
     post:
+      description: "Sets the tenant's status to active, suspended, or closed. Once a tenant is suspended or closed, every one of its api keys is rejected with 401 on any /v1 call, not only posting: reactivate it (set status back to active) to restore access."
       operationId: set-tenant-status
       parameters:
         - description: Tenant id
@@ -1587,7 +1593,7 @@ paths:
         - bearerAuth: []
       summary: Suspend, close, or reactivate a tenant
       tags:
-        - admin
+        - "admin: tenants"
   /v1/admin/webhooks:
     get:
       description: "Lists every subscription for a tenant, active or not. Never includes the signing secret: that is shown once, at creation time, and is never recoverable afterward."
@@ -1619,7 +1625,7 @@ paths:
         - bearerAuth: []
       summary: List a tenant's webhook subscriptions
       tags:
-        - admin
+        - "admin: webhooks"
     post:
       description: "Registers a callback URL to receive signed, retried, at-least-once webhook deliveries for a tenant's posted transactions (Task 4.1). The signing secret is returned exactly once, in this response, and is never stored anywhere recoverable again: store it now to verify each delivery's X-Ledger-Signature header."
       operationId: create-webhook-subscription
@@ -1646,7 +1652,7 @@ paths:
         - bearerAuth: []
       summary: Create a webhook subscription
       tags:
-        - admin
+        - "admin: webhooks"
   /v1/admin/webhooks/{id}:
     delete:
       description: "Deactivates the subscription: the fan-out worker stops creating new pending deliveries for it and the delivery worker stops attempting its existing pending ones, but its delivery history is kept, not discarded."
@@ -1673,7 +1679,7 @@ paths:
         - bearerAuth: []
       summary: Delete a webhook subscription
       tags:
-        - admin
+        - "admin: webhooks"
   /v1/audit/verify:
     get:
       description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012). The chain itself is built asynchronously by a single background chainer (ADR-017), so `pending` reports how many posted events are not yet reflected in it; a nonzero, non-growing pending count is normal lag, not a fault.
@@ -1781,6 +1787,7 @@ paths:
         - disputes
   /v1/disputes/{id}:
     get:
+      description: Fetches a single dispute by id, including its resolution details once resolved.
       operationId: get-dispute
       parameters:
         - description: Dispute id
@@ -2203,3 +2210,22 @@ paths:
 servers:
   - description: production
     url: https://go.sohag.pro
+tags:
+  - description: Onboard, suspend, close, or reactivate a tenant, and set its posting guardrails. Start here.
+    name: "admin: tenants"
+  - description: Issue, rotate, revoke, and list a tenant's api keys. Do this right after creating a tenant.
+    name: "admin: keys"
+  - description: Register callback URLs to receive signed webhook deliveries for a tenant's posted transactions.
+    name: "admin: webhooks"
+  - description: Create and manage the ledger accounts money moves between.
+    name: accounts
+  - description: Post and reverse double-entry transactions.
+    name: transactions
+  - description: Read-only reporting and analytics over a tenant's ledger.
+    name: reports
+  - description: Open and resolve disputes (chargebacks) against posted transactions.
+    name: disputes
+  - description: Read the tamper-evident audit trail.
+    name: audit
+  - description: Service health and metadata.
+    name: meta

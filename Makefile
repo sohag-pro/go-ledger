@@ -4,7 +4,7 @@ BUILD_DIR   := bin
 
 MIGRATIONS  := internal/postgres/migrations
 
-.PHONY: run build test cover load lint tidy clean dev docker-build image-size openapi sqlc proto migrate-up migrate-down jaeger help
+.PHONY: run build test cover load lint tidy clean dev docker-build image-size openapi sqlc proto migrate-up migrate-down jaeger demo local help
 
 run: ## Run the server
 	go run $(CMD)
@@ -54,6 +54,12 @@ dev: ## Run with hot reload (requires air)
 
 jaeger: ## Start Jaeger all-in-one for local tracing (UI on :16686)
 	docker compose up -d jaeger
+
+demo: ## One-command seeded demo (public admin), see ADR-019
+	docker compose --profile demo up --build
+
+local: ## One-command empty local stack; prints a bootstrap admin key on boot
+	docker compose --profile local up --build
 
 docker-build: ## Build the Docker image
 	DOCKER_BUILDKIT=1 docker build --build-arg BUILD_REVISION=$(REVISION) -t $(BINARY):latest .

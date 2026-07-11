@@ -487,6 +487,17 @@ type Querier interface {
 	// stable because txid is not reused and id is a bigserial tiebreaker for the
 	// (rare) case of equal txid.
 	ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error)
+	// Reconciles an already-existing key's scopes to exactly the given set, keyed
+	// by hash rather than id (ADR-019 follow-up, review fix): InsertAPIKey is
+	// insert-or-ignore on the unique key_hash, so a demo key row left over from a
+	// previous boot never has its scopes touched by a plain re-insert. cmd/server
+	// calls this right after provisioning the demo key, keyed by
+	// domain.HashAPIKey of its known plaintext, so the row's scopes always match
+	// demoKeyScopes(cfg.demoMode): it gains admin scope when demo mode turns on,
+	// and correctly loses it when a deployment flips out of demo mode. A hash
+	// with no matching row affects zero rows, which is fine: the INSERT that
+	// runs immediately before this in provisioning order creates it first.
+	SetAPIKeyScopesByHash(ctx context.Context, arg SetAPIKeyScopesByHashParams) error
 	// Task 5.5, audit A1.5: freezes, closes, or reactivates one account. Scoped
 	// to tenant_id like every other write here, so a caller can never flip a
 	// status on another tenant's account by id alone.
