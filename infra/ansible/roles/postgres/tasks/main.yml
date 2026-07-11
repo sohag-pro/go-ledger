@@ -56,3 +56,128 @@
     src: go-ledger-backup.j2
     dest: /etc/cron.daily/go-ledger-backup
     mode: "0755"
+
+# --- Offsite durability: pgBackRest (ADR-016) ---------------------------
+# WAL archiving plus full/differential base backups shipped to an encrypted,
+# offsite S3-compatible repository, giving point-in-time recovery. This is
+# the disaster recovery path; the pg_dump above stays as a same-box
+# convenience only.
+
+- name: Install pgbackrest
+  ansible.builtin.apt:
+    name: pgbackrest
+    state: present
+    update_cache: true
+
+- name: Create the pgbackrest config directory
+  ansible.builtin.file:
+    path: /etc/pgbackrest
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+- name: Create the pgbackrest spool directory for async WAL archiving
+  ansible.builtin.file:
+    path: /var/spool/pgbackrest
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0750"
+
+- name: Template the pgbackrest repository configuration
+  ansible.builtin.template:
+    src: pgbackrest.conf.j2
+    dest: /etc/pgbackrest/pgbackrest.conf
+    owner: postgres
+    group: postgres
+    mode: "0640"
+
+- name: Note whether the offsite pgbackrest repository is provisioned
+  ansible.builtin.set_fact:
+    postgres_pgbackrest_configured: "{{ pgbackrest_s3_endpoint != 'REPLACE_ME' }}"
+
+- name: Set replication GUCs needed for WAL archiving (safe to set regardless)
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+    regexp: "^#?{{ item.key }}"
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - { key: "wal_level", value: "replica" }
+    - { key: "max_wal_senders", value: "3" }
+  notify: Restart postgresql
+
+# archive_mode/archive_command/archive_timeout are gated behind
+# postgres_pgbackrest_configured: turning archiving on with a failing
+# archive_command (host still REPLACE_ME) makes Postgres retry archiving
+# forever and retain unarchived WAL, which can fill the 1GB shared VPS disk
+# (it also hosts the portfolio site). Until the offsite repo is provisioned,
+# leave archive_mode at its safe "off" default.
+- name: Enable WAL archiving to pgbackrest
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+    regexp: "^#?{{ item.key }}"
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - { key: "archive_mode", value: "on" }
+    - { key: "archive_command", value: "'pgbackrest --stanza={{ pgbackrest_stanza }} archive-push %p'" }
+    - { key: "archive_timeout", value: "60" }
+  when: postgres_pgbackrest_configured
+  notify: Restart postgresql
+
+- name: Skip stanza creation until the offsite repository is provisioned
+  ansible.builtin.debug:
+    msg: >-
+      pgbackrest_s3_endpoint is still REPLACE_ME, so the offsite repository
+      has not been provisioned yet. Skipping stanza-create and leaving the
+      backup timers installed but unstarted. Fill in the real S3 values in
+      group_vars/all.yml or vault, then re-run this role.
+  when: not postgres_pgbackrest_configured
+
+- name: Create the pgbackrest stanza (safe to re-run, already-exists is not an error)
+  # NOTE: the guard below treats any occurrence of the substring "already
+  # exists" in stdout/stderr as a benign no-op. That is deliberately loose:
+  # we don't have a confirmed, version-stable pgbackrest wording to
+  # distinguish "stanza already exists and matches" from "stanza already
+  # exists but the pg1-path (or other option) does not match", and pgbackrest
+  # error text has changed across versions. If a genuine mismatch error
+  # happens to also contain the words "already exists" (plausible, since
+  # that class of error is usually phrased as "stanza already exists ... but
+  # does not match"), this guard would currently swallow it as success.
+  # TODO: validate against a live pgbackrest binary (the target version
+  # pinned by the postgres role) before relying on this in production, and
+  # tighten the match to the exact success-only wording once confirmed.
+  ansible.builtin.command: pgbackrest --stanza={{ pgbackrest_stanza }} stanza-create
+  become: true
+  become_user: postgres
+  when: postgres_pgbackrest_configured
+  register: postgres_pgbackrest_stanza_create
+  changed_when: >-
+    'already exists' not in (postgres_pgbackrest_stanza_create.stdout | default(''))
+    and 'already exists' not in (postgres_pgbackrest_stanza_create.stderr | default(''))
+  failed_when: >-
+    postgres_pgbackrest_stanza_create.rc != 0
+    and 'already exists' not in (postgres_pgbackrest_stanza_create.stdout | default(''))
+    and 'already exists' not in (postgres_pgbackrest_stanza_create.stderr | default(''))
+
+- name: Install the pgbackrest systemd units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - pgbackrest-full.service
+    - pgbackrest-full.timer
+    - pgbackrest-diff.service
+    - pgbackrest-diff.timer
+
+- name: Enable and start the pgbackrest backup timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop:
+    - pgbackrest-full.timer
+    - pgbackrest-diff.timer
+  when: postgres_pgbackrest_configured

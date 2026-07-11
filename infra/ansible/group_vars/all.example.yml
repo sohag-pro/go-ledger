@@ -13,9 +13,29 @@ pg_database: goledger
 # Provide via vault or the real all.yml, never here:
 pg_password: "REPLACE_ME"
 
+# pgBackRest offsite durability (ADR-016). Supply the secret values via
+# ansible-vault or the real all.yml, never commit them.
+pgbackrest_stanza: go-ledger
+pgbackrest_s3_endpoint: "REPLACE_ME" # e.g. s3.us-west-002.backblazeb2.com
+pgbackrest_s3_bucket: "REPLACE_ME"
+pgbackrest_s3_region: "REPLACE_ME"
+pgbackrest_s3_key: "REPLACE_ME"
+pgbackrest_s3_key_secret: "REPLACE_ME"
+pgbackrest_cipher_pass: "REPLACE_ME" # losing this makes the repo unrecoverable
+pgbackrest_retention_full: 2
+
 server_name: go.sohag.pro
 upstream_addr: "127.0.0.1:8080"
 # The shared portfolio host whose availability the nginx role must not break:
 portfolio_url: "https://sohag.pro/"
 
 default_tenant_id: "00000000-0000-0000-0000-000000000001"
+
+# Off-box journald log shipping via systemd-journal-upload (Task 5.6b, audit
+# A6.3). Supply the real sink via vault or the real all.yml, never here; the
+# receiving endpoint must itself speak the journal-upload/journal-remote wire
+# protocol (see infra/ansible/roles/logship for why that forwarder was
+# chosen and what it costs).
+logship_sink_url: "REPLACE_ME" # e.g. https://journal-remote.example.net:19532/upload
+logship_trusted_cert_file: "" # path to a CA cert on the box, only if the sink uses a private CA; blank uses the system trust store
+journald_system_max_use: "200M" # local retention cap, applied regardless of whether logship_sink_url is provisioned

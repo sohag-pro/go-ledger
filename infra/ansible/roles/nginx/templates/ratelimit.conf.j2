@@ -1,0 +1,25 @@
+# Managed by Ansible. http-scoped rate limiting for the go-ledger vhost
+# (Task 5.2, audit A2.5/A6.4): a per-IP request flood at the edge, ahead of
+# anything the application itself can do about it.
+#
+# limit_req_zone MUST be declared in the http block; this role only manages
+# one vhost's server block (see templates/go.sohag.pro.conf.j2), not the
+# shared nginx.conf http block itself (the box also serves an unrelated
+# portfolio site this role does not own). Debian/Ubuntu's stock nginx.conf
+# includes /etc/nginx/conf.d/*.conf from inside its http block, so dropping
+# the zone declaration here reaches http scope without this role ever
+# touching nginx.conf or any other site's config.
+#
+# Zone size: 10m holds roughly 160k tracked IPs ($binary_remote_addr is 4 or
+# 16 bytes, plus per-entry bookkeeping; nginx docs put roughly 16000 IPs per
+# megabyte for the smaller IPv4 case), far more than this single box will
+# ever see distinct source IPs within a request window.
+#
+# Rate: 20r/s per IP is generous for a legitimate integration (the demo key's
+# own application-level limit is 60 requests per MINUTE, an order of
+# magnitude tighter) while still giving the edge a hard backstop against a
+# single source hammering the box faster than any per-key limit downstream
+# could even get evaluated. Tune the rate here and the burst per location in
+# go.sohag.pro.conf.j2; both are deliberately named "go_ledger_api" so they
+# are easy to find together.
+limit_req_zone $binary_remote_addr zone=go_ledger_api:10m rate=20r/s;

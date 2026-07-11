@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"time"
 )
 
 func mustMoney(t *testing.T, amount int64, cur Currency) Money {
@@ -133,6 +134,61 @@ func TestTransactionValidate(t *testing.T) {
 				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// strPtr returns a pointer to s, a small helper for table-driven tests that
+// need an optional *string field (Task 4.3, audit A1.3).
+func strPtr(s string) *string { return &s }
+
+// TestTransactionValidate_ReferenceAndEffectiveAt covers the Task 4.3 (audit
+// A1.3) validation added to Transaction.Validate: Reference is optional, but
+// when present must be non-empty and within MaxTransactionReferenceLen.
+// EffectiveAt is purely optional and never itself validated (any *time.Time,
+// including nil, is fine): it is a value date, not a field with its own shape
+// to reject.
+func TestTransactionValidate_ReferenceAndEffectiveAt(t *testing.T) {
+	balanced := []Posting{
+		{AccountID: "a", Amount: mustMoney(t, 100, "USD")},
+		{AccountID: "b", Amount: mustMoney(t, -100, "USD")},
+	}
+	past := time.Now().Add(-time.Hour)
+
+	tests := []struct {
+		name      string
+		reference *string
+		effective *time.Time
+		wantErr   error
+	}{
+		{name: "no reference, no effective_at", wantErr: nil},
+		{name: "reference present and effective_at set", reference: strPtr("INV-1001"), effective: &past, wantErr: nil},
+		{name: "reference at the length limit", reference: strPtr(string(make([]byte, MaxTransactionReferenceLen))), wantErr: nil},
+		{name: "reference over the length limit", reference: strPtr(string(make([]byte, MaxTransactionReferenceLen+1))), wantErr: ErrReferenceTooLong},
+		{name: "reference present but empty", reference: strPtr(""), wantErr: ErrInvalidReference},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := Transaction{ID: "tx_1", Postings: balanced, Reference: tt.reference, EffectiveAt: tt.effective}
+			if err := tx.Validate(); !errors.Is(err, tt.wantErr) {
+				t.Errorf("Validate() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestReferenceSentinelsAreDistinct checks the new Task 4.3 sentinels
+// (ErrInvalidReference, ErrReferenceTooLong, ErrDuplicateReference) are
+// distinct from each other and from the pre-existing idempotency-conflict
+// sentinel they are deliberately NOT the same as (a duplicate reference is a
+// different failure from a reused idempotency key).
+func TestReferenceSentinelsAreDistinct(t *testing.T) {
+	all := []error{ErrInvalidReference, ErrReferenceTooLong, ErrDuplicateReference, ErrIdempotencyConflict}
+	for i := range all {
+		for j := range all {
+			if i != j && errors.Is(all[i], all[j]) {
+				t.Errorf("sentinel %d and %d are not distinct", i, j)
+			}
+		}
 	}
 }
 

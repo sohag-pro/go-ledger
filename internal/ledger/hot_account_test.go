@@ -38,6 +38,9 @@ func TestPostConcurrentSameAccount(t *testing.T) {
 	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "hot account test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	a := &domain.Account{Name: "Hot A", Type: domain.Asset, Currency: "USD"}
 	b := &domain.Account{Name: "Hot B", Type: domain.Asset, Currency: "USD"}

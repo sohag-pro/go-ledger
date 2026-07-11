@@ -3,12 +3,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/fx"
@@ -36,11 +39,28 @@ const testAPIKeyPlaintext = "glk_handlers-test-default-key" //nolint:gosec // te
 type fakeRepo struct {
 	accounts map[string]domain.Account
 	txns     map[string]domain.Transaction
-	postings []postingRec
-	clock    int64
-	idem     map[string]domain.IdempotencyRecord // key -> record
-	audit    []domain.AuditEntry
-	apiKeys  map[string]domain.APIKey // key_hash -> resolved key
+	// txnCreatedAt is each transaction's own created_at (Task 4.4, audit
+	// A7.2), keyed by transaction id: the fake's stand-in for the real
+	// adapter's transactions.created_at column, which domain.Transaction
+	// itself does not carry (see domain.TransactionListItem's doc comment).
+	// ListTransactions pages and filters by this.
+	txnCreatedAt map[string]time.Time
+	postings     []postingRec
+	clock        int64
+	idem         map[string]fakeIdemEntry // key -> record + expiry (Task 4.5, audit A1.4)
+	audit        []domain.AuditEntry
+	apiKeys      map[string]domain.APIKey // key_hash -> resolved key
+	tenants      map[string]domain.Tenant // tenant id -> tenant row
+	// webhookSubs is a minimal in-memory stand-in for webhook_subscriptions
+	// (Task 4.1, audit A7.1), keyed by subscription id. No handler test in
+	// this package exercises fan-out or delivery (that is covered by
+	// internal/webhook's own Postgres-backed integration tests, which
+	// operate directly through sqlc rather than domain.Repository); this
+	// exists only so the admin webhook CRUD handlers have something to call.
+	webhookSubs map[string]domain.WebhookSubscription
+	// disputes is a minimal in-memory stand-in for the disputes table (Task
+	// 6.3, audit A9.2), keyed by dispute id.
+	disputes map[string]domain.Dispute
 }
 
 type postingRec struct {
@@ -49,18 +69,39 @@ type postingRec struct {
 	createdAt                         time.Time
 }
 
+// fakeIdemEntry is a stored idempotency record plus the wall-clock instant it
+// expires at (Task 4.5, audit A1.4): fakeRepo uses real time.Now() rather than
+// its own fake clock (f.clock) since ttl is a real time.Duration, not a step
+// count, and no handler test exercises expiry timing precisely enough to need
+// a controllable clock here.
+type fakeIdemEntry struct {
+	record    domain.IdempotencyRecord
+	expiresAt time.Time
+}
+
 func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
-		accounts: map[string]domain.Account{},
-		txns:     map[string]domain.Transaction{},
-		idem:     map[string]domain.IdempotencyRecord{},
-		apiKeys:  map[string]domain.APIKey{},
+		accounts:     map[string]domain.Account{},
+		txns:         map[string]domain.Transaction{},
+		txnCreatedAt: map[string]time.Time{},
+		idem:         map[string]fakeIdemEntry{},
+		apiKeys:      map[string]domain.APIKey{},
+		tenants:      map[string]domain.Tenant{},
+		webhookSubs:  map[string]domain.WebhookSubscription{},
+		disputes:     map[string]domain.Dispute{},
 	}
 }
 
 func (f *fakeRepo) CreateAccount(_ context.Context, _ string, a *domain.Account) error {
 	if a.ID == "" {
 		a.ID = uuid.NewString()
+	}
+	// Mirrors the real repository (Task 5.5, audit A1.5): every account is
+	// created active, the column default, so a caller reading the account
+	// straight back off this call (rather than through a later GetAccount)
+	// sees "active" too.
+	if a.Status == "" {
+		a.Status = domain.AccountActive
 	}
 	if err := a.Validate(); err != nil {
 		return err
@@ -89,9 +130,79 @@ func (f *fakeRepo) ListAccounts(_ context.Context, _ string, limit int) ([]domai
 	return out, nil
 }
 
+// SetAccountStatus mirrors the real repository (Task 5.5, audit A1.5):
+// domain.ErrInvalidAccount for an unrecognized status, domain.ErrAccountNotFound
+// for an unknown id.
+func (f *fakeRepo) SetAccountStatus(_ context.Context, _, id string, status domain.AccountStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidAccount
+	}
+	a, ok := f.accounts[id]
+	if !ok {
+		return domain.ErrAccountNotFound
+	}
+	a.Status = status
+	f.accounts[id] = a
+	return nil
+}
+
+// AccountPostingStates mirrors the real repository's tx-scoped read (Task
+// 5.5, audit A1.5), summing f.postings the same way Balance above does. An
+// account id with no matching fixture is simply absent from the returned
+// map, mirroring the real query and letting
+// domain.CheckAccountPostingConstraints report ErrAccountNotFound for it.
+func (f *fakeRepo) AccountPostingStates(_ context.Context, _ string, accountIDs []string) (map[string]domain.AccountPostingState, error) {
+	out := make(map[string]domain.AccountPostingState, len(accountIDs))
+	for _, id := range accountIDs {
+		a, ok := f.accounts[id]
+		if !ok {
+			continue
+		}
+		var sum int64
+		for _, p := range f.postings {
+			if p.accountID == id {
+				sum += p.amount
+			}
+		}
+		out[id] = domain.AccountPostingState{
+			AccountID:  id,
+			Status:     a.Status,
+			MinBalance: a.MinBalance,
+			IsSystem:   a.System,
+			Balance:    sum,
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeRepo) CreateTransaction(_ context.Context, _ string, t *domain.Transaction) error {
+	// Mirror the real repo's transactions_tenant_reference_idx (migration
+	// 0018, Task 4.3, audit A1.3): a linear scan is fine for a handler test's
+	// tiny fixture set, the same style GetReversalOf below already uses.
+	// fakeRepo is single-tenant, so this checks the whole map, matching the
+	// real unique index scoped to one tenant.
+	if t.Reference != nil {
+		for _, existing := range f.txns {
+			if existing.Reference != nil && *existing.Reference == *t.Reference {
+				return domain.ErrDuplicateReference
+			}
+		}
+	}
 	if t.ID == "" {
 		t.ID = uuid.NewString()
+	}
+	// createdAt is the transaction row's own created_at (Task 4.4, audit
+	// A7.2, f.txnCreatedAt), ticked before any posting's: mirrors the real
+	// adapter, which inserts the transaction row (stamping created_at) before
+	// any posting row. effective_at falls back to it when the caller
+	// supplied none (Task 4.3, audit A1.3), mirroring
+	// postgres.txRepo.CreateTransaction / Repository.assembleTransaction;
+	// f.clock is this fake's stand-in clock.
+	f.clock++
+	createdAt := time.Unix(f.clock, 0).UTC()
+	f.txnCreatedAt[t.ID] = createdAt
+	if t.EffectiveAt == nil {
+		t.EffectiveAt = &createdAt
 	}
 	f.txns[t.ID] = *t
 	for _, p := range t.Postings {
@@ -108,12 +219,96 @@ func (f *fakeRepo) CreateTransaction(_ context.Context, _ string, t *domain.Tran
 	return nil
 }
 
+// ListTransactions filters and keyset-pages f.txns (Task 4.4, audit A7.2),
+// mirroring the same "collect, sort ascending, then walk from the newest
+// applying the cursor" style Statement and ListAuditByAccount above already
+// use for their own in-memory paging. Each returned transaction's postings
+// are rebuilt from f.postings, in insertion order, rather than read straight
+// off f.txns: f.postings is where this fake's synthesized posting ids live
+// (postingRec.id), and CreateTransaction never writes an id back onto the
+// domain.Posting values it stores in f.txns itself.
+func (f *fakeRepo) ListTransactions(_ context.Context, _ string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
+	items := make([]domain.TransactionListItem, 0, len(f.txns))
+	for id, t := range f.txns {
+		createdAt := f.txnCreatedAt[id]
+		if filter.From != nil && createdAt.Before(*filter.From) {
+			continue
+		}
+		if filter.To != nil && !createdAt.Before(*filter.To) {
+			continue
+		}
+		if filter.Reference != nil && (t.Reference == nil || *t.Reference != *filter.Reference) {
+			continue
+		}
+		t.Postings = f.postingsFor(id, t.Postings)
+		items = append(items, domain.TransactionListItem{Transaction: t, CreatedAt: createdAt})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].CreatedAt.Before(items[j].CreatedAt)
+		}
+		return items[i].Transaction.ID < items[j].Transaction.ID
+	})
+	// newest first
+	out := make([]domain.TransactionListItem, 0, len(items))
+	for i := len(items) - 1; i >= 0; i-- {
+		it := items[i]
+		if after != nil {
+			if it.CreatedAt.After(after.CreatedAt) || (it.CreatedAt.Equal(after.CreatedAt) && it.Transaction.ID >= after.ID) {
+				continue
+			}
+		}
+		out = append(out, it)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// postingsFor rebuilds txnID's postings with each one's fake-assigned id
+// (postingRec.id) filled in, keeping original's currency and description
+// exactly as CreateTransaction stored them on the domain.Transaction itself
+// (f.postings does not carry currency, so it cannot be the source of truth
+// for the whole Posting). It assumes f.postings holds exactly len(original)
+// entries for txnID, in the same order CreateTransaction appended them,
+// which is always true for a transaction this fake wrote.
+func (f *fakeRepo) postingsFor(txnID string, original []domain.Posting) []domain.Posting {
+	var ids []string
+	for _, p := range f.postings {
+		if p.txnID == txnID {
+			ids = append(ids, p.id)
+		}
+	}
+	if len(ids) != len(original) {
+		return original
+	}
+	out := make([]domain.Posting, len(original))
+	copy(out, original)
+	for i := range out {
+		out[i].ID = ids[i]
+	}
+	return out
+}
+
 func (f *fakeRepo) GetTransaction(_ context.Context, _, id string) (domain.Transaction, error) {
 	t, ok := f.txns[id]
 	if !ok {
 		return domain.Transaction{}, domain.ErrTransactionNotFound
 	}
 	return t, nil
+}
+
+// GetReversalOf is a linear scan over the in-memory map: fine for a handler
+// test's tiny fixture set, mirroring the "at most one reversal per original"
+// invariant the real transactions_one_reversal_idx enforces in Postgres.
+func (f *fakeRepo) GetReversalOf(_ context.Context, _, originalID string) (domain.Transaction, error) {
+	for _, t := range f.txns {
+		if t.ReversesTransactionID != nil && *t.ReversesTransactionID == originalID {
+			return t, nil
+		}
+	}
+	return domain.Transaction{}, domain.ErrTransactionNotFound
 }
 
 // GetOrCreateClearingAccount is a minimal in-memory stand-in: it looks up the
@@ -132,21 +327,54 @@ func (f *fakeRepo) GetOrCreateClearingAccount(_ context.Context, _ string, curre
 	return a, nil
 }
 
-func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, transactionID string) error {
-	if _, ok := f.idem[key]; ok {
+// InsertIdempotencyKey mirrors the real adapter's upsert-on-expired behavior
+// (Task 4.5, audit A1.4): a still-live existing entry is a genuine duplicate,
+// but an expired one is silently replaced rather than treated as a conflict.
+func (f *fakeRepo) InsertIdempotencyKey(_ context.Context, _, key, fingerprint, scheme, transactionID string, ttl time.Duration) error {
+	if existing, ok := f.idem[key]; ok && time.Now().Before(existing.expiresAt) {
 		return domain.ErrDuplicateIdempotencyKey
 	}
-	f.idem[key] = domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, TransactionID: transactionID}
+	f.idem[key] = fakeIdemEntry{
+		record:    domain.IdempotencyRecord{Key: key, Fingerprint: fingerprint, Scheme: scheme, TransactionID: transactionID},
+		expiresAt: time.Now().Add(ttl),
+	}
 	return nil
 }
 
-func (f *fakeRepo) AppendAudit(_ context.Context, tenantID string, e domain.AuditEntry) error {
-	if e.ID == "" {
-		e.ID = uuid.NewString()
+// SweepExpiredIdempotencyKeys deletes every expired entry and reports how
+// many it removed, mirroring the real adapter's maintenance sweep (Task 4.5,
+// audit A1.4). No handler test currently exercises it directly; it exists so
+// fakeRepo keeps satisfying domain.Repository in full.
+func (f *fakeRepo) SweepExpiredIdempotencyKeys(_ context.Context) (int64, error) {
+	now := time.Now()
+	var n int64
+	for k, v := range f.idem {
+		if now.After(v.expiresAt) {
+			delete(f.idem, k)
+			n++
+		}
 	}
+	return n, nil
+}
+
+// AppendAuditOutbox mirrors the real chainer's job synchronously, right here
+// at write time: handler tests exercise HTTP wiring, not the async chaining
+// gap ADR-017 introduces, so this fake builds the chain immediately instead
+// of modeling an outbox + a separate drain step. CountPendingOutbox below
+// always reports 0 to match: as far as this fake is concerned, nothing is
+// ever pending.
+func (f *fakeRepo) AppendAuditOutbox(_ context.Context, tenantID string, ev domain.AuditEvent) error {
 	f.clock++
-	e.CreatedAt = time.Unix(f.clock, 0).UTC()
-	// Mirror the real repository's chain extension: prev is the last row's
+	e := domain.AuditEntry{
+		ID:            uuid.NewString(),
+		Action:        ev.Action,
+		TransactionID: ev.TransactionID,
+		Actor:         ev.Actor,
+		Before:        ev.Before,
+		After:         ev.After,
+		CreatedAt:     time.Unix(f.clock, 0).UTC(),
+	}
+	// Mirror the real chainer's chain extension: prev is the last row's
 	// RowHash (genesis if this is the first row appended by this fake repo).
 	prev := domain.AuditGenesisHash
 	if len(f.audit) > 0 {
@@ -154,8 +382,19 @@ func (f *fakeRepo) AppendAudit(_ context.Context, tenantID string, e domain.Audi
 	}
 	e.PrevHash = prev
 	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prev)
+	// ChainSeq mirrors the real chainer's chain_seq: a plain 1-based
+	// insertion-order sequence (Task 5.3), so ListAuditForVerifyPage above
+	// can page this fake's audit slice the same way the real adapter pages
+	// audit_log by chain_seq.
+	e.ChainSeq = int64(len(f.audit) + 1)
 	f.audit = append(f.audit, e)
 	return nil
+}
+
+// CountPendingOutbox always reports 0: this fake chains synchronously (see
+// AppendAuditOutbox), so nothing is ever pending.
+func (f *fakeRepo) CountPendingOutbox(_ context.Context, _ string) (int, error) {
+	return 0, nil
 }
 
 // ListAuditForVerify returns every audit row this fake repo holds, oldest
@@ -167,12 +406,51 @@ func (f *fakeRepo) ListAuditForVerify(_ context.Context, _ string) ([]domain.Aud
 	return out, nil
 }
 
+// ListAuditForVerifyPage is ListAuditForVerify's paged counterpart (Task
+// 5.3): f.audit is assigned ChainSeq 1, 2, 3... in append order (see
+// AppendAuditOutbox below), so "chain_seq > afterChainSeq" is simply a slice
+// index, and "up to limit rows" a slice bound. fakeRepo is single-tenant in
+// these handler tests, so tenantID is not filtered on, matching
+// ListAuditForVerify's own behavior above.
+func (f *fakeRepo) ListAuditForVerifyPage(_ context.Context, _ string, afterChainSeq int64, limit int) ([]domain.AuditEntry, error) {
+	var out []domain.AuditEntry
+	for _, e := range f.audit {
+		if e.ChainSeq <= afterChainSeq {
+			continue
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// GetAuditHead returns the last entry AppendAuditOutbox appended, or ok=false
+// for an empty chain.
+func (f *fakeRepo) GetAuditHead(_ context.Context, _ string) (chainSeq int64, rowHash string, ok bool, err error) {
+	if len(f.audit) == 0 {
+		return 0, "", false, nil
+	}
+	last := f.audit[len(f.audit)-1]
+	return last.ChainSeq, last.RowHash, true, nil
+}
+
+// LatestAuditAnchor always reports no anchor: no handler test in this
+// package exercises the anchor job (it is covered by internal/audit's own
+// Postgres-backed integration tests), so this fake never has one to return.
+func (f *fakeRepo) LatestAuditAnchor(_ context.Context, _ string) (domain.AuditAnchor, bool, error) {
+	return domain.AuditAnchor{}, false, nil
+}
+
+// GetIdempotencyKey treats an expired entry as absent (Task 4.5, audit
+// A1.4), mirroring the real adapter's "expires_at > now()" filter.
 func (f *fakeRepo) GetIdempotencyKey(_ context.Context, _, key string) (domain.IdempotencyRecord, error) {
-	rec, ok := f.idem[key]
-	if !ok {
+	entry, ok := f.idem[key]
+	if !ok || !time.Now().Before(entry.expiresAt) {
 		return domain.IdempotencyRecord{}, domain.ErrIdempotencyKeyNotFound
 	}
-	return rec, nil
+	return entry.record, nil
 }
 
 func (f *fakeRepo) ListAuditByTransaction(_ context.Context, _, transactionID string) ([]domain.AuditEntry, error) {
@@ -276,14 +554,75 @@ func (f *fakeRepo) Statement(_ context.Context, _, accountID string, currency do
 	return out, nil
 }
 
+// StatementExport mirrors Statement above (Task 6.3, audit A9.2), but
+// filters by an optional [from, to) created_at window instead of a keyset
+// cursor, and caps the result at limit without a "more pages" concept: the
+// caller (ledger.AccountService.StatementExport) detects truncation from
+// len(entries) > limit itself.
+func (f *fakeRepo) StatementExport(_ context.Context, _, accountID string, currency domain.Currency, from, to *time.Time, limit int) ([]domain.StatementEntry, error) {
+	recs := make([]postingRec, 0)
+	for _, p := range f.postings {
+		if p.accountID == accountID {
+			recs = append(recs, p)
+		}
+	}
+	sort.Slice(recs, func(i, j int) bool {
+		if !recs[i].createdAt.Equal(recs[j].createdAt) {
+			return recs[i].createdAt.Before(recs[j].createdAt)
+		}
+		return recs[i].id < recs[j].id
+	})
+	var run int64
+	asc := make([]domain.StatementEntry, 0, len(recs))
+	for _, r := range recs {
+		run += r.amount
+		amt, _ := domain.NewMoney(r.amount, currency)
+		rb, _ := domain.NewMoney(run, currency)
+		asc = append(asc, domain.StatementEntry{
+			ID: r.id, TransactionID: r.txnID, Amount: amt, RunningBalance: rb,
+			Description: r.description, CreatedAt: r.createdAt,
+		})
+	}
+	out := make([]domain.StatementEntry, 0, len(asc))
+	for i := len(asc) - 1; i >= 0; i-- {
+		e := asc[i]
+		if from != nil && e.CreatedAt.Before(*from) {
+			continue
+		}
+		if to != nil && !e.CreatedAt.Before(*to) {
+			continue
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeRepo) RunInTx(ctx context.Context, _ string, fn func(context.Context, domain.Tx) error) error {
 	return fn(ctx, f)
 }
 
+// GetAPIKeyByHash mirrors the real repository's join to tenants: the
+// returned key's TenantStatus reflects the tenant's current row in f.tenants
+// so a test can flip a tenant to suspended/closed with SetTenantStatus and
+// see it take effect the next time the key resolves. A key whose tenant was
+// never explicitly created (most existing tests, which predate tenants)
+// defaults to active, matching the common case of a key issued against a
+// tenant that exists and is active.
 func (f *fakeRepo) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
 	k, ok := f.apiKeys[hash]
-	if !ok {
+	if !ok || k.RevokedAt != nil {
+		// Mirrors the real query's "WHERE revoked_at IS NULL": a revoked key
+		// (Task 2.2b's RevokeAPIKey) is indistinguishable from an unknown one
+		// here, same as the real repository.
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if t, ok := f.tenants[k.TenantID]; ok {
+		k.TenantStatus = t.Status
+	} else {
+		k.TenantStatus = domain.TenantActive
 	}
 	return k, nil
 }
@@ -292,8 +631,322 @@ func (f *fakeRepo) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash stri
 	if k.ID == "" {
 		k.ID = uuid.NewString()
 	}
+	if len(k.Scopes) == 0 {
+		// Mirrors the real api_keys.scopes column default (migration 0012): a
+		// caller that does not set Scopes explicitly (every existing handler
+		// test) gets the same {read,post} a real insert would pick up from
+		// the DB default.
+		k.Scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now()
+	}
 	f.apiKeys[keyHash] = k
 	return nil
+}
+
+// TouchAPIKeyLastUsed is a no-op: handler tests do not assert on
+// last_used_at, which is covered in internal/auth's own tests.
+func (f *fakeRepo) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
+	return nil
+}
+
+// GetAPIKeyByID, ListAPIKeysByTenant, and RevokeAPIKey (Task 2.2b) all work
+// off the same hash-keyed map as InsertAPIKey and GetAPIKeyByHash: fakeRepo
+// has no separate id index, so these do a linear scan, which is fine for the
+// small number of keys any handler test provisions.
+
+func (f *fakeRepo) GetAPIKeyByID(_ context.Context, id string) (domain.APIKey, error) {
+	for _, k := range f.apiKeys {
+		if k.ID == id {
+			return k, nil
+		}
+	}
+	return domain.APIKey{}, domain.ErrAPIKeyNotFound
+}
+
+func (f *fakeRepo) ListAPIKeysByTenant(_ context.Context, tenantID string) ([]domain.APIKey, error) {
+	out := make([]domain.APIKey, 0)
+	for _, k := range f.apiKeys {
+		if k.TenantID == tenantID {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+func (f *fakeRepo) RevokeAPIKey(_ context.Context, id string) error {
+	for hash, k := range f.apiKeys {
+		if k.ID == id {
+			if k.RevokedAt == nil {
+				now := time.Now()
+				k.RevokedAt = &now
+			}
+			f.apiKeys[hash] = k
+			return nil
+		}
+	}
+	return domain.ErrAPIKeyNotFound
+}
+
+func (f *fakeRepo) CreateTenant(_ context.Context, tenantID, name string) error {
+	if _, exists := f.tenants[tenantID]; exists {
+		return domain.ErrTenantAlreadyExists
+	}
+	f.tenants[tenantID] = domain.Tenant{ID: tenantID, Name: name, Status: domain.TenantActive, CreatedAt: time.Now()}
+	return nil
+}
+
+func (f *fakeRepo) GetTenant(_ context.Context, tenantID string) (domain.Tenant, error) {
+	t, ok := f.tenants[tenantID]
+	if !ok {
+		return domain.Tenant{}, domain.ErrTenantNotFound
+	}
+	return t, nil
+}
+
+func (f *fakeRepo) ListTenants(_ context.Context, limit int) ([]domain.Tenant, error) {
+	out := make([]domain.Tenant, 0, len(f.tenants))
+	for _, t := range f.tenants {
+		if len(out) == limit {
+			break
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) SetTenantStatus(_ context.Context, tenantID string, status domain.TenantStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidTenant
+	}
+	t, ok := f.tenants[tenantID]
+	if !ok {
+		return domain.ErrTenantNotFound
+	}
+	t.Status = status
+	f.tenants[tenantID] = t
+	return nil
+}
+
+// SetTenantSettings overwrites the fake tenant's Settings field (Task 2.4b,
+// audit A3.4), the same whole-document replace the real repository does. It
+// returns domain.ErrTenantNotFound if tenantID has no row, matching the real
+// adapter's execrows-zero case.
+func (f *fakeRepo) SetTenantSettings(_ context.Context, tenantID string, settings json.RawMessage) error {
+	t, ok := f.tenants[tenantID]
+	if !ok {
+		return domain.ErrTenantNotFound
+	}
+	t.Settings = settings
+	f.tenants[tenantID] = t
+	return nil
+}
+
+// TenantDailyDebits is a minimal in-memory stand-in (Task 2.4b, audit A3.4):
+// it sums every posting's positive (debit) amount ever recorded, grouped by
+// the currency of the account it posted against, with no "today" filtering.
+// No handler test in this package sets a tenant policy with a
+// DailyVolumeLimit, so this is never exercised for its date semantics; real
+// day-boundary correctness is covered by the Postgres-backed integration
+// tests in internal/ledger instead (this fake has no server clock to filter
+// against, only a synthetic per-posting counter, see f.clock).
+func (f *fakeRepo) TenantDailyDebits(_ context.Context, _ string) (map[string]int64, error) {
+	out := make(map[string]int64)
+	for _, p := range f.postings {
+		if p.amount <= 0 {
+			continue
+		}
+		a, ok := f.accounts[p.accountID]
+		if !ok {
+			continue
+		}
+		out[string(a.Currency)] += p.amount
+	}
+	return out, nil
+}
+
+// InsertFXRate is not exercised by any handler test in this package (Task
+// 2.4's per-tenant resolution is covered by real-Postgres integration tests
+// in internal/fx and internal/ledger instead, since it depends on
+// CurrentFXRate's SQL, not on repository plumbing this fake stands in for);
+// it exists only so fakeRepo keeps satisfying domain.Repository.
+func (f *fakeRepo) InsertFXRate(_ context.Context, _ *string, _, _ domain.Currency, _ int64, _ int32, _ string, _ *time.Time) error {
+	return nil
+}
+
+// CreateWebhookSubscription mirrors the real repository's tenant-existence
+// gate (Task 4.1) so the handler tests that exercise it (a missing tenant
+// must 404, not 201) do not need a real database to prove it.
+func (f *fakeRepo) CreateWebhookSubscription(_ context.Context, sub *domain.WebhookSubscription, _ string) error {
+	if _, ok := f.tenants[sub.TenantID]; !ok {
+		return domain.ErrTenantNotFound
+	}
+	if sub.ID == "" {
+		sub.ID = uuid.NewString()
+	}
+	sub.Active = true
+	sub.CreatedAt = time.Now()
+	f.webhookSubs[sub.ID] = *sub
+	return nil
+}
+
+func (f *fakeRepo) ListWebhookSubscriptionsByTenant(_ context.Context, tenantID string) ([]domain.WebhookSubscription, error) {
+	out := make([]domain.WebhookSubscription, 0)
+	for _, s := range f.webhookSubs {
+		if s.TenantID == tenantID {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) SetWebhookSubscriptionActive(_ context.Context, id string, active bool) error {
+	s, ok := f.webhookSubs[id]
+	if !ok {
+		return domain.ErrWebhookSubscriptionNotFound
+	}
+	s.Active = active
+	f.webhookSubs[id] = s
+	return nil
+}
+
+// ShredTenantCryptoKey is a no-op for these handler tests (Task 6.2, audit
+// A9.3): none of them exercise PII crypto-shredding, which has its own
+// integration tests over the real postgres.Repository.
+func (f *fakeRepo) ShredTenantCryptoKey(_ context.Context, _ string) error {
+	return nil
+}
+
+// TrialBalanceByCurrency mirrors the real query (Task 6.3, audit A9.2):
+// SUM(amount) over every posting, grouped by the owning account's currency
+// (f.postings itself carries no currency, unlike the real postings table, so
+// this looks it up via the account).
+func (f *fakeRepo) TrialBalanceByCurrency(_ context.Context, _ string) ([]domain.CurrencyTotal, error) {
+	totals := map[domain.Currency]int64{}
+	for _, p := range f.postings {
+		a, ok := f.accounts[p.accountID]
+		if !ok {
+			continue
+		}
+		totals[a.Currency] += p.amount
+	}
+	out := make([]domain.CurrencyTotal, 0, len(totals))
+	for c, net := range totals {
+		out = append(out, domain.CurrencyTotal{Currency: c, Net: net})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Currency < out[j].Currency })
+	return out, nil
+}
+
+// TrialBalanceAccounts mirrors the real query (Task 6.3, audit A9.2): every
+// account's derived balance, including system accounts.
+func (f *fakeRepo) TrialBalanceAccounts(_ context.Context, _ string) ([]domain.AccountBalance, error) {
+	balances := map[string]int64{}
+	for _, p := range f.postings {
+		balances[p.accountID] += p.amount
+	}
+	out := make([]domain.AccountBalance, 0, len(f.accounts))
+	for id, a := range f.accounts {
+		out = append(out, domain.AccountBalance{
+			AccountID: id,
+			Name:      a.Name,
+			Type:      a.Type,
+			Currency:  a.Currency,
+			IsSystem:  a.System,
+			Balance:   balances[id],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// CreateDispute mirrors postgres.Repository.CreateDispute (Task 6.3, audit
+// A9.2): assigns an id if empty, validates, and stores.
+func (f *fakeRepo) CreateDispute(_ context.Context, tenantID string, d *domain.Dispute) error {
+	if d.ID == "" {
+		d.ID = uuid.NewString()
+	}
+	if d.Status == "" {
+		d.Status = domain.DisputeOpen
+	}
+	d.TenantID = tenantID
+	if err := d.Validate(); err != nil {
+		return err
+	}
+	f.clock++
+	d.CreatedAt = time.Unix(f.clock, 0).UTC()
+	f.disputes[d.ID] = *d
+	return nil
+}
+
+func (f *fakeRepo) GetDispute(_ context.Context, tenantID, id string) (domain.Dispute, error) {
+	d, ok := f.disputes[id]
+	if !ok || d.TenantID != tenantID {
+		return domain.Dispute{}, domain.ErrDisputeNotFound
+	}
+	return d, nil
+}
+
+// ListDisputes mirrors ListTransactions' "collect, sort ascending, then walk
+// from the newest applying the cursor" style (Task 6.3, audit A9.2).
+func (f *fakeRepo) ListDisputes(_ context.Context, tenantID string, status *domain.DisputeStatus, after *domain.StatementCursor, limit int) ([]domain.Dispute, error) {
+	asc := make([]domain.Dispute, 0, len(f.disputes))
+	for _, d := range f.disputes {
+		if d.TenantID != tenantID {
+			continue
+		}
+		if status != nil && d.Status != *status {
+			continue
+		}
+		asc = append(asc, d)
+	}
+	sort.Slice(asc, func(i, j int) bool {
+		if !asc[i].CreatedAt.Equal(asc[j].CreatedAt) {
+			return asc[i].CreatedAt.Before(asc[j].CreatedAt)
+		}
+		return asc[i].ID < asc[j].ID
+	})
+	out := make([]domain.Dispute, 0, len(asc))
+	for i := len(asc) - 1; i >= 0; i-- {
+		d := asc[i]
+		if after != nil {
+			if d.CreatedAt.After(after.CreatedAt) || (d.CreatedAt.Equal(after.CreatedAt) && d.ID >= after.ID) {
+				continue
+			}
+		}
+		out = append(out, d)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ResolveDispute mirrors postgres.Repository.ResolveDispute's guarded
+// transition (Task 6.3, audit A9.2): domain.ErrDisputeAlreadyResolved for
+// anything not currently open, domain.ErrDisputeNotFound for an unknown id.
+func (f *fakeRepo) ResolveDispute(_ context.Context, tenantID, id string, status domain.DisputeStatus, resolutionTransactionID *string) (domain.Dispute, error) {
+	d, ok := f.disputes[id]
+	if !ok || d.TenantID != tenantID {
+		return domain.Dispute{}, domain.ErrDisputeNotFound
+	}
+	if d.Status.Terminal() {
+		return domain.Dispute{}, domain.ErrDisputeAlreadyResolved
+	}
+	d.Status = status
+	d.ResolutionTransactionID = resolutionTransactionID
+	f.clock++
+	resolvedAt := time.Unix(f.clock, 0).UTC()
+	d.ResolvedAt = &resolvedAt
+	f.disputes[id] = d
+	return d, nil
 }
 
 var _ domain.Repository = (*fakeRepo)(nil)
@@ -308,7 +961,7 @@ type fakeFXProvider struct {
 	err       error
 }
 
-func (f *fakeFXProvider) Rate(_ context.Context, _, _ domain.Currency) (domain.FXQuote, int32, error) {
+func (f *fakeFXProvider) Rate(_ context.Context, _ string, _, _ domain.Currency) (domain.FXQuote, int32, error) {
 	if f.err != nil {
 		return domain.FXQuote{}, 0, f.err
 	}
@@ -337,11 +990,15 @@ func newAPIRouterWithOptions(repo domain.Repository, opts ...ledger.ServiceOptio
 		panic("newAPIRouter: provision default test key: " + err.Error())
 	}
 
+	transactions := ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, opts...)
 	r := chi.NewRouter()
 	New(r, Deps{
 		Accounts:     ledger.NewAccountService(repo),
-		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, opts...),
+		Transactions: transactions,
 		Audit:        ledger.NewAuditService(repo),
+		Admin:        admin.NewService(repo),
+		Reports:      ledger.NewReportService(repo),
+		Disputes:     ledger.NewDisputeService(repo, transactions),
 		Auth:         auth.NewResolver(repo, time.Minute),
 	})
 	return r
@@ -450,6 +1107,170 @@ func TestCreateAccount(t *testing.T) {
 			map[string]string{"name": "X", "type": "asset", "currency": "usd"})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422", rec.Code)
+		}
+	})
+
+	// Task 5.5, audit A1.5: a fresh account with no min_balance surfaces
+	// status "active" and an omitted min_balance field.
+	t.Run("defaults active with no min_balance", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]string{"name": "No Floor", "type": "asset", "currency": "USD"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Status != "active" {
+			t.Errorf("status = %q, want %q", out.Status, "active")
+		}
+		if out.MinBalance != nil {
+			t.Errorf("min_balance = %v, want nil", out.MinBalance)
+		}
+	})
+
+	// Task 5.5, audit A1.5: min_balance is optional at creation and, when
+	// given, round-trips on the create response.
+	t.Run("create with min_balance 201", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]any{"name": "Checking", "type": "asset", "currency": "USD", "min_balance": -50000})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Status != "active" {
+			t.Errorf("status = %q, want %q", out.Status, "active")
+		}
+		if out.MinBalance == nil || *out.MinBalance != -50000 {
+			t.Errorf("min_balance = %v, want -50000", out.MinBalance)
+		}
+	})
+
+	// Task 6.1, audit A9.1: party_reference and party_type are optional
+	// linkage metadata for an external KYC/party system; both round-trip on
+	// the create response when supplied.
+	t.Run("create with party fields 201", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]any{"name": "KYC Linked", "type": "asset", "currency": "USD", "party_reference": "cust-98765", "party_type": "individual"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.PartyReference == nil || *out.PartyReference != "cust-98765" {
+			t.Errorf("party_reference = %v, want %q", out.PartyReference, "cust-98765")
+		}
+		if out.PartyType == nil || *out.PartyType != "individual" {
+			t.Errorf("party_type = %v, want %q", out.PartyType, "individual")
+		}
+
+		// A fresh GET reflects the same linkage metadata.
+		getRec := do(t, r, http.MethodGet, "/v1/accounts/"+out.ID, nil)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("get status %d, want 200 (%s)", getRec.Code, getRec.Body.String())
+		}
+		var got AccountBody
+		_ = json.Unmarshal(getRec.Body.Bytes(), &got)
+		if got.PartyReference == nil || *got.PartyReference != "cust-98765" {
+			t.Errorf("get party_reference = %v, want %q", got.PartyReference, "cust-98765")
+		}
+		if got.PartyType == nil || *got.PartyType != "individual" {
+			t.Errorf("get party_type = %v, want %q", got.PartyType, "individual")
+		}
+	})
+
+	// Without party fields, both are omitted (nullable), the same default
+	// behavior as every account before this feature existed.
+	t.Run("create without party fields omits them", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts",
+			map[string]any{"name": "No KYC Link", "type": "asset", "currency": "USD"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.PartyReference != nil {
+			t.Errorf("party_reference = %v, want nil", out.PartyReference)
+		}
+		if out.PartyType != nil {
+			t.Errorf("party_type = %v, want nil", out.PartyType)
+		}
+	})
+}
+
+// TestSetAccountStatusEndpoint covers POST /v1/accounts/{id}/status (Task
+// 5.5, audit A1.5): freezing an account via the endpoint blocks a
+// subsequent post, reactivating it un-blocks one, the updated account
+// (with its new status) is returned in the response body, an invalid
+// status value is 422, and an unknown account id is 404.
+func TestSetAccountStatusEndpoint(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	rev := createAccount(t, r, "Revenue", "income")
+
+	t.Run("freeze blocks a post", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+cash+"/status",
+			map[string]string{"status": "frozen"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out AccountBody
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		if out.Status != "frozen" {
+			t.Errorf("response status = %q, want %q", out.Status, "frozen")
+		}
+
+		postRec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10000},
+				{"account_id": rev, "amount": -10000},
+			},
+		}, map[string]string{"Idempotency-Key": "frozen-account-post"})
+		if postRec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("post into frozen account: status %d, want 422 (%s)", postRec.Code, postRec.Body.String())
+		}
+
+		getRec := do(t, r, http.MethodGet, "/v1/accounts/"+cash, nil)
+		var got AccountBody
+		_ = json.Unmarshal(getRec.Body.Bytes(), &got)
+		if got.Status != "frozen" {
+			t.Errorf("GetAccount status = %q, want %q", got.Status, "frozen")
+		}
+	})
+
+	t.Run("reactivate un-blocks a post", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+cash+"/status",
+			map[string]string{"status": "active"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+
+		postRec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10000},
+				{"account_id": rev, "amount": -10000},
+			},
+		}, map[string]string{"Idempotency-Key": "reactivated-account-post"})
+		if postRec.Code != http.StatusCreated {
+			t.Fatalf("post into reactivated account: status %d, want 201 (%s)", postRec.Code, postRec.Body.String())
+		}
+	})
+
+	t.Run("invalid status 422", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+cash+"/status",
+			map[string]string{"status": "bogus"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("unknown account 404", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/accounts/"+uuid.NewString()+"/status",
+			map[string]string{"status": "closed"})
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status %d, want 404 (%s)", rec.Code, rec.Body.String())
 		}
 	})
 }
@@ -927,6 +1748,139 @@ func TestCreateTransactionIdempotentReplayHeader(t *testing.T) {
 	}
 }
 
+// TestCreateTransactionReferenceAndEffectiveAt covers the Task 4.3 (audit
+// A1.3) request/response fields end to end over REST: reference and
+// effective_at round-trip through both the create response and a later GET,
+// omitting both leaves reference absent and effective_at defaulted to the
+// post time, and reusing a reference already in use for the tenant is
+// rejected with 409 (distinct from the idempotency-key 409 the test above
+// already covers).
+func TestCreateTransactionReferenceAndEffectiveAt(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	rev := createAccount(t, r, "Revenue", "income")
+
+	t.Run("reference and effective_at round-trip", func(t *testing.T) {
+		past := time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 500},
+				{"account_id": rev, "amount": -500},
+			},
+			"reference":    "REST-INV-1001",
+			"effective_at": past,
+		}, map[string]string{"Idempotency-Key": "reference-roundtrip-1"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			ID          string `json:"id"`
+			Reference   string `json:"reference"`
+			EffectiveAt string `json:"effective_at"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+		}
+		if out.Reference != "REST-INV-1001" {
+			t.Errorf("reference = %q, want REST-INV-1001", out.Reference)
+		}
+		if out.EffectiveAt != past {
+			t.Errorf("effective_at = %q, want %q", out.EffectiveAt, past)
+		}
+
+		getRec := do(t, r, http.MethodGet, "/v1/transactions/"+out.ID, nil)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("get status %d", getRec.Code)
+		}
+		var reread struct {
+			Reference   string `json:"reference"`
+			EffectiveAt string `json:"effective_at"`
+		}
+		if err := json.Unmarshal(getRec.Body.Bytes(), &reread); err != nil {
+			t.Fatalf("unmarshal get: %v", err)
+		}
+		if reread.Reference != "REST-INV-1001" {
+			t.Errorf("re-read reference = %q, want REST-INV-1001", reread.Reference)
+		}
+		if reread.EffectiveAt != past {
+			t.Errorf("re-read effective_at = %q, want %q", reread.EffectiveAt, past)
+		}
+	})
+
+	t.Run("omitted reference and effective_at default cleanly", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 50},
+				{"account_id": rev, "amount": -50},
+			},
+		}, map[string]string{"Idempotency-Key": "reference-omitted-1"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, want 201 (%s)", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Reference   string    `json:"reference"`
+			EffectiveAt time.Time `json:"effective_at"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+		}
+		if out.Reference != "" {
+			t.Errorf("reference = %q, want empty (omitted)", out.Reference)
+		}
+		// fakeRepo's clock is a synthetic counter (see CreateTransaction), not
+		// wall time, so the fallback is checked against the zero value only:
+		// the point here is that SOME fallback value was resolved, not that
+		// it matches real time (the real Postgres adapter's created_at
+		// fallback is covered by internal/ledger's
+		// TestPost_EffectiveAtDefaultsToCreatedAt).
+		if out.EffectiveAt.IsZero() {
+			t.Error("effective_at is the zero value, want the created_at fallback")
+		}
+	})
+
+	t.Run("duplicate reference 409", func(t *testing.T) {
+		first := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10},
+				{"account_id": rev, "amount": -10},
+			},
+			"reference": "REST-DUP-1",
+		}, map[string]string{"Idempotency-Key": "reference-dup-1"})
+		if first.Code != http.StatusCreated {
+			t.Fatalf("first status %d, want 201 (%s)", first.Code, first.Body.String())
+		}
+
+		second := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 20},
+				{"account_id": rev, "amount": -20},
+			},
+			"reference": "REST-DUP-1",
+		}, map[string]string{"Idempotency-Key": "reference-dup-2"})
+		if second.Code != http.StatusConflict {
+			t.Errorf("duplicate reference status = %d, want 409 (%s)", second.Code, second.Body.String())
+		}
+	})
+
+	t.Run("empty reference is rejected 422", func(t *testing.T) {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 10},
+				{"account_id": rev, "amount": -10},
+			},
+			"reference": "",
+		}, map[string]string{"Idempotency-Key": "reference-empty-1"})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+}
+
 func TestAuditEndpoints(t *testing.T) {
 	repo := newFakeRepo()
 	a := &domain.Account{Name: "A", Type: domain.Asset, Currency: "USD"}
@@ -1018,6 +1972,257 @@ func TestMalformedCursorRejected(t *testing.T) {
 		rec := do(t, router, http.MethodGet, "/v1/accounts/"+a.ID+"/audit?cursor=garbage", nil)
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("list-transactions cursor", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/transactions?cursor=garbage", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("list-transactions from", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/transactions?from=not-a-timestamp", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("export-transactions to", func(t *testing.T) {
+		rec := do(t, router, http.MethodGet, "/v1/transactions/export?to=not-a-timestamp", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// seedListTransactionsHTTP posts n balanced transactions over the REST API,
+// each carrying a distinct reference ("http-list-ref-<i>") and a small sleep
+// between posts so fakeRepo's created_at ordering (a real wall-clock
+// time.Unix tick per transaction, see fakeRepo.CreateTransaction) is
+// unambiguous, mirroring seedListTransactions in
+// internal/postgres/list_transactions_test.go. It returns the posted ids in
+// posting order (oldest first).
+func seedListTransactionsHTTP(t *testing.T, r chi.Router, cash, other string, n int) []string {
+	t.Helper()
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 100 + i, "description": "seed"},
+				{"account_id": other, "amount": -(100 + i)},
+			},
+			"reference": fmt.Sprintf("http-list-ref-%d", i),
+		}, map[string]string{"Idempotency-Key": fmt.Sprintf("http-list-seed-%d", i)})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("seed post %d: %d (%s)", i, rec.Code, rec.Body.String())
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode seed post %d: %v", i, err)
+		}
+		ids[i] = out.ID
+	}
+	return ids
+}
+
+type transactionListResponse struct {
+	Transactions []struct {
+		ID        string  `json:"id"`
+		Reference *string `json:"reference,omitempty"`
+	} `json:"transactions"`
+	NextCursor *string `json:"next_cursor"`
+}
+
+// TestListTransactions covers GET /v1/transactions end to end over the fake
+// repo (Task 4.4, audit A7.2): the default page returns every seeded
+// transaction newest first, an exact reference filter narrows to one, and
+// keyset pagination with a small limit walks every transaction exactly once,
+// with no gap or overlap, stopping (next_cursor null) at the end.
+func TestListTransactions(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	other := createAccount(t, r, "Other", "asset")
+
+	const n = 5
+	ids := seedListTransactionsHTTP(t, r, cash, other, n)
+
+	t.Run("default page lists all, newest first", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out transactionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Transactions) != n {
+			t.Fatalf("got %d transactions, want %d", len(out.Transactions), n)
+		}
+		for i, txn := range out.Transactions {
+			wantID := ids[n-1-i]
+			if txn.ID != wantID {
+				t.Errorf("transactions[%d].ID = %s, want %s (newest first)", i, txn.ID, wantID)
+			}
+		}
+		if out.NextCursor != nil {
+			t.Errorf("expected no next_cursor when everything fits on one page, got %q", *out.NextCursor)
+		}
+	})
+
+	t.Run("reference filter narrows to exact match", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions?reference=http-list-ref-2", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out transactionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Transactions) != 1 || out.Transactions[0].ID != ids[2] {
+			t.Fatalf("reference filter = %+v, want exactly transaction %s", out.Transactions, ids[2])
+		}
+	})
+
+	t.Run("pagination walks every transaction with no gap or overlap", func(t *testing.T) {
+		const pageSize = 2
+		seen := map[string]bool{}
+		var walked []string
+		cursor := ""
+		for pages := 0; ; pages++ {
+			if pages > n {
+				t.Fatalf("pagination did not terminate after %d pages", pages)
+			}
+			path := fmt.Sprintf("/v1/transactions?limit=%d", pageSize)
+			if cursor != "" {
+				path += "&cursor=" + cursor
+			}
+			rec := do(t, r, http.MethodGet, path, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("page %d status %d (%s)", pages, rec.Code, rec.Body.String())
+			}
+			var out transactionListResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode page %d: %v", pages, err)
+			}
+			for _, txn := range out.Transactions {
+				if seen[txn.ID] {
+					t.Fatalf("transaction %s returned twice across pages (overlap)", txn.ID)
+				}
+				seen[txn.ID] = true
+				walked = append(walked, txn.ID)
+			}
+			if out.NextCursor == nil {
+				break
+			}
+			cursor = *out.NextCursor
+		}
+		wantOrder := make([]string, n)
+		for i := 0; i < n; i++ {
+			wantOrder[i] = ids[n-1-i]
+		}
+		if !reflect.DeepEqual(walked, wantOrder) {
+			t.Fatalf("walked order = %v, want %v (no gap, no overlap, newest first)", walked, wantOrder)
+		}
+	})
+}
+
+// TestExportTransactions covers GET /v1/transactions/export end to end over
+// the fake repo (Task 4.4, audit A7.2): csv gets a header row plus one row
+// per posting with the right content type and attachment disposition, and
+// json gets the same transaction bodies the list endpoint returns.
+func TestExportTransactions(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	other := createAccount(t, r, "Other", "asset")
+	const n = 3
+	ids := seedListTransactionsHTTP(t, r, cash, other, n)
+
+	t.Run("csv: header, one row per posting, content type and disposition", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "text/csv" {
+			t.Errorf("Content-Type = %q, want text/csv", ct)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != `attachment; filename="transactions.csv"` {
+			t.Errorf("Content-Disposition = %q", cd)
+		}
+		if trunc := rec.Header().Get("Export-Truncated"); trunc != "false" {
+			t.Errorf("Export-Truncated = %q, want false", trunc)
+		}
+		reader := csv.NewReader(strings.NewReader(rec.Body.String()))
+		rows, err := reader.ReadAll()
+		if err != nil {
+			t.Fatalf("parse csv: %v", err)
+		}
+		wantHeader := []string{
+			"transaction_id", "posting_id", "account_id", "amount", "currency",
+			"description", "reference", "created_at", "effective_at",
+		}
+		if len(rows) == 0 || !reflect.DeepEqual(rows[0], wantHeader) {
+			t.Fatalf("header = %v, want %v", rows[0], wantHeader)
+		}
+		// n transactions x 2 postings each, plus the header row.
+		if len(rows) != n*2+1 {
+			t.Fatalf("got %d csv rows (incl. header), want %d", len(rows), n*2+1)
+		}
+		seenTxnIDs := map[string]bool{}
+		for _, row := range rows[1:] {
+			seenTxnIDs[row[0]] = true
+			if row[1] == "" {
+				t.Errorf("row %v: posting_id is empty", row)
+			}
+			if row[2] == "" {
+				t.Errorf("row %v: account_id is empty", row)
+			}
+			if row[4] != "USD" {
+				t.Errorf("row %v: currency = %q, want USD", row, row[4])
+			}
+		}
+		for _, id := range ids {
+			if !seenTxnIDs[id] {
+				t.Errorf("transaction %s missing from csv export", id)
+			}
+		}
+	})
+
+	t.Run("json: same shape as the list endpoint", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export?format=json", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", ct)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != "" {
+			t.Errorf("Content-Disposition = %q, want empty for json", cd)
+		}
+		var bodies []TransactionBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &bodies); err != nil {
+			t.Fatalf("decode json export: %v (%s)", err, rec.Body.String())
+		}
+		if len(bodies) != n {
+			t.Fatalf("got %d transactions, want %d", len(bodies), n)
+		}
+	})
+
+	t.Run("reference filter applies to export too", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export?format=json&reference=http-list-ref-1", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var bodies []TransactionBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &bodies); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(bodies) != 1 || bodies[0].ID != ids[1] {
+			t.Fatalf("filtered export = %+v, want exactly transaction %s", bodies, ids[1])
 		}
 	})
 }

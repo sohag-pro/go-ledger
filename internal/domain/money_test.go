@@ -137,21 +137,51 @@ func TestMoneyNeg(t *testing.T) {
 
 func TestMoneyString(t *testing.T) {
 	tests := []struct {
-		amount int64
-		want   string
+		amount   int64
+		currency Currency
+		want     string
 	}{
-		{1050, "10.50 USD"},
-		{-1050, "-10.50 USD"},
-		{5, "0.05 USD"},
-		{-5, "-0.05 USD"},
-		{0, "0.00 USD"},
-		{100, "1.00 USD"},
-		{math.MinInt64, "-92233720368547758.08 USD"},
+		{1050, "USD", "10.50 USD"},
+		{-1050, "USD", "-10.50 USD"},
+		{5, "USD", "0.05 USD"},
+		{-5, "USD", "-0.05 USD"},
+		{0, "USD", "0.00 USD"},
+		{100, "USD", "1.00 USD"},
+		{math.MinInt64, "USD", "-92233720368547758.08 USD"},
+		// Zero-decimal currency: no decimal point at all.
+		{15000, "JPY", "15000 JPY"},
+		{-15000, "JPY", "-15000 JPY"},
+		{0, "JPY", "0 JPY"},
+		// Three-decimal currency: zero-padded to three places.
+		{10500, "BHD", "10.500 BHD"},
+		{-10500, "BHD", "-10.500 BHD"},
+		{5, "BHD", "0.005 BHD"},
+		{-5, "BHD", "-0.005 BHD"},
+		// Unknown code not in the registry defaults to 2-dp.
+		{1050, "XTS", "10.50 XTS"},
 	}
 	for _, tt := range tests {
-		m, _ := NewMoney(tt.amount, "USD")
+		m, _ := NewMoney(tt.amount, tt.currency)
 		if got := m.String(); got != tt.want {
-			t.Errorf("String() for %d = %q, want %q", tt.amount, got, tt.want)
+			t.Errorf("String() for %d %s = %q, want %q", tt.amount, tt.currency, got, tt.want)
+		}
+	}
+}
+
+func TestCurrencyMinorUnits(t *testing.T) {
+	tests := []struct {
+		code Currency
+		want int
+	}{
+		{"JPY", 0},
+		{"USD", 2},
+		{"BHD", 3},
+		{"KWD", 3},
+		{"XYZ", 2},
+	}
+	for _, tt := range tests {
+		if got := tt.code.MinorUnits(); got != tt.want {
+			t.Errorf("MinorUnits(%s) = %d, want %d", tt.code, got, tt.want)
 		}
 	}
 }

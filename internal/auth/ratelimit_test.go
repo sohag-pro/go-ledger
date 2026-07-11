@@ -142,6 +142,27 @@ func TestRetryAfterSeconds(t *testing.T) {
 	}
 }
 
+// TestLimiter_RetryAfterSeconds proves the exported RetryAfterSeconds
+// resolves a key's own RateLimitRPM override through rpmFor before applying
+// retryAfterSeconds, and falls back to the limiter's default for a key with
+// no override, the same resolution HumaMiddleware itself relies on for the
+// REST 429's Retry-After header (Task 5.1, audit A2.2: the gRPC rate-limit
+// interceptor reuses this same exported method for parity).
+func TestLimiter_RetryAfterSeconds(t *testing.T) {
+	t.Parallel()
+
+	l := NewLimiter(60) // default: 60 rpm -> 1s
+	overridden := domain.APIKey{ID: "k-override", RateLimitRPM: intp(30)}
+	unoverridden := domain.APIKey{ID: "k-default"}
+
+	if got := l.RetryAfterSeconds(overridden); got != 2 {
+		t.Errorf("RetryAfterSeconds(30 rpm override) = %d, want 2", got)
+	}
+	if got := l.RetryAfterSeconds(unoverridden); got != 1 {
+		t.Errorf("RetryAfterSeconds(default 60 rpm) = %d, want 1", got)
+	}
+}
+
 // newRateLimitTestAPI builds a huma test API that stands in for the resolved
 // key already being in context (as auth.HumaMiddleware would leave it after
 // a successful resolve; that middleware is covered on its own in

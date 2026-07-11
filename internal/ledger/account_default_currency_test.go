@@ -61,6 +61,9 @@ func TestAccountService_Create_DefaultCurrency(t *testing.T) {
 			}
 			svc := ledger.NewAccountService(repo, opts...)
 			tenant := uuid.NewString()
+			if err := repo.CreateTenant(ctx, tenant, "default currency test tenant"); err != nil {
+				t.Fatalf("create tenant: %v", err)
+			}
 
 			acct := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: tt.reqCurrency}
 			err := svc.Create(ctx, tenant, acct)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -24,7 +25,7 @@ func TestIdempotencyKeyTenantIsolation(t *testing.T) {
 	txnID, _, _ := seedTxn(t, repo, owner)
 
 	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
-		return tx.InsertIdempotencyKey(ctx, owner, "shared-key", "fp-1", txnID)
+		return tx.InsertIdempotencyKey(ctx, owner, "shared-key", "fp-1", "v1", txnID, time.Hour)
 	})
 	if err != nil {
 		t.Fatalf("insert idempotency key: %v", err)
@@ -48,7 +49,7 @@ func TestListAuditByTransactionTenantIsolation(t *testing.T) {
 	txnID, _, _ := seedTxn(t, repo, owner)
 
 	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, owner, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, owner, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         owner,
@@ -58,6 +59,7 @@ func TestListAuditByTransactionTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append audit: %v", err)
 	}
+	drainChainer(t, pool, owner)
 
 	other := uuid.NewString()
 	got, err := repo.ListAuditByTransaction(ctx, other, txnID)
@@ -83,7 +85,7 @@ func TestListAuditByAccountTenantIsolation(t *testing.T) {
 	txnID, debit, _ := seedTxn(t, repo, owner)
 
 	err := repo.RunInTx(ctx, owner, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, owner, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, owner, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         owner,
@@ -93,6 +95,7 @@ func TestListAuditByAccountTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append audit: %v", err)
 	}
+	drainChainer(t, pool, owner)
 
 	other := uuid.NewString()
 	got, err := repo.ListAuditByAccount(ctx, other, debit, nil, 50)

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
@@ -43,7 +44,7 @@ func TestKeyFromContext_RoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatalf("KeyFromContext ok = false, want true")
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("KeyFromContext = %+v, want %+v", got, want)
 	}
 }
@@ -55,7 +56,7 @@ func TestKeyFromContext_Missing(t *testing.T) {
 	if ok {
 		t.Fatalf("KeyFromContext ok = true, want false")
 	}
-	if got != (domain.APIKey{}) {
+	if !reflect.DeepEqual(got, domain.APIKey{}) {
 		t.Fatalf("KeyFromContext = %+v, want zero value", got)
 	}
 }

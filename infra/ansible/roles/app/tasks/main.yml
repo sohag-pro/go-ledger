@@ -35,7 +35,15 @@
     mode: "0640"
     force: false
 
-- name: Restricted sudoers so deploy can restart only the app
+- name: Install the pre-swap migrate wrapper (Task 5.6b, audit A4.3)
+  ansible.builtin.template:
+    src: go-ledger-migrate.j2
+    dest: /usr/local/sbin/go-ledger-migrate
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Restricted sudoers so deploy can restart the app as root and run the migrate wrapper as the app user, not root
   ansible.builtin.template:
     src: sudoers.j2
     dest: /etc/sudoers.d/go-ledger-deploy

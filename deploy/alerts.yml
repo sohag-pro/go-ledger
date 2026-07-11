@@ -1,0 +1,121 @@
+# Prometheus alerting rules for go-ledger (Task 5.6a, audit A6.1).
+#
+# Load this alongside deploy/prometheus.yml (rule_files: ["alerts.yml"]) on
+# whatever Prometheus instance scrapes the "go-ledger" job. It covers the
+# async subsystems' operational gauges (internal/opsmetrics), the two
+# request-path signals metrics.go already records, and basic service
+# liveness.
+#
+# Metric names here are the real, currently-registered ones (see
+# internal/metrics/metrics.go): transaction_post_duration_seconds and
+# transaction_post_serialization_retries_total predate this task,
+# ledger_audit_outbox_pending/lag_seconds, ledger_webhook_deliveries_dead/pending,
+# and ledger_balance_invariant_violations are the gauges added with it.
+groups:
+  - name: go-ledger.rules
+    rules:
+      # The balance-invariant canary (internal/opsmetrics.Collector, mirroring
+      # internal/verify's restore-verifier query). A healthy ledger always
+      # reports 0: any positive value means postings were recorded out of
+      # balance, a direct violation of the core double-entry invariant
+      # (ADR-001, ADR-014). This is a sev-1 signal: page immediately, on the
+      # shortest "for" window here, since even one minute of an undetected
+      # balance break is money genuinely wrong.
+      - alert: LedgerBalanceInvariantViolation
+        expr: ledger_balance_invariant_violations > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ledger balance invariant violated"
+          description: >-
+            {{ $value }} transaction/currency posting group(s) do not sum to
+            zero on {{ $labels.instance }}. The core double-entry invariant is
+            broken: this means money was recorded out of balance. Page
+            immediately; do not wait for a restore-and-verify cycle to
+            confirm it.
+
+      # The chain-backlog / "is the chainer keeping up" signal (ADR-017).
+      # A small pending count can still mean a stuck chainer if it never
+      # drains, so lag (the age of the OLDEST unprocessed row) is the
+      # threshold that actually matters, not the raw pending count.
+      - alert: LedgerAuditOutboxLagHigh
+        expr: ledger_audit_outbox_lag_seconds > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit outbox chainer is falling behind"
+          description: >-
+            The oldest unprocessed audit_outbox row on {{ $labels.instance }}
+            is {{ $value }}s old, above the 300s threshold for 10 minutes.
+            The chainer may be stuck, crashed, or lost its leader-election
+            advisory lock; the tamper-evident audit chain is falling behind
+            the postings it describes.
+
+      # Dead webhook deliveries mean a subscriber's callback URL has been
+      # unreachable or erroring long enough to exhaust the retry budget
+      # (internal/webhook.DefaultMaxAttempts); the event is not lost (the
+      # row remains, dead, in webhook_deliveries), but the subscriber never
+      # received it and will not without manual intervention.
+      - alert: LedgerWebhookDeadDeliveries
+        expr: ledger_webhook_deliveries_dead > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook deliveries have gone dead"
+          description: >-
+            {{ $value }} webhook_deliveries row(s) are in the dead state on
+            {{ $labels.instance }}: delivery exhausted its retry budget. At
+            least one tenant's webhook subscriber has stopped receiving
+            events.
+
+      # A climbing serialization-retry rate signals write contention on hot
+      # accounts (see metrics.go's own doc comment on SerializationRetries).
+      # The threshold (1/s sustained over 5m) is a starting point tuned for
+      # the load-test baseline; revisit once real production traffic
+      # patterns are known.
+      - alert: LedgerHighSerializationRetries
+        expr: rate(transaction_post_serialization_retries_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate of posting serialization retries"
+          description: >-
+            Posting transactions on {{ $labels.instance }} are retrying
+            after SERIALIZABLE conflicts at {{ $value }}/s (5m average),
+            above the 1/s threshold. This usually means heavy concurrent
+            write contention on a small set of hot accounts.
+
+      # p99 posting latency, from the same histogram the Week 4 latency
+      # baselines were tuned against. 500ms is a generous ceiling relative to
+      # those baselines (low tens of milliseconds locally); it exists to
+      # catch a real regression or contention episode, not to enforce a tight
+      # SLO.
+      - alert: LedgerPostLatencyP99High
+        expr: histogram_quantile(0.99, rate(transaction_post_duration_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transaction post p99 latency is high"
+          description: >-
+            The p99 transaction posting latency on {{ $labels.instance }} is
+            {{ $value }}s over the last 5m, above the 500ms ceiling.
+
+      # Basic liveness: Prometheus itself could not scrape the instance at
+      # all. Distinct from every gauge-based alert above, which all assume a
+      # reachable, scrapeable instance; this is the "the process is gone"
+      # backstop.
+      - alert: LedgerServiceDown
+        expr: up{job="go-ledger"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "go-ledger instance is down"
+          description: >-
+            Prometheus has not successfully scraped {{ $labels.instance }}
+            for 1 minute. The instance is unreachable or has crashed.

@@ -22,19 +22,60 @@ message Transaction {
   reserved "currency";
   string id = 1;
   repeated Posting postings = 3;
+  // reverses_transaction_id is set only when this transaction is itself a
+  // reversal (Task 4.2, audit A1.2): the id of the transaction it reverses.
+  // Empty for an ordinary post or convert.
+  string reverses_transaction_id = 4;
+  // reference is the caller's optional external id for reconciliation (Task
+  // 4.3, audit A1.3), unique per tenant when present. Empty when the
+  // transaction was posted without one.
+  string reference = 5;
+  // effective_at is the value date (Task 4.3, audit A1.3): when the
+  // transaction is considered to have happened economically. Always set,
+  // even when the caller supplied none: it then falls back to when the
+  // transaction was actually posted. RFC3339 timestamp.
+  string effective_at = 6;
 }
 
+// status and min_balance are Task 5.5 (audit A1.5) additions: status is one
+// of active, frozen, or closed; min_balance is the optional floor enforced
+// on the account's derived balance, in minor units. min_balance is 0 when
+// unset (proto3 has no distinct "absent" for a scalar int64), matching a
+// literal 0 floor; a caller that needs to tell "no floor" apart from "floor
+// of exactly zero" should use the REST API, whose min_balance is a JSON
+// null-able field.
+//
+// party_reference and party_type (Task 6.1, audit A9.1) are optional
+// linkage metadata for an external KYC/party system: an id and a free-text
+// classification (e.g. "individual", "business"). Both are empty string
+// when unset (proto3 has no distinct "absent" for a scalar string either); a
+// caller that needs to tell "unset" apart from "an empty string was
+// deliberately stored" should use the REST API instead, whose fields are
+// JSON null-able. Neither is validated by this service beyond a length cap;
+// the party/KYC system itself is external and out of scope.
 message Account {
   string id = 1;
   string name = 2;
   string type = 3; // asset, liability, equity, income, or expense
   string currency = 4;
+  string status = 5;
+  int64 min_balance = 6;
+  string party_reference = 7;
+  string party_type = 8;
 }
 
+// min_balance (Task 5.5, audit A1.5) is optional: 0 means no floor was
+// requested, the same convention Account.min_balance above documents.
+// party_reference and party_type (Task 6.1, audit A9.1) are optional too:
+// empty string means neither was supplied, the same convention
+// Account.party_reference/party_type above document.
 message CreateAccountRequest {
   string name = 1;
   string type = 2;
   string currency = 3;
+  int64 min_balance = 4;
+  string party_reference = 5;
+  string party_type = 6;
 }
 message CreateAccountResponse {
   Account account = 1;
@@ -44,6 +85,16 @@ message GetAccountRequest {
   string id = 1;
 }
 message GetAccountResponse {
+  Account account = 1;
+}
+
+// SetAccountStatusRequest freezes, closes, or reactivates one account (Task
+// 5.5, audit A1.5), mirroring POST /v1/accounts/{id}/status.
+message SetAccountStatusRequest {
+  string id = 1;
+  string status = 2; // one of: active, frozen, closed
+}
+message SetAccountStatusResponse {
   Account account = 1;
 }
 
@@ -89,6 +140,14 @@ message GetStatementResponse {
 message PostTransactionRequest {
   string currency = 1;
   repeated Posting postings = 2;
+  // reference is an optional external id for reconciliation (Task 4.3, audit
+  // A1.3), unique per tenant when supplied. Reusing one already in use
+  // returns ALREADY_EXISTS.
+  string reference = 3;
+  // effective_at is an optional value date (Task 4.3, audit A1.3), distinct
+  // from when the row is actually written. Empty defaults to the post time.
+  // RFC3339 timestamp.
+  string effective_at = 4;
 }
 message PostTransactionResponse {
   Transaction transaction = 1;
@@ -100,6 +159,37 @@ message GetTransactionRequest {
 }
 message GetTransactionResponse {
   Transaction transaction = 1;
+}
+
+// ListTransactionsRequest lists the tenant's transactions, newest first,
+// keyset paged by cursor, optionally filtered by a from/to created_at range
+// and/or an exact reference match (Task 4.4, audit A7.2), mirroring GET
+// /v1/transactions. from and to are RFC3339 timestamps; from is inclusive,
+// to is exclusive. Export has no gRPC equivalent: a streaming CSV export
+// does not fit gRPC's single-response model, so it stays REST-only.
+message ListTransactionsRequest {
+  string from = 1;
+  string to = 2;
+  string reference = 3;
+  int32 limit = 4;
+  string cursor = 5;
+}
+message ListTransactionsResponse {
+  repeated Transaction transactions = 1;
+  string next_cursor = 2;
+}
+
+// ReverseTransactionRequest posts the negated legs of original_transaction_id
+// as a new, linked transaction (Task 4.2, audit A1.2). Idempotent: a
+// transaction can be reversed at most once, so calling this again for the
+// same original returns the SAME reversal, with already_reversed = true,
+// instead of posting a second one.
+message ReverseTransactionRequest {
+  string original_transaction_id = 1;
+}
+message ReverseTransactionResponse {
+  Transaction transaction = 1;
+  bool already_reversed = 2;
 }
 
 message AuditEntry {
@@ -161,12 +251,15 @@ message ConvertResponse {
 service LedgerService {
   rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
   rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  rpc SetAccountStatus(SetAccountStatusRequest) returns (SetAccountStatusResponse);
   rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
   rpc GetStatement(GetStatementRequest) returns (GetStatementResponse);
   rpc PostTransaction(PostTransactionRequest) returns (PostTransactionResponse);
   rpc Convert(ConvertRequest) returns (ConvertResponse);
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse);
+  rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
+  rpc ReverseTransaction(ReverseTransactionRequest) returns (ReverseTransactionResponse);
   rpc GetTransactionAudit(GetTransactionAuditRequest) returns (GetTransactionAuditResponse);
   rpc GetAccountAudit(GetAccountAuditRequest) returns (GetAccountAuditResponse);
 }

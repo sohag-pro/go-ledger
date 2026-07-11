@@ -19,6 +19,9 @@ func TestAuditLogIsImmutable(t *testing.T) {
 
 	// Minimal valid rows to satisfy the FKs. Insert postings-free: the balance
 	// trigger is deferred and fires on postings, not on a bare transaction row.
+	// tenants first: accounts_tenant_fk (migration 0011) requires the tenant
+	// row to exist before an account can reference it.
+	mustExec(t, pool, `INSERT INTO tenants (id, name) VALUES ($1, 'test tenant')`, tenant)
 	mustExec(t, pool, `INSERT INTO accounts (id, tenant_id, name, type, currency) VALUES ($1,$2,'A','asset','USD')`, acct, tenant)
 	mustExec(t, pool, `INSERT INTO transactions (id, tenant_id) VALUES ($1,$2)`, txn, tenant)
 	// actor gets its own placeholder ($4) rather than reusing $2: Postgres cannot

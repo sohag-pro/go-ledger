@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -49,7 +50,13 @@ func seedFXRate(t *testing.T, quote string, midRateE8 int64, spreadBps int32) {
 	q := sqlc.New(sharedPool)
 	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
 		Base: "USD", Quote: quote, MidRateE8: midRateE8, SpreadBps: spreadBps,
-		Source: "test", EffectiveAt: time.Now().UTC(),
+		Source: "test",
+		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
+		// "effective_at <= now()" gate runs on the database SERVER's clock,
+		// so a timestamp from this test process landing even slightly ahead
+		// of it would make the row transiently invisible right after insert
+		// (Task 2.4's clock-skew fix; see internal/fx/provider_test.go).
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
 	}); err != nil {
 		t.Fatalf("seed fx rate USD/%s: %v", quote, err)
 	}
@@ -302,6 +309,9 @@ func TestGRPCConvertCrossTenantIsolation(t *testing.T) {
 	seedFXRate(t, "PLN", 100_000_000, 0)
 
 	tenantB := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenantB, "tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
 	plnB := &domain.Account{Name: "Tenant B PLN", Type: domain.Asset, Currency: "PLN"}
 	if err := repo.CreateAccount(ctx, tenantB, plnB); err != nil {
 		t.Fatalf("create tenant B account: %v", err)

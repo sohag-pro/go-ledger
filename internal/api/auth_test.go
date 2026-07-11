@@ -18,6 +18,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
@@ -215,6 +216,12 @@ func TestV1CrossTenantIsolation_Postgres(t *testing.T) {
 	const plaintextB = "glk_cross-tenant-test-key-b"
 
 	ctx := context.Background()
+	if err := repo.CreateTenant(ctx, tenantA, "tenant A"); err != nil {
+		t.Fatalf("create tenant A: %v", err)
+	}
+	if err := repo.CreateTenant(ctx, tenantB, "tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
 	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenantA, Name: "tenant A"}, domain.HashAPIKey(plaintextA)); err != nil {
 		t.Fatalf("insert tenant A key: %v", err)
 	}
@@ -308,12 +315,17 @@ func TestConvertCrossTenantIsolation_Postgres(t *testing.T) {
 
 	q := sqlc.New(sharedAuthPool)
 	if _, err := q.InsertFXRate(ctx, sqlc.InsertFXRateParams{
-		Base:        "USD",
-		Quote:       "PLN",
-		MidRateE8:   100_000_000,
-		SpreadBps:   0,
-		Source:      "test",
-		EffectiveAt: time.Now().UTC(),
+		Base:      "USD",
+		Quote:     "PLN",
+		MidRateE8: 100_000_000,
+		SpreadBps: 0,
+		Source:    "test",
+		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
+		// "effective_at <= now()" gate runs on the database SERVER's clock, so
+		// a timestamp from this test process landing even slightly ahead of
+		// it would make the row transiently invisible right after insert
+		// (Task 2.4's clock-skew fix; see internal/fx/provider_test.go).
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
 	}); err != nil {
 		t.Fatalf("seed fx rate: %v", err)
 	}
@@ -323,6 +335,12 @@ func TestConvertCrossTenantIsolation_Postgres(t *testing.T) {
 	const plaintextA = "glk_convert-cross-tenant-test-key-a"
 	const plaintextB = "glk_convert-cross-tenant-test-key-b"
 
+	if err := repo.CreateTenant(ctx, tenantA, "tenant A"); err != nil {
+		t.Fatalf("create tenant A: %v", err)
+	}
+	if err := repo.CreateTenant(ctx, tenantB, "tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
 	if err := repo.InsertAPIKey(ctx, domain.APIKey{TenantID: tenantA, Name: "tenant A"}, domain.HashAPIKey(plaintextA)); err != nil {
 		t.Fatalf("insert tenant A key: %v", err)
 	}

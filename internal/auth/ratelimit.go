@@ -121,6 +121,17 @@ func retryAfterSeconds(rpm int) int {
 	return secs
 }
 
+// RetryAfterSeconds is retryAfterSeconds resolved against key's own rate
+// limit (or l's default, via rpmFor). It is exported so a caller reporting
+// its own retry hint, such as the gRPC rate-limit interceptor's
+// codes.ResourceExhausted RetryInfo detail (internal/grpcserver, Task 5.1,
+// audit A2.2), reports the SAME value HumaMiddleware puts in the REST 429's
+// Retry-After header, rather than recomputing it against a hardcoded or
+// mismatched rpm.
+func (l *Limiter) RetryAfterSeconds(key domain.APIKey) int {
+	return retryAfterSeconds(l.rpmFor(key))
+}
+
 // HumaMiddleware returns a huma middleware enforcing l against the API key
 // already resolved into the request context by auth.HumaMiddleware. It must
 // be registered after (i.e. it runs downstream of) the auth middleware, so
@@ -146,7 +157,7 @@ func (l *Limiter) HumaMiddleware(api huma.API) func(huma.Context, func(huma.Cont
 		}
 
 		if !l.Allow(key) {
-			ctx.SetHeader("Retry-After", strconv.Itoa(retryAfterSeconds(l.rpmFor(key))))
+			ctx.SetHeader("Retry-After", strconv.Itoa(l.RetryAfterSeconds(key)))
 			_ = huma.WriteErr(api, ctx, http.StatusTooManyRequests, "")
 			return
 		}
@@ -169,7 +180,7 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 		}
 
 		if !l.Allow(key) {
-			writeTooManyRequests(w, retryAfterSeconds(l.rpmFor(key)))
+			writeTooManyRequests(w, l.RetryAfterSeconds(key))
 			return
 		}
 

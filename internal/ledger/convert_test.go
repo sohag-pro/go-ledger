@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
@@ -29,22 +30,63 @@ func seedConvertRate(t *testing.T, pool *pgxpool.Pool, quote domain.Currency, mi
 	t.Helper()
 	q := sqlc.New(pool)
 	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
-		Base:        "USD",
-		Quote:       string(quote),
-		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
-		Source:      "test",
-		EffectiveAt: time.Now().UTC(),
+		Base:      "USD",
+		Quote:     string(quote),
+		MidRateE8: midE8,
+		SpreadBps: spreadBps,
+		Source:    "test",
+		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
+		// "effective_at <= now()" gate runs on the database SERVER's clock, so
+		// a timestamp from this test process landing even slightly ahead of
+		// it would make the row transiently invisible right after insert
+		// (Task 2.4's clock-skew fix; see internal/fx/provider_test.go).
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
 	}); err != nil {
 		t.Fatalf("seed fx rate USD/%s: %v", quote, err)
 	}
 }
 
-// newConvertAccount creates and returns an account of the given currency.
+// seedTenantConvertRate writes one tenant-scoped fx_rates row directly via
+// sqlc (Task 2.4, audit A3.3), the tenant-scoped counterpart of
+// seedConvertRate above: tenantID must already have a tenants row (see
+// newConvertAccount, which creates one), since fx_rates.tenant_id carries a
+// foreign key to tenants.id.
+func seedTenantConvertRate(t *testing.T, pool *pgxpool.Pool, tenantID string, base, quote domain.Currency, midE8 int64, spreadBps int32) {
+	t.Helper()
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		t.Fatalf("parse tenant id %q: %v", tenantID, err)
+	}
+	q := sqlc.New(pool)
+	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
+		TenantID:  pgtype.UUID{Bytes: tid, Valid: true},
+		Base:      string(base),
+		Quote:     string(quote),
+		MidRateE8: midE8,
+		SpreadBps: spreadBps,
+		Source:    "test-tenant",
+		// Same past safety margin as seedConvertRate above, and for the same
+		// clock-skew reason (Task 2.4 remediation).
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
+	}); err != nil {
+		t.Fatalf("seed tenant fx rate %s/%s for tenant %s: %v", base, quote, tenantID, err)
+	}
+}
+
+// newConvertAccount creates and returns an account of the given currency. It
+// ensures tenant's own row exists first (accounts_tenant_fk, migration 0011):
+// every test in this file calls this for a freshly generated tenant id with
+// no tenant row of its own, and a caller that creates more than one account
+// for the same tenant is unaffected (ErrTenantAlreadyExists on the second
+// call is swallowed).
 func newConvertAccount(t *testing.T, repo *postgres.Repository, tenant string, currency domain.Currency) domain.Account {
 	t.Helper()
+	ctx := context.Background()
+	if err := repo.CreateTenant(ctx, tenant, "convert test tenant"); err != nil && !errors.Is(err, domain.ErrTenantAlreadyExists) {
+		t.Fatalf("create tenant: %v", err)
+	}
 	a := &domain.Account{Name: "acct-" + uuid.NewString(), Type: domain.Asset, Currency: currency}
-	if err := repo.CreateAccount(context.Background(), tenant, a); err != nil {
+	if err := repo.CreateAccount(ctx, tenant, a); err != nil {
 		t.Fatalf("create %s account: %v", currency, err)
 	}
 	return *a
@@ -200,6 +242,10 @@ func TestConvert_BalancesPerCurrencyAndRecordsRate(t *testing.T) {
 		t.Errorf("clearing EUR balance = %d, want %d", eurBal.Amount(), -wantConverted.Amount())
 	}
 
+	// Convert only writes an audit_outbox row (ADR-017); drain the chainer
+	// so there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
+
 	// The audit row must record per-posting currency and the rate detail, not
 	// one top-level currency stamped from postings[0] (the pre-Task-6 shape).
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, txn.ID)
@@ -292,6 +338,10 @@ func TestConvert_IdempotentRetryReplaysDespiteRateMove(t *testing.T) {
 	if second.FX == nil || second.FX.MidRateE8 != 80_000_000 {
 		t.Errorf("retry FX.MidRateE8 = %+v, want the ORIGINAL 80000000, not the moved rate", second.FX)
 	}
+
+	// Convert only writes an audit_outbox row (ADR-017); drain the chainer
+	// so there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
 
 	// Exactly one transaction, one audit row: the retry did not re-convert.
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, first.ID)
@@ -467,6 +517,93 @@ func TestConvert_NoRateForPair(t *testing.T) {
 	}
 }
 
+// TestConvert_TenantSpecificSpreadChangesConvertedAmount is the discriminating
+// Convert-level test for Task 2.4 (audit A3.3): tenant A gets its own
+// USD/MXN row (a different mid AND a wider spread than the global default);
+// tenant B has no row of its own. Converting the exact same source amount for
+// both tenants must produce two different converted amounts, proving the
+// per-tenant rate and spread flow all the way from fx_rates through
+// Provider.Rate, domain.Convert, and into the posted transaction's FX
+// snapshot, not just through an isolated Rate() lookup.
+func TestConvert_TenantSpecificSpreadChangesConvertedAmount(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := newConvertService(pool)
+	ctx := context.Background()
+
+	tenantA := uuid.NewString()
+	tenantB := uuid.NewString()
+
+	const (
+		base, quote  = domain.Currency("USD"), domain.Currency("MXN")
+		globalMidE8  = 1_700_000_000 // 17.00 MXN per USD, an arbitrary fixture rate
+		globalSpread = 25
+		tenantMidE8  = 1_800_000_000 // 18.00 MXN per USD: tenant A negotiated a different mid too
+		tenantSpread = 300           // a much wider spread than the global default
+		sourceAmount = 10_000        // $100.00
+	)
+	seedConvertRate(t, pool, quote, globalMidE8, globalSpread)
+
+	usdA := newConvertAccount(t, repo, tenantA, base)
+	mxnA := newConvertAccount(t, repo, tenantA, quote)
+	usdB := newConvertAccount(t, repo, tenantB, base)
+	mxnB := newConvertAccount(t, repo, tenantB, quote)
+
+	seedTenantConvertRate(t, pool, tenantA, base, quote, tenantMidE8, tenantSpread)
+
+	reqA := ledger.ConvertRequest{FromAccountID: usdA.ID, ToAccountID: mxnA.ID, SourceAmount: sourceAmount}
+	txnA, _, err := svc.Convert(ctx, tenantA, reqA, &domain.Idempotency{Key: "tenant-a-rate"})
+	if err != nil {
+		t.Fatalf("Convert() tenant A error = %v", err)
+	}
+
+	reqB := ledger.ConvertRequest{FromAccountID: usdB.ID, ToAccountID: mxnB.ID, SourceAmount: sourceAmount}
+	txnB, _, err := svc.Convert(ctx, tenantB, reqB, &domain.Idempotency{Key: "tenant-b-rate"})
+	if err != nil {
+		t.Fatalf("Convert() tenant B error = %v", err)
+	}
+
+	if txnA.FX == nil || txnB.FX == nil {
+		t.Fatalf("expected FX detail on both transactions")
+	}
+	if txnA.FX.MidRateE8 != tenantMidE8 || txnA.FX.SpreadBps != tenantSpread {
+		t.Errorf("tenant A FX = {mid: %d, spread: %d}, want {mid: %d, spread: %d} (its own row)",
+			txnA.FX.MidRateE8, txnA.FX.SpreadBps, tenantMidE8, tenantSpread)
+	}
+	if txnB.FX.MidRateE8 != globalMidE8 || txnB.FX.SpreadBps != globalSpread {
+		t.Errorf("tenant B FX = {mid: %d, spread: %d}, want {mid: %d, spread: %d} (the global default)",
+			txnB.FX.MidRateE8, txnB.FX.SpreadBps, globalMidE8, globalSpread)
+	}
+	if txnA.FX.ConvertedAmount == txnB.FX.ConvertedAmount {
+		t.Errorf("tenant A and tenant B converted the same source amount (%d) to the same result (%d): "+
+			"the per-tenant rate/spread did not change the outcome", sourceAmount, txnA.FX.ConvertedAmount)
+	}
+
+	// Cross-check against domain.Convert directly with each tenant's own
+	// (mid, spread), so this is verifying the service plumbed each tenant's
+	// OWN rate through end to end, not just that the two amounts happen to
+	// differ for some other reason.
+	source, err := domain.NewMoney(sourceAmount, base)
+	if err != nil {
+		t.Fatalf("NewMoney: %v", err)
+	}
+	wantA, _, err := domain.Convert(source, quote, tenantMidE8, tenantSpread)
+	if err != nil {
+		t.Fatalf("domain.Convert (tenant A): %v", err)
+	}
+	wantB, _, err := domain.Convert(source, quote, globalMidE8, globalSpread)
+	if err != nil {
+		t.Fatalf("domain.Convert (tenant B): %v", err)
+	}
+	if txnA.FX.ConvertedAmount != wantA.Amount() {
+		t.Errorf("tenant A ConvertedAmount = %d, want %d", txnA.FX.ConvertedAmount, wantA.Amount())
+	}
+	if txnB.FX.ConvertedAmount != wantB.Amount() {
+		t.Errorf("tenant B ConvertedAmount = %d, want %d", txnB.FX.ConvertedAmount, wantB.Amount())
+	}
+}
+
 // TestConvert_ConcurrentIdempotentHammer fires many concurrent Convert calls
 // at the same tenant with the same idempotency key. The idempotency precheck
 // (GetIdempotencyKey) runs before RunInTx's per-tenant mutex, so more than one
@@ -527,6 +664,10 @@ func TestConvert_ConcurrentIdempotentHammer(t *testing.T) {
 	if replayCount != n-1 {
 		t.Errorf("replay count = %d, want %d (exactly one real conversion)", replayCount, n-1)
 	}
+
+	// Convert only writes an audit_outbox row (ADR-017); drain the chainer
+	// so there is an audit_log row to check.
+	drainChainer(t, pool, tenant)
 
 	// Exactly one audit row for the one conversion, even under concurrency.
 	audit, err := repo.ListAuditByTransaction(ctx, tenant, first)

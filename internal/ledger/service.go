@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -21,13 +22,22 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/metrics"
 )
 
+// DefaultIdempotencyTTL is how long an idempotency key blocks reuse when the
+// service is constructed without WithIdempotencyTTL (Task 4.5, audit A1.4):
+// generous enough that existing tests' within-test retries still replay, and
+// the same default cmd/server falls back to for IDEMPOTENCY_TTL.
+const DefaultIdempotencyTTL = 24 * time.Hour
+
 // TransactionService posts transactions to the ledger. It is the single entry
 // point both the REST and gRPC layers will call to move money.
 type TransactionService struct {
-	repo       domain.Repository
-	log        *slog.Logger
-	tracer     oteltrace.Tracer
-	fxProvider fx.Provider
+	repo           domain.Repository
+	log            *slog.Logger
+	tracer         oteltrace.Tracer
+	fxProvider     fx.Provider
+	idempotencyTTL time.Duration
+	prePostHook    PrePostHook
+	cipher         DescriptionCipher
 }
 
 // ServiceOption configures optional TransactionService dependencies that most
@@ -43,6 +53,41 @@ func WithFXProvider(p fx.Provider) ServiceOption {
 	return func(s *TransactionService) { s.fxProvider = p }
 }
 
+// WithIdempotencyTTL sets how long a stored idempotency key blocks reuse
+// before GetIdempotencyKey starts treating it as absent (Task 4.5, audit
+// A1.4). A TransactionService constructed without this option uses
+// DefaultIdempotencyTTL. ttl <= 0 is ignored (falls back to the default)
+// rather than stamping every key pre-expired.
+func WithIdempotencyTTL(ttl time.Duration) ServiceOption {
+	return func(s *TransactionService) {
+		if ttl > 0 {
+			s.idempotencyTTL = ttl
+		}
+	}
+}
+
+// WithPrePostHook sets the PrePostHook Post and Convert call synchronously,
+// before either ever writes anything, to let an external screening or
+// transaction-monitoring system veto the transaction (Task 6.1, audit
+// A9.1). A TransactionService constructed without this option uses
+// NoopPrePostHook, which allows every transaction: default behavior is
+// unchanged for every existing caller and test that never wires one in.
+func WithPrePostHook(h PrePostHook) ServiceOption {
+	return func(s *TransactionService) { s.prePostHook = h }
+}
+
+// WithCipher sets the DescriptionCipher Post, Convert, and ReverseTransaction
+// use to encrypt posting descriptions before they are stored, and Get,
+// ListTransactions, and ExportTransactions use to decrypt them back on read
+// (Task 6.2, audit A9.3). A TransactionService constructed without this
+// option has a nil cipher, meaning encryption is disabled: descriptions are
+// stored and returned as plain strings, exactly as before Task 6.2 existed
+// (see cmd/server's config loading for when this option is actually wired
+// in: only when LEDGER_MASTER_KEY is set).
+func WithCipher(c DescriptionCipher) ServiceOption {
+	return func(s *TransactionService) { s.cipher = c }
+}
+
 // NewTransactionService returns a TransactionService backed by repo. If log is
 // nil the default slog logger is used; if tracer is nil the global tracer is used.
 func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer oteltrace.Tracer, opts ...ServiceOption) *TransactionService {
@@ -52,7 +97,7 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 	if tracer == nil {
 		tracer = otel.Tracer("github.com/sohag-pro/go-ledger/internal/ledger")
 	}
-	s := &TransactionService{repo: repo, log: log, tracer: tracer}
+	s := &TransactionService{repo: repo, log: log, tracer: tracer, idempotencyTTL: DefaultIdempotencyTTL, prePostHook: NoopPrePostHook{}}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -64,7 +109,27 @@ func NewTransactionService(repo domain.Repository, log *slog.Logger, tracer otel
 // records the idempotency key and, if the same key was already used, replays the
 // original transaction instead of writing a new one (returning replayed=true). A
 // key reused with a different request body returns domain.ErrIdempotencyConflict.
-// Every real post also writes one append-only audit row in the same transaction.
+// Every real post also writes one append-only audit_outbox row in the same
+// transaction (ADR-017): the tamper-evident audit chain itself is built
+// asynchronously by a single background chainer, not inside this call, so a
+// transaction just posted is durable immediately but its audit-chain link
+// appears a short time later (see internal/audit.Chainer).
+// Before any of that, t's postings are checked against tenantID's optional
+// TenantPolicy guardrails (Task 2.4b, audit A3.4: max transaction amount, daily
+// volume, currency allowlist); a tripped guardrail returns a
+// *domain.PolicyViolationError. Postings are also checked against each
+// touched (non-system) account's status and optional minimum balance (Task
+// 5.5, audit A1.5): a frozen or closed account returns a
+// *domain.AccountNotActiveError, and a posting that would breach an
+// account's floor returns a *domain.MinBalanceBreachError.
+//
+// Immediately before RunInTx (Task 6.1, audit A9.1), and only for a genuine
+// new post, never for a replay (see the idempotency precheck above this
+// call): the configured PrePostHook gets one synchronous chance to veto t.
+// A rejection (ErrScreeningRejected) or an ambiguous hook failure
+// (ErrScreeningUnavailable) both return here, before RunInTx ever opens a
+// transaction, so nothing is written for either outcome; see PrePostHook's
+// own doc comment for the fail-closed distinction between the two.
 func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domain.Transaction, idem *domain.Idempotency) (replayed bool, err error) {
 	ctx, span := s.tracer.Start(ctx, "ledger.PostTransaction",
 		oteltrace.WithAttributes(
@@ -82,14 +147,119 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		return false, err
 	}
 
-	fingerprint := t.Fingerprint()
+	// Resolved BEFORE RunInTx, on its own connection, never from inside
+	// RunInTx's closure: see enforceTenantPolicy's doc comment for the
+	// connection-pool deadlock a second in-tx Repository call would risk
+	// under a small pool.
+	policy, err := tenantPolicy(ctx, s.repo, tenantID)
+	if err != nil {
+		span.RecordError(err)
+		return false, err
+	}
+
+	// Computed under CurrentFingerprintScheme, and snapshotted as a plain
+	// value (before) rather than re-read off *t later, both before RunInTx
+	// runs: tx.CreateTransaction below resolves t.EffectiveAt's nil fallback
+	// to the row's created_at as a side effect on this same *t, even on an
+	// attempt that ultimately rolls back (a Go-level mutation is not undone
+	// by a SQL ROLLBACK). Fingerprinting *t again after that point, as
+	// replay() below would if it recomputed from *t directly, would hash a
+	// resolved timestamp the client never supplied instead of the absent
+	// marker the ORIGINAL successful post's fingerprint was computed and
+	// stored with, corrupting the "v2" scheme's comparison (Task 4.3, audit
+	// A1.3) on every legitimate retry that omits effective_at. Capturing
+	// "before" here, ahead of any mutation, is what keeps that comparison
+	// honest. ok is only false if CurrentFingerprintScheme itself is not
+	// registered in TransactionFingerprint, a programmer error this binary
+	// would make about itself, never about caller input.
+	fingerprint, ok := domain.TransactionFingerprint(domain.CurrentFingerprintScheme, *t)
+	if !ok {
+		return false, fmt.Errorf("ledger: fingerprint scheme %q (CurrentFingerprintScheme) is not registered in TransactionFingerprint", domain.CurrentFingerprintScheme)
+	}
+	before := *t
+
+	// Idempotency is resolved against any EXISTING stored key before ever
+	// attempting to write, mirroring Convert's own precheck (see convert.go).
+	// Post did not need this before Task 4.3: every prior unique constraint a
+	// retry could trip (transactions_pkey, the one-reversal index) only ever
+	// fired for a genuinely NEW transaction, never for an identical retry, so
+	// letting RunInTx's own ErrDuplicateIdempotencyKey handling below catch
+	// the retry was enough. transactions_tenant_reference_idx changes that:
+	// an identical retry that reuses the SAME reference now races its OWN
+	// prior success there too, and CreateTransaction runs before
+	// InsertIdempotencyKey inside RunInTx, so that reference collision would
+	// surface as ErrDuplicateReference and return a spurious conflict instead
+	// of ever reaching the idempotency-key check that should have replayed
+	// it. Checking here first avoids attempting that second insert at all for
+	// the common (non-concurrent) retry. RunInTx's post-hoc
+	// ErrDuplicateIdempotencyKey handling still exists below to catch the
+	// remaining race window: two concurrent identical requests for a
+	// brand-new key can both pass this precheck before either commits (see
+	// TestPostIdempotentHammer).
+	if idem != nil {
+		_, err := s.repo.GetIdempotencyKey(ctx, tenantID, idem.Key)
+		switch {
+		case err == nil:
+			return s.replay(ctx, tenantID, idem.Key, before, t)
+		case errors.Is(err, domain.ErrIdempotencyKeyNotFound):
+			// No existing key: proceed with a real post.
+		default:
+			span.RecordError(err)
+			return false, err
+		}
+	}
+
+	// Screening runs here, synchronously, and BEFORE RunInTx opens any
+	// transaction (Task 6.1, audit A9.1): a rejection or an ambiguous hook
+	// failure both return before a single row is written. This intentionally
+	// happens after the idempotency precheck above (a replay returns before
+	// reaching here), so an already-approved, already-posted transaction is
+	// never re-screened on retry; only a genuinely new post is.
+	if err := reviewPost(ctx, s.prePostHook, tenantID, t); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "screening rejected post")
+		metrics.PostDuration.WithLabelValues("rejected").Observe(0)
+		return false, err
+	}
+
+	// Encrypt-once (Task 6.2, audit A9.3): each posting's Description is
+	// encrypted here, ONCE, after screening (which must see plaintext) and
+	// before RunInTx ever opens a transaction, into a NEW slice (t.Postings
+	// is reassigned, never mutated in place). auditSnapshot below, called
+	// from inside RunInTx on this same *t, therefore captures the IDENTICAL
+	// ciphertext string CreateTransaction persists into postings.description:
+	// the audit row_hash (ComputeAuditRowHash) ends up covering that
+	// ciphertext, and stays verifiable after a shred (crypto-shredding
+	// destroys the key, never the stored bytes; see internal/crypto's
+	// package doc comment). t.Postings is restored to the caller's original,
+	// plaintext slice immediately after RunInTx returns, so the transaction
+	// this call hands back (and the transport layer echoes to the caller)
+	// still shows the plaintext the caller just submitted, not ciphertext.
+	// A nil cipher (encryption disabled) makes this whole block a no-op.
+	originalPostings := t.Postings
+	if s.cipher != nil {
+		encrypted, err := encryptPostings(ctx, s.cipher, tenantID, t.Postings)
+		if err != nil {
+			span.RecordError(err)
+			metrics.PostDuration.WithLabelValues("failed").Observe(0)
+			return false, err
+		}
+		t.Postings = encrypted
+	}
+
 	start := time.Now()
 	runErr := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
+		if err := enforceTenantPolicy(ctx, tx, tenantID, policy, t.Postings); err != nil {
+			return err
+		}
+		if err := enforceAccountConstraints(ctx, tx, tenantID, t.Postings); err != nil {
+			return err
+		}
 		if err := tx.CreateTransaction(ctx, tenantID, t); err != nil {
 			return err
 		}
 		if idem != nil {
-			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, t.ID); err != nil {
+			if err := tx.InsertIdempotencyKey(ctx, tenantID, idem.Key, fingerprint, domain.CurrentFingerprintScheme, t.ID, s.idempotencyTTL); err != nil {
 				return err
 			}
 		}
@@ -97,7 +267,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		if err != nil {
 			return err
 		}
-		return tx.AppendAudit(ctx, tenantID, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: t.ID,
 			Actor:         tenantID,
@@ -105,10 +275,18 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		})
 	})
 	elapsed := time.Since(start).Seconds()
+	// Restore the caller's plaintext Postings regardless of outcome: on the
+	// idempotency-conflict replay path just below, replay() overwrites *t
+	// entirely from a freshly (decrypted) fetch anyway, so this restore is
+	// belt-and-suspenders there; on every other path (including a genuine
+	// failure the caller inspects t after) it is what keeps t showing
+	// plaintext, never the ciphertext this call briefly swapped in for
+	// storage.
+	t.Postings = originalPostings
 
 	if runErr != nil {
 		if idem != nil && errors.Is(runErr, domain.ErrDuplicateIdempotencyKey) {
-			return s.replay(ctx, tenantID, idem.Key, fingerprint, t)
+			return s.replay(ctx, tenantID, idem.Key, before, t)
 		}
 		span.RecordError(runErr)
 		span.SetStatus(codes.Error, "post failed")
@@ -124,19 +302,33 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 	return false, nil
 }
 
-// replay resolves a duplicate idempotency key: if the stored fingerprint matches,
-// it loads the original transaction into t and reports a replay; if not, the key
-// was reused with a different body and it returns ErrIdempotencyConflict.
-func (s *TransactionService) replay(ctx context.Context, tenantID, key, fingerprint string, t *domain.Transaction) (bool, error) {
+// replay resolves a duplicate idempotency key: it recomputes before's
+// fingerprint under the SCHEME THE STORED RECORD CARRIES (rec.Scheme), not
+// necessarily the scheme this binary currently writes
+// (domain.CurrentFingerprintScheme), so a fingerprint-scheme change never
+// false-conflicts a key stored under an older scheme (Task 2.3, audit A1.6).
+// before is the pre-RunInTx snapshot Post captured, not a fresh read off *t:
+// see Post's doc comment at the call site for why recomputing from *t here
+// instead would corrupt the comparison for the "v2" scheme (Task 4.3, audit
+// A1.3), whose fingerprint includes EffectiveAt, once tx.CreateTransaction's
+// nil fallback has mutated it. If the recomputation over before matches the
+// stored fingerprint, it loads the original transaction into t and reports a
+// replay; if not, the key was reused with a different body and it returns
+// ErrIdempotencyConflict. If rec.Scheme is not one this binary knows how to
+// compute (for example a key written by a newer binary, then read by this
+// one after a downgrade), it fails closed with ErrIdempotencyConflict rather
+// than risk replaying a transaction it cannot verify the body of.
+func (s *TransactionService) replay(ctx context.Context, tenantID, key string, before domain.Transaction, t *domain.Transaction) (bool, error) {
 	rec, err := s.repo.GetIdempotencyKey(ctx, tenantID, key)
 	if err != nil {
 		return false, err
 	}
-	if rec.Fingerprint != fingerprint {
+	expected, ok := domain.TransactionFingerprint(rec.Scheme, before)
+	if !ok || rec.Fingerprint != expected {
 		metrics.IdempotencyConflicts.Inc()
 		return false, domain.ErrIdempotencyConflict
 	}
-	existing, err := s.repo.GetTransaction(ctx, tenantID, rec.TransactionID)
+	existing, err := s.getDecrypted(ctx, tenantID, rec.TransactionID)
 	if err != nil {
 		return false, err
 	}
@@ -158,6 +350,24 @@ func (s *TransactionService) replay(ctx context.Context, tenantID, key, fingerpr
 // detail actually applied: the mid rate, spread, applied rate, source, and
 // effective time, so the audit row is a full, self-contained record of what
 // happened without needing to join back to the transaction row.
+//
+// When t is itself a reversal (t.ReversesTransactionID is set), the snapshot
+// also carries reverses_transaction_id: the id of the original transaction it
+// reverses. Without it, the reversal's audit row names only itself, so an
+// auditor reading the tamper-evident chain in isolation cannot tell what got
+// reversed without joining back to the transactions table, defeating the
+// point of a self-contained snapshot. The field is omitted entirely for
+// ordinary (non-reversal) transactions, so this stays byte-identical to the
+// pre-existing snapshot for the create path and every previously written
+// audit row's hash is unaffected.
+//
+// effective_at (Task 4.3, audit A1.3) is always included: by the time this
+// runs, t.CreateTransaction has already resolved the read-time fallback to
+// created_at (see postgres.txRepo.CreateTransaction), so the value here is
+// never the zero time even for a caller that supplied none. reference is
+// included only when set, the same optional-field convention
+// reverses_transaction_id uses above: most transactions carry no external
+// reference at all.
 func auditSnapshot(t *domain.Transaction) map[string]any {
 	postings := make([]map[string]any, 0, len(t.Postings))
 	for _, p := range t.Postings {
@@ -171,6 +381,15 @@ func auditSnapshot(t *domain.Transaction) map[string]any {
 	snapshot := map[string]any{
 		"id":       t.ID,
 		"postings": postings,
+	}
+	if t.ReversesTransactionID != nil {
+		snapshot["reverses_transaction_id"] = *t.ReversesTransactionID
+	}
+	if t.Reference != nil {
+		snapshot["reference"] = *t.Reference
+	}
+	if t.EffectiveAt != nil {
+		snapshot["effective_at"] = *t.EffectiveAt
 	}
 	if t.FX != nil {
 		snapshot["fx"] = map[string]any{
@@ -188,6 +407,107 @@ func auditSnapshot(t *domain.Transaction) map[string]any {
 }
 
 // Get returns a transaction and its postings, or domain.ErrTransactionNotFound.
+// A posting's Description is decrypted (Task 6.2, audit A9.3) via
+// getDecrypted when a cipher is configured; a shredded tenant's descriptions
+// come back as crypto.RedactedMarker rather than an error.
 func (s *TransactionService) Get(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
-	return s.repo.GetTransaction(ctx, tenantID, id)
+	return s.getDecrypted(ctx, tenantID, id)
+}
+
+// getDecrypted fetches a transaction and decrypts its postings' descriptions
+// (Task 6.2, audit A9.3): the one place both Get and replay's idempotent-hit
+// path read a transaction back from storage, so decryption is applied
+// exactly once, consistently, regardless of which caller triggered the read.
+func (s *TransactionService) getDecrypted(ctx context.Context, tenantID, id string) (domain.Transaction, error) {
+	t, err := s.repo.GetTransaction(ctx, tenantID, id)
+	if err != nil {
+		return domain.Transaction{}, err
+	}
+	return s.decryptTransaction(ctx, tenantID, t)
+}
+
+// decryptTransaction decrypts t's postings' descriptions in place (returning
+// a copy with a new Postings slice; t itself, and whatever slice it holds,
+// is never mutated). A nil cipher (encryption disabled) returns t completely
+// unchanged.
+func (s *TransactionService) decryptTransaction(ctx context.Context, tenantID string, t domain.Transaction) (domain.Transaction, error) {
+	if s.cipher == nil {
+		return t, nil
+	}
+	decrypted, err := decryptPostings(ctx, s.cipher, tenantID, t.Postings)
+	if err != nil {
+		return domain.Transaction{}, err
+	}
+	t.Postings = decrypted
+	return t, nil
+}
+
+// decryptItems decrypts every item's postings' descriptions (Task 6.2, audit
+// A9.3): the shared tail of ListTransactions and ExportTransactions, both of
+// which read a page of transactions back from storage the same way Get does
+// for a single one.
+func (s *TransactionService) decryptItems(ctx context.Context, tenantID string, items []domain.TransactionListItem) ([]domain.TransactionListItem, error) {
+	if s.cipher == nil {
+		return items, nil
+	}
+	for i := range items {
+		decrypted, err := decryptPostings(ctx, s.cipher, tenantID, items[i].Transaction.Postings)
+		if err != nil {
+			return nil, err
+		}
+		items[i].Transaction.Postings = decrypted
+	}
+	return items, nil
+}
+
+// MaxExportRows bounds ExportTransactions (Task 4.4, audit A7.2): an export is
+// a single unpaged call, unlike ListTransactions, so it needs its own ceiling
+// rather than trusting a caller-supplied limit. 10000 rows is generous for the
+// reconciliation exports this endpoint is for, while still ruling out an
+// unbounded scan that could OOM the process on a tenant with a very long
+// history.
+const MaxExportRows = 10000
+
+// ListTransactions returns up to limit of tenantID's transactions matching
+// filter, newest first, keyset paged from after (Task 4.4, audit A7.2). It is
+// a thin read-through to the repository, the same shape AuditService.ByAccount
+// and AccountService.Statement already use: no cross-cutting logic belongs
+// here beyond the pass-through itself.
+func (s *TransactionService) ListTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
+	items, err := s.repo.ListTransactions(ctx, tenantID, filter, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.decryptItems(ctx, tenantID, items)
+}
+
+// ExportTransactions returns every one of tenantID's transactions matching
+// filter, newest first, up to MaxExportRows (Task 4.4, audit A7.2). Unlike
+// ListTransactions this is not paged: it is the single bounded read behind
+// GET /v1/transactions/export, REST-only (a streaming CSV export does not fit
+// gRPC's single-response model well). truncated is true when the tenant's
+// matching history is larger than MaxExportRows, in which case the export
+// silently contains only the newest MaxExportRows rows rather than growing
+// unbounded; a truncated export is logged at warn level so an operator can
+// see it happened, and the caller surfaces it too (see the REST handler's
+// Export-Truncated response header).
+func (s *TransactionService) ExportTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter) (items []domain.TransactionListItem, truncated bool, err error) {
+	rows, err := s.repo.ListTransactions(ctx, tenantID, filter, nil, MaxExportRows+1)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) > MaxExportRows {
+		s.log.WarnContext(ctx, "transaction export truncated",
+			"tenant_id", tenantID, "max_export_rows", MaxExportRows)
+		decrypted, err := s.decryptItems(ctx, tenantID, rows[:MaxExportRows])
+		if err != nil {
+			return nil, false, err
+		}
+		return decrypted, true, nil
+	}
+	decrypted, err := s.decryptItems(ctx, tenantID, rows)
+	if err != nil {
+		return nil, false, err
+	}
+	return decrypted, false, nil
 }

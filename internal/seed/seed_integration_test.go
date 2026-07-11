@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sohag-pro/go-ledger/internal/seed"
 )
@@ -31,7 +32,7 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 	tenant := uuid.NewString()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) // fixed, deterministic
 
-	if err := seed.Seed(ctx, pool, tenant, now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
 
@@ -100,10 +101,10 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 	tenant := uuid.NewString()
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	if err := seed.Seed(ctx, pool, tenant, now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("first Seed: %v", err)
 	}
-	if err := seed.Seed(ctx, pool, tenant, now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("second Seed: %v", err)
 	}
 
@@ -124,4 +125,84 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 	if txnCount < 200 || txnCount > 350 {
 		t.Errorf("transaction count after two Seed calls = %d, want roughly 285 (200 to 350), not doubled", txnCount)
 	}
+}
+
+// insertAPIKey writes one api_keys row for tenant directly (the seeder itself
+// never touches this table; only the app's provisioning path and this test
+// setup do). It ensures tenant's own row exists first (api_keys_tenant_fk,
+// migration 0011): the "only the demo key: proceeds" case below calls this
+// before Seed ever runs for that tenant, so Seed's own tenant upsert has not
+// happened yet.
+func insertAPIKey(t *testing.T, pool *pgxpool.Pool, tenant, keyHash string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, 'test tenant') ON CONFLICT (id) DO NOTHING`,
+		tenant); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO api_keys (id, tenant_id, name, key_hash) VALUES ($1, $2, $3, $4)`,
+		uuid.NewString(), tenant, "test-key", keyHash); err != nil {
+		t.Fatalf("insert api key: %v", err)
+	}
+}
+
+// TestSeed_RefusesTenantWithForeignAPIKey proves the safe-by-default guard
+// (ADR-015, "Safe-by-default deployment"): Seed must never wipe a tenant that
+// holds an api key other than the demo key, since that is the signal that
+// DEFAULT_TENANT_ID has been misconfigured to point at a real tenant instead
+// of the demo one. Seed proceeds normally when the tenant has no api keys
+// yet, or only the demo key, and refuses (wiping nothing) the moment any
+// other key is present.
+func TestSeed_RefusesTenantWithForeignAPIKey(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("no api keys yet: proceeds", func(t *testing.T) {
+		tenant := uuid.NewString()
+		if err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash); err != nil {
+			t.Fatalf("Seed with no api keys: %v", err)
+		}
+	})
+
+	t.Run("only the demo key: proceeds", func(t *testing.T) {
+		tenant := uuid.NewString()
+		insertAPIKey(t, pool, tenant, testDemoKeyHash)
+		if err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash); err != nil {
+			t.Fatalf("Seed with only the demo key present: %v", err)
+		}
+	})
+
+	t.Run("a foreign key present: refuses and wipes nothing", func(t *testing.T) {
+		tenant := uuid.NewString()
+		// Seed once so the tenant has data worth protecting, then attach a
+		// non-demo api key, simulating a real tenant's ledger.
+		if err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash); err != nil {
+			t.Fatalf("initial seed: %v", err)
+		}
+		insertAPIKey(t, pool, tenant, "some-other-tenants-key-hash")
+
+		var acctBefore int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM accounts WHERE tenant_id = $1`, tenant).Scan(&acctBefore); err != nil {
+			t.Fatalf("count accounts before refused reseed: %v", err)
+		}
+
+		err := seed.Seed(ctx, pool, tenant, now, "USD", testDemoKeyHash)
+		if err == nil {
+			t.Fatal("Seed against a tenant holding a foreign api key: got nil error, want a refusal")
+		}
+
+		var acctAfter int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM accounts WHERE tenant_id = $1`, tenant).Scan(&acctAfter); err != nil {
+			t.Fatalf("count accounts after refused reseed: %v", err)
+		}
+		if acctAfter != acctBefore {
+			t.Errorf("Seed wiped data despite refusing: accounts before=%d after=%d", acctBefore, acctAfter)
+		}
+	})
 }

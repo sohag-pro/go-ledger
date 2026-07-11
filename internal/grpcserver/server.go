@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -32,6 +33,30 @@ const (
 	maxPageLimit         = 200
 )
 
+// maxPostingsPerTransaction bounds how many postings a single
+// PostTransaction RPC may submit (Task 5.1, audit A2.2). REST has no
+// explicit count check of its own: it is implicitly bounded by
+// api.MaxRequestBodyBytes (64 KB), and JSON's per-field overhead means a
+// 64 KB body cannot smuggle many more than about 100 postings anyway. gRPC's
+// protobuf encoding is dense enough that the same 64 KB (or even
+// maxGRPCRecvMsgBytes below) could carry many more, so gRPC needs its own
+// explicit count check rather than relying on the message-size cap alone.
+// 100 matches the audit's stated cap; there is no existing domain-level
+// maximum to align with instead (domain.Transaction.Validate only enforces a
+// MINIMUM of two postings and that they sum to zero per currency).
+const maxPostingsPerTransaction = 100
+
+// maxGRPCRecvMsgBytes replaces gRPC's 4 MiB default incoming-message limit
+// with a deliberate one (Task 5.1, audit A2.2), parallel to REST's 64 KB
+// MaxRequestBodyBytes cap. 1 MiB is comfortably above the largest legitimate
+// request this service ever receives (a PostTransaction at
+// maxPostingsPerTransaction postings, each with an account id, an amount,
+// and a description, is on the order of tens of KB) while still being a
+// small, deliberate fraction of the library default, so an oversized or
+// malicious payload is rejected by the transport before it is ever
+// unmarshaled or reaches a handler.
+const maxGRPCRecvMsgBytes = 1 << 20 // 1 MiB
+
 // clampLimit returns def when requested is <= 0, maxVal when requested
 // exceeds maxVal, and requested otherwise. It guards the gRPC handlers
 // against a caller requesting an unbounded scan, mirroring the REST layer's
@@ -48,12 +73,18 @@ func clampLimit(requested, def, maxVal int) int {
 
 // Deps are the shared services the gRPC handlers call, the same ones the REST
 // layer uses, plus the resolver the auth interceptor uses to authenticate
-// every call and derive its tenant (see ADR-012).
+// every call and derive its tenant (see ADR-012), and the rate limiter the
+// rate-limit interceptor enforces (Task 5.1, audit A2.2). RateLimiter must be
+// the SAME *auth.Limiter instance passed to api.Deps.RateLimiter in
+// cmd/server/main.go, not a second one: see rateLimitUnaryInterceptor's doc
+// comment (internal/grpcserver/interceptors.go) for why a shared instance is
+// the deliberate choice.
 type Deps struct {
 	Accounts     *ledger.AccountService
 	Transactions *ledger.TransactionService
 	Audit        *ledger.AuditService
 	Auth         *auth.Resolver
+	RateLimiter  *auth.Limiter
 }
 
 // Server implements the generated LedgerServiceServer as a thin adapter: it
@@ -77,16 +108,40 @@ func NewServer(d Deps) *Server {
 // gRPC health check is exempt so liveness probes work without an API key.
 // Reflection is likewise left open: it only describes the service, it does
 // not call it, so there is nothing to authenticate.
+//
+// The rate-limit interceptor is chained AFTER authUnaryInterceptor
+// deliberately (Task 5.1, audit A2.2): it reads the key authUnaryInterceptor
+// resolved into the context, so it must run downstream of it, the same
+// dependency HumaMiddleware has on the REST auth middleware.
+//
+// grpc.MaxRecvMsgSize replaces the library's 4 MiB default with
+// maxGRPCRecvMsgBytes, a deliberate bound parallel to REST's
+// api.MaxRequestBodyBytes (see maxGRPCRecvMsgBytes's own doc comment).
+//
+// TLS/loopback decision (Task 5.1, audit A2.2, ADR-015 Phase 5): this server
+// is NOT given transport credentials here. It is deployed loopback-only (see
+// cfg.grpcAddr's default in cmd/server/main.go, "127.0.0.1:9091"), the same
+// posture as Postgres ("listen_addresses = 'localhost'") and the metrics
+// endpoint (ADR-004): every caller reaching it is already on the box, so
+// there is no network hop for TLS to protect. Exposing this service to a
+// caller off-box requires terminating TLS in front of it first, either an
+// nginx grpc_pass proxy (matching how REST already terminates TLS at nginx)
+// or grpc.Creds(credentials.NewTLS(...)) added here; shipping it in the
+// clear on a public interface, which was the audit finding, is exactly what
+// the loopback default now prevents by construction rather than by
+// operator discipline.
 func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	s := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.MaxRecvMsgSize(maxGRPCRecvMsgBytes),
 		grpc.ChainUnaryInterceptor(
 			recoveryUnaryInterceptor(log),
 			loggingUnaryInterceptor(log),
 			authUnaryInterceptor(d.Auth, log),
+			rateLimitUnaryInterceptor(d.RateLimiter, log),
 		),
 	)
 	ledgerv1.RegisterLedgerServiceServer(s, NewServer(d))
@@ -101,8 +156,26 @@ func NewGRPCServer(d Deps, log *slog.Logger) *grpc.Server {
 
 // --- translation helpers ---
 
+// toProtoAccount translates a domain.Account to its protobuf shape. MinBalance
+// (Task 5.5, audit A1.5) is left at its zero value (0) when unset: proto3 has
+// no distinct "absent" for a scalar int64, so a gRPC caller cannot tell "no
+// floor" apart from "floor of exactly zero" the way the REST API's nullable
+// min_balance can (see the proto's own doc comment on Account.min_balance).
+// PartyReference and PartyType (Task 6.1, audit A9.1) are left at their zero
+// value ("") when unset, the same ambiguity the proto's own doc comment on
+// Account.party_reference/party_type documents.
 func toProtoAccount(a domain.Account) *ledgerv1.Account {
-	return &ledgerv1.Account{Id: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency)}
+	pa := &ledgerv1.Account{Id: a.ID, Name: a.Name, Type: a.Type.String(), Currency: string(a.Currency), Status: string(a.Status)}
+	if a.MinBalance != nil {
+		pa.MinBalance = *a.MinBalance
+	}
+	if a.PartyReference != nil {
+		pa.PartyReference = *a.PartyReference
+	}
+	if a.PartyType != nil {
+		pa.PartyType = *a.PartyType
+	}
+	return pa
 }
 
 // toProtoTransaction translates a domain.Transaction to its protobuf shape.
@@ -120,7 +193,26 @@ func toProtoTransaction(t domain.Transaction) *ledgerv1.Transaction {
 			Currency:    string(p.Amount.Currency()),
 		})
 	}
-	return &ledgerv1.Transaction{Id: t.ID, Postings: postings}
+	pt := &ledgerv1.Transaction{Id: t.ID, Postings: postings}
+	// reverses_transaction_id (Task 4.2, audit A1.2) is set only when t is
+	// itself a reversal; left at its zero value ("") otherwise.
+	if t.ReversesTransactionID != nil {
+		pt.ReversesTransactionId = *t.ReversesTransactionID
+	}
+	// reference (Task 4.3, audit A1.3) is left at its zero value ("") when t
+	// was posted without one.
+	if t.Reference != nil {
+		pt.Reference = *t.Reference
+	}
+	// effective_at (Task 4.3, audit A1.3) is always set by the time t reaches
+	// here: CreateTransaction resolves the read-time fallback to created_at
+	// itself (see postgres.txRepo.CreateTransaction and
+	// Repository.transactionFromRow). Defensive nil check anyway, the same
+	// as toTransactionBody's REST counterpart.
+	if t.EffectiveAt != nil {
+		pt.EffectiveAt = t.EffectiveAt.UTC().Format(time.RFC3339Nano)
+	}
+	return pt
 }
 
 // toProtoFXDetail translates a domain.FXDetail to its protobuf shape. Nil
@@ -155,13 +247,26 @@ func toProtoAuditEntry(e domain.AuditEntry) *ledgerv1.AuditEntry {
 
 // --- handlers ---
 
-// CreateAccount creates an account for the calling tenant.
+// CreateAccount creates an account for the calling tenant. min_balance (Task
+// 5.5, audit A1.5) is optional: 0 means no floor was requested, mirroring
+// toProtoAccount's own doc comment on the same ambiguity. party_reference
+// and party_type (Task 6.1, audit A9.1) are optional the same way: an empty
+// string means neither was supplied.
 func (s *Server) CreateAccount(ctx context.Context, req *ledgerv1.CreateAccountRequest) (*ledgerv1.CreateAccountResponse, error) {
 	at, err := domain.ParseAccountType(req.Type)
 	if err != nil {
 		return nil, toStatus(err)
 	}
 	acct := &domain.Account{Name: req.Name, Type: at, Currency: domain.Currency(req.Currency)}
+	if req.MinBalance != 0 {
+		acct.MinBalance = &req.MinBalance
+	}
+	if req.PartyReference != "" {
+		acct.PartyReference = &req.PartyReference
+	}
+	if req.PartyType != "" {
+		acct.PartyType = &req.PartyType
+	}
 	if err := s.accounts.Create(ctx, tenantFrom(ctx), acct); err != nil {
 		return nil, toStatus(err)
 	}
@@ -175,6 +280,17 @@ func (s *Server) GetAccount(ctx context.Context, req *ledgerv1.GetAccountRequest
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.GetAccountResponse{Account: toProtoAccount(acct)}, nil
+}
+
+// SetAccountStatus freezes, closes, or reactivates an account for the
+// calling tenant (Task 5.5, audit A1.5), mirroring POST
+// /v1/accounts/{id}/status, and returns the updated account.
+func (s *Server) SetAccountStatus(ctx context.Context, req *ledgerv1.SetAccountStatusRequest) (*ledgerv1.SetAccountStatusResponse, error) {
+	acct, err := s.accounts.SetStatus(ctx, tenantFrom(ctx), req.Id, domain.AccountStatus(req.Status))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &ledgerv1.SetAccountStatusResponse{Account: toProtoAccount(acct)}, nil
 }
 
 // ListAccounts lists accounts for the calling tenant, most recent first.
@@ -240,6 +356,10 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 	if key == "" {
 		return nil, status.Error(codes.InvalidArgument, "idempotency-key metadata is required")
 	}
+	if len(req.Postings) > maxPostingsPerTransaction {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"too many postings: got %d, max %d", len(req.Postings), maxPostingsPerTransaction)
+	}
 
 	currency := domain.Currency(req.Currency)
 	postings := make([]domain.Posting, 0, len(req.Postings))
@@ -251,6 +371,21 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 		postings = append(postings, domain.Posting{AccountID: p.AccountId, Amount: amount, Description: p.Description})
 	}
 	txn := &domain.Transaction{Postings: postings}
+	// reference and effective_at (Task 4.3, audit A1.3) are both optional:
+	// an empty proto string means "not supplied", the same convention
+	// idempotency-key metadata already uses, so an unset reference stays nil
+	// rather than becoming a pointer to "" (which Transaction.Validate would
+	// reject as ErrInvalidReference).
+	if req.Reference != "" {
+		txn.Reference = &req.Reference
+	}
+	if req.EffectiveAt != "" {
+		effectiveAt, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "effective_at must be an RFC3339 timestamp")
+		}
+		txn.EffectiveAt = &effectiveAt
+	}
 	idem := &domain.Idempotency{Key: key}
 	replayed, err := s.txns.Post(ctx, tenantFrom(ctx), txn, idem)
 	if err != nil {
@@ -295,6 +430,88 @@ func (s *Server) GetTransaction(ctx context.Context, req *ledgerv1.GetTransactio
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.GetTransactionResponse{Transaction: toProtoTransaction(txn)}, nil
+}
+
+// parseTransactionFilter builds a domain.TransactionFilter from
+// ListTransactionsRequest's from/to/reference fields (Task 4.4, audit A7.2).
+// from and to are optional RFC3339 timestamps; an empty string leaves that
+// side of the filter unset, mirroring the REST layer's identical helper
+// (internal/api/transactions.go's parseTransactionFilter): kept as its own
+// small copy here rather than shared, the same as this package's page-limit
+// constants above, since a proto string field and a huma query tag are not
+// worth threading one shared helper through.
+func parseTransactionFilter(from, to, reference string) (domain.TransactionFilter, error) {
+	var filter domain.TransactionFilter
+	if from != "" {
+		t, err := time.Parse(time.RFC3339Nano, from)
+		if err != nil {
+			return filter, errors.New("from must be an RFC3339 timestamp")
+		}
+		filter.From = &t
+	}
+	if to != "" {
+		t, err := time.Parse(time.RFC3339Nano, to)
+		if err != nil {
+			return filter, errors.New("to must be an RFC3339 timestamp")
+		}
+		filter.To = &t
+	}
+	if reference != "" {
+		filter.Reference = &reference
+	}
+	return filter, nil
+}
+
+// ListTransactions returns a page of the tenant's transactions, newest
+// first, keyset paged by cursor, optionally filtered by a from/to
+// created_at range and/or an exact reference match (Task 4.4, audit A7.2),
+// mirroring GET /v1/transactions. Export has no gRPC equivalent: a
+// streaming CSV export does not fit gRPC's single-response model, so it
+// stays REST-only (see internal/api/transactions.go's export handler).
+func (s *Server) ListTransactions(ctx context.Context, req *ledgerv1.ListTransactionsRequest) (*ledgerv1.ListTransactionsResponse, error) {
+	filter, err := parseTransactionFilter(req.From, req.To, req.Reference)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	after, err := paging.DecodeCursor(req.Cursor)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	limit := clampLimit(int(req.Limit), defaultPageLimit, maxPageLimit)
+	// Requested as limit+1, not limit: see paging.Page's doc comment for why
+	// that is what lets hasMore below detect a next page without a second
+	// round trip.
+	rows, err := s.txns.ListTransactions(ctx, tenantFrom(ctx), filter, after, limit+1)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	page, hasMore := paging.Page(rows, limit)
+	out := make([]*ledgerv1.Transaction, 0, len(page))
+	for _, item := range page {
+		out = append(out, toProtoTransaction(item.Transaction))
+	}
+	resp := &ledgerv1.ListTransactionsResponse{Transactions: out}
+	if hasMore {
+		last := page[len(page)-1]
+		resp.NextCursor = paging.EncodeCursor(last.CreatedAt, last.Transaction.ID)
+	}
+	return resp, nil
+}
+
+// ReverseTransaction posts the negated legs of the transaction named by
+// req.OriginalTransactionId as a new, linked transaction, mirroring POST
+// /v1/transactions/{id}/reverse (Task 4.2, audit A1.2). Idempotent: a
+// repeat call for the same original returns the SAME reversal, with
+// already_reversed = true, instead of posting a second one.
+func (s *Server) ReverseTransaction(ctx context.Context, req *ledgerv1.ReverseTransactionRequest) (*ledgerv1.ReverseTransactionResponse, error) {
+	reversal, alreadyReversed, err := s.txns.ReverseTransaction(ctx, tenantFrom(ctx), req.OriginalTransactionId)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &ledgerv1.ReverseTransactionResponse{
+		Transaction:     toProtoTransaction(*reversal),
+		AlreadyReversed: alreadyReversed,
+	}, nil
 }
 
 // GetTransactionAudit returns the audit trail entries recorded for a transaction.

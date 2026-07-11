@@ -13,16 +13,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getAuditHead = `-- name: GetAuditHead :one
+SELECT chain_seq, row_hash FROM audit_log
+WHERE tenant_id = $1
+ORDER BY chain_seq DESC
+LIMIT 1
+`
+
+type GetAuditHeadRow struct {
+	ChainSeq int64
+	RowHash  pgtype.Text
+}
+
+// The tenant's current head: chain_seq and row_hash of its latest audit_log
+// row (Task 5.3). See GetLastAuditHash's own comment (ADR-017) for why
+// chain_seq, not id or created_at, is the correct "latest" order; this is
+// the same lookup, just also returning chain_seq, which GetLastAuditHash's
+// only caller (the chainer) never needed since it only ever extends the
+// chain from a row_hash. Used to surface the live head alongside the last
+// off-box anchor (the verify-audit-chain endpoint, internal/api/audit.go)
+// and by VerifyFromLatestAnchor to fall back to a full verify when no
+// anchor exists yet. ErrNoRows means the tenant has no audit rows at all.
+func (q *Queries) GetAuditHead(ctx context.Context, tenantID uuid.UUID) (GetAuditHeadRow, error) {
+	row := q.db.QueryRow(ctx, getAuditHead, tenantID)
+	var i GetAuditHeadRow
+	err := row.Scan(&i.ChainSeq, &i.RowHash)
+	return i, err
+}
+
 const getLastAuditHash = `-- name: GetLastAuditHash :one
 SELECT row_hash FROM audit_log
 WHERE tenant_id = $1
-ORDER BY created_at DESC, id DESC
+ORDER BY chain_seq DESC
 LIMIT 1
 `
 
 // The tenant's most recent row_hash, used to extend the per-tenant hash chain.
-// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
-// caller treats that as the chain's genesis (domain.AuditGenesisHash).
+// Ordered by chain_seq, not id (ADR-017 IMPORTANT 2, migration 0016): id is a
+// UUIDv7, monotonic only within the ONE process that minted it, so a leader
+// failover to a different host with clock skew can mint an id LOWER than the
+// current head, and ordering by id would then return the wrong "latest" row
+// and corrupt the chain. chain_seq is a plain ascending sequence the single
+// chainer process advances on every insert, in the same order it assigns
+// row_hash values, so it stays correct across any failover regardless of
+// clock skew. created_at is copied from the ORIGINATING event's post time
+// (audit_outbox.occurred_at), which under concurrent posts across many
+// transactions is NOT guaranteed to be monotonic with the order those
+// transactions actually commit in (a transaction that starts later can
+// commit first); ordering by created_at would occasionally return the wrong
+// "latest" row too. A fresh tenant (or one with no rows yet) surfaces as
+// pgx.ErrNoRows; the caller treats that as the chain's genesis
+// (domain.AuditGenesisHash).
 func (q *Queries) GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error) {
 	row := q.db.QueryRow(ctx, getLastAuditHash, tenantID)
 	var row_hash pgtype.Text
@@ -30,9 +71,61 @@ func (q *Queries) GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgt
 	return row_hash, err
 }
 
+const getLatestAuditAnchor = `-- name: GetLatestAuditAnchor :one
+SELECT tenant_id, chain_seq, row_hash, created_at FROM audit_anchors
+WHERE tenant_id = $1
+ORDER BY chain_seq DESC
+LIMIT 1
+`
+
+type GetLatestAuditAnchorRow struct {
+	TenantID  uuid.UUID
+	ChainSeq  int64
+	RowHash   string
+	CreatedAt time.Time
+}
+
+// The tenant's most recently recorded anchor (Task 5.3): the chain_seq,
+// row_hash, and timestamp the anchor job last logged off-box for this
+// tenant. ErrNoRows means no anchor has ever been recorded (a brand-new
+// tenant, or one that posted before the anchor job's first tick).
+func (q *Queries) GetLatestAuditAnchor(ctx context.Context, tenantID uuid.UUID) (GetLatestAuditAnchorRow, error) {
+	row := q.db.QueryRow(ctx, getLatestAuditAnchor, tenantID)
+	var i GetLatestAuditAnchorRow
+	err := row.Scan(
+		&i.TenantID,
+		&i.ChainSeq,
+		&i.RowHash,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertAuditAnchor = `-- name: InsertAuditAnchor :exec
+INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash)
+VALUES ($1, $2, $3)
+`
+
+type InsertAuditAnchorParams struct {
+	TenantID uuid.UUID
+	ChainSeq int64
+	RowHash  string
+}
+
+// Records tenantID's current chain head as a new off-box-anchored
+// checkpoint (Task 5.3, migration 0025). Called only by the periodic
+// anchor job (internal/audit.AnchorJob), never the request path: the job
+// runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
+// insert is not scoped through withTenant the way a request-path write
+// would be.
+func (q *Queries) InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error {
+	_, err := q.db.Exec(ctx, insertAuditAnchor, arg.TenantID, arg.ChainSeq, arg.RowHash)
+	return err
+}
+
 const insertAuditLog = `-- name: InsertAuditLog :exec
-INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 `
 
 type InsertAuditLogParams struct {
@@ -46,8 +139,15 @@ type InsertAuditLogParams struct {
 	CreatedAt     time.Time
 	PrevHash      pgtype.Text
 	RowHash       pgtype.Text
+	OutboxID      pgtype.Int8
 }
 
+// outbox_id is the source audit_outbox row this audit_log row was chained
+// from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a
+// second attempt to chain the same outbox row fails this insert with a
+// unique violation instead of silently forking the chain. chain_seq is left
+// to its column DEFAULT (nextval), never supplied by the caller: it is what
+// makes chain order immune to any host's clock (see GetLastAuditHash below).
 func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error {
 	_, err := q.db.Exec(ctx, insertAuditLog,
 		arg.ID,
@@ -60,6 +160,7 @@ func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) 
 		arg.CreatedAt,
 		arg.PrevHash,
 		arg.RowHash,
+		arg.OutboxID,
 	)
 	return err
 }
@@ -75,28 +176,42 @@ WHERE audit_log.tenant_id = $1
     FROM postings
     WHERE postings.tenant_id = $1 AND postings.account_id = $2
   )
-  AND (audit_log.created_at < $3
-       OR (audit_log.created_at = $3 AND audit_log.id < $4))
-ORDER BY audit_log.created_at DESC, audit_log.id DESC
-LIMIT $5
+  AND audit_log.id < $3
+ORDER BY audit_log.id DESC
+LIMIT $4
 `
 
 type ListAuditByAccountParams struct {
-	TenantID       uuid.UUID
-	AccountID      uuid.UUID
-	AfterCreatedAt time.Time
-	AfterID        uuid.UUID
-	PageLimit      int32
+	TenantID  uuid.UUID
+	AccountID uuid.UUID
+	AfterID   uuid.UUID
+	PageLimit int32
+}
+
+type ListAuditByAccountRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
 }
 
 // Keyset page of audit rows for every transaction with a posting touching the
-// account, newest first. after_created_at / after_id are the keyset position:
-// pass a far-future timestamp and the max uuid for the first page.
-func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error) {
+// account, newest first. after_id is the keyset position: pass the max uuid
+// for the first page. Ordered and paged by id alone, not (created_at, id):
+// see GetLastAuditHash's comment (ADR-017) for why id, assigned by the
+// chainer in true chain-insertion order, is what must drive ordering here,
+// not created_at (copied from the original event's post time, which is not
+// guaranteed monotonic with commit order under concurrent posts).
+func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]ListAuditByAccountRow, error) {
 	rows, err := q.db.Query(ctx, listAuditByAccount,
 		arg.TenantID,
 		arg.AccountID,
-		arg.AfterCreatedAt,
 		arg.AfterID,
 		arg.PageLimit,
 	)
@@ -104,9 +219,9 @@ func (q *Queries) ListAuditByAccount(ctx context.Context, arg ListAuditByAccount
 		return nil, err
 	}
 	defer rows.Close()
-	var items []AuditLog
+	var items []ListAuditByAccountRow
 	for rows.Next() {
-		var i AuditLog
+		var i ListAuditByAccountRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -133,7 +248,7 @@ const listAuditByTransaction = `-- name: ListAuditByTransaction :many
 SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
 FROM audit_log
 WHERE tenant_id = $1 AND transaction_id = $2
-ORDER BY created_at, id
+ORDER BY id
 `
 
 type ListAuditByTransactionParams struct {
@@ -141,15 +256,30 @@ type ListAuditByTransactionParams struct {
 	TransactionID uuid.UUID
 }
 
-func (q *Queries) ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error) {
+type ListAuditByTransactionRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
+}
+
+// Ordered by id, not created_at: see GetLastAuditHash's comment (ADR-017) for
+// why id is the chain-consistent order and created_at is not.
+func (q *Queries) ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]ListAuditByTransactionRow, error) {
 	rows, err := q.db.Query(ctx, listAuditByTransaction, arg.TenantID, arg.TransactionID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []AuditLog
+	var items []ListAuditByTransactionRow
 	for rows.Next() {
-		var i AuditLog
+		var i ListAuditByTransactionRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -176,20 +306,36 @@ const listAuditForVerify = `-- name: ListAuditForVerify :many
 SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
 FROM audit_log
 WHERE tenant_id = $1
-ORDER BY created_at, id
+ORDER BY chain_seq
 `
 
-// Every audit row for the tenant, oldest first: the full walk used to
-// recompute and check the tamper-evident hash chain end to end.
-func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error) {
+type ListAuditForVerifyRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
+}
+
+// Every audit row for the tenant, in true chain order: the full walk used to
+// recompute and check the tamper-evident hash chain end to end. Ordered by
+// chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
+// migration 0016) for why chain_seq, not id, is the failover-safe chain
+// order.
+func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error) {
 	rows, err := q.db.Query(ctx, listAuditForVerify, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []AuditLog
+	var items []ListAuditForVerifyRow
 	for rows.Next() {
-		var i AuditLog
+		var i ListAuditForVerifyRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -202,6 +348,115 @@ func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([
 			&i.PrevHash,
 			&i.RowHash,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditForVerifyPage = `-- name: ListAuditForVerifyPage :many
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq
+FROM audit_log
+WHERE tenant_id = $1 AND chain_seq > $2
+ORDER BY chain_seq
+LIMIT $3
+`
+
+type ListAuditForVerifyPageParams struct {
+	TenantID      uuid.UUID
+	AfterChainSeq int64
+	PageLimit     int32
+}
+
+type ListAuditForVerifyPageRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
+	ChainSeq      int64
+}
+
+// A bounded page of the tenant's audit rows in true chain order, strictly
+// after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
+// ListAuditForVerify above, which loads the entire chain into memory at
+// once. AuditService.Verify calls this in a loop, advancing
+// after_chain_seq to the last row's chain_seq on each page, until a page
+// comes back with fewer than page_limit rows, so memory use is bounded by
+// page_limit regardless of how long the chain has grown. Includes
+// chain_seq (unlike ListAuditForVerify) precisely so the caller can advance
+// the cursor without a second round trip. after_chain_seq is 0 to start
+// from genesis, or an anchor's chain_seq to start from a trusted checkpoint
+// (VerifyFromLatestAnchor).
+func (q *Queries) ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error) {
+	rows, err := q.db.Query(ctx, listAuditForVerifyPage, arg.TenantID, arg.AfterChainSeq, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAuditForVerifyPageRow
+	for rows.Next() {
+		var i ListAuditForVerifyPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Action,
+			&i.TransactionID,
+			&i.Actor,
+			&i.Before,
+			&i.After,
+			&i.CreatedAt,
+			&i.PrevHash,
+			&i.RowHash,
+			&i.ChainSeq,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditHeads = `-- name: ListAuditHeads :many
+SELECT DISTINCT ON (tenant_id) tenant_id, chain_seq, row_hash
+FROM audit_log
+ORDER BY tenant_id, chain_seq DESC
+`
+
+type ListAuditHeadsRow struct {
+	TenantID uuid.UUID
+	ChainSeq int64
+	RowHash  pgtype.Text
+}
+
+// One row per tenant with at least one audit_log entry: that tenant's
+// current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
+// this once per tick rather than enumerating tenants and calling
+// GetAuditHead once per tenant (an N+1 round trip): it inserts one
+// audit_anchors row and emits one structured log line per tenant returned
+// here.
+func (q *Queries) ListAuditHeads(ctx context.Context) ([]ListAuditHeadsRow, error) {
+	rows, err := q.db.Query(ctx, listAuditHeads)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAuditHeadsRow
+	for rows.Next() {
+		var i ListAuditHeadsRow
+		if err := rows.Scan(&i.TenantID, &i.ChainSeq, &i.RowHash); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

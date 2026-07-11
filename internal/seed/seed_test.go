@@ -25,6 +25,11 @@ var (
 	poolErr    error
 )
 
+// testDemoKeyHash stands in for domain.HashAPIKey(cfg.demoAPIKey) in tests
+// that do not care about the actual demo key value, only that Seed is given
+// some hash to compare a tenant's api_keys rows against.
+const testDemoKeyHash = "test-demo-key-hash-not-a-real-hash"
+
 func TestMain(m *testing.M) {
 	os.Exit(runWithContainer(m))
 }
@@ -105,7 +110,7 @@ func TestSeed(t *testing.T) {
 	tenant := uuid.New()
 	now := time.Now()
 
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -144,7 +149,7 @@ func TestSeed(t *testing.T) {
 
 	// Re-seeding resets rather than appends: the transaction count is stable.
 	before := countTxns(t, pool, tenant)
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("re-seed: %v", err)
 	}
 	if after := countTxns(t, pool, tenant); after != before {
@@ -152,13 +157,18 @@ func TestSeed(t *testing.T) {
 	}
 }
 
-// TestSeedResetsAuditAndIdempotency proves the reset clears idempotency_keys
-// and audit_log for the tenant, and that it does so despite audit_log's
-// append-only immutability trigger (via the seeder's gated SET LOCAL). The
-// seeder itself writes raw rows and never populates these two tables, so this
-// test stands in for the application path: it attaches a fabricated
-// idempotency key and audit row to one of the seeded transactions, then
-// re-seeds and checks both are gone.
+// TestSeedResetsAuditAndIdempotency proves the reset clears idempotency_keys,
+// audit_log, and audit_outbox (ADR-017) for the tenant, and that it does so
+// despite audit_log's append-only immutability trigger (via the seeder's
+// gated SET LOCAL). The seeder itself writes raw rows and never populates
+// these tables, so this test stands in for the application path: it attaches
+// a fabricated idempotency key, audit row, and outbox row to one of the
+// seeded transactions, then re-seeds and checks all three are gone. The
+// outbox row matters here beyond "is it cleared": audit_outbox.transaction_id
+// references transactions(id) (migration 0015), the same as idempotency_keys
+// and audit_log already do, so a reset that deleted transactions before
+// audit_outbox would fail a foreign-key check with a still-referencing
+// outbox row in place; this test would catch that ordering regression.
 func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -166,7 +176,7 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 	tenant := uuid.New()
 	now := time.Now()
 
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -176,9 +186,13 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 		t.Fatalf("find seeded transaction: %v", err)
 	}
 
+	// expires_at (Task 4.5, audit A1.4) is NOT NULL as of migration 0019, so
+	// this fabricated row must supply one, the same as the real application
+	// insert path does; a comfortably future value keeps it live for the
+	// rest of this test regardless of how long the reset takes.
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, transaction_id)
-		 VALUES ($1, 'test-key', 'test-fingerprint', $2)`, tenant, txnID); err != nil {
+		`INSERT INTO idempotency_keys (tenant_id, idempotency_key, fingerprint, transaction_id, expires_at)
+		 VALUES ($1, 'test-key', 'test-fingerprint', $2, now() + interval '1 hour')`, tenant, txnID); err != nil {
 		t.Fatalf("insert idempotency key: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
@@ -187,14 +201,22 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 		uuid.New(), tenant, txnID, tenant.String()); err != nil {
 		t.Fatalf("insert audit row: %v", err)
 	}
-
-	// Re-seeding must clear both, even though audit_log rejects DELETE outside
-	// the seeder's gated transaction.
-	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD"); err != nil {
-		t.Fatalf("re-seed over idempotency and audit rows: %v", err)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO audit_outbox (tenant_id, action, transaction_id, actor, after)
+		 VALUES ($1, 'transaction.created', $2, $3, '{}'::jsonb)`,
+		tenant, txnID, tenant.String()); err != nil {
+		t.Fatalf("insert audit outbox row: %v", err)
 	}
 
-	var idemCount, auditCount int
+	// Re-seeding must clear all three, even though audit_log rejects DELETE
+	// outside the seeder's gated transaction, and even though audit_outbox
+	// (like idempotency_keys and audit_log) references the transactions row
+	// this reset is about to delete.
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("re-seed over idempotency, audit, and outbox rows: %v", err)
+	}
+
+	var idemCount, auditCount, outboxCount int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM idempotency_keys WHERE tenant_id = $1", tenant).Scan(&idemCount); err != nil {
 		t.Fatalf("count idempotency_keys: %v", err)
@@ -203,10 +225,17 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 		"SELECT count(*) FROM audit_log WHERE tenant_id = $1", tenant).Scan(&auditCount); err != nil {
 		t.Fatalf("count audit_log: %v", err)
 	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM audit_outbox WHERE tenant_id = $1", tenant).Scan(&outboxCount); err != nil {
+		t.Fatalf("count audit_outbox: %v", err)
+	}
 	if idemCount != 0 {
 		t.Errorf("idempotency_keys not cleared on reset: %d rows remain", idemCount)
 	}
 	if auditCount != 0 {
 		t.Errorf("audit_log not cleared on reset: %d rows remain", auditCount)
+	}
+	if outboxCount != 0 {
+		t.Errorf("audit_outbox not cleared on reset: %d rows remain", outboxCount)
 	}
 }

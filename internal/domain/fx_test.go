@@ -155,3 +155,78 @@ func TestConvert_NegativeSourceOrdinaryRounding(t *testing.T) {
 		t.Fatalf("-33.6 should round to -34, got %d", got.Amount())
 	}
 }
+
+// TestConvert_USDToJPY_ExponentFactor is the bug case from the audit: JPY has
+// a zero-decimal minor unit, so converting 100.00 USD (10000 minor) at mid
+// 150.0 (midE8 = 150e8) must land on 15000 yen, not 1,500,000 (the old code's
+// answer, which is off by exactly the missing 10^(0-2) factor).
+func TestConvert_USDToJPY_ExponentFactor(t *testing.T) {
+	src, _ := NewMoney(10000, "USD") // 100.00 USD
+	got, _, err := Convert(src, "JPY", 150*RateScale, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Amount() != 15000 {
+		t.Fatalf("100.00 USD at mid 150.0 should be 15000 JPY minor, got %d", got.Amount())
+	}
+	if got.Currency() != "JPY" {
+		t.Fatalf("currency = %s, want JPY", got.Currency())
+	}
+}
+
+// TestConvert_JPYToUSD_ExponentFactor exercises the reverse direction: JPY
+// (0-dp) into USD (2-dp), so the exponent factor now widens the denominator
+// instead of the numerator. midE8 = 666667 is round_half_even(1e8/150), the
+// inverse of the 150.0 mid used above. 15000 yen at that mid works out to
+// exactly 10000 USD minor units (100.00 USD): the remainder from the
+// division is 5e9 against a denominator of 1e12, well under half, so it
+// truncates rather than rounding up.
+func TestConvert_JPYToUSD_ExponentFactor(t *testing.T) {
+	src, _ := NewMoney(15000, "JPY") // 15000 yen
+	got, _, err := Convert(src, "USD", 666667, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Amount() != 10000 {
+		t.Fatalf("15000 JPY at mid ~0.0066667 should be ~10000 USD minor (100.00 USD), got %d", got.Amount())
+	}
+	if got.Currency() != "USD" {
+		t.Fatalf("currency = %s, want USD", got.Currency())
+	}
+}
+
+// TestConvert_USDToBHD_ExponentFactor exercises a three-decimal currency
+// (BHD): the exponent factor here is 10^1 (3-dp quote minus 2-dp base),
+// applied to the numerator. 100.00 USD (10000 minor) at mid 0.377 BHD per USD
+// (midE8 = 37,700,000) works out to exactly 37.700 BHD (37700 minor).
+func TestConvert_USDToBHD_ExponentFactor(t *testing.T) {
+	src, _ := NewMoney(10000, "USD") // 100.00 USD
+	got, _, err := Convert(src, "BHD", 37_700_000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Amount() != 37700 {
+		t.Fatalf("100.00 USD at mid 0.377 should be 37700 BHD minor (37.700 BHD), got %d", got.Amount())
+	}
+	if got.Currency() != "BHD" {
+		t.Fatalf("currency = %s, want BHD", got.Currency())
+	}
+}
+
+// TestConvert_USDToEUR_Unchanged re-confirms that a same-exponent pair
+// (both 2-dp) is unaffected by the exponent factor (diff == 0), guarding
+// against a regression in the existing USD/EUR test coverage above.
+func TestConvert_USDToEUR_Unchanged(t *testing.T) {
+	src, _ := NewMoney(12345, "USD")                              // 123.45 USD
+	got, applied, err := Convert(src, "EUR", 92*RateScale/100, 0) // mid 0.92
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 123.45 * 0.92 = 113.574 -> banker's round -> 11357 minor (113.57 EUR).
+	if got.Amount() != 11357 {
+		t.Fatalf("123.45 USD at mid 0.92 should be 11357 EUR minor, got %d", got.Amount())
+	}
+	if applied != 92_000_000 {
+		t.Fatalf("applied rate = %d, want 92000000", applied)
+	}
+}

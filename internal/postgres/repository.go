@@ -6,10 +6,10 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,59 +44,68 @@ func retryBackoff(attempt int) time.Duration {
 	return time.Duration(rand.Int64N(int64(exp) + 1)) //nolint:gosec // jitter, not crypto
 }
 
-// keyedMutex is a set of independent mutexes, one per key, created lazily on
-// first use. It serializes callers that share a key while leaving callers
-// with different keys fully concurrent, without ever touching a database
-// connection: waiters block on ordinary Go scheduling, not on anything held
-// against Postgres.
-//
-// Each key's mutex is a capacity-1 channel rather than a sync.Mutex so that a
-// waiter can give up: acquiring it is a select between sending on the channel
-// and the caller's context being done, so a cancelled or timed-out caller
-// stops waiting immediately instead of blocking until the current holder
-// releases.
-//
-// The underlying sync.Map grows by one entry per distinct key ever seen and
-// is never evicted. That is deliberate: keys here are tenant ids, bounded by
-// the number of tenants the service has, not by request volume, so the map
-// stays small for the life of the process and eviction would add complexity
-// for no real memory benefit at this scale.
-type keyedMutex struct{ m sync.Map }
-
-// lock blocks until key's mutex is free or ctx is done, whichever comes
-// first. On success it returns a func that releases the mutex; the caller is
-// expected to defer it. On cancellation it returns ctx.Err() and a nil func;
-// the mutex is left exactly as it was, since this caller never acquired it.
-func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
-	chAny, _ := k.m.LoadOrStore(key, make(chan struct{}, 1))
-	ch := chAny.(chan struct{}) //nolint:forcetypeassert // this map only ever stores chan struct{}, set two lines up
-	select {
-	case ch <- struct{}{}:
-		return func() { <-ch }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 // Repository is a domain.Repository backed by a pgx connection pool.
 type Repository struct {
 	pool *pgxpool.Pool
 	q    *sqlc.Queries
-	// tenantLocks serializes RunInTx calls per tenant (see RunInTx's doc
-	// comment for why). Its zero value is ready to use, since sync.Map needs
-	// no initialization, but the field is spelled out explicitly here rather
-	// than left implicit so the serialization mechanism is visible on the
-	// struct, not just inside RunInTx.
-	tenantLocks keyedMutex
 }
 
 // NewRepository returns a Repository that uses pool for all queries.
 func NewRepository(pool *pgxpool.Pool) *Repository {
-	return &Repository{pool: pool, q: sqlc.New(pool), tenantLocks: keyedMutex{}}
+	return &Repository{pool: pool, q: sqlc.New(pool)}
 }
 
 // compile-time check that Repository satisfies the domain port.
 var _ domain.Repository = (*Repository)(nil)
+
+// withTenant runs fn against a *sqlc.Queries bound to a dedicated
+// transaction with the RLS GUC app.tenant_id set to tenantID
+// (transaction-local, migration 0024, Task 5.4b, audit A3.5), then commits.
+// It exists because the app's tenant-scoped reads run directly on r.q
+// (bound to the pool), which carries no GUC and therefore no RLS
+// protection: a single bare statement on a pooled connection is its own
+// implicit transaction, so a set_config('app.tenant_id', ..., true) issued
+// as a separate statement would evaporate before the very next query ran.
+// Wrapping both the set_config and the read in one explicit transaction is
+// what makes the GUC actually apply while fn runs.
+//
+// It is also used for the handful of standalone writes that, like the
+// reads above, run outside RunInTx (CreateAccount, GetOrCreateClearingAccount,
+// SetAccountStatus, CreateWebhookSubscription, a tenant-specific
+// InsertFXRate): the same "forgotten WHERE/mismatched value" defense in
+// depth RunInTx gives every write inside a domain.Tx applies to these too.
+//
+// The extra per-call transaction (BEGIN, set_config, the query, COMMIT,
+// versus one bare statement on the pool) is an accepted cost of the
+// defense-in-depth: RLS with FORCE is only a backstop if the tenant's GUC
+// is actually set on the connection that runs the query, and that requires
+// a real transaction boundary.
+//
+// Deliberately NOT used for genuinely cross-tenant reads: the audit
+// chainer, the webhook fan-out and delivery worker, the idempotency
+// sweep, and restore-verify's own tenant enumeration all query through
+// their own code paths (or, for the sweep, directly on r.q with no
+// tenantID in scope), never through withTenant, so the GUC stays unset on
+// those connections and the "allow when unset" branch of every policy
+// keeps their cross-tenant access working.
+func (r *Repository) withTenant(ctx context.Context, tenantID string, fn func(q *sqlc.Queries) error) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: begin tenant-scoped call: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return fmt.Errorf("postgres: set tenant guc: %w", err)
+	}
+	if err := fn(sqlc.New(tx)); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit tenant-scoped call: %w", err)
+	}
+	return nil
+}
 
 // CreateAccount assigns an identity if a.ID is empty, validates the account, and
 // inserts it.
@@ -112,6 +121,15 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 		}
 		a.ID = id.String()
 	}
+	// status is not accepted at creation (Task 5.5, audit A1.5): every
+	// account is created active, the column default; freezing or closing one
+	// afterward goes through SetAccountStatus. Stamping it here too (rather
+	// than leaving a.Status "") is just so the *domain.Account this call
+	// hands back to its caller already reflects "active" without a round
+	// trip through GetAccount, mirroring how a.ID is assigned above.
+	if a.Status == "" {
+		a.Status = domain.AccountActive
+	}
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -119,12 +137,17 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 	if err != nil {
 		return fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	return r.q.CreateAccount(ctx, sqlc.CreateAccountParams{
-		ID:       aid,
-		TenantID: tid,
-		Name:     a.Name,
-		Type:     a.Type.String(),
-		Currency: string(a.Currency),
+	return r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		return q.CreateAccount(ctx, sqlc.CreateAccountParams{
+			ID:             aid,
+			TenantID:       tid,
+			Name:           a.Name,
+			Type:           a.Type.String(),
+			Currency:       string(a.Currency),
+			MinBalance:     ptrToInt8(a.MinBalance),
+			PartyReference: ptrToText(a.PartyReference),
+			PartyType:      ptrToText(a.PartyType),
+		})
 	})
 }
 
@@ -138,14 +161,19 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	row, err := r.q.GetAccount(ctx, sqlc.GetAccountParams{TenantID: tid, ID: aid})
+	var row sqlc.GetAccountRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetAccount(ctx, sqlc.GetAccountParams{TenantID: tid, ID: aid})
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Account{}, domain.ErrAccountNotFound
 	}
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
 	}
-	return accountFromRow(row.ID, row.Name, row.Type, row.Currency)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
 }
 
 // ListAccounts returns up to limit of the tenant's accounts, ordered by name.
@@ -154,22 +182,58 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	rows, err := r.q.ListAccounts(ctx, sqlc.ListAccountsParams{
-		TenantID: tid,
-		Limit:    int32(limit), //nolint:gosec // limit is bounded by the API layer
+	var rows []sqlc.ListAccountsRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAccounts(ctx, sqlc.ListAccountsParams{
+			TenantID: tid,
+			Limit:    int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list accounts: %w", err)
 	}
 	out := make([]domain.Account, 0, len(rows))
 	for _, row := range rows {
-		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
+		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, acct)
 	}
 	return out, nil
+}
+
+// SetAccountStatus updates the account's status (Task 5.5, audit A1.5). It
+// returns domain.ErrInvalidAccount if status is not one of
+// AccountStatus.Valid()'s three values, or domain.ErrAccountNotFound if no
+// account matches id within tenantID.
+func (r *Repository) SetAccountStatus(ctx context.Context, tenantID, id string, status domain.AccountStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidAccount
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	var rows int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.SetAccountStatus(ctx, sqlc.SetAccountStatusParams{TenantID: tid, ID: aid, Status: string(status)})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: set account status: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrAccountNotFound
+	}
+	return nil
 }
 
 // clearingAccountName is the reserved, deterministic name of a tenant's FX
@@ -198,22 +262,22 @@ func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID st
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: generate clearing account id: %w", err)
 	}
-	row, err := r.q.GetOrCreateClearingAccount(ctx, sqlc.GetOrCreateClearingAccountParams{
-		ID:       id,
-		TenantID: tid,
-		Name:     clearingAccountName(currency),
-		Type:     domain.Liability.String(),
-		Currency: string(currency),
+	var row sqlc.GetOrCreateClearingAccountRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetOrCreateClearingAccount(ctx, sqlc.GetOrCreateClearingAccountParams{
+			ID:       id,
+			TenantID: tid,
+			Name:     clearingAccountName(currency),
+			Type:     domain.Liability.String(),
+			Currency: string(currency),
+		})
+		return err
 	})
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get or create clearing account: %w", err)
 	}
-	acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency)
-	if err != nil {
-		return domain.Account{}, err
-	}
-	acct.System = row.IsSystem
-	return acct, nil
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
 }
 
 // CreateTransaction validates t and writes the transaction and all its postings
@@ -237,47 +301,32 @@ func (r *Repository) CreateTransaction(ctx context.Context, tenantID string, t *
 // replayed up to maxPostAttempts times. fn must therefore be safe to run more
 // than once. Each attempt acquires its own connection from the pool via
 // BeginTx and releases it (Commit or Rollback) before the next attempt's
-// backoff wait, exactly as if RunInTx had no notion of tenants at all: no
-// connection is ever held across a backoff or across attempts.
+// backoff wait: no connection is ever held across a backoff or across
+// attempts.
 //
-// Before any of that, RunInTx acquires tenantID's lock from an in-process
-// keyed mutex and holds it for every attempt, releasing it only when the
-// whole call returns. This serializes same-tenant calls one at a time while
-// leaving different tenants (different keys) fully concurrent. It exists
-// because of the per-tenant audit hash chain (ADR-012): each attempt reads
-// the tenant's latest audit row_hash and then inserts the next one, and two
-// concurrent same-tenant attempts reading the same chain tail is a genuine
-// read-write antidependency that SERIALIZABLE must abort. Under high
-// same-tenant concurrency that repeated abort can exhaust the retry budget
-// and surface as a 503.
+// Until ADR-017, RunInTx also acquired tenantID's lock from an in-process
+// keyed mutex before opening any transaction, and held it for every attempt:
+// each post read the tenant's latest audit row_hash and then inserted the
+// next one (ADR-012), and two concurrent same-tenant attempts racing on that
+// read were a genuine read-write antidependency that SERIALIZABLE would
+// abort, which under high same-tenant concurrency could repeatedly exhaust
+// the retry budget and surface as a 503. Worse, that mutex lived in one
+// process's memory: with more than one instance, two instances could still
+// post the same tenant concurrently, both read the same chain head, and fork
+// the chain, since SERIALIZABLE is not guaranteed to see every such conflict
+// across processes (ADR-017's Context).
 //
-// The lock is a channel-backed in-process mutex, not a database lock, and
-// that is the point (see ADR-012). A waiter blocks on Go's scheduler; it has
-// not acquired a database connection and never will until it is its turn to
-// run an attempt, so a burst of same-tenant callers cannot exhaust the
-// connection pool or starve other tenants of connections the way a lock held
-// on a checked-out connection can. It also means Postgres's lock_timeout,
-// which bounds how long a session will wait on a database-level lock, never
-// applies here: there is no database lock wait to time out. Unlike a plain
-// sync.Mutex, the wait itself respects ctx: if the caller's context is
-// cancelled or times out while parked waiting for the tenant lock, lock
-// returns ctx.Err() immediately instead of leaving the goroutine parked until
-// the current holder finishes, so a pile of abandoned client requests cannot
-// accumulate blocked goroutines under sustained same-tenant overload.
-//
-// This only serializes same-tenant posting within one process. go-ledger runs
-// as a single instance (a VPS, not a fleet), so that is a complete fix today.
-// If the service ever runs as more than one instance, two different
-// instances could still race on the same tenant; the SERIALIZABLE retry loop
-// above remains in place as the backstop for that case; it would simply see
-// same-tenant conflicts occasionally instead of never.
-func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error {
-	unlock, err := r.tenantLocks.lock(ctx, tenantID)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
+// ADR-017 removes the audit chain read from the posting transaction
+// entirely: a post now writes an append-only outbox row (see
+// domain.Tx.AppendAuditOutbox), and a single background chainer
+// (internal/audit.Chainer) builds the chain asynchronously, so no posting
+// transaction ever reads or extends a chain head. That removes the reason
+// for the mutex, so RunInTx no longer takes one: same-tenant calls, from any
+// number of instances, now run fully concurrently, serialized only by
+// whatever SERIALIZABLE itself detects (the balance invariant and the
+// idempotency primary key, both still enforced in-transaction) and retried
+// exactly as any other serialization conflict is.
+func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(context.Context, domain.Tx) error) error { //nolint:revive // tenantID is part of domain.Repository's interface signature and kept named for godoc; ADR-017 removed the per-tenant mutex that used to read it here
 	var lastErr error
 	for attempt := 0; attempt < maxPostAttempts; attempt++ {
 		if attempt > 0 {
@@ -294,6 +343,23 @@ func (r *Repository) RunInTx(ctx context.Context, tenantID string, fn func(conte
 		tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 		if err != nil {
 			return fmt.Errorf("postgres: begin: %w", err)
+		}
+
+		// Set the RLS GUC (migration 0024, Task 5.4b, audit A3.5)
+		// transaction-local (set_config's third argument, true) so it
+		// disappears when this attempt commits or rolls back rather than
+		// leaking onto whatever request next borrows this pooled
+		// connection. Parameterized, never string-interpolated: tenantID
+		// is untrusted input from the request. Every write this attempt's
+		// fn performs now runs with app.tenant_id set to tenantID, so a
+		// write that ever forgot its own tenant_id filter (an UPDATE or
+		// DELETE missing a WHERE, not just a SELECT) still cannot touch
+		// another tenant's row: the FORCE ROW LEVEL SECURITY policies
+		// restrict both the read side (USING) and the write side (WITH
+		// CHECK) to this one tenant for the rest of the transaction.
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+			return fmt.Errorf("postgres: set tenant guc: %w", err)
 		}
 
 		if err := fn(ctx, txRepo{q: r.q.WithTx(tx)}); err != nil {
@@ -413,11 +479,61 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 		params.FxEffectiveAt = pgtype.Timestamptz{Time: t.FX.EffectiveAt, Valid: true}
 		params.FxRateID = pgtype.Int8{Int64: t.FX.RateID, Valid: true}
 	}
-	if err := tr.q.CreateTransaction(ctx, params); err != nil {
+	// ReversesTransactionID (Task 4.2, audit A1.2) is nil for an ordinary
+	// post; only BuildReversal ever sets it.
+	if t.ReversesTransactionID != nil {
+		reversesID, err := uuid.Parse(*t.ReversesTransactionID)
+		if err != nil {
+			return fmt.Errorf("postgres: parse reverses transaction id: %w", err)
+		}
+		params.ReversesTransactionID = pgtype.UUID{Bytes: reversesID, Valid: true}
+	}
+	// reference and effective_at (Task 4.3, audit A1.3) are both nil for a
+	// caller that supplies neither; t.Validate (called before this, by
+	// Repository.CreateTransaction) already rejected a present-but-empty or
+	// over-length reference, so nothing left to check here.
+	if t.Reference != nil {
+		params.Reference = pgtype.Text{String: *t.Reference, Valid: true}
+	}
+	if t.EffectiveAt != nil {
+		params.EffectiveAt = pgtype.Timestamptz{Time: *t.EffectiveAt, Valid: true}
+	}
+	createdAt, err := tr.q.CreateTransaction(ctx, params)
+	if err != nil {
 		if isUniqueViolation(err) {
-			return domain.ErrDuplicateTransaction
+			switch pgConstraint(err) {
+			// transactions_one_reversal_idx (migration 0017): a second
+			// reversal of the same original. Distinguished from an ordinary
+			// id collision (transactions_pkey) so the service can catch it
+			// specifically and read back the existing reversal instead of
+			// treating it as ErrDuplicateTransaction.
+			case "transactions_one_reversal_idx":
+				return domain.ErrTransactionAlreadyReversed
+			// transactions_tenant_reference_idx (migration 0018): a second
+			// transaction reusing a reference already taken in this tenant.
+			// Distinguished from both transactions_pkey and
+			// transactions_one_reversal_idx above, and deliberately its own
+			// domain error (not ErrDuplicateTransaction): a duplicate
+			// reference is a different failure than an id collision.
+			case "transactions_tenant_reference_idx":
+				return domain.ErrDuplicateReference
+			default:
+				return domain.ErrDuplicateTransaction
+			}
 		}
 		return fmt.Errorf("postgres: insert transaction: %w", err)
+	}
+	// EffectiveAt's read-time fallback to created_at (see
+	// Repository.transactionFromRow) applies just as much to the object this
+	// call just built as to one read back later: without resolving it here,
+	// a caller that reads t.EffectiveAt straight off the value CreateTransaction
+	// was handed (the common case, no round trip through GetTransaction) would
+	// see nil for a caller that omitted it, while every later GetTransaction
+	// or List call on the very same row would see the fallback. Resolving it
+	// here, from the RETURNING created_at above, keeps both views consistent
+	// without a second query.
+	if t.EffectiveAt == nil {
+		t.EffectiveAt = &createdAt
 	}
 	for i := range t.Postings {
 		p := &t.Postings[i]
@@ -449,10 +565,20 @@ func (tr txRepo) CreateTransaction(ctx context.Context, tenantID string, t *doma
 	return nil
 }
 
-// InsertIdempotencyKey records the key inside the surrounding transaction. A
-// primary-key collision means the key already exists: it is mapped to
-// ErrDuplicateIdempotencyKey so the service can replay the original response.
-func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, transactionID string) error {
+// InsertIdempotencyKey records the key inside the surrounding transaction,
+// with expires_at stamped as the DATABASE SERVER's now() + ttl (see
+// idempotency.sql's InsertIdempotencyKey query), never this process's clock
+// (Task 4.5, audit A1.4). The underlying query is an upsert: a conflict
+// against an EXPIRED existing row for (tenantID, key) is replaced in place
+// (RETURNING yields the row), while a conflict against a still-LIVE row
+// leaves it untouched and RETURNING yields nothing, which pgx surfaces as
+// pgx.ErrNoRows here; that case is mapped to ErrDuplicateIdempotencyKey so
+// the service replays the original response exactly as it would for a plain
+// unique-violation. scheme is stored alongside fingerprint (see
+// domain.CurrentFingerprintScheme) so a future fingerprint-scheme change can
+// recompute this row's fingerprint under the scheme that produced it instead
+// of the scheme current at replay time.
+func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, fingerprint, scheme, transactionID string, ttl time.Duration) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -461,13 +587,15 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 	if err != nil {
 		return fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	if err := tr.q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
-		TenantID:       tid,
-		IdempotencyKey: key,
-		Fingerprint:    fingerprint,
-		TransactionID:  txID,
+	if _, err := tr.q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
+		TenantID:          tid,
+		IdempotencyKey:    key,
+		Fingerprint:       fingerprint,
+		FingerprintScheme: scheme,
+		TransactionID:     txID,
+		TtlSeconds:        ttl.Seconds(),
 	}); err != nil {
-		if pgConstraint(err) == "idempotency_keys_pkey" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrDuplicateIdempotencyKey
 		}
 		return fmt.Errorf("postgres: insert idempotency key: %w", err)
@@ -475,25 +603,19 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 	return nil
 }
 
-// AppendAudit writes one audit row inside the surrounding transaction,
-// extending that tenant's tamper-evident hash chain (ADR-012). The id is a
-// fresh UUIDv7 so rows sort by creation time.
+// AppendAuditOutbox writes one append-only audit_outbox row inside the
+// surrounding transaction (ADR-017): the event is durable if and only if the
+// caller's transaction commits. Unlike the old AppendAudit, it never reads
+// the tenant's chain head and never computes a hash: it is a plain insert
+// with no read dependency on any other row, tenant or otherwise, so it
+// cannot conflict with a concurrent same-tenant (or same-anything) insert
+// under SERIALIZABLE. occurred_at, txid, and created_at are all left to
+// their column defaults (migration 0015); the database server's clock and
+// current transaction id stamp them, not this process's.
 //
-// The chain extension happens entirely within this call, inside the caller's
-// transaction: it reads the tenant's current latest row_hash (GetLastAuditHash;
-// no rows yet means this is the tenant's first row, so prev is
-// domain.AuditGenesisHash), stamps CreatedAt with the application clock (not a
-// database default, so the exact value hashed is the exact value stored),
-// computes RowHash over that content plus prev, and inserts all of it
-// together. Because the read and the write are in the same SERIALIZABLE
-// transaction, two concurrent posts for the same tenant would conflict on
-// this read (one sees the other's insert as a predicate change) were they
-// allowed to race at all. RunInTx prevents the race up front instead: it
-// holds tenantID's in-process mutex for the whole call, so only one posting
-// transaction per tenant is ever open at a time, and this read always sees
-// the tenant's true latest row. See RunInTx's doc comment and ADR-012 for why
-// an in-process mutex, not a database lock, is what makes that true.
-func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.AuditEntry) error {
+// The single background chainer (internal/audit.Chainer) is what later reads
+// this row back and extends the tenant's tamper-evident hash chain.
+func (tr txRepo) AppendAuditOutbox(ctx context.Context, tenantID string, e domain.AuditEvent) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
@@ -502,59 +624,117 @@ func (tr txRepo) AppendAudit(ctx context.Context, tenantID string, e domain.Audi
 	if err != nil {
 		return fmt.Errorf("postgres: parse audit transaction id: %w", err)
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return fmt.Errorf("postgres: generate audit id: %w", err)
-	}
-
-	prevHash := domain.AuditGenesisHash
-	last, err := tr.q.GetLastAuditHash(ctx, tid)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// No prior row for this tenant: genesis.
-	case err != nil:
-		return fmt.Errorf("postgres: get last audit hash: %w", err)
-	default:
-		// A pre-migration legacy row has a NULL row_hash, which surfaces here
-		// as an invalid pgtype.Text. Those rows predate the hash chain and are
-		// cleared by the seeder's reset within four hours, so treating them as
-		// an unchained starting point (genesis) is the only meaningful choice.
-		// Made explicit rather than relying on the zero-value .String of an
-		// invalid pgtype.Text happening to equal genesis ("").
-		if last.Valid {
-			prevHash = last.String
-		} else {
-			prevHash = domain.AuditGenesisHash
-		}
-	}
-
-	e.ID = id.String()
-	// Truncated to microseconds: Postgres timestamptz only stores microsecond
-	// precision, so a nanosecond-precision time.Now() would silently lose its
-	// last three digits on the round trip through the column. Truncating here,
-	// before it is both hashed and stored, guarantees the value fed to
-	// ComputeAuditRowHash is bit-for-bit the same value a later read (and thus
-	// a later recompute, for the verify walk) will see; skipping this step
-	// would make every stored row_hash permanently unrecomputable.
-	e.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
-	e.PrevHash = prevHash
-	e.RowHash = domain.ComputeAuditRowHash(tenantID, e, prevHash)
-
-	if err := tr.q.InsertAuditLog(ctx, sqlc.InsertAuditLogParams{
-		ID:            id,
+	if err := tr.q.InsertAuditOutbox(ctx, sqlc.InsertAuditOutboxParams{
 		TenantID:      tid,
 		Action:        e.Action,
 		TransactionID: txID,
 		Actor:         e.Actor,
 		Before:        e.Before,
 		After:         e.After,
-		CreatedAt:     e.CreatedAt,
-		PrevHash:      pgtype.Text{String: e.PrevHash, Valid: true},
-		RowHash:       pgtype.Text{String: e.RowHash, Valid: true},
 	}); err != nil {
-		return fmt.Errorf("postgres: insert audit log: %w", err)
+		return fmt.Errorf("postgres: insert audit outbox: %w", err)
 	}
 	return nil
+}
+
+// TenantDailyDebits returns the tenant's per-currency debit total for today,
+// within the surrounding transaction (Task 2.4b, audit A3.4). See
+// domain.Tx.TenantDailyDebits for the race-safety this depends on: RunInTx's
+// per-tenant in-process lock (ADR-012) is what makes this read consistent
+// with the write that follows it in the same call.
+func (tr txRepo) TenantDailyDebits(ctx context.Context, tenantID string) (map[string]int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := tr.q.TenantDailyDebits(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: tenant daily debits: %w", err)
+	}
+	out := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		out[row.Currency] = row.Total
+	}
+	return out, nil
+}
+
+// AccountPostingStates returns each of accountIDs's current status,
+// min_balance, is_system flag, and derived balance, within the surrounding
+// transaction (Task 5.5, audit A1.5). See domain.Tx.AccountPostingStates for
+// the race-safety this depends on: read under the same SERIALIZABLE
+// transaction CreateTransaction writes into right after, the same pattern
+// TenantDailyDebits above already uses for the daily-volume policy check. An
+// empty accountIDs returns an empty map without a round trip: ANY($2::uuid[])
+// against an empty slice is well-defined SQL (it matches nothing), but a
+// transaction can never touch zero accounts (Transaction.Validate requires
+// at least two postings), so this is defense against a caller bug, not a
+// real code path.
+func (tr txRepo) AccountPostingStates(ctx context.Context, tenantID string, accountIDs []string) (map[string]domain.AccountPostingState, error) {
+	if len(accountIDs) == 0 {
+		return map[string]domain.AccountPostingState{}, nil
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	ids := make([]uuid.UUID, len(accountIDs))
+	for i, id := range accountIDs {
+		aid, err := uuid.Parse(id)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: parse account id: %w", err)
+		}
+		ids[i] = aid
+	}
+
+	// Phase 1: status, min_balance, is_system for every touched account.
+	// This is the ONLY query that runs unconditionally on every post; see
+	// AccountStatusFlags's own doc comment for why it is kept to the
+	// accounts table alone.
+	flagRows, err := tr.q.AccountStatusFlags(ctx, sqlc.AccountStatusFlagsParams{TenantID: tid, AccountIds: ids})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: account status flags: %w", err)
+	}
+	out := make(map[string]domain.AccountPostingState, len(flagRows))
+	var needBalance []uuid.UUID
+	for _, row := range flagRows {
+		state := domain.AccountPostingState{
+			AccountID: row.ID.String(),
+			Status:    domain.AccountStatus(row.Status),
+			IsSystem:  row.IsSystem,
+		}
+		if row.MinBalance.Valid {
+			v := row.MinBalance.Int64
+			state.MinBalance = &v
+			// A system account is exempt from the min_balance check
+			// (domain.CheckAccountPostingConstraints), so its balance is
+			// never inspected: skip the second, postings-touching query for
+			// it even if a min_balance somehow ended up set on its row (the
+			// public API never lets a caller set one, but this keeps the
+			// exemption unconditional rather than "true only because nobody
+			// configures this").
+			if !row.IsSystem {
+				needBalance = append(needBalance, row.ID)
+			}
+		}
+		out[state.AccountID] = state
+	}
+
+	// Phase 2: derived balance, ONLY for accounts that actually have a
+	// MinBalance configured (see AccountBalances's own doc comment for why
+	// this read is not run unconditionally like phase 1 is).
+	if len(needBalance) > 0 {
+		balRows, err := tr.q.AccountBalances(ctx, sqlc.AccountBalancesParams{TenantID: tid, AccountIds: needBalance})
+		if err != nil {
+			return nil, fmt.Errorf("postgres: account balances: %w", err)
+		}
+		for _, row := range balRows {
+			id := row.ID.String()
+			state := out[id]
+			state.Balance = row.Balance
+			out[id] = state
+		}
+	}
+	return out, nil
 }
 
 // GetTransaction returns the transaction and its postings, or
@@ -568,35 +748,112 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	row, err := r.q.GetTransaction(ctx, sqlc.GetTransactionParams{TenantID: tid, ID: txID})
+	var out domain.Transaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		row, err := q.GetTransaction(ctx, sqlc.GetTransactionParams{TenantID: tid, ID: txID})
+		if err != nil {
+			return err
+		}
+		out, err = transactionFromRow(ctx, q, tid, row)
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Transaction{}, domain.ErrTransactionNotFound
 	}
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: get transaction: %w", err)
 	}
-	postings, err := r.q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
+	return out, nil
+}
+
+// GetReversalOf returns the transaction that reverses originalID within
+// tenantID, or domain.ErrTransactionNotFound if none exists yet (Task 4.2,
+// audit A1.2). transactions_one_reversal_idx (migration 0017) guarantees at
+// most one row can ever match.
+func (r *Repository) GetReversalOf(ctx context.Context, tenantID, originalID string) (domain.Transaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	origID, err := uuid.Parse(originalID)
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: parse original transaction id: %w", err)
+	}
+	var out domain.Transaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		row, err := q.GetReversalOf(ctx, sqlc.GetReversalOfParams{
+			TenantID:              tid,
+			ReversesTransactionID: pgtype.UUID{Bytes: origID, Valid: true},
+		})
+		if err != nil {
+			return err
+		}
+		out, err = transactionFromRow(ctx, q, tid, row)
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Transaction{}, domain.ErrTransactionNotFound
+	}
+	if err != nil {
+		return domain.Transaction{}, fmt.Errorf("postgres: get reversal: %w", err)
+	}
+	return out, nil
+}
+
+// transactionFromRow loads tid's postings and assembles the full
+// domain.Transaction from a sqlc.Transaction row already fetched by
+// GetTransaction or GetReversalOf: both queries select the identical column
+// set, so the postings fetch and the rest of the assembly (shared with
+// ListTransactions, see assembleTransaction) are not duplicated per query.
+// It takes q rather than closing over a Repository so the caller controls
+// which transaction (and therefore which RLS GUC scope, see withTenant)
+// the postings fetch runs in, the same one the row above was fetched in.
+func transactionFromRow(ctx context.Context, q *sqlc.Queries, tid uuid.UUID, row sqlc.Transaction) (domain.Transaction, error) {
+	rows, err := q.ListPostingsByTransaction(ctx, sqlc.ListPostingsByTransactionParams{
 		TenantID:      tid,
-		TransactionID: txID,
+		TransactionID: row.ID,
 	})
 	if err != nil {
 		return domain.Transaction{}, fmt.Errorf("postgres: list postings: %w", err)
 	}
-	out := domain.Transaction{ID: row.ID.String(), Postings: make([]domain.Posting, 0, len(postings))}
-	for _, p := range postings {
-		// Each posting carries its own currency (ADR-014): an FX transaction has
-		// two currencies in play, so Money is rebuilt per row, never from one
-		// transaction-wide currency.
-		money, err := domain.NewMoney(p.Amount, domain.Currency(p.Currency))
+	postings := make([]domain.Posting, 0, len(rows))
+	for _, p := range rows {
+		posting, err := postingFromRow(p.ID, p.AccountID, p.Amount, p.Currency, p.Description)
 		if err != nil {
-			return domain.Transaction{}, fmt.Errorf("postgres: build posting money: %w", err)
+			return domain.Transaction{}, err
 		}
-		out.Postings = append(out.Postings, domain.Posting{
-			AccountID:   p.AccountID.String(),
-			Amount:      money,
-			Description: p.Description,
-		})
+		postings = append(postings, posting)
 	}
+	return assembleTransaction(row, postings), nil
+}
+
+// postingFromRow builds a domain.Posting from a posting row's columns,
+// shared by transactionFromRow (one transaction's postings) and
+// ListTransactions (a batch of many transactions' postings), so the
+// currency-to-Money conversion is not duplicated per call site. Each posting
+// carries its own currency (ADR-014): an FX transaction has two currencies in
+// play, so Money is rebuilt per row, never from one transaction-wide
+// currency.
+func postingFromRow(id, accountID uuid.UUID, amount int64, currency, description string) (domain.Posting, error) {
+	money, err := domain.NewMoney(amount, domain.Currency(currency))
+	if err != nil {
+		return domain.Posting{}, fmt.Errorf("postgres: build posting money: %w", err)
+	}
+	return domain.Posting{
+		ID:          id.String(),
+		AccountID:   accountID.String(),
+		Amount:      money,
+		Description: description,
+	}, nil
+}
+
+// assembleTransaction builds a domain.Transaction from a sqlc.Transaction row
+// and its already-loaded postings, shared by transactionFromRow (a single
+// transaction) and ListTransactions (a page of many), so the FX snapshot,
+// ReversesTransactionID, reference, and effective_at assembly is not
+// duplicated per call site.
+func assembleTransaction(row sqlc.Transaction, postings []domain.Posting) domain.Transaction {
+	out := domain.Transaction{ID: row.ID.String(), Postings: postings}
 	// fx_mid_rate_e8 is only ever NULL together with the other seven fx_*
 	// columns (all written in the same CreateTransaction call, see txRepo);
 	// its validity is enough to tell an FX transaction from a plain one.
@@ -612,7 +869,110 @@ func (r *Repository) GetTransaction(ctx context.Context, tenantID, id string) (d
 			RateID:          row.FxRateID.Int64,
 		}
 	}
-	return out, nil
+	// reverses_transaction_id (Task 4.2, audit A1.2) is NULL for an ordinary
+	// transaction; only a reversal carries it.
+	if row.ReversesTransactionID.Valid {
+		reversesID := uuid.UUID(row.ReversesTransactionID.Bytes).String()
+		out.ReversesTransactionID = &reversesID
+	}
+	// reference (Task 4.3, audit A1.3) is NULL when the caller supplied
+	// none; left nil rather than a pointer to "".
+	if row.Reference.Valid {
+		reference := row.Reference.String
+		out.Reference = &reference
+	}
+	// effective_at falls back to created_at when NULL (Task 4.3, audit
+	// A1.3): the column is never backfilled, so a transaction posted with no
+	// value date reads back as having happened when its row was written.
+	effectiveAt := row.CreatedAt
+	if row.EffectiveAt.Valid {
+		effectiveAt = row.EffectiveAt.Time
+	}
+	out.EffectiveAt = &effectiveAt
+	return out
+}
+
+// ListTransactions returns up to limit of tenantID's transactions matching
+// filter, newest first, keyset paged by (created_at, id) descending, the
+// same cursor shape Statement uses (Task 4.4, audit A7.2). after is the
+// keyset position to page from; nil starts at the newest transaction.
+//
+// Postings for the whole returned page are fetched in one extra batched round
+// trip (ListPostingsByTransactionIDs) rather than one query per transaction,
+// so this stays O(1) queries regardless of how many transactions the page
+// contains, not O(n).
+func (r *Repository) ListTransactions(ctx context.Context, tenantID string, filter domain.TransactionFilter, after *domain.StatementCursor, limit int) ([]domain.TransactionListItem, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+
+	// First page: a sentinel that is strictly greater than any real
+	// (created_at, id). Subsequent pages: the cursor handed back from the
+	// previous page.
+	afterTime, afterID := statementFirstPageTime, uuid.Max
+	if after != nil {
+		afterTime = after.CreatedAt
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+
+	var reference pgtype.Text
+	if filter.Reference != nil {
+		reference = pgtype.Text{String: *filter.Reference, Valid: true}
+	}
+
+	var rows []sqlc.Transaction
+	var postingRows []sqlc.ListPostingsByTransactionIDsRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListTransactions(ctx, sqlc.ListTransactionsParams{
+			TenantID:       tid,
+			FromTs:         ptrToTimestamptz(filter.From),
+			ToTs:           ptrToTimestamptz(filter.To),
+			Reference:      reference,
+			AfterCreatedAt: afterTime,
+			AfterID:        afterID,
+			PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		if err != nil || len(rows) == 0 {
+			return err
+		}
+
+		ids := make([]uuid.UUID, len(rows))
+		for i, row := range rows {
+			ids[i] = row.ID
+		}
+		postingRows, err = q.ListPostingsByTransactionIDs(ctx, sqlc.ListPostingsByTransactionIDsParams{
+			TenantID:       tid,
+			TransactionIds: ids,
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list transactions: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	byTransaction := make(map[uuid.UUID][]domain.Posting, len(rows))
+	for _, p := range postingRows {
+		posting, err := postingFromRow(p.ID, p.AccountID, p.Amount, p.Currency, p.Description)
+		if err != nil {
+			return nil, err
+		}
+		byTransaction[p.TransactionID] = append(byTransaction[p.TransactionID], posting)
+	}
+
+	items := make([]domain.TransactionListItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, domain.TransactionListItem{
+			Transaction: assembleTransaction(row, byTransaction[row.ID]),
+			CreatedAt:   row.CreatedAt,
+		})
+	}
+	return items, nil
 }
 
 // GetIdempotencyKey returns the stored record for (tenantID, key), or
@@ -622,7 +982,12 @@ func (r *Repository) GetIdempotencyKey(ctx context.Context, tenantID, key string
 	if err != nil {
 		return domain.IdempotencyRecord{}, fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	row, err := r.q.GetIdempotencyKey(ctx, sqlc.GetIdempotencyKeyParams{TenantID: tid, IdempotencyKey: key})
+	var row sqlc.GetIdempotencyKeyRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetIdempotencyKey(ctx, sqlc.GetIdempotencyKeyParams{TenantID: tid, IdempotencyKey: key})
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.IdempotencyRecord{}, domain.ErrIdempotencyKeyNotFound
 	}
@@ -632,6 +997,7 @@ func (r *Repository) GetIdempotencyKey(ctx context.Context, tenantID, key string
 	return domain.IdempotencyRecord{
 		Key:           row.IdempotencyKey,
 		Fingerprint:   row.Fingerprint,
+		Scheme:        row.FingerprintScheme,
 		TransactionID: row.TransactionID.String(),
 	}, nil
 }
@@ -646,70 +1012,15 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse transaction id: %w", err)
 	}
-	rows, err := r.q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{TenantID: tid, TransactionID: txID})
+	var rows []sqlc.ListAuditByTransactionRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{TenantID: tid, TransactionID: txID})
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list audit by transaction: %w", err)
 	}
-	return auditEntriesFromRows(rows), nil
-}
-
-// ListAuditByAccount returns one keyset page of audit rows for every
-// transaction with a posting touching the account, newest first.
-func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
-	tid, err := uuid.Parse(tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
-	}
-	aid, err := uuid.Parse(accountID)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: parse account id: %w", err)
-	}
-
-	// First page: a sentinel that is strictly greater than any real (created_at,
-	// id). Subsequent pages: the cursor handed back from the previous page.
-	afterTime, afterID := statementFirstPageTime, uuid.Max
-	if after != nil {
-		afterTime = after.CreatedAt
-		if afterID, err = uuid.Parse(after.ID); err != nil {
-			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
-		}
-	}
-
-	rows, err := r.q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{
-		TenantID:       tid,
-		AccountID:      aid,
-		AfterCreatedAt: afterTime,
-		AfterID:        afterID,
-		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
-	})
-	if err != nil {
-		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
-	}
-	return auditEntriesFromRows(rows), nil
-}
-
-// ListAuditForVerify returns every audit row for the tenant, oldest first,
-// including PrevHash and RowHash: the full walk used to recompute and check
-// the tamper-evident hash chain end to end.
-func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([]domain.AuditEntry, error) {
-	tid, err := uuid.Parse(tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
-	}
-	rows, err := r.q.ListAuditForVerify(ctx, tid)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
-	}
-	return auditEntriesFromRows(rows), nil
-}
-
-// auditEntriesFromRows converts sqlc audit rows to domain entries. Before/After
-// are jsonb columns surfaced as []byte; they convert to json.RawMessage.
-// PrevHash/RowHash are nullable at the column level only for rows written
-// before migration 0009; every row this application writes populates both, and
-// .String on an invalid (NULL) pgtype.Text zero-values to "" for those legacy
-// rows.
-func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
 	out := make([]domain.AuditEntry, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, domain.AuditEntry{
@@ -724,7 +1035,262 @@ func auditEntriesFromRows(rows []sqlc.AuditLog) []domain.AuditEntry {
 			RowHash:       row.RowHash.String,
 		})
 	}
-	return out
+	return out, nil
+}
+
+// ListAuditByAccount returns one keyset page of audit rows for every
+// transaction with a posting touching the account, newest first.
+//
+// Paging keys on id alone, not (created_at, id) (ADR-017): id is the
+// chainer's true chain-insertion order, and created_at (copied from the
+// originating event's post time) is not guaranteed monotonic with that order
+// under concurrent posts (see GetLastAuditHash's doc comment in
+// internal/postgres/queries/audit.sql). after.CreatedAt is accepted (the
+// domain.StatementCursor type is shared with Statement's own, unrelated
+// posting pagination) but not used here beyond round-tripping through the
+// cursor: only after.ID drives the query.
+func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+
+	// First page: a sentinel strictly greater than any real id. Subsequent
+	// pages: the cursor handed back from the previous page.
+	afterID := uuid.Max
+	if after != nil {
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+
+	var rows []sqlc.ListAuditByAccountRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditByAccount(ctx, sqlc.ListAuditByAccountParams{
+			TenantID:  tid,
+			AccountID: aid,
+			AfterID:   afterID,
+			PageLimit: int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit by account: %w", err)
+	}
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+		})
+	}
+	return out, nil
+}
+
+// ListAuditForVerify returns every audit row for the tenant, oldest first,
+// including PrevHash and RowHash: the full walk used to recompute and check
+// the tamper-evident hash chain end to end.
+func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var rows []sqlc.ListAuditForVerifyRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditForVerify(ctx, tid)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit for verify: %w", err)
+	}
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+		})
+	}
+	return out, nil
+}
+
+// ListAuditForVerifyPage returns up to limit of the tenant's audit rows with
+// ChainSeq strictly greater than afterChainSeq, in chain order, including
+// ChainSeq (Task 5.3, audit A2.4): the bounded-memory counterpart to
+// ListAuditForVerify, which AuditService.Verify calls in a loop instead of
+// loading the whole chain at once. Runs through withTenant, exactly like
+// every other tenant-scoped audit read here: paging must keep working with
+// migration 0024's RLS in force for the tenant being verified (Task 5.4b).
+func (r *Repository) ListAuditForVerifyPage(ctx context.Context, tenantID string, afterChainSeq int64, limit int) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var rows []sqlc.ListAuditForVerifyPageRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAuditForVerifyPage(ctx, sqlc.ListAuditForVerifyPageParams{
+			TenantID:      tid,
+			AfterChainSeq: afterChainSeq,
+			PageLimit:     int32(limit), //nolint:gosec // limit is an application-configured page size, not user input
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit for verify page: %w", err)
+	}
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+			ChainSeq:      row.ChainSeq,
+		})
+	}
+	return out, nil
+}
+
+// GetAuditHead returns the tenant's current chain head: the chain_seq and
+// row_hash of its latest audit_log row (Task 5.3). ok is false when the
+// tenant has no audit rows yet (pgx.ErrNoRows), not an error: an empty chain
+// simply has no head to report.
+func (r *Repository) GetAuditHead(ctx context.Context, tenantID string) (chainSeq int64, rowHash string, ok bool, err error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, "", false, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var row sqlc.GetAuditHeadRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetAuditHead(ctx, tid)
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, fmt.Errorf("postgres: get audit head: %w", err)
+	}
+	return row.ChainSeq, row.RowHash.String, true, nil
+}
+
+// LatestAuditAnchor returns the tenant's most recently recorded off-box
+// anchor (Task 5.3, migration 0025). ok is false when no anchor has ever
+// been recorded for this tenant (pgx.ErrNoRows), not an error.
+func (r *Repository) LatestAuditAnchor(ctx context.Context, tenantID string) (domain.AuditAnchor, bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.AuditAnchor{}, false, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var row sqlc.GetLatestAuditAnchorRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetLatestAuditAnchor(ctx, tid)
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AuditAnchor{}, false, nil
+	}
+	if err != nil {
+		return domain.AuditAnchor{}, false, fmt.Errorf("postgres: get latest audit anchor: %w", err)
+	}
+	return domain.AuditAnchor{ChainSeq: row.ChainSeq, RowHash: row.RowHash, CreatedAt: row.CreatedAt}, true, nil
+}
+
+// CountPendingOutbox returns the number of tenantID's audit_outbox rows the
+// chainer has not yet processed (ADR-017): the audit chain's lag, surfaced by
+// audit verify alongside the chained head.
+func (r *Repository) CountPendingOutbox(ctx context.Context, tenantID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var n int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		n, err = q.CountPendingOutbox(ctx, tid)
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("postgres: count pending outbox: %w", err)
+	}
+	return int(n), nil
+}
+
+// sweepBatchSize bounds each delete statement the idempotency sweep issues
+// (see SweepExpiredIdempotencyKeys) so a large backlog of expired keys is
+// reclaimed in bounded chunks instead of one unbounded DELETE contending
+// with live posts. A constant rather than an env knob: there is no
+// deployment-shaped reason to tune it, just a sane default.
+const sweepBatchSize = 1000
+
+// sweepMaxIterations bounds how many batches a single
+// SweepExpiredIdempotencyKeys call will issue, so a pathological backlog (or
+// a backlog that keeps growing as fast as it drains) can never turn one
+// sweep tick into an unbounded loop; the remainder is picked up on the next
+// scheduled tick.
+const sweepMaxIterations = 1000
+
+// SweepExpiredIdempotencyKeys deletes every idempotency_keys row whose
+// expires_at has passed, across every tenant, and returns how many rows it
+// deleted in total (Task 4.5, audit A1.4). It runs directly against the
+// pool, not inside RunInTx: it is a plain maintenance statement, never part
+// of a request's unit of work.
+//
+// It deletes in bounded batches of sweepBatchSize rows (a single unbounded
+// DELETE could lock and remove an arbitrarily large number of rows in one
+// statement, contending with live posts under a large backlog) rather than
+// one statement for the whole table. It loops the batched delete until a
+// batch reports 0 rows deleted, up to sweepMaxIterations batches as a safety
+// valve, respecting context cancellation between batches. It is best-effort
+// maintenance: an error from any batch is returned (and logged by the
+// caller) without panicking, and rows already deleted by prior batches in
+// this call stay deleted.
+func (r *Repository) SweepExpiredIdempotencyKeys(ctx context.Context) (int64, error) {
+	var total int64
+	for range sweepMaxIterations {
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("postgres: sweep expired idempotency keys: %w", err)
+		}
+		n, err := r.q.SweepExpiredIdempotencyKeysBatch(ctx, sweepBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("postgres: sweep expired idempotency keys: %w", err)
+		}
+		total += n
+		if n < sweepBatchSize {
+			// Fewer rows than the batch size means this batch drained
+			// everything currently expired; no need to issue another
+			// statement that would just find 0 rows.
+			break
+		}
+	}
+	return total, nil
 }
 
 // Balance returns the derived balance of an account in the account's currency.
@@ -743,7 +1309,12 @@ func (r *Repository) Balance(ctx context.Context, tenantID, accountID string) (d
 	if err != nil {
 		return domain.Money{}, fmt.Errorf("postgres: parse account id: %w", err)
 	}
-	sum, err := r.q.AccountBalance(ctx, sqlc.AccountBalanceParams{TenantID: tid, AccountID: aid})
+	var sum int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		sum, err = q.AccountBalance(ctx, sqlc.AccountBalanceParams{TenantID: tid, AccountID: aid})
+		return err
+	})
 	if err != nil {
 		return domain.Money{}, fmt.Errorf("postgres: account balance: %w", err)
 	}
@@ -776,12 +1347,17 @@ func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, 
 		}
 	}
 
-	rows, err := r.q.AccountStatement(ctx, sqlc.AccountStatementParams{
-		TenantID:       tid,
-		AccountID:      aid,
-		AfterCreatedAt: afterTime,
-		AfterID:        afterID,
-		PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+	var rows []sqlc.AccountStatementRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.AccountStatement(ctx, sqlc.AccountStatementParams{
+			TenantID:       tid,
+			AccountID:      aid,
+			AfterCreatedAt: afterTime,
+			AfterID:        afterID,
+			PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: account statement: %w", err)
@@ -796,6 +1372,58 @@ func (r *Repository) Statement(ctx context.Context, tenantID, accountID string, 
 		running, err := domain.NewMoney(row.RunningBalance, currency)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: statement running balance: %w", err)
+		}
+		entries = append(entries, domain.StatementEntry{
+			ID:             row.ID.String(),
+			TransactionID:  row.TransactionID.String(),
+			Amount:         amount,
+			RunningBalance: running,
+			Description:    row.Description,
+			CreatedAt:      row.CreatedAt,
+		})
+	}
+	return entries, nil
+}
+
+// StatementExport returns up to limit postings affecting the account within
+// an optional [from, to) created_at window, newest first, each with its
+// running balance (Task 6.3, audit A9.2): the per-account period statement
+// export's bounded, unpaged counterpart to Statement.
+func (r *Repository) StatementExport(ctx context.Context, tenantID, accountID string, currency domain.Currency, from, to *time.Time, limit int) ([]domain.StatementEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+
+	var rows []sqlc.AccountStatementRangeRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.AccountStatementRange(ctx, sqlc.AccountStatementRangeParams{
+			TenantID:  tid,
+			AccountID: aid,
+			FromTs:    ptrToTimestamptz(from),
+			ToTs:      ptrToTimestamptz(to),
+			RowLimit:  int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: account statement export: %w", err)
+	}
+
+	entries := make([]domain.StatementEntry, 0, len(rows))
+	for _, row := range rows {
+		amount, err := domain.NewMoney(row.Amount, currency)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: statement export amount: %w", err)
+		}
+		running, err := domain.NewMoney(row.RunningBalance, currency)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: statement export running balance: %w", err)
 		}
 		entries = append(entries, domain.StatementEntry{
 			ID:             row.ID.String(),
@@ -824,11 +1452,137 @@ func (r *Repository) GetAPIKeyByHash(ctx context.Context, hash string) (domain.A
 		TenantID:     row.TenantID.String(),
 		Name:         row.Name,
 		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+		TenantStatus: domain.TenantStatus(row.TenantStatus),
+		Scopes:       scopesFromStrings(row.Scopes),
+		ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
+		LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
+		CreatedAt:    row.CreatedAt,
+		RevokedAt:    timestamptzToPtr(row.RevokedAt),
 	}, nil
 }
 
+// GetAPIKeyByID returns the api_keys row with the given id, revoked or not,
+// or domain.ErrAPIKeyNotFound if none exists (Task 2.2b).
+func (r *Repository) GetAPIKeyByID(ctx context.Context, id string) (domain.APIKey, error) {
+	keyID, err := uuid.Parse(id)
+	if err != nil {
+		return domain.APIKey{}, fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	row, err := r.q.GetAPIKeyByID(ctx, keyID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.APIKey{}, domain.ErrAPIKeyNotFound
+	}
+	if err != nil {
+		return domain.APIKey{}, fmt.Errorf("postgres: get api key by id: %w", err)
+	}
+	return domain.APIKey{
+		ID:           row.ID.String(),
+		TenantID:     row.TenantID.String(),
+		Name:         row.Name,
+		RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+		Scopes:       scopesFromStrings(row.Scopes),
+		ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
+		LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
+		CreatedAt:    row.CreatedAt,
+		RevokedAt:    timestamptzToPtr(row.RevokedAt),
+	}, nil
+}
+
+// ListAPIKeysByTenant returns every api_keys row for tenantID, oldest first,
+// revoked or not (Task 2.2b).
+func (r *Repository) ListAPIKeysByTenant(ctx context.Context, tenantID string) ([]domain.APIKey, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.ListAPIKeysByTenant(ctx, tid)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list api keys by tenant: %w", err)
+	}
+	out := make([]domain.APIKey, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.APIKey{
+			ID:           row.ID.String(),
+			TenantID:     row.TenantID.String(),
+			Name:         row.Name,
+			RateLimitRPM: int4ToPtr(row.RateLimitRpm),
+			Scopes:       scopesFromStrings(row.Scopes),
+			ExpiresAt:    timestamptzToPtr(row.ExpiresAt),
+			LastUsedAt:   timestamptzToPtr(row.LastUsedAt),
+			CreatedAt:    row.CreatedAt,
+			RevokedAt:    timestamptzToPtr(row.RevokedAt),
+		})
+	}
+	return out, nil
+}
+
+// RevokeAPIKey sets revoked_at (if not already set) for the key identified by
+// id (Task 2.2b), or returns domain.ErrAPIKeyNotFound if no key matches id.
+func (r *Repository) RevokeAPIKey(ctx context.Context, id string) error {
+	keyID, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	rows, err := r.q.RevokeAPIKey(ctx, keyID)
+	if err != nil {
+		return fmt.Errorf("postgres: revoke api key: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrAPIKeyNotFound
+	}
+	return nil
+}
+
+// TouchAPIKeyLastUsed sets api_keys.last_used_at for the key identified by
+// id. Called best-effort and throttled from the auth resolver (Task 2.2), so
+// its caller (internal/auth.Resolver) fires it asynchronously and ignores its
+// error beyond a debug log: a failed touch must never fail the request it
+// rode in on.
+func (r *Repository) TouchAPIKeyLastUsed(ctx context.Context, id string, when time.Time) error {
+	keyID, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse api key id: %w", err)
+	}
+	if err := r.q.TouchAPIKeyLastUsed(ctx, sqlc.TouchAPIKeyLastUsedParams{
+		ID:         keyID,
+		LastUsedAt: pgtype.Timestamptz{Time: when, Valid: true},
+	}); err != nil {
+		return fmt.Errorf("postgres: touch api key last used: %w", err)
+	}
+	return nil
+}
+
+// scopesFromStrings converts the raw text[] scopes column to []domain.Scope.
+// It does not validate each element against Scope.Valid(): the
+// api_keys_scopes_valid CHECK constraint (migration 0012) already guarantees
+// every stored value is one of the three known scopes.
+func scopesFromStrings(scopes []string) []domain.Scope {
+	if scopes == nil {
+		return nil
+	}
+	out := make([]domain.Scope, len(scopes))
+	for i, s := range scopes {
+		out[i] = domain.Scope(s)
+	}
+	return out
+}
+
+// timestamptzToPtr converts a nullable Postgres timestamptz to *time.Time,
+// nil when the column is NULL (never expires, or never yet used).
+func timestamptzToPtr(v pgtype.Timestamptz) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := v.Time
+	return &t
+}
+
 // InsertAPIKey assigns an identity if k.ID is empty and inserts k with keyHash
-// as its stored credential. Only the hash is ever written.
+// as its stored credential. Only the hash is ever written. An empty k.Scopes
+// defaults to {read, post} (Task 2.2b), matching the api_keys.scopes column's
+// own default, so every caller that predates scopes (cmd/server's demo and
+// load-test provisioning, and every pre-2.2 test) keeps working unchanged
+// instead of hitting the scopes NOT NULL / api_keys_scopes_valid constraint.
 func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error {
 	if k.ID == "" {
 		id, err := uuid.NewV7()
@@ -845,16 +1599,230 @@ func (r *Repository) InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash 
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
+	scopes := k.Scopes
+	if len(scopes) == 0 {
+		scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	}
 	if err := r.q.InsertAPIKey(ctx, sqlc.InsertAPIKeyParams{
 		ID:           id,
 		TenantID:     tid,
 		Name:         k.Name,
 		KeyHash:      keyHash,
 		RateLimitRpm: ptrToInt4(k.RateLimitRPM),
+		Scopes:       scopesToStrings(scopes),
+		ExpiresAt:    ptrToTimestamptz(k.ExpiresAt),
 	}); err != nil {
 		return fmt.Errorf("postgres: insert api key: %w", err)
 	}
 	return nil
+}
+
+// scopesToStrings converts []domain.Scope to the raw []string the scopes
+// text[] column stores, the reverse of scopesFromStrings.
+func scopesToStrings(scopes []domain.Scope) []string {
+	out := make([]string, len(scopes))
+	for i, s := range scopes {
+		out[i] = string(s)
+	}
+	return out
+}
+
+// ptrToTimestamptz converts *time.Time to a nullable Postgres timestamptz,
+// NULL when p is nil, the reverse of timestamptzToPtr.
+func ptrToTimestamptz(p *time.Time) pgtype.Timestamptz {
+	if p == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *p, Valid: true}
+}
+
+// CreateTenant inserts a new tenant row with the given id and name, active by
+// default (the column default; this method never sets status explicitly). It
+// returns domain.ErrTenantAlreadyExists if id is already in use.
+func (r *Repository) CreateTenant(ctx context.Context, tenantID, name string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if err := (domain.Tenant{Name: name, Status: domain.TenantActive}).Validate(); err != nil {
+		return err
+	}
+	if err := r.q.CreateTenant(ctx, sqlc.CreateTenantParams{ID: tid, Name: name}); err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrTenantAlreadyExists
+		}
+		return fmt.Errorf("postgres: create tenant: %w", err)
+	}
+	return nil
+}
+
+// GetTenant returns the tenant with the given id, or domain.ErrTenantNotFound
+// if none exists.
+func (r *Repository) GetTenant(ctx context.Context, tenantID string) (domain.Tenant, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Tenant{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	row, err := r.q.GetTenant(ctx, tid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Tenant{}, domain.ErrTenantNotFound
+	}
+	if err != nil {
+		return domain.Tenant{}, fmt.Errorf("postgres: get tenant: %w", err)
+	}
+	return tenantFromRow(row), nil
+}
+
+// ListTenants returns up to limit tenants, oldest first.
+func (r *Repository) ListTenants(ctx context.Context, limit int) ([]domain.Tenant, error) {
+	rows, err := r.q.ListTenants(ctx, int32(limit)) //nolint:gosec // limit is bounded by the caller
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list tenants: %w", err)
+	}
+	out := make([]domain.Tenant, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, tenantFromRow(row))
+	}
+	return out, nil
+}
+
+// SetTenantStatus updates the tenant's status. It returns domain.ErrInvalidTenant
+// if status is not one of TenantStatus.Valid()'s three values, or
+// domain.ErrTenantNotFound if no tenant matches id.
+func (r *Repository) SetTenantStatus(ctx context.Context, tenantID string, status domain.TenantStatus) error {
+	if !status.Valid() {
+		return domain.ErrInvalidTenant
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.SetTenantStatus(ctx, sqlc.SetTenantStatusParams{ID: tid, Status: string(status)})
+	if err != nil {
+		return fmt.Errorf("postgres: set tenant status: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrTenantNotFound
+	}
+	return nil
+}
+
+// SetTenantSettings overwrites the tenant's settings jsonb column with
+// settings (Task 2.4b, audit A3.4): a whole-document replace, not a merge
+// (see domain.Repository.SetTenantSettings). It returns
+// domain.ErrTenantNotFound if no tenant matches id.
+func (r *Repository) SetTenantSettings(ctx context.Context, tenantID string, settings json.RawMessage) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	rows, err := r.q.SetTenantSettings(ctx, sqlc.SetTenantSettingsParams{ID: tid, Settings: settings})
+	if err != nil {
+		return fmt.Errorf("postgres: set tenant settings: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrTenantNotFound
+	}
+	return nil
+}
+
+// InsertFXRate appends a new fx_rates row (Task 2.4, audit A3.3). tenantID
+// nil inserts the global default rate (tenant_id NULL); a non-nil tenantID
+// inserts that tenant's own rate, after confirming the tenant exists (a
+// clean domain.ErrTenantNotFound rather than a raw foreign-key-violation
+// error from the fx_rates_tenant_id_fkey constraint).
+//
+// Validation mirrors the fx_rates CHECK constraints and runs before any
+// write, the same defense-in-depth style CreateAccount and CreateTransaction
+// use elsewhere in this file: base and quote must each be a valid currency
+// code and must differ, midRateE8 must be positive, and spreadBps must be in
+// [0, 10000).
+//
+// effectiveAt nil leaves the sqlc param unset (pgtype.Timestamptz{Valid:
+// false}), which the InsertFXRate query's COALESCE(sqlc.narg('effective_at'),
+// now()) resolves to the DATABASE SERVER's now(), not this process's clock
+// (see the query's doc comment and domain.Repository.InsertFXRate for why
+// that distinction is a real correctness fix, not a style choice). A non-nil
+// effectiveAt (an explicit, possibly future, scheduled rate) is passed
+// through untouched.
+func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, quote domain.Currency, midRateE8 int64, spreadBps int32, source string, effectiveAt *time.Time) error {
+	if err := base.Validate(); err != nil {
+		return err
+	}
+	if err := quote.Validate(); err != nil {
+		return err
+	}
+	if base == quote {
+		return domain.ErrSameCurrencyRate
+	}
+	if midRateE8 <= 0 {
+		return domain.ErrNonPositiveRate
+	}
+	if spreadBps < 0 || spreadBps >= 10_000 {
+		return domain.ErrInvalidSpread
+	}
+
+	var pgTenantID pgtype.UUID
+	if tenantID != nil {
+		tid, err := uuid.Parse(*tenantID)
+		if err != nil {
+			return fmt.Errorf("postgres: parse tenant id: %w", err)
+		}
+		if _, err := r.q.GetTenant(ctx, tid); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrTenantNotFound
+			}
+			return fmt.Errorf("postgres: check tenant exists: %w", err)
+		}
+		pgTenantID = pgtype.UUID{Bytes: tid, Valid: true}
+	}
+
+	var pgEffectiveAt pgtype.Timestamptz
+	if effectiveAt != nil {
+		pgEffectiveAt = pgtype.Timestamptz{Time: *effectiveAt, Valid: true}
+	}
+
+	params := sqlc.InsertFXRateParams{
+		TenantID:    pgTenantID,
+		Base:        string(base),
+		Quote:       string(quote),
+		MidRateE8:   midRateE8,
+		SpreadBps:   spreadBps,
+		Source:      source,
+		EffectiveAt: pgEffectiveAt,
+	}
+	// A tenant-specific rate is inserted with the GUC set to that tenant
+	// (fx_rates's RLS policy, migration 0024, still allows it: WITH CHECK
+	// is "tenant_id IS NULL OR <matches the GUC>", and this row's tenant_id
+	// equals the GUC). A global rate (tenantID nil, tenant_id column left
+	// NULL) has no tenant to scope the GUC to; its WITH CHECK passes
+	// unconditionally via the "tenant_id IS NULL" branch regardless, so it
+	// is inserted directly on the pool, same as before this migration.
+	if tenantID != nil {
+		err := r.withTenant(ctx, *tenantID, func(q *sqlc.Queries) error {
+			_, err := q.InsertFXRate(ctx, params)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("postgres: insert fx rate: %w", err)
+		}
+		return nil
+	}
+	if _, err := r.q.InsertFXRate(ctx, params); err != nil {
+		return fmt.Errorf("postgres: insert fx rate: %w", err)
+	}
+	return nil
+}
+
+// tenantFromRow converts a sqlc Tenant row to a domain.Tenant.
+func tenantFromRow(row sqlc.Tenant) domain.Tenant {
+	return domain.Tenant{
+		ID:        row.ID.String(),
+		Name:      row.Name,
+		Status:    domain.TenantStatus(row.Status),
+		Settings:  json.RawMessage(row.Settings),
+		CreatedAt: row.CreatedAt,
+	}
 }
 
 // int4ToPtr converts a nullable Postgres int4 to *int, nil when the column is
@@ -875,6 +1843,37 @@ func ptrToInt4(p *int) pgtype.Int4 {
 	return pgtype.Int4{Int32: int32(*p), Valid: true} //nolint:gosec // rate limits are small, application-set values
 }
 
+// ptrToInt8 converts *int64 to a nullable Postgres int8, NULL when p is nil.
+// Used for accounts.min_balance (Task 5.5, audit A1.5): nil means "no floor
+// configured", the same meaning NULL carries in the column.
+func ptrToInt8(p *int64) pgtype.Int8 {
+	if p == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *p, Valid: true}
+}
+
+// ptrToText converts *string to a nullable Postgres text, NULL when p is
+// nil. Used for accounts.party_reference and accounts.party_type (Task 6.1,
+// audit A9.1): nil means "no party linkage supplied", the same meaning NULL
+// carries in the column.
+func ptrToText(p *string) pgtype.Text {
+	if p == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *p, Valid: true}
+}
+
+// textToPtr is the inverse of ptrToText: nil when t is not Valid (NULL in
+// the column), otherwise a pointer to its string value.
+func textToPtr(t pgtype.Text) *string {
+	if !t.Valid {
+		return nil
+	}
+	v := t.String
+	return &v
+}
+
 // accountFromRow builds a domain.Account from the scalar fields common to every
 // account-shaped row sqlc generates (GetAccountRow, ListAccountsRow, ...). Taking
 // individual fields rather than one sqlc row type is deliberate: sqlc gives each
@@ -882,15 +1881,131 @@ func ptrToInt4(p *int) pgtype.Int4 {
 // column of the accounts table (which stopped being true once the schema grew
 // columns like is_system that not every query selects), so a single shared
 // struct type would not compile across call sites.
-func accountFromRow(id uuid.UUID, name, accountType, currency string) (domain.Account, error) {
+//
+// status, minBalance, and isSystem are Task 5.5 (audit A1.5) additions;
+// partyReference and partyType are Task 6.1 (audit A9.1) additions: every
+// query that selects them (GetAccount, ListAccounts, GetOrCreateClearingAccount)
+// passes its own row's values through unchanged.
+func accountFromRow(id uuid.UUID, name, accountType, currency, status string, minBalance pgtype.Int8, isSystem bool, partyReference, partyType pgtype.Text) (domain.Account, error) {
 	at, err := domain.ParseAccountType(accountType)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
 	}
-	return domain.Account{
-		ID:       id.String(),
-		Name:     name,
-		Type:     at,
-		Currency: domain.Currency(currency),
-	}, nil
+	a := domain.Account{
+		ID:             id.String(),
+		Name:           name,
+		Type:           at,
+		Currency:       domain.Currency(currency),
+		Status:         domain.AccountStatus(status),
+		System:         isSystem,
+		PartyReference: textToPtr(partyReference),
+		PartyType:      textToPtr(partyType),
+	}
+	if minBalance.Valid {
+		v := minBalance.Int64
+		a.MinBalance = &v
+	}
+	return a, nil
+}
+
+// CreateWebhookSubscription assigns an identity if sub.ID is empty and
+// inserts sub with secret as its stored HMAC signing key (Task 4.1, audit
+// A7.1). It precisely mirrors InsertFXRate's own tenant-existence precheck
+// (a plain GetTenant lookup before ever writing) rather than catching the
+// webhook_subscriptions_tenant_id_fkey violation after the fact, so a
+// missing tenant surfaces as domain.ErrTenantNotFound instead of a raw
+// foreign-key-violation error reaching the caller.
+func (r *Repository) CreateWebhookSubscription(ctx context.Context, sub *domain.WebhookSubscription, secret string) error {
+	if sub.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate webhook subscription id: %w", err)
+		}
+		sub.ID = id.String()
+	}
+	id, err := uuid.Parse(sub.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse webhook subscription id: %w", err)
+	}
+	tid, err := uuid.Parse(sub.TenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if _, err := r.q.GetTenant(ctx, tid); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrTenantNotFound
+		}
+		return fmt.Errorf("postgres: check tenant exists: %w", err)
+	}
+
+	eventTypes := sub.EventTypes
+	if eventTypes == nil {
+		eventTypes = []string{}
+	}
+	err = r.withTenant(ctx, sub.TenantID, func(q *sqlc.Queries) error {
+		return q.InsertWebhookSubscription(ctx, sqlc.InsertWebhookSubscriptionParams{
+			ID:         id,
+			TenantID:   tid,
+			Url:        sub.URL,
+			Secret:     secret,
+			EventTypes: eventTypes,
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: insert webhook subscription: %w", err)
+	}
+	sub.Active = true
+	return nil
+}
+
+// ListWebhookSubscriptionsByTenant returns every webhook_subscriptions row
+// for tenantID, oldest first, active or not (Task 4.1). Never carries a
+// secret: domain.WebhookSubscription has no field for one.
+func (r *Repository) ListWebhookSubscriptionsByTenant(ctx context.Context, tenantID string) ([]domain.WebhookSubscription, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var rows []sqlc.ListWebhookSubscriptionsByTenantRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListWebhookSubscriptionsByTenant(ctx, tid)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list webhook subscriptions by tenant: %w", err)
+	}
+	out := make([]domain.WebhookSubscription, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.WebhookSubscription{
+			ID:         row.ID.String(),
+			TenantID:   row.TenantID.String(),
+			URL:        row.Url,
+			EventTypes: row.EventTypes,
+			Active:     row.Active,
+			CreatedAt:  row.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+// SetWebhookSubscriptionActive sets active for the subscription identified
+// by id (Task 4.1), or returns domain.ErrWebhookSubscriptionNotFound if no
+// subscription matches id.
+func (r *Repository) SetWebhookSubscriptionActive(ctx context.Context, id string, active bool) error {
+	subID, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse webhook subscription id: %w", err)
+	}
+	rows, err := r.q.SetWebhookSubscriptionActive(ctx, sqlc.SetWebhookSubscriptionActiveParams{
+		Active: active,
+		ID:     subID,
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: set webhook subscription active: %w", err)
+	}
+	if rows == 0 {
+		return domain.ErrWebhookSubscriptionNotFound
+	}
+	return nil
 }

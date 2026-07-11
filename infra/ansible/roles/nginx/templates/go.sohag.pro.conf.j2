@@ -1,5 +1,7 @@
 # Managed by Ansible. certbot rewrites this to add the 443 listener, cert paths,
-# and the HTTP to HTTPS redirect on first run (see the tls role).
+# and the HTTP to HTTPS redirect on first run (see the tls role). certbot copies
+# each existing location block into the new 443 server verbatim, so the rate
+# limit below applies there too without any separate handling.
 server {
     listen 80;
     listen [::]:80;
@@ -14,7 +16,36 @@ server {
     gzip_proxied any;
     gzip_types application/json application/javascript text/css text/plain application/xml image/svg+xml;
 
+    # Per-IP request flood protection (Task 5.2, audit A2.5/A6.4). The zone
+    # itself (rate, size) is declared once, at http scope, in
+    # conf.d/ratelimit.conf.j2 (limit_req_zone cannot live here: this block is
+    # server scope). 429, not the nginx default 503, so a rate-limited
+    # response reads the same as the application layer's own 429s.
+    limit_req_status 429;
+
+    # The health check gets its own, much looser budget: it is liveness-probe
+    # traffic (this service's own uptime monitoring, and any future orchestrator
+    # readiness check), not attacker-shaped, and losing it to the same limit as
+    # the rest of the API would turn a monitoring poll interval into a false
+    # "service down" signal. burst=100 nodelay is a backstop against a
+    # misconfigured, tight-looping health checker, not a real-world budget.
+    location = /healthz {
+        limit_req zone=go_ledger_api burst=100 nodelay;
+        proxy_pass http://{{ upstream_addr }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location / {
+        # rate=20r/s (conf.d/ratelimit.conf.j2) with burst=40 nodelay: a
+        # client can spend up to 40 requests in one instant (nodelay serves
+        # the burst immediately instead of queuing/delaying it), then must
+        # keep to the steady 20r/s rate; only requests beyond the burst get
+        # the 429 above. Tune the steady rate in ratelimit.conf.j2 and the
+        # burst here; both share the "go_ledger_api" zone name.
+        limit_req zone=go_ledger_api burst=40 nodelay;
         proxy_pass http://{{ upstream_addr }};
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

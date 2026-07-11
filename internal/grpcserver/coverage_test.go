@@ -11,6 +11,7 @@ package grpcserver_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,192 @@ func TestGRPCAccountLifecycle(t *testing.T) {
 	}
 	if !found {
 		t.Error("list accounts did not include the account just created")
+	}
+}
+
+// TestGRPCAccountStatusAndMinBalance covers Task 5.5 (audit A1.5) over
+// gRPC: a fresh account defaults to status "active" with min_balance 0 (no
+// floor, the documented gRPC convention: see toProtoAccount's doc comment);
+// creating with an explicit min_balance round-trips it; SetAccountStatus
+// freezes the account, which then blocks a PostTransaction with
+// FailedPrecondition, and reactivating un-blocks it; SetAccountStatus on an
+// unknown account id is NotFound.
+func TestGRPCAccountStatusAndMinBalance(t *testing.T) {
+	client := dialClient(t)
+	ctx := authedCtx(context.Background())
+
+	plain, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Status Coverage Cash", Type: "asset", Currency: "USD"})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if plain.Account.Status != "active" {
+		t.Errorf("status = %q, want %q", plain.Account.Status, "active")
+	}
+	if plain.Account.MinBalance != 0 {
+		t.Errorf("min_balance = %d, want 0 (no floor)", plain.Account.MinBalance)
+	}
+
+	withFloor, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Status Coverage Checking", Type: "asset", Currency: "USD", MinBalance: -50000})
+	if err != nil {
+		t.Fatalf("create account with min_balance: %v", err)
+	}
+	if withFloor.Account.MinBalance != -50000 {
+		t.Errorf("min_balance = %d, want -50000", withFloor.Account.MinBalance)
+	}
+
+	rev, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Status Coverage Revenue", Type: "income", Currency: "USD"})
+	if err != nil {
+		t.Fatalf("create revenue account: %v", err)
+	}
+
+	frozen, err := client.SetAccountStatus(ctx, &ledgerv1.SetAccountStatusRequest{Id: plain.Account.Id, Status: "frozen"})
+	if err != nil {
+		t.Fatalf("set account status frozen: %v", err)
+	}
+	if frozen.Account.Status != "frozen" {
+		t.Errorf("response status = %q, want %q", frozen.Account.Status, "frozen")
+	}
+
+	postCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "grpc-frozen-account-post")
+	_, err = client.PostTransaction(postCtx, &ledgerv1.PostTransactionRequest{
+		Currency: "USD",
+		Postings: []*ledgerv1.Posting{
+			{AccountId: plain.Account.Id, Amount: 10000},
+			{AccountId: rev.Account.Id, Amount: -10000},
+		},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("post into frozen account code = %v, want FailedPrecondition", status.Code(err))
+	}
+
+	got, err := client.GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: plain.Account.Id})
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if got.Account.Status != "frozen" {
+		t.Errorf("GetAccount status = %q, want %q", got.Account.Status, "frozen")
+	}
+
+	if _, err := client.SetAccountStatus(ctx, &ledgerv1.SetAccountStatusRequest{Id: plain.Account.Id, Status: "active"}); err != nil {
+		t.Fatalf("reactivate: %v", err)
+	}
+	reactivatedCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", "grpc-reactivated-account-post")
+	if _, err := client.PostTransaction(reactivatedCtx, &ledgerv1.PostTransactionRequest{
+		Currency: "USD",
+		Postings: []*ledgerv1.Posting{
+			{AccountId: plain.Account.Id, Amount: 10000},
+			{AccountId: rev.Account.Id, Amount: -10000},
+		},
+	}); err != nil {
+		t.Fatalf("post into reactivated account: %v", err)
+	}
+
+	if _, err := client.SetAccountStatus(ctx, &ledgerv1.SetAccountStatusRequest{Id: missingID, Status: "closed"}); status.Code(err) != codes.NotFound {
+		t.Errorf("set status on missing account code = %v, want NotFound", status.Code(err))
+	}
+}
+
+// TestGRPCAccountPartyFields covers Task 6.1 (audit A9.1) over gRPC: a fresh
+// account defaults to empty party_reference/party_type (the documented gRPC
+// convention for "unset", mirroring min_balance's 0-means-absent
+// convention: see toProtoAccount's doc comment); creating with explicit
+// party_reference/party_type round-trips both on the create response and a
+// fresh GetAccount.
+func TestGRPCAccountPartyFields(t *testing.T) {
+	client := dialClient(t)
+	ctx := authedCtx(context.Background())
+
+	plain, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{Name: "Party Fields Plain", Type: "asset", Currency: "USD"})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if plain.Account.PartyReference != "" {
+		t.Errorf("party_reference = %q, want empty (unset)", plain.Account.PartyReference)
+	}
+	if plain.Account.PartyType != "" {
+		t.Errorf("party_type = %q, want empty (unset)", plain.Account.PartyType)
+	}
+
+	linked, err := client.CreateAccount(ctx, &ledgerv1.CreateAccountRequest{
+		Name: "Party Fields Linked", Type: "asset", Currency: "USD",
+		PartyReference: "cust-grpc-1", PartyType: "business",
+	})
+	if err != nil {
+		t.Fatalf("create account with party fields: %v", err)
+	}
+	if linked.Account.PartyReference != "cust-grpc-1" {
+		t.Errorf("party_reference = %q, want %q", linked.Account.PartyReference, "cust-grpc-1")
+	}
+	if linked.Account.PartyType != "business" {
+		t.Errorf("party_type = %q, want %q", linked.Account.PartyType, "business")
+	}
+
+	got, err := client.GetAccount(ctx, &ledgerv1.GetAccountRequest{Id: linked.Account.Id})
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if got.Account.PartyReference != "cust-grpc-1" {
+		t.Errorf("GetAccount party_reference = %q, want %q", got.Account.PartyReference, "cust-grpc-1")
+	}
+	if got.Account.PartyType != "business" {
+		t.Errorf("GetAccount party_type = %q, want %q", got.Account.PartyType, "business")
+	}
+}
+
+// TestGRPCCreateAccountPartyFieldTooLong is the fix for a gap in Task 6.1
+// (audit A9.1): domain.ErrPartyReferenceTooLong and domain.ErrPartyTypeTooLong
+// had no case in toStatus, so an over-length party field fell through to the
+// default codes.Internal instead of a client validation error. The REST layer
+// catches an over-length value earlier via its maxLength JSON schema tag
+// (internal/api/accounts.go), but the gRPC proto has no equivalent length
+// constraint on party_reference/party_type, so this path is reachable only
+// over gRPC. Both fields must map to InvalidArgument, and, critically, the
+// account must not be created: CreateAccount returning an error alone is not
+// enough proof, since the pre-fix bug also returned an error (just the wrong
+// code) while still rejecting the write; this confirms no account with the
+// attempted name exists afterward.
+func TestGRPCCreateAccountPartyFieldTooLong(t *testing.T) {
+	client := dialClient(t)
+	ctx := authedCtx(context.Background())
+	tooLong := strings.Repeat("x", domain.MaxPartyReferenceLen+1)
+
+	tests := []struct {
+		name string
+		req  *ledgerv1.CreateAccountRequest
+	}{
+		{
+			name: "party reference too long",
+			req: &ledgerv1.CreateAccountRequest{
+				Name: "Party Ref Guard " + tooLong[:8], Type: "asset", Currency: "USD",
+				PartyReference: tooLong,
+			},
+		},
+		{
+			name: "party type too long",
+			req: &ledgerv1.CreateAccountRequest{
+				Name: "Party Type Guard " + tooLong[:8], Type: "asset", Currency: "USD",
+				PartyType: tooLong,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.CreateAccount(ctx, tc.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("code = %v, want InvalidArgument", status.Code(err))
+			}
+
+			list, err := client.ListAccounts(ctx, &ledgerv1.ListAccountsRequest{})
+			if err != nil {
+				t.Fatalf("list accounts: %v", err)
+			}
+			for _, a := range list.Accounts {
+				if a.Name == tc.req.Name {
+					t.Fatalf("account %q was created despite a rejected over-length party field, want nothing persisted", tc.req.Name)
+				}
+			}
+		})
 	}
 }
 
@@ -231,6 +418,9 @@ func TestGRPCGetTransactionAudit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
+	// PostTransaction only writes an audit_outbox row (ADR-017); drain the
+	// chainer so there is an audit_log row to read back.
+	drainChainer(t, sharedPool, testTenant)
 
 	resp, err := client.GetTransactionAudit(ctx, &ledgerv1.GetTransactionAuditRequest{TransactionId: post.Transaction.Id})
 	if err != nil {
@@ -334,6 +524,9 @@ func TestGRPCGetAccountAuditPaginatesAndValidatesCursor(t *testing.T) {
 			t.Fatalf("post %d: %v", i, err)
 		}
 	}
+	// PostTransaction only writes an audit_outbox row (ADR-017); drain the
+	// chainer so there are audit_log rows to page through.
+	drainChainer(t, sharedPool, testTenant)
 
 	page1, err := client.GetAccountAudit(ctx, &ledgerv1.GetAccountAuditRequest{AccountId: cash.Account.Id, Limit: 1})
 	if err != nil {

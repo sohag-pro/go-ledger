@@ -10,15 +10,18 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 )
 
-// appendAudit writes one audit row for txnID under tenant, inside its own
-// RunInTx, mirroring how the ledger service calls AppendAudit alongside
-// CreateTransaction. Callers that need the row's hashes should read it back
-// via ListAuditForVerify.
+// appendAudit writes one audit_outbox row for txnID under tenant, inside its
+// own RunInTx, mirroring how the ledger service calls AppendAuditOutbox
+// alongside CreateTransaction, then drains the chainer so the resulting
+// audit_log row exists by the time this returns (ADR-017: chaining is
+// asynchronous, but these tests want to assert on audit_log immediately, the
+// same way they did when AppendAudit chained synchronously). Callers that
+// need the row's hashes should read it back via ListAuditForVerify.
 func appendAudit(t *testing.T, repo *postgres.Repository, tenant, txnID string) {
 	t.Helper()
 	ctx := context.Background()
 	err := repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
-		return tx.AppendAudit(ctx, tenant, domain.AuditEntry{
+		return tx.AppendAuditOutbox(ctx, tenant, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: txnID,
 			Actor:         tenant,
@@ -26,8 +29,9 @@ func appendAudit(t *testing.T, repo *postgres.Repository, tenant, txnID string) 
 		})
 	})
 	if err != nil {
-		t.Fatalf("append audit for %s: %v", txnID, err)
+		t.Fatalf("append audit outbox for %s: %v", txnID, err)
 	}
+	drainChainer(t, newTestPool(t), tenant)
 }
 
 // TestAuditHashChainBuildsAcrossTransactions posts two transactions for one
@@ -177,12 +181,25 @@ func TestAuditHashChainDetectsTamper(t *testing.T) {
 }
 
 // TestAuditHashChainDetectsTenantRewrite proves the tenant id is genuinely
-// part of what row_hash covers, not just a structural scoping detail: a
-// privileged raw UPDATE that rewrites a row's tenant_id (moving it into
-// another tenant's chain), bypassing the immutability trigger the same way
-// TestAuditHashChainDetectsTamper does, is detectable. Recomputing the hash
-// with the row's current (rewritten) tenant id no longer matches the
-// row_hash that was stored under the row's original tenant id.
+// part of what row_hash covers, not just a structural scoping detail, and
+// that this is now backed by two independent layers (Task 5.4a, audit
+// A4.4): the composite foreign key (tenant_id, transaction_id) REFERENCES
+// transactions (tenant_id, id), migration 0023, and the hash chain itself.
+//
+// A privileged raw UPDATE that rewrites a row's tenant_id alone (moving it
+// into another tenant's chain while still pointing at the original
+// tenant's transaction), bypassing the immutability trigger the same way
+// TestAuditHashChainDetectsTamper does, is now rejected outright by the
+// composite FK: no transactions row exists under the new tenant with that
+// transaction_id. That is a strictly stronger guarantee than detection:
+// the write never lands.
+//
+// A more careful rewrite that also relinks transaction_id to a real
+// transaction that does belong to the new tenant satisfies the FK, so it
+// is not caught at the database-constraint layer. The hash chain is the
+// second layer: row_hash was computed over the row's original tenant_id
+// and transaction_id together, so recomputing it with the rewritten
+// (tenant, transaction) pair no longer matches the stored row_hash.
 func TestAuditHashChainDetectsTenantRewrite(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -205,12 +222,34 @@ func TestAuditHashChainDetectsTenantRewrite(t *testing.T) {
 	if recomputed := domain.ComputeAuditRowHash(tenantA, row, domain.AuditGenesisHash); recomputed != row.RowHash {
 		t.Fatalf("row failed to verify before any rewrite: recomputed %q != stored %q", recomputed, row.RowHash)
 	}
-
-	// Rewrite: move the row into tenant B's chain by changing only tenant_id,
-	// bypassing the application entirely. This only succeeds because we
-	// deliberately flip the same GUC gate the seeder uses; the application
-	// path never does this.
 	rowID := uuid.MustParse(row.ID)
+
+	// Layer 1: rewriting tenant_id alone, leaving transaction_id pointing at
+	// tenant A's transaction, is rejected by the composite FK (migration
+	// 0023): (tenant B, txnID) matches no row in transactions.
+	func() {
+		tamperTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin tenant-only rewrite tx: %v", err)
+		}
+		defer tamperTx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // rolled back deliberately (FK violation), or a no-op after that
+		if _, err := tamperTx.Exec(ctx, `SET LOCAL audit.allow_purge = 'on'`); err != nil {
+			t.Fatalf("set local: %v", err)
+		}
+		_, err = tamperTx.Exec(ctx,
+			`UPDATE audit_log SET tenant_id = $1 WHERE id = $2`,
+			uuid.MustParse(tenantB), rowID,
+		)
+		if err == nil {
+			t.Fatal("tenant-only rewrite: expected a composite foreign-key violation, got nil")
+		}
+	}()
+
+	// Layer 2: rewrite both tenant_id and transaction_id together, to a
+	// transaction that genuinely belongs to tenant B, so the composite FK is
+	// satisfied. This only succeeds because we deliberately flip the same
+	// GUC gate the seeder uses; the application path never does this.
+	txnIDB, _, _ := seedTxn(t, repo, tenantB)
 	tamperTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin rewrite tx: %v", err)
@@ -220,10 +259,10 @@ func TestAuditHashChainDetectsTenantRewrite(t *testing.T) {
 		t.Fatalf("set local: %v", err)
 	}
 	if _, err := tamperTx.Exec(ctx,
-		`UPDATE audit_log SET tenant_id = $1 WHERE id = $2`,
-		uuid.MustParse(tenantB), rowID,
+		`UPDATE audit_log SET tenant_id = $1, transaction_id = $2 WHERE id = $3`,
+		uuid.MustParse(tenantB), uuid.MustParse(txnIDB), rowID,
 	); err != nil {
-		t.Fatalf("rewrite tenant_id: %v", err)
+		t.Fatalf("rewrite tenant_id and transaction_id: %v", err)
 	}
 	if err := tamperTx.Commit(ctx); err != nil {
 		t.Fatalf("commit rewrite: %v", err)
@@ -239,11 +278,12 @@ func TestAuditHashChainDetectsTenantRewrite(t *testing.T) {
 	}
 	claimed := rewritten[0]
 
-	// The row_hash on disk is untouched (only tenant_id changed), so
-	// recomputing with the tenant the row currently claims (tenant B) must no
-	// longer match the row_hash stored under its original tenant (tenant A).
+	// The row_hash on disk is untouched (only tenant_id and transaction_id
+	// changed), so recomputing with the values the row currently claims
+	// (tenant B, txnIDB) must no longer match the row_hash stored under its
+	// original values (tenant A, txnID).
 	if recomputed := domain.ComputeAuditRowHash(tenantB, claimed, claimed.PrevHash); recomputed == claimed.RowHash {
-		t.Error("tenant_id rewrite was not detected: recomputed hash still matched stored row_hash")
+		t.Error("tenant_id/transaction_id rewrite was not detected: recomputed hash still matched stored row_hash")
 	}
 }
 

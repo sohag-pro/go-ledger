@@ -94,7 +94,14 @@ type txn struct {
 // (ADR-014, "New-account default currency is env-configured"); an empty
 // currency falls back to "USD" so a direct caller that does not care about
 // multi-currency still gets a valid, single-currency demo ledger.
-func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency string) error {
+//
+// demoKeyHash is the SHA-256 hash (domain.HashAPIKey) of the demo api key.
+// Before any destructive reset, Seed checks whether tenantID holds an api key
+// other than that one; if it does, Seed refuses and wipes nothing (see
+// ADR-015, "Safe-by-default deployment"). This is the guard against the
+// seeder ever destroying a real tenant's data if DEFAULT_TENANT_ID is ever
+// misconfigured to point at a live tenant instead of the demo one.
+func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency, demoKeyHash string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return fmt.Errorf("seed: parse tenant id: %w", err)
@@ -140,6 +147,32 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
 
+	// Ensure the tenant row exists before writing any tenant-owned data:
+	// accounts_tenant_fk and transactions_tenant_fk (migration 0011, Task 2.1)
+	// require it. ON CONFLICT DO NOTHING: a tenant already provisioned via
+	// cmd/server's provisionAPIKeys (which runs before the seeder starts) is
+	// left exactly as it is, including any name or status an operator may
+	// already have set; only a tenant that has never been provisioned gets a
+	// placeholder row here.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+		tid, "demo-"+tenantID[:8]); err != nil {
+		return fmt.Errorf("seed: ensure tenant row: %w", err)
+	}
+
+	// Refuse to touch a tenant that holds any api key other than the demo key,
+	// before any destructive statement runs. A misconfigured DEFAULT_TENANT_ID
+	// pointed at a live tenant must never lose data to a periodic demo reset.
+	var foreignKeys int
+	if err := tx.QueryRow(ctx,
+		"SELECT count(*) FROM api_keys WHERE tenant_id = $1 AND key_hash != $2",
+		tid, demoKeyHash).Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("seed: check api keys for tenant %s: %w", tenantID, err)
+	}
+	if foreignKeys > 0 {
+		return fmt.Errorf("seed: refusing to reset tenant %s: it holds %d api key(s) other than the demo key", tenantID, foreignKeys)
+	}
+
 	// audit_log is append-only, guarded by a trigger that rejects UPDATE/DELETE.
 	// The demo seeder is the one sanctioned exception: this transaction-local GUC
 	// lets the reset clear audit rows. Only the seeder sets it; the service path
@@ -148,9 +181,12 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 		return fmt.Errorf("seed: enable audit purge: %w", err)
 	}
 
-	// Reset: idempotency_keys and audit_log reference transactions, so clear them
-	// first, then postings and transactions before accounts.
-	for _, table := range []string{"idempotency_keys", "audit_log", "postings", "transactions", "accounts"} {
+	// Reset: idempotency_keys, audit_log, and audit_outbox (ADR-017) all
+	// reference transactions, so clear them first, then postings and
+	// transactions before accounts. audit_outbox is not append-only guarded
+	// (no immutability trigger; it holds no chain data, just pending
+	// events), so it needs no purge GUC, unlike audit_log above.
+	for _, table := range []string{"idempotency_keys", "audit_log", "audit_outbox", "postings", "transactions", "accounts"} {
 		if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE tenant_id = $1", tid); err != nil {
 			return fmt.Errorf("seed: clear %s: %w", table, err)
 		}

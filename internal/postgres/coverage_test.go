@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -93,6 +94,18 @@ func TestMalformedIDsReturnErrors(t *testing.T) {
 			_, err := repo.Statement(ctx, uuid.NewString(), uuid.NewString(), "USD", cursor, 10)
 			return err
 		}},
+		{"SetAccountStatus bad tenant", func() error {
+			return repo.SetAccountStatus(ctx, bad, uuid.NewString(), domain.AccountFrozen)
+		}},
+		{"SetAccountStatus bad account id", func() error {
+			return repo.SetAccountStatus(ctx, uuid.NewString(), bad, domain.AccountFrozen)
+		}},
+		{"TouchAPIKeyLastUsed bad id", func() error {
+			return repo.TouchAPIKeyLastUsed(ctx, bad, time.Now())
+		}},
+		{"CreateTenant bad tenant id", func() error {
+			return repo.CreateTenant(ctx, bad, "some tenant")
+		}},
 	}
 
 	for _, tt := range tests {
@@ -158,6 +171,9 @@ func TestCreateTransactionDuplicateID(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "duplicate txn id tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	a := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	b := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -202,6 +218,9 @@ func TestCreateTransactionUnbalancedViaRunInTx(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "unbalanced runintx tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	a := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, tenant, a); err != nil {
@@ -251,6 +270,9 @@ func TestCreateTransactionPostingAccountMissing(t *testing.T) {
 	repo := postgres.NewRepository(pool)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "missing posting account tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	existing := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	if err := repo.CreateAccount(ctx, tenant, existing); err != nil {
@@ -273,8 +295,9 @@ func TestCreateTransactionPostingAccountMissing(t *testing.T) {
 // TestInsertIdempotencyKeyEdges drives InsertIdempotencyKey's malformed-id and
 // generic-error branches: a bad tenant id, a bad transaction id, and a
 // well-formed but nonexistent transaction id (a foreign-key violation, the
-// fallback branch below the idempotency_keys_pkey mapping already covered by
-// TestIdempotencyKeyInsertAndDuplicate in idempotency_audit_test.go).
+// fallback branch below the pgx.ErrNoRows-on-a-still-live-conflict mapping
+// (Task 4.5, audit A1.4) already covered by TestIdempotencyKeyInsertAndDuplicate
+// in idempotency_audit_test.go).
 func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -284,7 +307,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", uuid.NewString())
+			return tx.InsertIdempotencyKey(ctx, "not-a-uuid", "k", "fp", "v1", uuid.NewString(), time.Hour)
 		})
 		if err == nil {
 			t.Fatal("expected error, got nil")
@@ -294,7 +317,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "not-a-uuid")
+			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", "not-a-uuid", time.Hour)
 		})
 		if err == nil {
 			t.Fatal("expected error, got nil")
@@ -304,7 +327,7 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", uuid.NewString())
+			return tx.InsertIdempotencyKey(ctx, uuid.NewString(), "k", "fp", "v1", uuid.NewString(), time.Hour)
 		})
 		if err == nil {
 			t.Fatal("expected a foreign-key error, got nil")
@@ -315,10 +338,11 @@ func TestInsertIdempotencyKeyEdges(t *testing.T) {
 	})
 }
 
-// TestAppendAuditEdges drives AppendAudit's malformed-id and generic-error
-// branches: a bad tenant id, a bad transaction id, and a well-formed but
-// nonexistent transaction id (a foreign-key violation).
-func TestAppendAuditEdges(t *testing.T) {
+// TestAppendAuditOutboxEdges drives AppendAuditOutbox's malformed-id and
+// generic-error branches: a bad tenant id, a bad transaction id, and a
+// well-formed but nonexistent transaction id (a foreign-key violation:
+// audit_outbox.transaction_id references transactions(id), migration 0015).
+func TestAppendAuditOutboxEdges(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	repo := postgres.NewRepository(pool)
@@ -327,7 +351,7 @@ func TestAppendAuditEdges(t *testing.T) {
 	t.Run("bad tenant", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.AppendAudit(ctx, "not-a-uuid", domain.AuditEntry{
+			return tx.AppendAuditOutbox(ctx, "not-a-uuid", domain.AuditEvent{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: uuid.NewString(),
 				Actor:         "actor",
@@ -342,7 +366,7 @@ func TestAppendAuditEdges(t *testing.T) {
 	t.Run("bad transaction id", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.AppendAudit(ctx, uuid.NewString(), domain.AuditEntry{
+			return tx.AppendAuditOutbox(ctx, uuid.NewString(), domain.AuditEvent{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: "not-a-uuid",
 				Actor:         "actor",
@@ -357,7 +381,7 @@ func TestAppendAuditEdges(t *testing.T) {
 	t.Run("transaction does not exist", func(t *testing.T) {
 		t.Parallel()
 		err := repo.RunInTx(ctx, uuid.NewString(), func(ctx context.Context, tx domain.Tx) error {
-			return tx.AppendAudit(ctx, uuid.NewString(), domain.AuditEntry{
+			return tx.AppendAuditOutbox(ctx, uuid.NewString(), domain.AuditEvent{
 				Action:        domain.ActionTransactionCreated,
 				TransactionID: uuid.NewString(),
 				Actor:         "actor",

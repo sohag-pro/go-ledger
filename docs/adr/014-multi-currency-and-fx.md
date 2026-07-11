@@ -215,6 +215,43 @@ the scheme with the key, accept old-scheme keys under their old hash) is the
 correct fix once real traffic exists; it is deferred to that point, recorded here
 so the debt is explicit.
 
+## Amendment (audit remediation, task 0.2, findings A1.1 and A8.3)
+
+Decision 6's formula was missing a factor and has been corrected. `mid_rate_e8`
+is, and always was intended to be, a **major-unit** ratio (quote major per one
+base major, scaled by 1e8; a rate of "150.0" seeds as `150e8`). `Convert`,
+however, operates on minor units, and the original implementation treated
+`source_minor * mid_e8` as if minor units and major units used the same scale
+for every currency. That is only true when the base and quote currency share
+the same minor-unit exponent (for example USD and EUR, both 2 decimal
+places), which is why the existing USD/EUR test suite did not catch it. For a
+pair with differing exponents (JPY at 0 decimals, BHD/KWD/OMR and others at 3)
+the result was wrong by a power of ten: converting 100.00 USD to JPY at mid
+150.0 produced 1,500,000 instead of the correct 15,000 yen.
+
+The fix adds one more factor to the single rounding step, folding in each
+currency's minor-unit exponent (`Currency.MinorUnits()`, a new registry
+covering the common 0-decimal and 3-decimal currencies, defaulting to 2 for
+everything else):
+
+```
+converted_minor = bankers_round( source_minor * mid_e8 * (10000 - spread_bps)
+                                * 10^(exp(quote) - exp(base))
+                                / (10^8 * 10000) )
+```
+
+If `exp(quote) - exp(base)` is positive the factor multiplies the numerator;
+if negative, its reciprocal multiplies the denominator. Either way it is
+folded into the same `math/big` numerator and denominator used for the mid
+and spread, so the whole thing is still one `bankersDiv` call: no
+intermediate rounding is introduced by this fix. `applied_e8` is unaffected
+and stays a major-unit display rate, per decision 6.
+
+This does not change rate storage, `internal/fx`, or how env rates are
+seeded: `mid_rate_e8` was already being seeded and stored correctly as a
+major-unit ratio. The bug was entirely in how `Convert` consumed that ratio
+against minor-unit amounts.
+
 ## Consequences
 
 - The ledger models real cross-currency movement with double-entry intact per

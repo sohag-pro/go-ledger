@@ -1,0 +1,10 @@
+# Managed by Ansible (infra/ansible/roles/logship). Ships this host's local
+# journal off-box via systemd-journal-upload (Task 5.6b, audit A6.3). The
+# receiving endpoint must speak the systemd journal-upload/journal-remote
+# wire protocol; see the role's own task comments for why that tradeoff was
+# accepted over vector or promtail.
+[Upload]
+URL={{ logship_sink_url }}
+{% if logship_trusted_cert_file %}
+TrustedCertificateFile={{ logship_trusted_cert_file }}
+{% endif %}

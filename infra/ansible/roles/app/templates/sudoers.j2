@@ -1,1 +1,9 @@
 {{ deploy_user }} ALL=(root) NOPASSWD: /usr/bin/systemctl restart go-ledger
+# Run-as is {{ app_user }}, NOT root: the migrate wrapper execs deploy-uploaded
+# code (go-ledger.new), and {{ deploy_user }} fully owns {{ app_dir }} (CI
+# scp's into it on every push). Root run-as here would let anyone holding
+# DEPLOY_SSH_KEY scp an arbitrary binary and run it as root via this rule.
+# Running as {{ app_user }} instead means a leaked deploy key still only gets
+# what the sandboxed systemd service already gets (see the "systemctl
+# restart" line above, and the goledger.service unit's own hardening).
+{{ deploy_user }} ALL=({{ app_user }}) NOPASSWD: /usr/local/sbin/go-ledger-migrate

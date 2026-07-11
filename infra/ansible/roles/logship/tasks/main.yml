@@ -1,0 +1,71 @@
+---
+# Off-box journald log shipping (Task 5.6b, audit A6.3).
+#
+# systemd-journal-upload ships this host's local journal to a remote
+# systemd-journal-remote-compatible endpoint. It is the fallback this role
+# deliberately picked over vector or promtail: it ships in Ubuntu's own
+# systemd-journal-remote package (nothing extra to install, update, or trust
+# beyond what apt already provisions) and needs no configuration beyond a
+# URL. The tradeoff, recorded here rather than discovered later: the
+# receiving end must itself speak the journal-upload/journal-remote wire
+# protocol, not a generic log-SaaS ingestion API, so if the eventual sink is
+# Loki, Datadog, or similar, swap this role for vector or promtail instead.
+# The upload protocol also has no per-unit filter, so it ships the whole
+# local journal (system logs alongside go-ledger's); the receiving side
+# scopes by unit at read time (for example `journalctl --merge -u go-ledger`).
+#
+# The local retention cap below is applied unconditionally, regardless of
+# whether the off-box sink has been provisioned, so the journal alone can
+# never fill this box's small disk (see docs/ops/server-setup.md, "Disk and
+# memory").
+
+- name: Install systemd-journal-remote (provides systemd-journal-upload)
+  ansible.builtin.apt:
+    name: systemd-journal-remote
+    state: present
+    update_cache: true
+
+- name: Journald drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"
+
+- name: Cap journald's local disk use
+  ansible.builtin.template:
+    src: journald-retention.conf.j2
+    dest: /etc/systemd/journald.conf.d/go-ledger-retention.conf
+    mode: "0644"
+  notify: Restart systemd-journald
+
+- name: Note whether the off-box log sink is provisioned
+  ansible.builtin.set_fact:
+    logship_configured: "{{ logship_sink_url != 'REPLACE_ME' }}"
+
+- name: Skip journal-upload configuration until the off-box sink is provisioned
+  ansible.builtin.debug:
+    msg: >-
+      logship_sink_url is still REPLACE_ME, so systemd-journal-upload is
+      installed but not configured or started. Provision a
+      systemd-journal-remote-compatible receiver, fill in the real
+      logship_sink_url (and logship_trusted_cert_file if it uses a private
+      CA) in group_vars/all.yml or vault, then re-run this role.
+  when: not logship_configured
+
+- name: Template the journal-upload configuration
+  ansible.builtin.template:
+    src: journal-upload.conf.j2
+    dest: /etc/systemd/journal-upload.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: logship_configured
+  notify: Restart systemd-journal-upload
+
+- name: Enable and start systemd-journal-upload
+  ansible.builtin.systemd_service:
+    name: systemd-journal-upload
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: logship_configured

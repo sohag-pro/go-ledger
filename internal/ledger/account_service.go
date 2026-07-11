@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"time"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 )
@@ -12,6 +13,7 @@ import (
 type AccountService struct {
 	repo            domain.Repository
 	defaultCurrency domain.Currency
+	cipher          DescriptionCipher
 }
 
 // AccountOption configures optional AccountService dependencies, mirroring
@@ -26,6 +28,14 @@ type AccountOption func(*AccountService)
 // same behavior as before this option existed.
 func WithDefaultCurrency(c domain.Currency) AccountOption {
 	return func(s *AccountService) { s.defaultCurrency = c }
+}
+
+// WithAccountCipher sets the DescriptionCipher Statement uses to decrypt a
+// posting's description on read (Task 6.2, audit A9.3). Without this option
+// the cipher is nil (encryption disabled), so Statement returns descriptions
+// exactly as stored, matching behavior before Task 6.2.
+func WithAccountCipher(c DescriptionCipher) AccountOption {
+	return func(s *AccountService) { s.cipher = c }
 }
 
 // NewAccountService returns an AccountService backed by repo.
@@ -54,6 +64,22 @@ func (s *AccountService) Get(ctx context.Context, tenantID, id string) (domain.A
 	return s.repo.GetAccount(ctx, tenantID, id)
 }
 
+// SetStatus updates an account's lifecycle status (Task 5.5, audit A1.5:
+// freeze, close, or reactivate one account) and returns the updated
+// account. It returns domain.ErrInvalidAccount if status is not one of
+// domain.AccountStatus.Valid()'s three values, or domain.ErrAccountNotFound
+// if no account matches id. The new status takes effect for the NEXT
+// posting attempt: it is read fresh, inside that posting's own SERIALIZABLE
+// transaction (see internal/ledger's enforceAccountConstraints), never
+// cached, so there is no window where a just-frozen account's in-flight
+// posting is missed.
+func (s *AccountService) SetStatus(ctx context.Context, tenantID, id string, status domain.AccountStatus) (domain.Account, error) {
+	if err := s.repo.SetAccountStatus(ctx, tenantID, id, status); err != nil {
+		return domain.Account{}, err
+	}
+	return s.repo.GetAccount(ctx, tenantID, id)
+}
+
 // List returns up to limit of the tenant's accounts, ordered by name.
 func (s *AccountService) List(ctx context.Context, tenantID string, limit int) ([]domain.Account, error) {
 	return s.repo.ListAccounts(ctx, tenantID, limit)
@@ -77,5 +103,62 @@ func (s *AccountService) Statement(ctx context.Context, tenantID, id string, aft
 	if err != nil {
 		return domain.Account{}, nil, err
 	}
+	// Decrypt each entry's Description (Task 6.2, audit A9.3): a nil cipher
+	// (encryption disabled) leaves entries completely unchanged.
+	if s.cipher != nil {
+		for i := range entries {
+			if entries[i].Description == "" {
+				continue
+			}
+			plaintext, err := s.cipher.Decrypt(ctx, tenantID, entries[i].Description)
+			if err != nil {
+				return domain.Account{}, nil, err
+			}
+			entries[i].Description = plaintext
+		}
+	}
 	return acct, entries, nil
+}
+
+// StatementExport returns the account plus up to MaxExportRows of its
+// postings within an optional [from, to) created_at window, newest first,
+// each with its running balance (Task 6.3, audit A9.2): the per-account
+// period statement export, bounded like ExportTransactions rather than
+// keyset paged like Statement (and, like ExportTransactions, not caller
+// configurable: MaxExportRows is the same fixed ceiling both exports share).
+// truncated is true when the account's matching posting history within the
+// window exceeds MaxExportRows, in which case the export contains only the
+// newest MaxExportRows entries; the caller (the REST handler) surfaces it
+// via the same Export-Truncated response header the transaction export
+// uses.
+func (s *AccountService) StatementExport(ctx context.Context, tenantID, id string, from, to *time.Time) (domain.Account, []domain.StatementEntry, bool, error) {
+	acct, err := s.repo.GetAccount(ctx, tenantID, id)
+	if err != nil {
+		return domain.Account{}, nil, false, err
+	}
+	entries, err := s.repo.StatementExport(ctx, tenantID, id, acct.Currency, from, to, MaxExportRows+1)
+	if err != nil {
+		return domain.Account{}, nil, false, err
+	}
+	truncated := false
+	if len(entries) > MaxExportRows {
+		entries = entries[:MaxExportRows]
+		truncated = true
+	}
+	// Decrypt each entry's Description (Task 6.2, audit A9.3), the same
+	// pass Statement above applies: a nil cipher (encryption disabled)
+	// leaves entries completely unchanged.
+	if s.cipher != nil {
+		for i := range entries {
+			if entries[i].Description == "" {
+				continue
+			}
+			plaintext, err := s.cipher.Decrypt(ctx, tenantID, entries[i].Description)
+			if err != nil {
+				return domain.Account{}, nil, false, err
+			}
+			entries[i].Description = plaintext
+		}
+	}
+	return acct, entries, truncated, nil
 }

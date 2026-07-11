@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
 // TestMaxBodyBytes exercises the router-level body-size middleware directly
@@ -127,17 +130,238 @@ func TestLoadConfig_ValidatesDefaultCurrency(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_ValidatesMasterKey proves LEDGER_MASTER_KEY (Task 6.2,
+// audit A9.3) is validated at config-load time, fail-fast, before the server
+// or any dependent component is constructed: an unset key is a valid
+// configuration (PII encryption simply disabled), but a SET, malformed key
+// (not base64, or not exactly 32 bytes once decoded) is rejected immediately,
+// with the same error crypto.NewCipher would produce later.
+func TestLoadConfig_ValidatesMasterKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		masterKey string
+		wantErr   bool
+	}{
+		{name: "unset: PII encryption disabled, not an error", masterKey: "", wantErr: false},
+		{name: "valid 32-byte base64 key", masterKey: testMasterKeyB64, wantErr: false},
+		{name: "not valid base64 rejected", masterKey: "not-valid-base64!!!", wantErr: true},
+		{name: "too short once decoded rejected", masterKey: "c2hvcnQ=", wantErr: true}, // base64("short")
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("DEFAULT_CURRENCY", "")
+			t.Setenv("LEDGER_MASTER_KEY", tt.masterKey)
+
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Fatalf("loadConfig() with LEDGER_MASTER_KEY=%q: got nil error, want an error", tt.masterKey)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("loadConfig() with LEDGER_MASTER_KEY=%q: got error %v, want nil", tt.masterKey, err)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_GRPCAddrDefaultsToLoopback proves GRPC_ADDR defaults to
+// loopback-only (Task 5.1, audit A2.2, ADR-015 Phase 5): the gRPC server
+// ships with no TLS of its own, so binding every interface by default (the
+// prior ":9091") would serve it in the clear to anyone who could reach the
+// box. An explicit GRPC_ADDR is still honored unchanged, so a deployment
+// that has terminated TLS in front of gRPC can still widen it deliberately.
+func TestLoadConfig_GRPCAddrDefaultsToLoopback(t *testing.T) {
+	tests := []struct {
+		name       string
+		grpcAddr   string
+		wantResult string
+	}{
+		{name: "unset defaults to loopback", grpcAddr: "", wantResult: "127.0.0.1:9091"},
+		{name: "explicit value is honored unchanged", grpcAddr: "0.0.0.0:9091", wantResult: "0.0.0.0:9091"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("DEFAULT_CURRENCY", "")
+			// t.Setenv cannot unset; loadConfig's getenv already treats an
+			// empty string as unset, so setting it to "" here has the same
+			// effect as GRPC_ADDR never being set.
+			t.Setenv("GRPC_ADDR", tt.grpcAddr)
+
+			cfg, err := loadConfig()
+			if err != nil {
+				t.Fatalf("loadConfig() with GRPC_ADDR=%q: unexpected error: %v", tt.grpcAddr, err)
+			}
+			if cfg.grpcAddr != tt.wantResult {
+				t.Errorf("grpcAddr = %q, want %q", cfg.grpcAddr, tt.wantResult)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_IdempotencyTTL proves IDEMPOTENCY_TTL (Task 4.5, audit
+// A1.4) defaults to ledger.DefaultIdempotencyTTL (24h) when unset, accepts a
+// widened or narrowed override (a week, a minute), and fails loadConfig fast
+// on a zero or negative duration rather than silently stamping every
+// idempotency key pre-expired.
+func TestLoadConfig_IdempotencyTTL(t *testing.T) {
+	tests := []struct {
+		name           string
+		idempotencyTTL string
+		wantErr        bool
+		wantTTL        time.Duration
+	}{
+		{name: "unset falls back to the 24h default", idempotencyTTL: "", wantErr: false, wantTTL: ledger.DefaultIdempotencyTTL},
+		{name: "widened to a week", idempotencyTTL: "168h", wantErr: false, wantTTL: 168 * time.Hour},
+		{name: "narrowed to a minute", idempotencyTTL: "1m", wantErr: false, wantTTL: time.Minute},
+		{name: "zero rejected", idempotencyTTL: "0s", wantErr: true},
+		{name: "negative rejected", idempotencyTTL: "-1h", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("IDEMPOTENCY_TTL", tt.idempotencyTTL)
+
+			cfg, err := loadConfig()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("loadConfig() with IDEMPOTENCY_TTL=%q: got nil error, want an error", tt.idempotencyTTL)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() with IDEMPOTENCY_TTL=%q: got error %v, want nil", tt.idempotencyTTL, err)
+			}
+			if cfg.idempotencyTTL != tt.wantTTL {
+				t.Errorf("idempotencyTTL = %s, want %s", cfg.idempotencyTTL, tt.wantTTL)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_SafeByDefault proves the safe-by-default deployment
+// behavior of ADR-015: a plain development boot leaves both DEMO_MODE and
+// SEED_ENABLED off, and a production boot (APP_ENV=production) refuses to
+// start with either DEMO_MODE=true or the published public demo api key,
+// while a production boot with a real DEMO_API_KEY and demo mode off
+// succeeds.
+// testMasterKeyB64 is a fixed, valid 32-byte LEDGER_MASTER_KEY (Task 6.2,
+// audit A9.3), base64-encoded, used wherever a test needs loadConfig to see
+// a well-formed key (for example a production boot, which requires one) but
+// does not care about its actual bytes.
+const testMasterKeyB64 = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=" // base64("01234567890123456789012345678901")
+
+func TestLoadConfig_SafeByDefault(t *testing.T) {
+	tests := []struct {
+		name            string
+		appEnv          string
+		demoMode        string
+		demoAPIKey      string
+		masterKey       string
+		wantErr         bool
+		wantDemoMode    bool
+		wantSeedEnabled bool
+	}{
+		{
+			name: "development boot with no DEMO_MODE set stays fully off by default",
+			// appEnv, demoMode, demoAPIKey, masterKey all left unset (empty):
+			// PII encryption is optional outside production (Task 6.2).
+			wantDemoMode:    false,
+			wantSeedEnabled: false,
+		},
+		{ //nolint:gosec // demoAPIKey below is a test fixture, not a real credential
+			name:       "production refuses DEMO_MODE=true",
+			appEnv:     "production",
+			demoMode:   "true",
+			demoAPIKey: "glk_real_production_key",
+			masterKey:  testMasterKeyB64,
+			wantErr:    true,
+		},
+		{
+			name:      "production refuses the published public demo api key",
+			appEnv:    "production",
+			masterKey: testMasterKeyB64,
+			// demoAPIKey left unset so it defaults to the public constant.
+			wantErr: true,
+		},
+		{ //nolint:gosec // demoAPIKey below is a test fixture, not a real credential
+			name:       "production refuses an unset LEDGER_MASTER_KEY",
+			appEnv:     "production",
+			demoAPIKey: "glk_real_production_key",
+			// masterKey left unset: PII crypto-shredding is mandatory in
+			// production (Task 6.2, audit A9.3).
+			wantErr: true,
+		},
+		{ //nolint:gosec // demoAPIKey below is a test fixture, not a real credential
+			name:            "production boots with a real demo api key, demo mode off, and a master key",
+			appEnv:          "production",
+			demoAPIKey:      "glk_real_production_key",
+			masterKey:       testMasterKeyB64,
+			wantDemoMode:    false,
+			wantSeedEnabled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("DEFAULT_CURRENCY", "")
+			// t.Setenv cannot unset; loadConfig's getenv/getenvBool already
+			// treat an empty string as unset, so setting these to "" when a
+			// test case leaves them blank has the same effect as never
+			// setting them.
+			t.Setenv("APP_ENV", tt.appEnv)
+			t.Setenv("DEMO_MODE", tt.demoMode)
+			t.Setenv("DEMO_API_KEY", tt.demoAPIKey)
+			t.Setenv("LEDGER_MASTER_KEY", tt.masterKey)
+			t.Setenv("SEED_ENABLED", "")
+
+			cfg, err := loadConfig()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("loadConfig() with APP_ENV=%q DEMO_MODE=%q DEMO_API_KEY=%q: got nil error, want an error",
+						tt.appEnv, tt.demoMode, tt.demoAPIKey)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig(): unexpected error: %v", err)
+			}
+			if cfg.demoMode != tt.wantDemoMode {
+				t.Errorf("demoMode = %v, want %v", cfg.demoMode, tt.wantDemoMode)
+			}
+			if cfg.seedEnabled != tt.wantSeedEnabled {
+				t.Errorf("seedEnabled = %v, want %v", cfg.seedEnabled, tt.wantSeedEnabled)
+			}
+		})
+	}
+}
+
 // fakeKeyStore is an in-memory api_keys store for the provisioning test. It
-// mirrors the two behaviours provisionAPIKeys depends on from the real
-// postgres repository: a second insert of the same key_hash fails with a
-// Postgres unique-violation (23505) rather than overwriting, and a stored key
-// resolves back by hash so the resolver can find it.
+// mirrors the behaviours provisionAPIKeys depends on from the real postgres
+// repository: a second insert of the same key_hash fails with a Postgres
+// unique-violation (23505) rather than overwriting, a second CreateTenant for
+// the same id fails with domain.ErrTenantAlreadyExists rather than
+// overwriting, and a stored key resolves back by hash so the resolver can
+// find it.
 type fakeKeyStore struct {
-	byHash map[string]domain.APIKey
+	byHash  map[string]domain.APIKey
+	tenants map[string]bool
 }
 
 func newFakeKeyStore() *fakeKeyStore {
-	return &fakeKeyStore{byHash: map[string]domain.APIKey{}}
+	return &fakeKeyStore{byHash: map[string]domain.APIKey{}, tenants: map[string]bool{}}
+}
+
+func (s *fakeKeyStore) CreateTenant(_ context.Context, tenantID, _ string) error {
+	if s.tenants[tenantID] {
+		return domain.ErrTenantAlreadyExists
+	}
+	s.tenants[tenantID] = true
+	return nil
 }
 
 func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash string) error {
@@ -149,16 +373,37 @@ func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash 
 	if k.ID == "" {
 		k.ID = "id-" + keyHash
 	}
+	if len(k.Scopes) == 0 {
+		// Mirrors the real api_keys.scopes column default (migration 0012):
+		// provisionAPIKeys never sets Scopes explicitly, so a real insert
+		// picks up {read,post} from the DB default. This in-memory fake has
+		// no DB default to fall back on, so it applies the same one here.
+		k.Scopes = []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	}
 	s.byHash[keyHash] = k
 	return nil
 }
 
+// GetAPIKeyByHash defaults an unset TenantStatus to active: this fake has no
+// tenants table of its own, and every key provisionAPIKeys inserts here
+// stands for a tenant that exists and is active (the case these tests cover;
+// tenant status gating itself is tested in internal/auth against a fake that
+// tracks status explicitly).
 func (s *fakeKeyStore) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
 	k, ok := s.byHash[hash]
 	if !ok {
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
 	}
+	if k.TenantStatus == "" {
+		k.TenantStatus = domain.TenantActive
+	}
 	return k, nil
+}
+
+// TouchAPIKeyLastUsed is a no-op: these provisioning tests do not assert on
+// last_used_at, which is covered in internal/auth's own tests.
+func (s *fakeKeyStore) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
+	return nil
 }
 
 // TestProvisionAPIKeysIsIdempotent proves provisionAPIKeys is safe to run on
@@ -188,6 +433,7 @@ func TestProvisionAPIKeysIsIdempotent(t *testing.T) {
 			store := newFakeKeyStore()
 			cfg := config{
 				defaultTenant:   demoTenant,
+				demoMode:        true,
 				demoAPIKey:      defaultDemoAPIKey,
 				loadTestKey:     tt.loadTestKey,
 				loadTestTenants: tt.loadTestTenants,
@@ -251,5 +497,111 @@ func TestProvisionAPIKeysIsIdempotent(t *testing.T) {
 				seenTenants[tenantKey.TenantID] = true
 			}
 		})
+	}
+}
+
+// TestProvisionAPIKeysDemoModeGate proves demo behavior is opt-in (ADR-015,
+// "Safe-by-default deployment"): with demoMode false, provisionAPIKeys
+// provisions no demo key row, the demo key does not resolve, and nothing
+// about a demo key is logged.
+func TestProvisionAPIKeysDemoModeGate(t *testing.T) {
+	const demoTenant = "00000000-0000-0000-0000-0000000000bb"
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	store := newFakeKeyStore()
+	cfg := config{
+		defaultTenant: demoTenant,
+		demoMode:      false,
+		demoAPIKey:    defaultDemoAPIKey,
+	}
+
+	if err := provisionAPIKeys(context.Background(), store, cfg, logger); err != nil {
+		t.Fatalf("provisionAPIKeys: %v", err)
+	}
+
+	if got := len(store.byHash); got != 0 {
+		t.Errorf("api key rows = %d, want 0 when demo mode is off", got)
+	}
+
+	resolver := auth.NewResolver(store, time.Minute)
+	if _, err := resolver.Resolve(context.Background(), "Bearer "+defaultDemoAPIKey); !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("demo key resolve err = %v, want ErrUnauthorized when demo mode is off", err)
+	}
+
+	if strings.Contains(strings.ToLower(logBuf.String()), "demo") {
+		t.Errorf("log mentions a demo key when demo mode is off: %q", logBuf.String())
+	}
+}
+
+// fakeSweeper is an in-memory idempotencySweeper: each call to
+// SweepExpiredIdempotencyKeys pops the next queued result (or reports an
+// error) and signals a buffered channel so a test can wait for a specific
+// number of calls without a real database or a sleep-based race.
+type fakeSweeper struct {
+	mu      sync.Mutex
+	results []int64 // -1 means "return an error instead"
+	calls   chan int64
+}
+
+func newFakeSweeper(results ...int64) *fakeSweeper {
+	return &fakeSweeper{results: results, calls: make(chan int64, len(results)+8)}
+}
+
+func (s *fakeSweeper) SweepExpiredIdempotencyKeys(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	if len(s.results) > 0 {
+		n = s.results[0]
+		s.results = s.results[1:]
+	}
+	if n == -1 {
+		s.calls <- -1
+		return 0, errors.New("fake sweep failure")
+	}
+	s.calls <- n
+	return n, nil
+}
+
+// TestRunIdempotencySweep proves the background sweep (Task 4.5, audit A1.4)
+// runs once immediately (not waiting a full interval first), keeps running
+// on the ticker until its context is cancelled, and survives a failed sweep
+// (logged, not fatal) rather than exiting the loop.
+func TestRunIdempotencySweep(t *testing.T) {
+	sweeper := newFakeSweeper(3, -1, 0, 5)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runIdempotencySweep(ctx, logger, sweeper, time.Millisecond)
+		close(done)
+	}()
+
+	// Wait for all four queued results to have been consumed: the immediate
+	// call plus three ticks.
+	for i := 0; i < 4; i++ {
+		select {
+		case <-sweeper.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for sweep call %d", i+1)
+		}
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runIdempotencySweep did not return after its context was cancelled")
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "idempotency key sweep failed") {
+		t.Errorf("log missing the failed-sweep error line: %q", logs)
+	}
+	if !strings.Contains(logs, "idempotency keys swept") {
+		t.Errorf("log missing a successful non-zero sweep line: %q", logs)
 	}
 }

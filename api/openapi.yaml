@@ -18,6 +18,33 @@ components:
         - entries
         - next_cursor
       type: object
+    AccountBalanceBody:
+      additionalProperties: false
+      properties:
+        account_id:
+          type: string
+        balance:
+          description: Signed derived balance in minor units
+          format: int64
+          type: integer
+        currency:
+          type: string
+        is_system:
+          description: true for a system account (e.g. an FX clearing account), which carries a permanent open position rather than a normal user-owned balance
+          type: boolean
+        name:
+          type: string
+        type:
+          description: "One of: asset, liability, equity, income, expense"
+          type: string
+      required:
+        - account_id
+        - name
+        - type
+        - currency
+        - is_system
+        - balance
+      type: object
     AccountBody:
       additionalProperties: false
       properties:
@@ -27,7 +54,20 @@ components:
         id:
           description: Account id (UUID)
           type: string
+        min_balance:
+          description: Optional minimum balance floor, in minor units. Omitted when unset.
+          format: int64
+          type: integer
         name:
+          type: string
+        party_reference:
+          description: Optional external customer/party id, for linking to an external KYC system. Omitted when unset.
+          type: string
+        party_type:
+          description: Optional free-text party classification, e.g. individual or business. Omitted when unset.
+          type: string
+        status:
+          description: "One of: active, frozen, closed"
           type: string
         type:
           description: "One of: asset, liability, equity, income, expense"
@@ -37,6 +77,7 @@ components:
         - name
         - type
         - currency
+        - status
       type: object
     AccountsOutputBody:
       additionalProperties: false
@@ -49,6 +90,22 @@ components:
             - "null"
       required:
         - accounts
+      type: object
+    AuditAnchorBody:
+      additionalProperties: false
+      properties:
+        chain_seq:
+          format: int64
+          type: integer
+        created_at:
+          format: date-time
+          type: string
+        row_hash:
+          type: string
+      required:
+        - chain_seq
+        - row_hash
+        - created_at
       type: object
     AuditEntryBody:
       additionalProperties: false
@@ -73,6 +130,18 @@ components:
         - actor
         - after
         - created_at
+      type: object
+    AuditHeadBody:
+      additionalProperties: false
+      properties:
+        chain_seq:
+          format: int64
+          type: integer
+        row_hash:
+          type: string
+      required:
+        - chain_seq
+        - row_hash
       type: object
     AuditListOutputBody:
       additionalProperties: false
@@ -140,10 +209,22 @@ components:
           description: ISO 4217 alphabetic code. Defaults to the server's DEFAULT_CURRENCY when omitted.
           pattern: ^[A-Z]{3}$
           type: string
+        min_balance:
+          description: Optional minimum balance floor, in minor units. Omit for no floor.
+          format: int64
+          type: integer
         name:
           description: Human-readable account name
           maxLength: 200
           minLength: 1
+          type: string
+        party_reference:
+          description: Optional external customer/party id (KYC linkage). Omit if not linked to an external party system.
+          maxLength: 256
+          type: string
+        party_type:
+          description: Optional free-text party classification, e.g. individual or business.
+          maxLength: 256
           type: string
         type:
           description: Fundamental account class
@@ -158,12 +239,27 @@ components:
         - name
         - type
       type: object
+    CreateTenantInputBody:
+      additionalProperties: false
+      properties:
+        name:
+          description: Human-readable tenant name
+          maxLength: 200
+          minLength: 1
+          type: string
+      required:
+        - name
+      type: object
     CreateTransactionInputBody:
       additionalProperties: false
       properties:
         currency:
           description: ISO 4217 code shared by every posting
           pattern: ^[A-Z]{3}$
+          type: string
+        effective_at:
+          description: Optional value date, distinct from when the transaction was posted. Defaults to the post time when omitted.
+          format: date-time
           type: string
         postings:
           description: Two or more legs that must sum to zero
@@ -174,9 +270,80 @@ components:
           type:
             - array
             - "null"
+        reference:
+          description: Optional external reference for reconciliation, unique per tenant. Reusing one already in use returns 409.
+          maxLength: 256
+          type: string
       required:
         - currency
         - postings
+      type: object
+    CreateWebhookSubscriptionInputBody:
+      additionalProperties: false
+      properties:
+        event_types:
+          description: Actions to receive, e.g. transaction.created, transaction.reversed. Omit (or leave empty) to receive every action.
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        tenant_id:
+          description: Tenant this subscription belongs to
+          format: uuid
+          type: string
+        url:
+          description: Callback URL; must be an absolute http or https URL
+          type: string
+      required:
+        - tenant_id
+        - url
+      type: object
+    CurrencyBalanceBody:
+      additionalProperties: false
+      properties:
+        currency:
+          type: string
+        imbalance:
+          description: true if net is nonzero, which should never happen
+          type: boolean
+        net:
+          description: Sum of every posting in this currency across the tenant, in minor units. Must be zero in a correct double-entry ledger.
+          format: int64
+          type: integer
+      required:
+        - currency
+        - net
+        - imbalance
+      type: object
+    DisputeBody:
+      additionalProperties: false
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        reason:
+          type: string
+        resolution_transaction_id:
+          description: The reversal posted on resolution, if any. Only set when status is resolved_reversed.
+          type: string
+        resolved_at:
+          description: When the dispute was resolved. Unset while status is open.
+          format: date-time
+          type: string
+        status:
+          description: "One of: open, resolved_reversed, resolved_rejected"
+          type: string
+        transaction_id:
+          type: string
+      required:
+        - id
+        - transaction_id
+        - status
+        - reason
+        - created_at
       type: object
     ErrorDetail:
       additionalProperties: false
@@ -277,6 +444,11 @@ components:
     HealthOutputBody:
       additionalProperties: false
       properties:
+        revision:
+          description: Build revision (git short SHA) the running binary was built from; "dev" outside a real build
+          examples:
+            - a1b2c3d
+          type: string
         status:
           description: Liveness status, "ok" while the service is serving
           examples:
@@ -284,6 +456,210 @@ components:
           type: string
       required:
         - status
+        - revision
+      type: object
+    IssueKeyInputBody:
+      additionalProperties: false
+      properties:
+        expires_at:
+          description: Optional expiry. Omit for a key that never expires.
+          format: date-time
+          type: string
+        name:
+          description: Human-readable label for this key
+          maxLength: 200
+          minLength: 1
+          type: string
+        scopes:
+          description: "One or more of: read, post, admin"
+          items:
+            type: string
+          minItems: 1
+          type:
+            - array
+            - "null"
+        tenant_id:
+          description: Tenant this key acts as
+          format: uuid
+          type: string
+      required:
+        - tenant_id
+        - name
+        - scopes
+      type: object
+    IssuedKeyBody:
+      additionalProperties: false
+      properties:
+        expires_at:
+          description: Null if the key never expires
+          format: date-time
+          type:
+            - string
+            - "null"
+        id:
+          type: string
+        name:
+          type: string
+        plaintext:
+          description: "The api key credential, e.g. for the Authorization: Bearer header. Shown once: store it now, it cannot be retrieved again."
+          type: string
+        scopes:
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        tenant_id:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - name
+        - scopes
+        - expires_at
+        - plaintext
+      type: object
+    IssuedWebhookSubscriptionBody:
+      additionalProperties: false
+      properties:
+        event_types:
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        id:
+          type: string
+        secret:
+          description: "HMAC-SHA256 signing secret. Shown once: store it now, it cannot be retrieved again. Verify each delivery's X-Ledger-Signature header as sha256=hex(hmac_sha256(secret, raw_body))."
+          type: string
+        tenant_id:
+          type: string
+        url:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - url
+        - event_types
+        - secret
+      type: object
+    KeyBody:
+      additionalProperties: false
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        expires_at:
+          description: Null if the key never expires
+          format: date-time
+          type:
+            - string
+            - "null"
+        id:
+          description: Key id (UUID)
+          type: string
+        last_used_at:
+          description: Null if the key has never been used
+          format: date-time
+          type:
+            - string
+            - "null"
+        name:
+          type: string
+        revoked_at:
+          description: Null if the key is still live
+          format: date-time
+          type:
+            - string
+            - "null"
+        scopes:
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        tenant_id:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - name
+        - scopes
+        - expires_at
+        - last_used_at
+        - revoked_at
+        - created_at
+      type: object
+    ListDisputesOutputBody:
+      additionalProperties: false
+      properties:
+        disputes:
+          items:
+            $ref: "#/components/schemas/DisputeBody"
+          type:
+            - array
+            - "null"
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+      required:
+        - disputes
+        - next_cursor
+      type: object
+    ListKeysOutputBody:
+      additionalProperties: false
+      properties:
+        keys:
+          items:
+            $ref: "#/components/schemas/KeyBody"
+          type:
+            - array
+            - "null"
+      required:
+        - keys
+      type: object
+    ListTenantsOutputBody:
+      additionalProperties: false
+      properties:
+        tenants:
+          items:
+            $ref: "#/components/schemas/TenantBody"
+          type:
+            - array
+            - "null"
+      required:
+        - tenants
+      type: object
+    ListWebhookSubscriptionsOutputBody:
+      additionalProperties: false
+      properties:
+        subscriptions:
+          items:
+            $ref: "#/components/schemas/WebhookSubscriptionBody"
+          type:
+            - array
+            - "null"
+      required:
+        - subscriptions
+      type: object
+    OpenDisputeInputBody:
+      additionalProperties: false
+      properties:
+        reason:
+          description: Free-text reason for the dispute
+          maxLength: 256
+          minLength: 1
+          type: string
+        transaction_id:
+          description: The transaction being disputed; must belong to the caller's tenant
+          format: uuid
+          type: string
+      required:
+        - transaction_id
+        - reason
       type: object
     PostingBody:
       additionalProperties: false
@@ -321,6 +697,72 @@ components:
       required:
         - account_id
         - amount
+      type: object
+    ResolveDisputeInputBody:
+      additionalProperties: false
+      properties:
+        action:
+          description: "reverse: post a real reversal of the disputed transaction. reject: no money moves."
+          enum:
+            - reverse
+            - reject
+          type: string
+      required:
+        - action
+      type: object
+    SetAccountStatusInputBody:
+      additionalProperties: false
+      properties:
+        status:
+          description: New account status
+          enum:
+            - active
+            - frozen
+            - closed
+          type: string
+      required:
+        - status
+      type: object
+    SetTenantPolicyInputBody:
+      additionalProperties: false
+      properties:
+        allowed_currencies:
+          description: Currencies this tenant may post in. Empty (or omitted) means every currency is allowed.
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        daily_volume_limit:
+          description: Max per-currency cumulative debit total for the current day, in minor units. 0 (or omitted) means unlimited.
+          format: int64
+          type: integer
+        max_transaction_amount:
+          description: Max per-currency debit total for a single transaction, in minor units. 0 (or omitted) means unlimited.
+          format: int64
+          type: integer
+      type: object
+    SetTenantStatusInputBody:
+      additionalProperties: false
+      properties:
+        status:
+          description: New tenant status
+          enum:
+            - active
+            - suspended
+            - closed
+          type: string
+      required:
+        - status
+      type: object
+    ShredTenantPIIInputBody:
+      additionalProperties: false
+      properties:
+        confirm:
+          description: "Must be true. This operation is irreversible: it permanently destroys the tenant's PII encryption key, and every posting description ever encrypted under it becomes permanently unreadable."
+          type: boolean
+      required:
+        - confirm
       type: object
     StatementEntryBody:
       additionalProperties: false
@@ -375,9 +817,29 @@ components:
         - entries
         - next_cursor
       type: object
+    TenantBody:
+      additionalProperties: false
+      properties:
+        id:
+          description: Tenant id (UUID)
+          type: string
+        name:
+          type: string
+        status:
+          description: "One of: active, suspended, closed"
+          type: string
+      required:
+        - id
+        - name
+        - status
+      type: object
     TransactionBody:
       additionalProperties: false
       properties:
+        effective_at:
+          description: Value date; defaults to when the transaction was posted if not supplied
+          format: date-time
+          type: string
         id:
           type: string
         postings:
@@ -386,13 +848,60 @@ components:
           type:
             - array
             - "null"
+        reference:
+          description: Optional client-supplied external reference, unique per tenant
+          type: string
+        reverses_transaction_id:
+          description: "Set only when this transaction is a reversal: the id of the transaction it reverses"
+          type: string
       required:
         - id
         - postings
+        - effective_at
+      type: object
+    TransactionListOutputBody:
+      additionalProperties: false
+      properties:
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+        transactions:
+          items:
+            $ref: "#/components/schemas/TransactionBody"
+          type:
+            - array
+            - "null"
+      required:
+        - transactions
+        - next_cursor
+      type: object
+    TrialBalanceOutputBody:
+      additionalProperties: false
+      properties:
+        accounts:
+          items:
+            $ref: "#/components/schemas/AccountBalanceBody"
+          type:
+            - array
+            - "null"
+        currencies:
+          items:
+            $ref: "#/components/schemas/CurrencyBalanceBody"
+          type:
+            - array
+            - "null"
+      required:
+        - currencies
+        - accounts
       type: object
     VerifyAuditOutputBody:
       additionalProperties: false
       properties:
+        anchor:
+          $ref: "#/components/schemas/AuditAnchorBody"
+          description: The tenant's most recently recorded off-box anchor, or null if none has been recorded yet
         checked:
           format: int64
           type: integer
@@ -401,12 +910,52 @@ components:
           type:
             - string
             - "null"
+        head:
+          $ref: "#/components/schemas/AuditHeadBody"
+          description: The tenant's current chain head (chain_seq + row_hash), or null for an empty chain
+        pending:
+          description: "Posted events not yet reflected in the chain (ADR-017): the chain is built asynchronously, so this lags briefly behind posting"
+          format: int64
+          type: integer
         valid:
           type: boolean
       required:
         - valid
         - checked
         - first_break_id
+        - pending
+        - head
+        - anchor
+      type: object
+    WebhookSubscriptionBody:
+      additionalProperties: false
+      properties:
+        active:
+          type: boolean
+        created_at:
+          format: date-time
+          type: string
+        event_types:
+          description: Actions this subscription receives; empty means every action
+          items:
+            type: string
+          type:
+            - array
+            - "null"
+        id:
+          description: Subscription id (UUID)
+          type: string
+        tenant_id:
+          type: string
+        url:
+          type: string
+      required:
+        - id
+        - tenant_id
+        - url
+        - event_types
+        - active
+        - created_at
       type: object
   securitySchemes:
     bearerAuth:
@@ -440,7 +989,7 @@ openapi: 3.1.0
 paths:
   /healthz:
     get:
-      description: Returns 200 with {"status":"ok"} while the service is up. Used by the deploy pipeline and uptime monitoring.
+      description: Returns 200 with {"status":"ok","revision":"<build revision>"} while the service is up. Used by the deploy pipeline and uptime monitoring.
       operationId: health-check
       responses:
         "200":
@@ -673,10 +1222,470 @@ paths:
       summary: List an account's postings with running balance
       tags:
         - accounts
+  /v1/accounts/{id}/statement/export:
+    get:
+      description: "Exports the account's postings within an optional from/to created_at window (from inclusive, to exclusive), each with its running balance, as csv (default, one row per posting) or json. Not paged: bounded instead at a fixed row cap (the same ledger.MaxExportRows GET /v1/transactions/export uses), so a longer matching history than the cap yields only the newest rows up to it, reported via the Export-Truncated response header."
+      operationId: export-account-statement
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+        - description: RFC3339 timestamp. Only postings created at or after this time.
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: RFC3339 timestamp. Only postings created at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only postings created strictly before this time.
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: RFC3339 timestamp. Only postings created strictly before this time.
+            type: string
+        - description: "csv (default): one row per posting, with a header row. json: an array of statement entries."
+          explode: false
+          in: query
+          name: format
+          schema:
+            default: csv
+            description: "csv (default): one row per posting, with a header row. json: an array of statement entries."
+            enum:
+              - csv
+              - json
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                contentEncoding: base64
+                type: string
+          description: OK
+          headers:
+            Content-Disposition:
+              schema:
+                description: Set to attachment for csv; unset for json
+                type: string
+            Content-Type:
+              schema:
+                type: string
+            Export-Truncated:
+              schema:
+                description: true if the account's matching posting history exceeds the export row cap and this export contains only the newest rows up to it
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Export an account's period statement
+      tags:
+        - accounts
+  /v1/accounts/{id}/status:
+    post:
+      operationId: set-account-status
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAccountStatusInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Freeze, close, or reactivate an account
+      tags:
+        - accounts
+  /v1/admin/keys:
+    get:
+      description: "Lists every key for a tenant, live and revoked, oldest first. Never includes a plaintext: that is shown once, at issue or rotate time, and is never recoverable afterward."
+      operationId: list-keys
+      parameters:
+        - description: Tenant to list keys for
+          explode: false
+          in: query
+          name: tenant_id
+          required: true
+          schema:
+            description: Tenant to list keys for
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListKeysOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List a tenant's api keys
+      tags:
+        - admin
+    post:
+      description: "Mints a new api key for a tenant. The plaintext is returned exactly once, in this response, and is never stored or recoverable again: store it now."
+      operationId: issue-key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IssueKeyInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedKeyBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Issue a new api key
+      tags:
+        - admin
+  /v1/admin/keys/{id}/revoke:
+    post:
+      operationId: revoke-key
+      parameters:
+        - description: Key id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Key id
+            format: uuid
+            type: string
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Revoke an api key
+      tags:
+        - admin
+  /v1/admin/keys/{id}/rotate:
+    post:
+      description: Mints a replacement key with the same tenant, name, and scopes as an existing one. The old key is left active (an overlap window for callers to cut over); revoke it explicitly once they have.
+      operationId: rotate-key
+      parameters:
+        - description: Key id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Key id
+            format: uuid
+            type: string
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedKeyBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Rotate an api key
+      tags:
+        - admin
+  /v1/admin/tenants:
+    get:
+      operationId: list-tenants
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListTenantsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List tenants
+      tags:
+        - admin
+    post:
+      operationId: create-tenant
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTenantInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Create a tenant
+      tags:
+        - admin
+  /v1/admin/tenants/{id}/policy:
+    post:
+      description: "Sets the tenant's optional per-currency guardrails (Task 2.4b): a max transaction amount, a daily volume cap, and a currency allowlist. Writes the full policy the body describes; an omitted field clears (unlimits) that guardrail rather than leaving a previous value in place."
+      operationId: set-tenant-policy
+      parameters:
+        - description: Tenant id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Tenant id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetTenantPolicyInputBody"
+        required: true
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Set a tenant's posting guardrails
+      tags:
+        - admin
+  /v1/admin/tenants/{id}/shred-pii:
+    post:
+      description: "Crypto-shredding (Task 6.2): destroys the tenant's Data Encryption Key. Every posting description ever encrypted under it becomes permanently unreadable (a later read returns a redacted marker, not an error); money data (accounts, transactions, amounts, balances) and the tamper-evident audit hash chain are completely untouched and remain verifiable. THIS CANNOT BE UNDONE: there is no way to recover an erased description, by anyone, once this call succeeds. Requires confirm: true in the body. Idempotent: calling it again for an already-shredded tenant succeeds with no effect."
+      operationId: shred-tenant-pii
+      parameters:
+        - description: Tenant id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Tenant id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ShredTenantPIIInputBody"
+        required: true
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Irreversibly erase a tenant's PII encryption key
+      tags:
+        - admin
+  /v1/admin/tenants/{id}/status:
+    post:
+      operationId: set-tenant-status
+      parameters:
+        - description: Tenant id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Tenant id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetTenantStatusInputBody"
+        required: true
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Suspend, close, or reactivate a tenant
+      tags:
+        - admin
+  /v1/admin/webhooks:
+    get:
+      description: "Lists every subscription for a tenant, active or not. Never includes the signing secret: that is shown once, at creation time, and is never recoverable afterward."
+      operationId: list-webhook-subscriptions
+      parameters:
+        - description: Tenant to list webhook subscriptions for
+          explode: false
+          in: query
+          name: tenant_id
+          required: true
+          schema:
+            description: Tenant to list webhook subscriptions for
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWebhookSubscriptionsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List a tenant's webhook subscriptions
+      tags:
+        - admin
+    post:
+      description: "Registers a callback URL to receive signed, retried, at-least-once webhook deliveries for a tenant's posted transactions (Task 4.1). The signing secret is returned exactly once, in this response, and is never stored anywhere recoverable again: store it now to verify each delivery's X-Ledger-Signature header."
+      operationId: create-webhook-subscription
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWebhookSubscriptionInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedWebhookSubscriptionBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Create a webhook subscription
+      tags:
+        - admin
+  /v1/admin/webhooks/{id}:
+    delete:
+      description: "Deactivates the subscription: the fan-out worker stops creating new pending deliveries for it and the delivery worker stops attempting its existing pending ones, but its delivery history is kept, not discarded."
+      operationId: delete-webhook-subscription
+      parameters:
+        - description: Webhook subscription id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Webhook subscription id
+            format: uuid
+            type: string
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Delete a webhook subscription
+      tags:
+        - admin
   /v1/audit/verify:
     get:
-      description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012).
+      description: Walks the caller's tenant audit chain oldest first and recomputes every row's hash, detecting any row that was altered after it was written (ADR-012). The chain itself is built asynchronously by a single background chainer (ADR-017), so `pending` reports how many posted events are not yet reflected in it; a nonzero, non-growing pending count is normal lag, not a fault.
       operationId: verify-audit-chain
+      parameters:
+        - description: "When true, verify only from the tenant's latest off-box anchor (bounded cost) instead of from genesis (complete but O(chain length)). Falls back to a full verify when the tenant has no anchor yet. See the response's anchor field and ADR-012's Task 5.3 addendum for the trust model this trades: the anchored prefix is trusted as a checkpoint, not re-proven."
+          explode: false
+          in: query
+          name: fast
+          schema:
+            description: "When true, verify only from the tenant's latest off-box anchor (bounded cost) instead of from genesis (complete but O(chain length)). Falls back to a full verify when the tenant has no anchor yet. See the response's anchor field and ADR-012's Task 5.3 addendum for the trust model this trades: the anchored prefix is trusted as a checkpoint, not re-proven."
+            type: boolean
       responses:
         "200":
           content:
@@ -695,16 +1704,241 @@ paths:
       summary: Verify the tamper-evident audit chain
       tags:
         - audit
-  /v1/transactions:
+  /v1/disputes:
+    get:
+      description: "Lists the tenant's disputes, newest first, optionally filtered by status. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
+      operationId: list-disputes
+      parameters:
+        - description: "Optional filter: one of open, resolved_reversed, resolved_rejected. Omitted returns every status."
+          explode: false
+          in: query
+          name: status
+          schema:
+            description: "Optional filter: one of open, resolved_reversed, resolved_rejected. Omitted returns every status."
+            type: string
+        - description: Max disputes per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max disputes per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListDisputesOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List disputes
+      tags:
+        - disputes
     post:
-      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict."
+      description: Opens a dispute (status open) against transaction_id, which must belong to the caller's tenant. Opening a dispute records intent only; no money moves until it is resolved (POST /v1/disputes/{id}/resolve).
+      operationId: open-dispute
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenDisputeInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Open a dispute against a transaction
+      tags:
+        - disputes
+  /v1/disputes/{id}:
+    get:
+      operationId: get-dispute
+      parameters:
+        - description: Dispute id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Dispute id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Get a dispute
+      tags:
+        - disputes
+  /v1/disputes/{id}/resolve:
+    post:
+      description: Resolves the dispute named by id. action=reverse posts a real reversal of the disputed transaction through the normal posting path (screening, policy, account status, encryption), sets resolution_transaction_id to the reversal's id, and moves status to resolved_reversed; if the transaction was already reversed by other means, the existing reversal is reused rather than posting a second one. action=reject moves status to resolved_rejected with no money movement. Resolving an already-resolved dispute returns 409 Conflict.
+      operationId: resolve-dispute
+      parameters:
+        - description: Dispute id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Dispute id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveDisputeInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Resolve a dispute
+      tags:
+        - disputes
+  /v1/reports/trial-balance:
+    get:
+      description: Returns, for the caller's tenant, each currency's net posted total (which must be zero in a correct double-entry ledger, the balance proof) and every account's derived balance, including system (FX clearing) accounts, which hold the FX position and are part of the proof.
+      operationId: trial-balance
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrialBalanceOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: "Trial balance: the double-entry balance proof"
+      tags:
+        - reports
+  /v1/transactions:
+    get:
+      description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive) and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
+      operationId: list-transactions
+      parameters:
+        - description: RFC3339 timestamp. Only transactions created at or after this time.
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: RFC3339 timestamp. Only transactions created at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions created strictly before this time.
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: RFC3339 timestamp. Only transactions created strictly before this time.
+            type: string
+        - description: Exact match on the transaction's reference.
+          explode: false
+          in: query
+          name: reference
+          schema:
+            description: Exact match on the transaction's reference.
+            type: string
+        - description: Max transactions per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max transactions per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionListOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List transactions
+      tags:
+        - transactions
+    post:
+      description: "Posts a balanced transaction whose postings sum to zero in the given currency. Requires an Idempotency-Key header to make retries safe: a repeat with the same key returns the original transaction (with Idempotent-Replayed: true) instead of posting again, and reusing a key with a different body returns 409 Conflict. A key's replay window is bounded (server-configured IDEMPOTENCY_TTL, default 24h): after that window a reused key is treated as never having been used, so the same header value posts a new transaction instead of replaying or conflicting; retry within the window if you need the original guarantee. An optional reference (an external id for reconciliation) must be unique per tenant when supplied: reusing one already in use returns 409 Conflict too, distinct from the idempotency-key conflict. An optional effective_at sets the value date; omitted, it defaults to the post time."
       operationId: create-transaction
       parameters:
-        - description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+        - description: "Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new transaction instead of replaying or conflicting."
           in: header
           name: Idempotency-Key
           schema:
-            description: Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409.
+            description: "Required. Retrying with the same key returns the original transaction; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new transaction instead of replaying or conflicting."
             maxLength: 255
             type: string
       requestBody:
@@ -737,14 +1971,14 @@ paths:
         - transactions
   /v1/transactions/convert:
     post:
-      description: "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict."
+      description: "Converts source_amount from the from_account's currency into the to_account's currency, at the tenant's current FX rate, and posts the four resulting legs (debit the from account, credit its currency's clearing account, debit the to currency's clearing account, credit the to account) atomically. The destination currency always comes from the to account: a client cannot supply a rate or target currency directly. Requires an Idempotency-Key header, the same as POST /v1/transactions: a repeat with the same key returns the original conversion (with Idempotent-Replayed: true) instead of converting again, and reusing a key with a different body returns 409 Conflict. The same bounded replay window applies (server-configured IDEMPOTENCY_TTL, default 24h): past it, a reused key is treated as never having been used and converts again instead of replaying or conflicting."
       operationId: convert-transaction
       parameters:
-        - description: Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409.
+        - description: "Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new conversion instead of replaying or conflicting."
           in: header
           name: Idempotency-Key
           schema:
-            description: Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409.
+            description: "Required. Retrying with the same key returns the original conversion; reusing a key with a different body returns 409. Keys are remembered for a bounded replay window (server-configured IDEMPOTENCY_TTL, default 24h): once a key expires it is treated as unused, so reusing it after the window starts a brand-new conversion instead of replaying or conflicting."
             maxLength: 255
             type: string
       requestBody:
@@ -773,6 +2007,74 @@ paths:
       security:
         - bearerAuth: []
       summary: Convert between currencies
+      tags:
+        - transactions
+  /v1/transactions/export:
+    get:
+      description: "Exports the tenant's transactions matching the same from/to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only."
+      operationId: export-transactions
+      parameters:
+        - description: RFC3339 timestamp. Only transactions created at or after this time.
+          explode: false
+          in: query
+          name: from
+          schema:
+            description: RFC3339 timestamp. Only transactions created at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions created strictly before this time.
+          explode: false
+          in: query
+          name: to
+          schema:
+            description: RFC3339 timestamp. Only transactions created strictly before this time.
+            type: string
+        - description: Exact match on the transaction's reference.
+          explode: false
+          in: query
+          name: reference
+          schema:
+            description: Exact match on the transaction's reference.
+            type: string
+        - description: "csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."
+          explode: false
+          in: query
+          name: format
+          schema:
+            default: csv
+            description: "csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."
+            enum:
+              - csv
+              - json
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                contentEncoding: base64
+                type: string
+          description: OK
+          headers:
+            Content-Disposition:
+              schema:
+                description: Set to attachment for csv; unset for json
+                type: string
+            Content-Type:
+              schema:
+                type: string
+            Export-Truncated:
+              schema:
+                description: true if the tenant's matching history exceeds the export row cap and this export contains only the newest rows up to it
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Export transactions
       tags:
         - transactions
   /v1/transactions/{id}:
@@ -833,6 +2135,41 @@ paths:
       security:
         - bearerAuth: []
       summary: List a transaction's audit log
+      tags:
+        - transactions
+  /v1/transactions/{id}/reverse:
+    post:
+      description: "Posts the negated legs of the transaction named by id as a new, linked transaction (postings are append-only, ADR-001: this never mutates the original). Idempotent: a transaction can be reversed at most once, so calling this again for the same id returns the SAME reversal, with Already-Reversed: true, instead of posting a second one. Reversing a transaction that is itself a reversal returns 422."
+      operationId: reverse-transaction
+      parameters:
+        - description: Transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Transaction id
+            format: uuid
+            type: string
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionBody"
+          description: Created
+          headers:
+            Already-Reversed:
+              schema:
+                type: boolean
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Reverse a transaction
       tags:
         - transactions
 servers:

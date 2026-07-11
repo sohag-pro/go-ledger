@@ -12,13 +12,17 @@ import (
 )
 
 type Account struct {
-	ID        uuid.UUID
-	TenantID  uuid.UUID
-	Name      string
-	Type      string
-	Currency  string
-	CreatedAt time.Time
-	IsSystem  bool
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	CreatedAt      time.Time
+	IsSystem       bool
+	Status         string
+	MinBalance     pgtype.Int8
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
 }
 
 type ApiKey struct {
@@ -29,6 +33,17 @@ type ApiKey struct {
 	RateLimitRpm pgtype.Int4
 	CreatedAt    time.Time
 	RevokedAt    pgtype.Timestamptz
+	Scopes       []string
+	ExpiresAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
+}
+
+type AuditAnchor struct {
+	ID        int64
+	TenantID  uuid.UUID
+	ChainSeq  int64
+	RowHash   string
+	CreatedAt time.Time
 }
 
 type AuditLog struct {
@@ -42,6 +57,41 @@ type AuditLog struct {
 	CreatedAt     time.Time
 	PrevHash      pgtype.Text
 	RowHash       pgtype.Text
+	ChainSeq      int64
+	OutboxID      pgtype.Int8
+}
+
+type AuditOutbox struct {
+	ID            int64
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	OccurredAt    time.Time
+	Txid          int64
+	CreatedAt     time.Time
+	ProcessedAt   pgtype.Timestamptz
+}
+
+type CryptoKey struct {
+	TenantID   uuid.UUID
+	WrappedDek []byte
+	CreatedAt  time.Time
+	ShreddedAt pgtype.Timestamptz
+	Version    int32
+}
+
+type Dispute struct {
+	ID                      uuid.UUID
+	TenantID                uuid.UUID
+	TransactionID           uuid.UUID
+	Status                  string
+	Reason                  string
+	ResolutionTransactionID pgtype.UUID
+	CreatedAt               time.Time
+	ResolvedAt              pgtype.Timestamptz
 }
 
 type FxRate struct {
@@ -53,14 +103,17 @@ type FxRate struct {
 	Source      string
 	EffectiveAt time.Time
 	CreatedAt   time.Time
+	TenantID    pgtype.UUID
 }
 
 type IdempotencyKey struct {
-	TenantID       uuid.UUID
-	IdempotencyKey string
-	Fingerprint    string
-	TransactionID  uuid.UUID
-	CreatedAt      time.Time
+	TenantID          uuid.UUID
+	IdempotencyKey    string
+	Fingerprint       string
+	TransactionID     uuid.UUID
+	CreatedAt         time.Time
+	FingerprintScheme string
+	ExpiresAt         time.Time
 }
 
 type Posting struct {
@@ -74,16 +127,57 @@ type Posting struct {
 	Currency      string
 }
 
+type Tenant struct {
+	ID        uuid.UUID
+	Name      string
+	Status    string
+	Settings  []byte
+	CreatedAt time.Time
+}
+
 type Transaction struct {
-	ID                uuid.UUID
-	TenantID          uuid.UUID
-	CreatedAt         time.Time
-	FxSourceAmount    pgtype.Int8
-	FxConvertedAmount pgtype.Int8
-	FxMidRateE8       pgtype.Int8
-	FxSpreadBps       pgtype.Int4
-	FxAppliedE8       pgtype.Int8
-	FxRateSource      pgtype.Text
-	FxEffectiveAt     pgtype.Timestamptz
-	FxRateID          pgtype.Int8
+	ID                    uuid.UUID
+	TenantID              uuid.UUID
+	CreatedAt             time.Time
+	FxSourceAmount        pgtype.Int8
+	FxConvertedAmount     pgtype.Int8
+	FxMidRateE8           pgtype.Int8
+	FxSpreadBps           pgtype.Int4
+	FxAppliedE8           pgtype.Int8
+	FxRateSource          pgtype.Text
+	FxEffectiveAt         pgtype.Timestamptz
+	FxRateID              pgtype.Int8
+	ReversesTransactionID pgtype.UUID
+	Reference             pgtype.Text
+	EffectiveAt           pgtype.Timestamptz
+}
+
+type WebhookDelivery struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	SubscriptionID uuid.UUID
+	AuditChainSeq  int64
+	EventType      string
+	Payload        []byte
+	Status         string
+	Attempts       int32
+	NextAttemptAt  time.Time
+	LastError      pgtype.Text
+	CreatedAt      time.Time
+	DeliveredAt    pgtype.Timestamptz
+}
+
+type WebhookFanoutCursor struct {
+	ID           bool
+	LastChainSeq int64
+}
+
+type WebhookSubscription struct {
+	ID         uuid.UUID
+	TenantID   uuid.UUID
+	Url        string
+	Secret     string
+	EventTypes []string
+	Active     bool
+	CreatedAt  time.Time
 }

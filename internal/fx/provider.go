@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
@@ -22,10 +24,13 @@ import (
 // storage, an external rate feed, or anything else; the conversion service
 // depends only on this interface (see ADR-014, decision 4).
 type Provider interface {
-	// Rate returns the current mid quote for converting base into quote,
-	// plus the spread_bps to widen it by, or an error if no rate is known
-	// for the pair in either direction.
-	Rate(ctx context.Context, base, quote domain.Currency) (domain.FXQuote, int32, error)
+	// Rate returns the current mid quote for converting base into quote for
+	// tenantID, plus the spread_bps to widen it by, or an error if no rate
+	// is known for the pair in either direction. A tenant-specific rate for
+	// the pair takes priority over the global default; a tenant with no
+	// rate of its own resolves the global default (Task 2.4, audit A3.3;
+	// see migration 0014 and the CurrentFXRate query).
+	Rate(ctx context.Context, tenantID string, base, quote domain.Currency) (domain.FXQuote, int32, error)
 }
 
 // dbRateProvider is the v1 Provider: it reads the current row from fx_rates
@@ -42,15 +47,24 @@ func NewDBProvider(db sqlc.DBTX) Provider {
 	return &dbRateProvider{q: sqlc.New(db)}
 }
 
-// Rate tries CurrentFXRate(base, quote) first. If that pair is not stored,
-// it tries the reverse, CurrentFXRate(quote, base), and inverts the mid so
+// Rate tries CurrentFXRate(tenantID, base, quote) first. If that pair is not
+// stored (in either the tenant's own rows or the global default), it tries
+// the reverse, CurrentFXRate(tenantID, quote, base), and inverts the mid so
 // the result is still expressed as quote-per-base; the spread returned is
 // the one stored on whichever row was actually found (a spread is a
 // property of the quoted pair, not of the direction it happens to be
-// requested in). If neither direction has a row, it returns
-// domain.ErrFXRateNotFound.
-func (p *dbRateProvider) Rate(ctx context.Context, base, quote domain.Currency) (domain.FXQuote, int32, error) {
-	direct, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{Base: string(base), Quote: string(quote)})
+// requested in). Both lookups resolve a tenant-specific row for tenantID
+// ahead of the global default (Task 2.4, audit A3.3), so the inverse pair
+// honors a tenant's own rate too, not just the direct pair. If neither
+// direction has a row, it returns domain.ErrFXRateNotFound.
+func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote domain.Currency) (domain.FXQuote, int32, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.FXQuote{}, 0, fmt.Errorf("fx: parse tenant id %q: %w", tenantID, err)
+	}
+	pgTenantID := pgtype.UUID{Bytes: tid, Valid: true}
+
+	direct, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: pgTenantID, Base: string(base), Quote: string(quote)})
 	if err == nil {
 		return domain.FXQuote{
 			Base: base, Quote: quote, MidRateE8: direct.MidRateE8,
@@ -64,7 +78,7 @@ func (p *dbRateProvider) Rate(ctx context.Context, base, quote domain.Currency) 
 	// No direct quote: try a single inversion of the reverse pair. This is
 	// deliberately not a multi-hop search through a third currency; v1
 	// stores and inverts exactly the pairs the ledger needs (ADR-014).
-	inverse, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{Base: string(quote), Quote: string(base)})
+	inverse, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: pgTenantID, Base: string(quote), Quote: string(base)})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.FXQuote{}, 0, fmt.Errorf("%w: %s/%s", domain.ErrFXRateNotFound, base, quote)

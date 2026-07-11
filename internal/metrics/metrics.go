@@ -47,10 +47,68 @@ var (
 		Name: "transaction_idempotency_conflicts_total",
 		Help: "Number of transaction posts rejected for an idempotency-key/body mismatch.",
 	})
+
+	// BuildInfo is always 1, labeled with the running binary's build
+	// revision (git short SHA; "dev" outside a real build). Joining other
+	// series against this one in a dashboard or alert shows which revision
+	// produced them; see cmd/server, which sets the single "revision" series
+	// once at startup.
+	BuildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "build_info",
+		Help: "Always 1; labeled by the running binary's build revision.",
+	}, []string{"revision"})
+
+	// AuditOutboxPending is the count of audit_outbox rows not yet chained
+	// (processed_at IS NULL): the chain backlog (ADR-017). Set by
+	// internal/opsmetrics.Collector on an interval, not on the request path.
+	AuditOutboxPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ledger_audit_outbox_pending",
+		Help: "Number of audit_outbox rows the chainer has not yet processed.",
+	})
+
+	// AuditOutboxLagSeconds is the age, in seconds, of the OLDEST unprocessed
+	// audit_outbox row (0 when the outbox is empty): the real "is the
+	// chainer keeping up" signal, since a small pending count can still mean
+	// a stuck chainer if that count never drains.
+	AuditOutboxLagSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ledger_audit_outbox_lag_seconds",
+		Help: "Age in seconds of the oldest unprocessed audit_outbox row; 0 when none are pending.",
+	})
+
+	// WebhookDeliveriesDead is the count of webhook_deliveries rows that
+	// exhausted their retry budget (status = 'dead').
+	WebhookDeliveriesDead = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ledger_webhook_deliveries_dead",
+		Help: "Number of webhook_deliveries rows in the dead state (retry budget exhausted).",
+	})
+
+	// WebhookDeliveriesPending is the count of webhook_deliveries rows still
+	// due for delivery (status IN ('pending', 'failed')).
+	WebhookDeliveriesPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ledger_webhook_deliveries_pending",
+		Help: "Number of webhook_deliveries rows still pending or awaiting retry.",
+	})
+
+	// BalanceInvariantViolations is the balance-invariant canary: the count
+	// of (transaction_id, currency) posting groups whose postings do NOT sum
+	// to zero. The core double-entry invariant (ADR-001, per currency since
+	// ADR-014) guarantees this is 0 in a healthy ledger; any positive value
+	// is a sev-1 signal, since it means money was recorded out of balance.
+	// Mirrors the exact query internal/verify's restore-verifier uses.
+	BalanceInvariantViolations = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ledger_balance_invariant_violations",
+		Help: "Count of transaction/currency posting groups whose postings do not sum to zero. Must be 0; a sev-1 signal otherwise.",
+	})
 )
 
 func init() {
-	registry.MustRegister(PostDuration, SerializationRetries, IdempotencyReplays, IdempotencyConflicts)
+	registry.MustRegister(
+		PostDuration, SerializationRetries, IdempotencyReplays, IdempotencyConflicts,
+		BuildInfo,
+		AuditOutboxPending, AuditOutboxLagSeconds,
+		WebhookDeliveriesDead, WebhookDeliveriesPending,
+		BalanceInvariantViolations,
+	)
 	// Standard runtime and process metrics (go_*, process_*) for baseline
 	// observability: goroutines, memory, GC, open FDs, CPU.
 	registry.MustRegister(

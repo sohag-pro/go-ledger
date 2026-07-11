@@ -6,6 +6,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -13,32 +14,166 @@ import (
 
 type Querier interface {
 	AccountBalance(ctx context.Context, arg AccountBalanceParams) (int64, error)
+	// Task 5.5, audit A1.5: each named account's derived balance, read inside
+	// the caller's SERIALIZABLE RunInTx body so it is consistent with the
+	// CreateTransaction write that follows in the same transaction: two
+	// concurrent posts that would each individually keep an account above its
+	// floor, but together breach it, are a genuine read-write antidependency
+	// SERIALIZABLE detects and aborts one of. Called ONLY for accounts that
+	// AccountStatusFlags reported as having a MinBalance configured (see
+	// AccountStatusFlags's own doc comment for why this query is kept separate
+	// and only run when actually needed). The LEFT JOIN (rather than a subquery
+	// per account) means an account with no postings yet still returns one row,
+	// with balance COALESCEd to 0.
+	AccountBalances(ctx context.Context, arg AccountBalancesParams) ([]AccountBalancesRow, error)
 	// Postings affecting an account, newest first, each with the running balance as
 	// of that posting. The running balance is a window SUM over the account's full
 	// posting history (the CTE); the keyset filter and limit then return one page.
 	// after_created_at / after_id are the keyset position: pass a far-future
 	// timestamp and the max uuid for the first page.
 	AccountStatement(ctx context.Context, arg AccountStatementParams) ([]AccountStatementRow, error)
+	// The per-account period statement export (Task 6.3, audit A9.2): like
+	// AccountStatement above, the running balance is a window SUM over the
+	// account's FULL posting history (the CTE), so a filtered page still shows
+	// each entry's real running balance, not one reset to the filtered window.
+	// from_ts/to_ts are optional via sqlc.narg (NULL disables that bound, the
+	// same half-open [from, to) convention ListTransactions uses); the outer
+	// query applies the date filter and caps the result at row_limit, requested
+	// by the caller as one more than the export cap it wants so a truncated
+	// export can be detected without a second round trip.
+	AccountStatementRange(ctx context.Context, arg AccountStatementRangeParams) ([]AccountStatementRangeRow, error)
+	// Task 5.5, audit A1.5: each named account's current status, min_balance,
+	// and is_system flag ONLY (no balance), read inside the caller's
+	// SERIALIZABLE RunInTx body (see domain.Tx.AccountPostingStates). This is
+	// deliberately split from AccountBalances below: this query touches only the
+	// accounts table, which nothing in the posting path ever writes to (a post
+	// inserts into transactions/postings/audit_outbox/idempotency_keys, never
+	// accounts), so it can never be the read side of a SERIALIZABLE read-write
+	// antidependency against a concurrent post. That is exactly what a combined
+	// query joining postings would risk: reading every historical posting for a
+	// hot account inside the same transaction as a concurrent INSERT into that
+	// account's postings is precisely the kind of broad read-write overlap
+	// SERIALIZABLE flags, and doing it unconditionally on every single post
+	// (unlike the opt-in TenantDailyDebits check) reintroduced, under many-way
+	// single-tenant concurrency onto a handful of accounts, the same class of
+	// retry storm ADR-017 removed the audit chain read to get rid of (see
+	// TestPostConcurrentStressSingleTenant). AccountBalances is now only ever
+	// called for the subset of accounts that actually have a MinBalance set.
+	AccountStatusFlags(ctx context.Context, arg AccountStatusFlagsParams) ([]AccountStatusFlagsRow, error)
+	// The oldest transaction id still in flight, cast the same way audit_outbox.txid
+	// is (xid8 has no direct cast to bigint). A row whose txid is strictly below
+	// this watermark is guaranteed committed and safe to chain (ADR-017,
+	// "Ordering: process only settled rows, in transaction-commit order").
+	AuditOutboxWatermark(ctx context.Context) (int64, error)
+	// Unprocessed outbox rows for one tenant: the lag the verify endpoint reports
+	// alongside the chained head (ADR-017 section 5), so a caller can see whether
+	// the chain is current or behind.
+	CountPendingOutbox(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// min_balance (Task 5.5, audit A1.5), party_reference, and party_type (Task
+	// 6.1, audit A9.1) are all nullable: sqlc.narg leaves each unset (NULL) when
+	// the caller passes no value, matching "no floor configured" / "no party
+	// linkage supplied", every account's behavior before these columns existed.
+	// status is NOT inserted explicitly: the column default ('active', migration
+	// 0022) applies, the same way CreateTenant leaves status to the column
+	// default.
 	CreateAccount(ctx context.Context, arg CreateAccountParams) error
+	// Task 6.3, audit A9.2: status is NOT inserted explicitly (the column
+	// default 'open' applies), the same convention CreateAccount leaves status
+	// to its own column default for.
+	CreateDispute(ctx context.Context, arg CreateDisputeParams) error
 	CreatePosting(ctx context.Context, arg CreatePostingParams) error
+	CreateTenant(ctx context.Context, arg CreateTenantParams) error
 	// currency lives on each posting now (ADR-014), not here: an FX transaction
 	// spans two currencies, so there is no single transaction-level value left to
 	// store. The fx_* columns are the immutable snapshot of the conversion
 	// actually applied; all nullable, since a single-currency transaction (still
-	// the common case) has none of this.
-	CreateTransaction(ctx context.Context, arg CreateTransactionParams) error
-	// The latest quote for (base, quote) at or before now. id DESC is the
-	// deterministic tiebreaker when two rows share the same effective_at (for
-	// example a re-seed within the same second), so "current" always resolves to
-	// exactly one row.
+	// the common case) has none of this. reverses_transaction_id (Task 4.2,
+	// audit A1.2) is likewise nullable: only a reversal carries it. reference and
+	// effective_at (Task 4.3, audit A1.3) are both nullable client-supplied
+	// fields. created_at is RETURNED (not just inserted): the caller uses it to
+	// resolve effective_at's read-time fallback right after a fresh insert,
+	// without a second round trip (see Repository.txRepo.CreateTransaction).
+	CreateTransaction(ctx context.Context, arg CreateTransactionParams) (time.Time, error)
+	// The latest quote for (base, quote) at or before now, preferring a
+	// tenant-specific row over the global default (Task 2.4, audit A3.3):
+	// tenant_id = $1 matches the tenant's own rows, and tenant_id IS NULL always
+	// matches the global default, so a tenant with no row of its own still
+	// resolves the global one. ORDER BY (tenant_id IS NULL) sorts a tenant-owned
+	// row (false, i.e. 0) ahead of a global row (true, i.e. 1), so when both
+	// exist the tenant's own wins regardless of which is more recently
+	// effective; effective_at DESC, id DESC is then the same "latest, ties
+	// broken by insertion order" tiebreak CurrentFXRate always used, applied
+	// within whichever tier (tenant-owned or global) won.
 	CurrentFXRate(ctx context.Context, arg CurrentFXRateParams) (FxRate, error)
+	// Joins tenants so the resolver gets the tenant's current status alongside
+	// the key in the same round trip (Task 2.1, ADR-015): gating needs no extra
+	// query. The join is safe against a dangling reference: api_keys_tenant_fk
+	// (migration 0011) guarantees every api_keys row's tenant_id has a tenants
+	// row. scopes, expires_at, and last_used_at (Task 2.2) are returned as-is:
+	// expiry and scope enforcement happen in the resolver and the transport
+	// middleware, not in this query.
 	GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error)
+	// Raw fetch by id, unfiltered by revoked_at: the admin surface (Task 2.2b)
+	// uses this to look up an existing key (including an already-revoked one) by
+	// id, for example to copy a key's tenant/name/scopes when rotating it. It
+	// does not join tenants: callers that need the tenant's current status look
+	// it up separately via GetTenant.
+	GetAPIKeyByID(ctx context.Context, id uuid.UUID) (GetAPIKeyByIDRow, error)
 	GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error)
-	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
+	// The tenant's current head: chain_seq and row_hash of its latest audit_log
+	// row (Task 5.3). See GetLastAuditHash's own comment (ADR-017) for why
+	// chain_seq, not id or created_at, is the correct "latest" order; this is
+	// the same lookup, just also returning chain_seq, which GetLastAuditHash's
+	// only caller (the chainer) never needed since it only ever extends the
+	// chain from a row_hash. Used to surface the live head alongside the last
+	// off-box anchor (the verify-audit-chain endpoint, internal/api/audit.go)
+	// and by VerifyFromLatestAnchor to fall back to a full verify when no
+	// anchor exists yet. ErrNoRows means the tenant has no audit rows at all.
+	GetAuditHead(ctx context.Context, tenantID uuid.UUID) (GetAuditHeadRow, error)
+	// Read-only lookup of ONE SPECIFIC DEK version, for a decrypt whose stored
+	// ciphertext names the version it was sealed under (ADR-018). Never
+	// creates a row: a description already carrying internal/crypto.EncodingPrefix
+	// implies a key existed for that exact version at encrypt time, so
+	// pgx.ErrNoRows here is a genuine inconsistency for the caller to surface as
+	// an error, not the ordinary first-use case.
+	GetCryptoKeyVersion(ctx context.Context, arg GetCryptoKeyVersionParams) (GetCryptoKeyVersionRow, error)
+	// ADR-018 (Task 6.2 fix): tenant_id's CURRENT (highest-version) key row,
+	// whatever its shredded state. internal/crypto.Cipher.Encrypt uses this to
+	// decide whether to reuse it (found && not shredded) or mint a fresh,
+	// forward version (not found at all, or the current one is shredded): see
+	// MintCryptoKeyVersion below. pgx.ErrNoRows here means the tenant has never
+	// encrypted anything and never been shredded: a genuine first-use case, not
+	// an error, for the caller to handle.
+	GetCurrentCryptoKey(ctx context.Context, tenantID uuid.UUID) (GetCurrentCryptoKeyRow, error)
+	GetDispute(ctx context.Context, arg GetDisputeParams) (Dispute, error)
+	// An expired row is treated as absent (Task 4.5, audit A1.4): the "AND
+	// expires_at > now()" filter is what makes a key whose replay window has
+	// passed behave exactly like a key that was never written, from the caller's
+	// point of view, whether or not the background sweep has physically deleted
+	// the row yet.
+	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (GetIdempotencyKeyRow, error)
 	// The tenant's most recent row_hash, used to extend the per-tenant hash chain.
-	// A fresh tenant (or one with no rows yet) surfaces as pgx.ErrNoRows; the
-	// caller treats that as the chain's genesis (domain.AuditGenesisHash).
+	// Ordered by chain_seq, not id (ADR-017 IMPORTANT 2, migration 0016): id is a
+	// UUIDv7, monotonic only within the ONE process that minted it, so a leader
+	// failover to a different host with clock skew can mint an id LOWER than the
+	// current head, and ordering by id would then return the wrong "latest" row
+	// and corrupt the chain. chain_seq is a plain ascending sequence the single
+	// chainer process advances on every insert, in the same order it assigns
+	// row_hash values, so it stays correct across any failover regardless of
+	// clock skew. created_at is copied from the ORIGINATING event's post time
+	// (audit_outbox.occurred_at), which under concurrent posts across many
+	// transactions is NOT guaranteed to be monotonic with the order those
+	// transactions actually commit in (a transaction that starts later can
+	// commit first); ordering by created_at would occasionally return the wrong
+	// "latest" row too. A fresh tenant (or one with no rows yet) surfaces as
+	// pgx.ErrNoRows; the caller treats that as the chain's genesis
+	// (domain.AuditGenesisHash).
 	GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgtype.Text, error)
+	// The tenant's most recently recorded anchor (Task 5.3): the chain_seq,
+	// row_hash, and timestamp the anchor job last logged off-box for this
+	// tenant. ErrNoRows means no anchor has ever been recorded (a brand-new
+	// tenant, or one that posted before the anchor job's first tick).
+	GetLatestAuditAnchor(ctx context.Context, tenantID uuid.UUID) (GetLatestAuditAnchorRow, error)
 	// The per-tenant per-currency FX clearing account (ADR-014, is_system=true),
 	// created lazily on first use. Keyed by (tenant_id, name): name is the
 	// reserved, deterministic "fx.clearing.<CURRENCY>" string the caller builds,
@@ -64,23 +199,362 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
+	// The reversal of a given original, if one exists (Task 4.2, audit A1.2):
+	// transactions_one_reversal_idx (migration 0017) guarantees at most one row
+	// can ever match, so this is a plain :one lookup, not a list.
+	GetReversalOf(ctx context.Context, arg GetReversalOfParams) (Transaction, error)
+	GetTenant(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetTransaction(ctx context.Context, arg GetTransactionParams) (Transaction, error)
+	// Raw fetch by id: tests and any future delivery-inspection tooling read a
+	// single row's full lifecycle state back this way.
+	GetWebhookDelivery(ctx context.Context, id uuid.UUID) (WebhookDelivery, error)
+	// Reads the singleton fan-out cursor and locks its row for the rest of the
+	// surrounding transaction (Task 4.1): the same "read the watermark, then
+	// act, all in one transaction" shape ADR-017's chainer uses for audit_log,
+	// so the cursor read and its eventual advance (SetWebhookFanoutCursor) never
+	// race a concurrent fan-out pass.
+	GetWebhookFanoutCursorForUpdate(ctx context.Context) (int64, error)
+	// scopes and expires_at (Task 2.2b) are now written on insert: the admin
+	// surface (internal/admin) is what actually sets them to something other
+	// than the column default. Every pre-2.2b caller (cmd/server's demo and
+	// load-test key provisioning, and every repository test that predates
+	// scopes) still works unchanged, because the Go-level repository method
+	// defaults an empty Scopes slice to {read,post} before it ever reaches this
+	// query, the same default the api_keys.scopes column itself carries.
 	InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) error
+	// Records tenantID's current chain head as a new off-box-anchored
+	// checkpoint (Task 5.3, migration 0025). Called only by the periodic
+	// anchor job (internal/audit.AnchorJob), never the request path: the job
+	// runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
+	// insert is not scoped through withTenant the way a request-path write
+	// would be.
+	InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error
+	// outbox_id is the source audit_outbox row this audit_log row was chained
+	// from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a
+	// second attempt to chain the same outbox row fails this insert with a
+	// unique violation instead of silently forking the chain. chain_seq is left
+	// to its column DEFAULT (nextval), never supplied by the caller: it is what
+	// makes chain order immune to any host's clock (see GetLastAuditHash below).
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
+	// Writes one outbox row inside the caller's own transaction (ADR-017): the
+	// event is durable if and only if the surrounding post/convert transaction
+	// commits. occurred_at, txid, and created_at are all left to their column
+	// defaults (the database server's now() and pg_current_xact_id(), see
+	// migration 0015): no chain read, no hash computed, here.
+	InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxParams) error
 	// fx_rates is append-only (ADR-014): a new quote is a new row, never an
 	// update, so every rate ever applied to a transaction stays reconstructible.
+	// tenant_id NULL makes this the global default rate for the pair; a non-NULL
+	// tenant_id makes it that tenant's own rate (Task 2.4, audit A3.3), resolved
+	// ahead of the global default by CurrentFXRate below.
+	//
+	// effective_at is a nullable named param (sqlc.narg): when the caller omits
+	// an explicit effective_at, COALESCE falls through to the DATABASE SERVER's
+	// now(), never the calling process's clock. Stamping an "immediate" rate
+	// with the caller's clock is what caused a real clock-skew bug (Task 2.4
+	// remediation): CurrentFXRate below gates on "effective_at <= now()" using
+	// the server's clock too, so if the caller's clock ran even slightly ahead,
+	// a just-inserted row was transiently invisible and the query silently fell
+	// through to the global default. Passing NULL here (rather than the CLI
+	// host's time.Now()) makes the two clocks the same clock for the common,
+	// unscheduled case; an explicit future effective_at (a scheduled rate) is
+	// unaffected, since the caller still supplies it directly.
 	InsertFXRate(ctx context.Context, arg InsertFXRateParams) (FxRate, error)
-	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
+	// Inserts a fresh idempotency key with a server-computed expires_at (now() +
+	// ttl_seconds, never the calling process's clock: Task 4.5, audit A1.4,
+	// consistent with fx_rates.effective_at's own server-side stamping).
+	//
+	// ON CONFLICT upserts rather than plain-inserts because a row for
+	// (tenant_id, idempotency_key) can already be present and EXPIRED: the
+	// lookup path (GetIdempotencyKey) treats an expired row as absent, so the
+	// caller proceeds to post a brand-new transaction and lands here again with
+	// the same key. Without the upsert that would hit the primary key and be
+	// misread as a genuine duplicate (replaying a stale, no-longer-relevant
+	// transaction). The "WHERE idempotency_keys.expires_at <= now()" guard on
+	// the DO UPDATE means the replace only happens when the existing row has, in
+	// fact, expired; a conflict against a still-live row leaves it untouched and
+	// the update affects zero rows, so RETURNING yields no row and the caller
+	// (postgres.txRepo.InsertIdempotencyKey) maps pgx.ErrNoRows to
+	// domain.ErrDuplicateIdempotencyKey exactly as a plain unique-violation used
+	// to, preserving replay-on-duplicate for the still-live case.
+	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (uuid.UUID, error)
+	// Creates one fan-out row for a (subscription, audit event) pairing. The
+	// ON CONFLICT DO NOTHING against the UNIQUE (subscription_id,
+	// audit_chain_seq) index (migration 0021) is what makes fan-out
+	// exactly-once into this table even if the fan-out step ever ran twice over
+	// the same audit_log range: a repeat attempt is a silent no-op, not a
+	// duplicate delivery row, so execrows reports 0 for a pairing that already
+	// existed and 1 for a genuinely new one.
+	InsertWebhookDelivery(ctx context.Context, arg InsertWebhookDeliveryParams) (int64, error)
+	// Inserts a new webhook_subscriptions row, always active (a caller creates a
+	// subscription to receive events; deactivating happens later, via
+	// SetWebhookSubscriptionActive). secret is stored as-is, never hashed (Task
+	// 4.1, audit A7.1): the delivery worker must read it back in full to sign
+	// every outbound payload.
+	InsertWebhookSubscription(ctx context.Context, arg InsertWebhookSubscriptionParams) error
+	// Every key for a tenant, oldest first, including revoked ones: the admin
+	// surface's list view (Task 2.2b) is meant to show a tenant's full key
+	// history, not just its live keys. Never selects key_hash: plaintext is
+	// shown once at issue/rotate time and is never recoverable afterward, and
+	// the hash itself has no business leaving the resolver's lookup path.
+	ListAPIKeysByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListAPIKeysByTenantRow, error)
 	ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error)
+	// The fan-out step's per-tenant read (Task 4.1): every ACTIVE subscription
+	// for one tenant, including the secret and event_types the fan-out needs to
+	// decide whether and how to create a webhook_deliveries row for it. Ordered
+	// by id only for a stable, deterministic iteration order within one fan-out
+	// pass; it carries no meaning beyond that.
+	ListActiveWebhookSubscriptionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListActiveWebhookSubscriptionsByTenantRow, error)
 	// Keyset page of audit rows for every transaction with a posting touching the
-	// account, newest first. after_created_at / after_id are the keyset position:
-	// pass a far-future timestamp and the max uuid for the first page.
-	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]AuditLog, error)
-	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]AuditLog, error)
-	// Every audit row for the tenant, oldest first: the full walk used to
-	// recompute and check the tamper-evident hash chain end to end.
-	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]AuditLog, error)
+	// account, newest first. after_id is the keyset position: pass the max uuid
+	// for the first page. Ordered and paged by id alone, not (created_at, id):
+	// see GetLastAuditHash's comment (ADR-017) for why id, assigned by the
+	// chainer in true chain-insertion order, is what must drive ordering here,
+	// not created_at (copied from the original event's post time, which is not
+	// guaranteed monotonic with commit order under concurrent posts).
+	ListAuditByAccount(ctx context.Context, arg ListAuditByAccountParams) ([]ListAuditByAccountRow, error)
+	// Ordered by id, not created_at: see GetLastAuditHash's comment (ADR-017) for
+	// why id is the chain-consistent order and created_at is not.
+	ListAuditByTransaction(ctx context.Context, arg ListAuditByTransactionParams) ([]ListAuditByTransactionRow, error)
+	// Every audit row for the tenant, in true chain order: the full walk used to
+	// recompute and check the tamper-evident hash chain end to end. Ordered by
+	// chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
+	// migration 0016) for why chain_seq, not id, is the failover-safe chain
+	// order.
+	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
+	// A bounded page of the tenant's audit rows in true chain order, strictly
+	// after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
+	// ListAuditForVerify above, which loads the entire chain into memory at
+	// once. AuditService.Verify calls this in a loop, advancing
+	// after_chain_seq to the last row's chain_seq on each page, until a page
+	// comes back with fewer than page_limit rows, so memory use is bounded by
+	// page_limit regardless of how long the chain has grown. Includes
+	// chain_seq (unlike ListAuditForVerify) precisely so the caller can advance
+	// the cursor without a second round trip. after_chain_seq is 0 to start
+	// from genesis, or an anchor's chain_seq to start from a trusted checkpoint
+	// (VerifyFromLatestAnchor).
+	ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error)
+	// One row per tenant with at least one audit_log entry: that tenant's
+	// current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
+	// this once per tick rather than enumerating tenants and calling
+	// GetAuditHead once per tenant (an N+1 round trip): it inserts one
+	// audit_anchors row and emits one structured log line per tenant returned
+	// here.
+	ListAuditHeads(ctx context.Context) ([]ListAuditHeadsRow, error)
+	// The fan-out step's source read: every chained audit_log event past the
+	// cursor, oldest first, up to batch_limit. Reads chain_seq (ADR-017's
+	// failover-safe, skew-proof linearization key), not id or created_at, for
+	// the same reason GetLastAuditHash does: it is the one order the chainer
+	// itself guarantees is monotonic across any failover.
+	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
+	// Filtered, keyset-paged list of a tenant's disputes, newest first (Task
+	// 6.3, audit A9.2). status is an optional filter via sqlc.narg: NULL
+	// disables it (every status is returned). Keyset paged by (created_at, id)
+	// descending, the identical cursor shape ListTransactions and
+	// AccountStatement already use.
+	ListDisputes(ctx context.Context, arg ListDisputesParams) ([]Dispute, error)
+	// The delivery worker's batch read: pending/failed rows whose backoff has
+	// elapsed, oldest due first, joined to their subscription for the url and
+	// secret needed to sign and send. "AND ws.active" means a subscription that
+	// was deactivated after fan-out already created pending rows for it simply
+	// stops being picked up here (see SetWebhookSubscriptionActive's doc
+	// comment): its existing rows are left exactly as they are, neither
+	// delivered nor purged, just never attempted again. FOR UPDATE OF wd SKIP
+	// LOCKED is defense in depth against two workers ever running at once (the
+	// leader-election lock is what actually prevents that in normal operation,
+	// ADR-017's discipline mirrored for this worker): a second reader skips a
+	// row the first is mid-processing rather than picking it up concurrently.
+	// This query runs as its own standalone statement (never inside a
+	// surrounding transaction that also makes the outbound HTTP call), so the
+	// row lock is released the moment this statement completes; correctness
+	// does not depend on holding it any longer than that.
+	ListDueWebhookDeliveries(ctx context.Context, batchLimit int32) ([]ListDueWebhookDeliveriesRow, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
+	// Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
+	// ListTransactions returns up to a page's worth of transaction rows, and
+	// assembling each one's postings via ListPostingsByTransaction one at a time
+	// would be N+1 queries for a full page. This fetches every posting for every
+	// transaction id in the page in a single round trip; the caller groups rows
+	// back by transaction_id (see Repository.ListTransactions). Ordered by
+	// transaction_id then (created_at, id), matching ListPostingsByTransaction's
+	// own per-transaction order, so grouping by transaction_id yields each
+	// transaction's postings already in that transaction's insertion order.
+	ListPostingsByTransactionIDs(ctx context.Context, arg ListPostingsByTransactionIDsParams) ([]ListPostingsByTransactionIDsRow, error)
+	ListTenants(ctx context.Context, limit int32) ([]Tenant, error)
+	// Filtered, keyset-paged list of a tenant's transactions, newest first (Task
+	// 4.4, audit A7.2). from_ts/to_ts/reference are optional filters via
+	// sqlc.narg: NULL disables that filter's clause (it becomes a no-op OR),
+	// so this single query serves every filter combination rather than one
+	// built dynamically per request. from_ts is inclusive (created_at >=),
+	// to_ts is exclusive (created_at <): a half-open [from, to) window.
+	//
+	// Keyset paged by (created_at, id) descending, the identical cursor shape
+	// AccountStatement already uses: after_created_at/after_id are the keyset
+	// position, a far-future timestamp and the max uuid for the first page.
+	// page_limit is requested by the caller as one more than the page size it
+	// actually wants, so a next page can be detected without a second round
+	// trip; this query itself just returns up to page_limit rows in whatever
+	// amount it is asked for.
+	ListTransactions(ctx context.Context, arg ListTransactionsParams) ([]Transaction, error)
+	// Every delivery row for one subscription, in fan-out order (the same
+	// chain_seq order the source audit_log events were read in). Used by tests
+	// to assert fan-out and delivery outcomes end to end.
+	ListWebhookDeliveriesBySubscription(ctx context.Context, subscriptionID uuid.UUID) ([]WebhookDelivery, error)
+	// Every subscription for a tenant, oldest first, active or not: the admin
+	// surface's list view. Never selects secret: it is shown once, at creation
+	// time, and never recoverable through a list call.
+	ListWebhookSubscriptionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListWebhookSubscriptionsByTenantRow, error)
+	// Sets processed_at for one outbox row. The chainer calls this in the same
+	// transaction as the audit_log insert it produced, so a crash between the two
+	// is impossible: either both happen or neither does.
+	MarkAuditOutboxProcessed(ctx context.Context, id int64) error
+	// A 2xx response: terminal success. attempts is set to the total number of
+	// tries this delivery took (including the successful one), the same total
+	// MarkWebhookDeliveryFailed accumulates on the way here, so attempts always
+	// means "how many times this delivery was actually tried", not just "how
+	// many times it failed".
+	MarkWebhookDeliveryDelivered(ctx context.Context, arg MarkWebhookDeliveryDeliveredParams) error
+	// A non-2xx response or transport error: the caller (internal/webhook)
+	// computes the new attempts count, the resulting status ('failed' to retry
+	// again later, or 'dead' once attempts reaches the configured max), the next
+	// backoff deadline, and the error text to record, all in Go (backoff and the
+	// max-attempts cap are application config, not schema), and this query just
+	// persists that decision.
+	MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) error
+	// Atomically creates tenant_id's crypto_keys row at the given version,
+	// wrapping the CALLER-GENERATED candidate_wrapped_dek (ADR-018: only
+	// internal/crypto.Cipher ever holds the master key needed to produce one).
+	// pg_advisory_xact_lock serializes this against ShredCurrentCryptoKey for
+	// the SAME tenant (both take the identical hashtextextended(tenant_id, 0)
+	// key), so a version this call is in the middle of minting can never be the
+	// exact version a concurrent shred call means to destroy, or vice versa;
+	// the lock is released automatically at the end of this call's transaction
+	// (withTenant's COMMIT/ROLLBACK).
+	//
+	// The ON CONFLICT DO UPDATE is the same "force RETURNING to yield the
+	// winning row" trick migration 0027's original GetOrCreateCryptoKey used at
+	// the single-version grain (see also GetOrCreateClearingAccount): if two
+	// callers race to mint the exact same (tenant_id, version) pair, for example
+	// two concurrent first-use Encrypt calls for a brand-new tenant both
+	// targeting version 1, one wins and the other's own candidate wrapped_dek is
+	// silently discarded; both RETURNING the SAME winning row in one round
+	// trip, so both callers end up using the identical DEK.
+	// sqlc.arg(tenant_id), repeated, names the SAME parameter (one field in the
+	// generated Params struct) at every use; the redundant ::uuid cast at each
+	// use (not just the ::text one hashtextextended needs) is deliberate, not
+	// decorative: Postgres assigns an untyped placeholder's type by unifying
+	// every one of its uses in the statement, and the ::text cast below would
+	// otherwise make the planner infer the WHOLE parameter as text, including
+	// the INSERT's tenant_id (uuid) column, which then fails to bind ("column
+	// tenant_id is of type uuid but expression is of type text"). Casting to
+	// uuid explicitly at each use pins its type regardless of statement order.
+	MintCryptoKeyVersion(ctx context.Context, arg MintCryptoKeyVersionParams) (MintCryptoKeyVersionRow, error)
+	// Task 6.3, audit A9.2: the guarded transition out of 'open'. The WHERE
+	// status = 'open' clause is what makes resolving an already-resolved (or
+	// concurrently-being-resolved) dispute return zero rows rather than
+	// silently overwriting a prior resolution: the caller
+	// (postgres.Repository.ResolveDispute) treats a zero-row result as
+	// domain.ErrDisputeAlreadyResolved.
+	ResolveDispute(ctx context.Context, arg ResolveDisputeParams) (Dispute, error)
+	// COALESCE makes this idempotent: revoking an already-revoked key keeps its
+	// original revoked_at instead of bumping it, and still reports one row
+	// affected (not zero), so the admin service can tell "no such key" (0 rows)
+	// from "already revoked" (1 row, unchanged) without a separate lookup.
+	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// The chainer's batch read: unprocessed rows whose inserting transaction is
+	// guaranteed settled (txid < the watermark passed in), oldest commit order
+	// first. Ordering by (txid, id) is the total order ADR-017 defines: it is
+	// stable because txid is not reused and id is a bigserial tiebreaker for the
+	// (rare) case of equal txid.
+	ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error)
+	// Task 5.5, audit A1.5: freezes, closes, or reactivates one account. Scoped
+	// to tenant_id like every other write here, so a caller can never flip a
+	// status on another tenant's account by id alone.
+	SetAccountStatus(ctx context.Context, arg SetAccountStatusParams) (int64, error)
+	// Task 2.4b (audit A3.4): a whole-document replace of the settings jsonb
+	// column, used by admin.Service.SetTenantPolicy to write {"policy": {...}}.
+	SetTenantSettings(ctx context.Context, arg SetTenantSettingsParams) (int64, error)
+	SetTenantStatus(ctx context.Context, arg SetTenantStatusParams) (int64, error)
+	// Advances the singleton fan-out cursor. Always called in the same
+	// transaction as the webhook_deliveries inserts it corresponds to (Task
+	// 4.1), so a crash between the two is impossible: either both the inserts
+	// and the cursor advance land, or neither does, and a retried fan-out pass
+	// sees the same audit_log rows again (harmless: InsertWebhookDelivery's
+	// ON CONFLICT DO NOTHING against the (subscription_id, audit_chain_seq)
+	// unique index makes re-inserting the same pairing a no-op).
+	SetWebhookFanoutCursor(ctx context.Context, lastChainSeq int64) error
+	// Flips active for one subscription by id. The admin surface's
+	// DeleteSubscription calls this with active=false instead of a hard DELETE
+	// (see domain.Repository.SetWebhookSubscriptionActive's doc comment for
+	// why): a webhook_deliveries row's foreign key to its subscription has no
+	// cascade, so deactivating, not deleting, is what "stops future deliveries"
+	// without breaking or discarding delivery history.
+	SetWebhookSubscriptionActive(ctx context.Context, arg SetWebhookSubscriptionActiveParams) (int64, error)
+	// Irreversibly destroys tenant_id's CURRENT (highest-version) DEK (ADR-018):
+	// every posting description ever encrypted under that version becomes
+	// permanently unreadable, while postings.description and audit_log.after
+	// keep their exact stored ciphertext bytes untouched, so the tamper-evident
+	// hash chain (which hashes those bytes, never decrypts them) stays
+	// verifiable. Money data and every OTHER tenant's keys are completely
+	// unaffected. The tenant is NOT bricked: its next Encrypt call
+	// (internal/crypto.Cipher) sees the current version shredded and mints the
+	// next one, so posting, converting, and reversing all keep working.
+	//
+	// Serialized against MintCryptoKeyVersion by the same per-tenant
+	// pg_advisory_xact_lock (see that query's own comment): this can never
+	// target a version a concurrent first-use mint is still in the middle of
+	// creating, and a concurrent mint can never land a version this call has
+	// already decided to shred out from under it.
+	//
+	// A tenant with NO crypto_keys row at all yet (never encrypted anything)
+	// still gets a permanent version-1 shredded tombstone (GREATEST(...,1)
+	// below): without one, that tenant's very next Encrypt would happily mint a
+	// brand-new, LIVE version 1, silently undoing an operator's already-issued
+	// shred request. Idempotent: shredding an already-shredded current version
+	// leaves its shredded_at at its ORIGINAL value (COALESCE), matching
+	// RevokeAPIKey's own idempotent-revoke convention.
+	// Same sqlc.arg(tenant_id), repeated, plus the same explicit ::uuid cast at
+	// every use as MintCryptoKeyVersion, and for the same reason (see that
+	// query's own comment): the ::text cast inside hashtextextended would
+	// otherwise make the planner infer the whole parameter as text, breaking
+	// the uuid comparison/insert below.
+	ShredCurrentCryptoKey(ctx context.Context, tenantID uuid.UUID) error
+	// Deletes up to batch_size idempotency keys whose replay window has passed,
+	// across all tenants (Task 4.5, audit A1.4; batched per the follow-up
+	// review: a plain "DELETE ... WHERE expires_at < now()" has no bound, so a
+	// large backlog could delete an unbounded number of rows in one statement
+	// and contend with live posts). The ctid subquery caps each statement's own
+	// row scan/lock footprint to batch_size rows instead of the whole table.
+	// Not tenant-scoped and not run inside RunInTx: it is a plain maintenance
+	// statement. The Go caller (postgres.Repository.SweepExpiredIdempotencyKeys)
+	// loops this query in batches until a call deletes 0 rows (or a max
+	// iteration guard trips), summing the deleted count for the sweep log line.
+	SweepExpiredIdempotencyKeysBatch(ctx context.Context, batchSize int32) (int64, error)
+	// Task 2.4b (audit A3.4): each currency's already-posted debit total for
+	// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
+	// up with the same clock that stamped created_at on every posting). Read
+	// from inside the caller's SERIALIZABLE RunInTx body, under the per-tenant
+	// in-process serialization (ADR-012), so a daily-volume policy check is race
+	// free: two concurrent posts for the same tenant can never both read this
+	// same total and both post believing they are under the cap. Only positive
+	// amounts (debits, ADR-002) are summed: a transaction's credits are the
+	// mirror image of its debits within each currency (the balance invariant),
+	// so counting only debits avoids double-counting the same movement.
+	TenantDailyDebits(ctx context.Context, tenantID uuid.UUID) ([]TenantDailyDebitsRow, error)
+	// Updates last_used_at for a single key by id. Called best-effort and
+	// throttled from the auth resolver (Task 2.2): not every request, so this is
+	// not a write on the hot path of every authenticated call.
+	TouchAPIKeyLastUsed(ctx context.Context, arg TouchAPIKeyLastUsedParams) error
+	// Task 6.3, audit A9.2: every account's derived balance, including system
+	// (FX clearing) accounts, which hold the FX position and are part of the
+	// balance proof. The LEFT JOIN means an account with no postings yet still
+	// returns one row, with balance COALESCEd to 0, the same shape
+	// AccountBalances (postings.sql) already uses.
+	TrialBalanceAccounts(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceAccountsRow, error)
+	// Task 6.3, audit A9.2: the double-entry balance proof. Each currency's net
+	// posted total across every account in the tenant; in a correct ledger every
+	// total is zero (ADR-001).
+	TrialBalanceByCurrency(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceByCurrencyRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

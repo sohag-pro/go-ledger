@@ -1,0 +1,528 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sohag-pro/go-ledger/internal/admin"
+	"github.com/sohag-pro/go-ledger/internal/domain"
+)
+
+// --- resolveHandler: subcommand dispatch, no serviceFactory involved at all. ---
+
+func TestResolveHandlerKnownSubcommands(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ resource, action string }{
+		{"tenant", "create"},
+		{"tenant", "list"},
+		{"tenant", "status"},
+		{"tenant", "policy"},
+		{"tenant", "shred-pii"},
+		{"key", "issue"},
+		{"key", "rotate"},
+		{"key", "revoke"},
+		{"key", "list"},
+		{"rate", "set"},
+		{"webhook", "add"},
+		{"webhook", "list"},
+		{"webhook", "remove"},
+	}
+	for _, tc := range cases {
+		h, err := resolveHandler(tc.resource, tc.action)
+		if err != nil {
+			t.Errorf("resolveHandler(%q, %q): %v", tc.resource, tc.action, err)
+		}
+		if h == nil {
+			t.Errorf("resolveHandler(%q, %q) returned a nil handler", tc.resource, tc.action)
+		}
+	}
+}
+
+func TestResolveHandlerUnknownResource(t *testing.T) {
+	t.Parallel()
+	_, err := resolveHandler("account", "create")
+	if err == nil {
+		t.Fatal("expected an error for an unknown resource")
+	}
+	if !strings.Contains(err.Error(), `unknown resource "account"`) {
+		t.Errorf("error = %q, want it to name the unknown resource", err.Error())
+	}
+}
+
+func TestResolveHandlerUnknownAction(t *testing.T) {
+	t.Parallel()
+	_, err := resolveHandler("tenant", "delete")
+	if err == nil {
+		t.Fatal("expected an error for an unknown action")
+	}
+	if !strings.Contains(err.Error(), `unknown action "delete"`) {
+		t.Errorf("error = %q, want it to name the unknown action", err.Error())
+	}
+}
+
+// --- run: dispatch happens before serviceFactory is ever called. ---
+
+// TestRunUnknownSubcommandNeverCallsServiceFactory proves resolveHandler
+// runs before newService (see run): a bad resource/action fails immediately,
+// with no DATABASE_URL or database round trip attempted at all.
+func TestRunUnknownSubcommandNeverCallsServiceFactory(t *testing.T) {
+	t.Parallel()
+	called := false
+	factory := func(context.Context) (*admin.Service, func(), error) {
+		called = true
+		return nil, func() {}, nil
+	}
+
+	err := run([]string{"bogus", "action"}, os.Stdout, factory)
+	if err == nil {
+		t.Fatal("expected an error for an unknown resource/action pair")
+	}
+	if called {
+		t.Error("run called the service factory for an unrecognized subcommand; it should fail before connecting")
+	}
+}
+
+func TestRunTooFewArgs(t *testing.T) {
+	t.Parallel()
+	called := false
+	factory := func(context.Context) (*admin.Service, func(), error) {
+		called = true
+		return nil, func() {}, nil
+	}
+
+	if err := run([]string{"tenant"}, os.Stdout, factory); err == nil {
+		t.Fatal("expected a usage error with fewer than two args")
+	}
+	if called {
+		t.Error("run called the service factory with too few args")
+	}
+}
+
+// TestRunServiceFactoryErrorPropagates proves a serviceFactory failure (e.g.
+// missing DATABASE_URL in the real one) surfaces as run's own error, once a
+// recognized subcommand has already been resolved.
+func TestRunServiceFactoryErrorPropagates(t *testing.T) {
+	t.Parallel()
+	wantErr := errors.New("DATABASE_URL is required")
+	factory := func(context.Context) (*admin.Service, func(), error) {
+		return nil, nil, wantErr
+	}
+
+	err := run([]string{"tenant", "list"}, os.Stdout, factory)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("run error = %v, want %v", err, wantErr)
+	}
+}
+
+// --- pure flag-parsing helpers, no database or service involved. ---
+
+func TestParseTenantStatusValid(t *testing.T) {
+	t.Parallel()
+	id, status, err := parseTenantStatus([]string{"--id", "tenant-1", "--status", "suspended"})
+	if err != nil {
+		t.Fatalf("parseTenantStatus: %v", err)
+	}
+	if id != "tenant-1" {
+		t.Errorf("id = %q, want tenant-1", id)
+	}
+	if status != domain.TenantSuspended {
+		t.Errorf("status = %q, want suspended", status)
+	}
+}
+
+func TestParseTenantStatusMissingID(t *testing.T) {
+	t.Parallel()
+	_, _, err := parseTenantStatus([]string{"--status", "active"})
+	if err == nil {
+		t.Fatal("expected an error for a missing --id")
+	}
+}
+
+func TestParseTenantStatusInvalidStatus(t *testing.T) {
+	t.Parallel()
+	_, _, err := parseTenantStatus([]string{"--id", "tenant-1", "--status", "pending"})
+	if err == nil {
+		t.Fatal("expected an error for an invalid --status")
+	}
+}
+
+func TestParseScopes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		raw  string
+		want []domain.Scope
+	}{
+		{"empty", "", nil},
+		{"single", "read", []domain.Scope{domain.ScopeRead}},
+		{"multiple", "read,post", []domain.Scope{domain.ScopeRead, domain.ScopePost}},
+		{"whitespace and trailing comma", " read , post ,", []domain.Scope{domain.ScopeRead, domain.ScopePost}},
+		{"unknown scope passed through for the service to reject", "superuser", []domain.Scope{"superuser"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseScopes(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseScopes(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("parseScopes(%q)[%d] = %q, want %q", tc.raw, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseKeyIssueRequiredFlags(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing tenant", []string{"--name", "n", "--scopes", "read"}},
+		{"missing name", []string{"--tenant", "t", "--scopes", "read"}},
+		{"missing scopes", []string{"--tenant", "t", "--name", "n"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, _, _, err := parseKeyIssue(tc.args, now)
+			if err == nil {
+				t.Fatalf("parseKeyIssue(%v): expected an error", tc.args)
+			}
+		})
+	}
+}
+
+func TestParseKeyIssueExpiresIn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tenantID, name, scopes, expiresAt, err := parseKeyIssue(
+		[]string{"--tenant", "t1", "--name", "ci", "--scopes", "read,post", "--expires-in", "24h"}, now)
+	if err != nil {
+		t.Fatalf("parseKeyIssue: %v", err)
+	}
+	if tenantID != "t1" || name != "ci" {
+		t.Errorf("tenantID/name = %q/%q, want t1/ci", tenantID, name)
+	}
+	if len(scopes) != 2 || scopes[0] != domain.ScopeRead || scopes[1] != domain.ScopePost {
+		t.Errorf("scopes = %v, want [read post]", scopes)
+	}
+	want := now.Add(24 * time.Hour)
+	if expiresAt == nil || !expiresAt.Equal(want) {
+		t.Errorf("expiresAt = %v, want %v", expiresAt, want)
+	}
+}
+
+func TestParseKeyIssueNoExpiryByDefault(t *testing.T) {
+	t.Parallel()
+	_, _, _, expiresAt, err := parseKeyIssue([]string{"--tenant", "t1", "--name", "ci", "--scopes", "read"}, time.Now())
+	if err != nil {
+		t.Fatalf("parseKeyIssue: %v", err)
+	}
+	if expiresAt != nil {
+		t.Errorf("expiresAt = %v, want nil (never expires)", *expiresAt)
+	}
+}
+
+func TestParseKeyIssueBadDuration(t *testing.T) {
+	t.Parallel()
+	_, _, _, _, err := parseKeyIssue([]string{"--tenant", "t1", "--name", "ci", "--scopes", "read", "--expires-in", "not-a-duration"}, time.Now())
+	if err == nil {
+		t.Fatal("expected an error for a malformed --expires-in")
+	}
+}
+
+func TestParseKeyID(t *testing.T) {
+	t.Parallel()
+	id, err := parseKeyID("key rotate", []string{"--id", "key-1"})
+	if err != nil {
+		t.Fatalf("parseKeyID: %v", err)
+	}
+	if id != "key-1" {
+		t.Errorf("id = %q, want key-1", id)
+	}
+
+	if _, err := parseKeyID("key rotate", nil); err == nil {
+		t.Fatal("expected an error for a missing --id")
+	}
+}
+
+// --- rate set: pure flag-parsing, no database or service involved. ---
+
+func TestParseRateSetValid(t *testing.T) {
+	t.Parallel()
+
+	a, err := parseRateSet([]string{
+		"--tenant", "tenant-1", "--base", "usd", "--quote", "eur",
+		"--mid", "0.9200", "--spread-bps", "50",
+	})
+	if err != nil {
+		t.Fatalf("parseRateSet: %v", err)
+	}
+	if a.tenantID != "tenant-1" {
+		t.Errorf("tenantID = %q, want tenant-1", a.tenantID)
+	}
+	if a.base != "USD" || a.quote != "EUR" {
+		t.Errorf("base/quote = %s/%s, want USD/EUR (lowercase input upper-cased)", a.base, a.quote)
+	}
+	if a.midRateE8 != 92_000_000 {
+		t.Errorf("midRateE8 = %d, want 92000000 (0.9200 scaled by 1e8, no ParseFloat)", a.midRateE8)
+	}
+	if a.spreadBps != 50 {
+		t.Errorf("spreadBps = %d, want 50", a.spreadBps)
+	}
+	if a.source != defaultRateSource {
+		t.Errorf("source = %q, want default %q", a.source, defaultRateSource)
+	}
+	// --effective-at omitted: effectiveAt must be nil, not this process's
+	// time.Now(), so the database server's clock stamps the row instead
+	// (Task 2.4 remediation; see rateSetArgs.effectiveAt).
+	if a.effectiveAt != nil {
+		t.Errorf("effectiveAt = %v, want nil (server-stamped) when --effective-at is omitted", a.effectiveAt)
+	}
+}
+
+func TestParseRateSetExplicitSourceAndEffectiveAt(t *testing.T) {
+	t.Parallel()
+	a, err := parseRateSet([]string{
+		"--tenant", "tenant-1", "--base", "USD", "--quote", "BDT",
+		"--mid", "110.50", "--spread-bps", "25",
+		"--source", "negotiated", "--effective-at", "2026-03-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("parseRateSet: %v", err)
+	}
+	if a.midRateE8 != 11_050_000_000 {
+		t.Errorf("midRateE8 = %d, want 11050000000 (110.50 scaled by 1e8)", a.midRateE8)
+	}
+	if a.source != "negotiated" {
+		t.Errorf("source = %q, want negotiated", a.source)
+	}
+	want := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	if a.effectiveAt == nil || !a.effectiveAt.Equal(want) {
+		t.Errorf("effectiveAt = %v, want %v", a.effectiveAt, want)
+	}
+}
+
+func TestParseRateSetRequiredFlags(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing tenant", []string{"--base", "USD", "--quote", "EUR", "--mid", "0.92"}},
+		{"missing base", []string{"--tenant", "t", "--quote", "EUR", "--mid", "0.92"}},
+		{"missing quote", []string{"--tenant", "t", "--base", "USD", "--mid", "0.92"}},
+		{"missing mid", []string{"--tenant", "t", "--base", "USD", "--quote", "EUR"}},
+		{"invalid base", []string{"--tenant", "t", "--base", "US", "--quote", "EUR", "--mid", "0.92"}},
+		{"same base and quote", []string{"--tenant", "t", "--base", "USD", "--quote", "USD", "--mid", "0.92"}},
+		{"spread out of range", []string{"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.92", "--spread-bps", "10000"}},
+		{"negative spread", []string{"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.92", "--spread-bps", "-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseRateSet(tc.args); err == nil {
+				t.Fatalf("parseRateSet(%v): expected an error", tc.args)
+			}
+		})
+	}
+}
+
+// TestParseRateSetMidNeverFloatParsed proves --mid goes through fx.ParseRateE8
+// (integer scaling), not strconv.ParseFloat: a rate with more fractional
+// digits than domain.RateScale can hold is truncated, never rounded, exactly
+// the guarantee fx.ParseRateE8 documents, which a float64 parse-and-round
+// would not give.
+func TestParseRateSetMidNeverFloatParsed(t *testing.T) {
+	t.Parallel()
+	a, err := parseRateSet([]string{
+		"--tenant", "t", "--base", "USD", "--quote", "EUR", "--mid", "0.123456789",
+	})
+	if err != nil {
+		t.Fatalf("parseRateSet: %v", err)
+	}
+	if a.midRateE8 != 12_345_678 {
+		t.Errorf("midRateE8 = %d, want 12345678 (truncated to 8 fractional digits, not rounded)", a.midRateE8)
+	}
+}
+
+func TestJoinAndFormatHelpers(t *testing.T) {
+	t.Parallel()
+	if got := joinScopes(nil); got != "" {
+		t.Errorf("joinScopes(nil) = %q, want empty", got)
+	}
+	if got := joinScopes([]domain.Scope{domain.ScopeRead, domain.ScopePost}); got != "read,post" {
+		t.Errorf("joinScopes = %q, want read,post", got)
+	}
+	if got := formatExpiry(nil); got != "never" {
+		t.Errorf("formatExpiry(nil) = %q, want never", got)
+	}
+	when := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if got := formatExpiry(&when); got != when.Format(time.RFC3339) {
+		t.Errorf("formatExpiry = %q, want %q", got, when.Format(time.RFC3339))
+	}
+}
+
+// TestParseTenantPolicyValid proves parseTenantPolicy (Task 2.4b, audit
+// A3.4) reads every flag into the matching domain.TenantPolicy field, and
+// upper-cases a lowercase --currencies entry the same way parseRateSet
+// upper-cases --base/--quote.
+func TestParseTenantPolicyValid(t *testing.T) {
+	t.Parallel()
+	tenantID, policy, err := parseTenantPolicy([]string{
+		"--tenant", "tenant-1", "--max-amount", "50000", "--daily-limit", "200000", "--currencies", "usd, eur",
+	})
+	if err != nil {
+		t.Fatalf("parseTenantPolicy: %v", err)
+	}
+	if tenantID != "tenant-1" {
+		t.Errorf("tenantID = %q, want tenant-1", tenantID)
+	}
+	if policy.MaxTransactionAmount != 50000 {
+		t.Errorf("MaxTransactionAmount = %d, want 50000", policy.MaxTransactionAmount)
+	}
+	if policy.DailyVolumeLimit != 200000 {
+		t.Errorf("DailyVolumeLimit = %d, want 200000", policy.DailyVolumeLimit)
+	}
+	if len(policy.AllowedCurrencies) != 2 || policy.AllowedCurrencies[0] != "USD" || policy.AllowedCurrencies[1] != "EUR" {
+		t.Errorf("AllowedCurrencies = %v, want [USD EUR] (upper-cased, trimmed)", policy.AllowedCurrencies)
+	}
+}
+
+// TestParseTenantPolicyOmittedFlagsAreUnlimited proves every flag but
+// --tenant is genuinely optional, and that omitting one yields the
+// unlimited zero value for that guardrail (0, or a nil AllowedCurrencies),
+// not an error and not some other default.
+func TestParseTenantPolicyOmittedFlagsAreUnlimited(t *testing.T) {
+	t.Parallel()
+	_, policy, err := parseTenantPolicy([]string{"--tenant", "tenant-1"})
+	if err != nil {
+		t.Fatalf("parseTenantPolicy: %v", err)
+	}
+	if policy.MaxTransactionAmount != 0 {
+		t.Errorf("MaxTransactionAmount = %d, want 0 (unlimited)", policy.MaxTransactionAmount)
+	}
+	if policy.DailyVolumeLimit != 0 {
+		t.Errorf("DailyVolumeLimit = %d, want 0 (unlimited)", policy.DailyVolumeLimit)
+	}
+	if len(policy.AllowedCurrencies) != 0 {
+		t.Errorf("AllowedCurrencies = %v, want empty (every currency allowed)", policy.AllowedCurrencies)
+	}
+}
+
+// TestParseTenantPolicyMissingTenant proves --tenant is the one required
+// flag.
+func TestParseTenantPolicyMissingTenant(t *testing.T) {
+	t.Parallel()
+	if _, _, err := parseTenantPolicy([]string{"--max-amount", "100"}); err == nil {
+		t.Fatal("parseTenantPolicy with no --tenant: expected an error")
+	}
+}
+
+// --- webhook subcommands (Task 4.1, audit A7.1) ---
+
+func TestParseWebhookEvents(t *testing.T) {
+	t.Parallel()
+	if got := parseWebhookEvents(""); got != nil {
+		t.Errorf("parseWebhookEvents(\"\") = %v, want nil", got)
+	}
+	got := parseWebhookEvents("transaction.created, transaction.reversed ,")
+	want := []string{"transaction.created", "transaction.reversed"}
+	if len(got) != len(want) {
+		t.Fatalf("parseWebhookEvents = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("parseWebhookEvents[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseWebhookAddValid(t *testing.T) {
+	t.Parallel()
+	tenantID, url, events, err := parseWebhookAdd([]string{
+		"--tenant", "t1", "--url", "https://example.com/hooks", "--events", "transaction.created",
+	})
+	if err != nil {
+		t.Fatalf("parseWebhookAdd: %v", err)
+	}
+	if tenantID != "t1" || url != "https://example.com/hooks" {
+		t.Errorf("tenantID/url = %q/%q, want t1/https://example.com/hooks", tenantID, url)
+	}
+	if len(events) != 1 || events[0] != "transaction.created" {
+		t.Errorf("events = %v, want [transaction.created]", events)
+	}
+}
+
+func TestParseWebhookAddOmittedEventsIsNil(t *testing.T) {
+	t.Parallel()
+	_, _, events, err := parseWebhookAdd([]string{"--tenant", "t1", "--url", "https://example.com/hooks"})
+	if err != nil {
+		t.Fatalf("parseWebhookAdd: %v", err)
+	}
+	if events != nil {
+		t.Errorf("events = %v, want nil (every event)", events)
+	}
+}
+
+func TestParseWebhookAddRequiredFlags(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing tenant", []string{"--url", "https://example.com/hooks"}},
+		{"missing url", []string{"--tenant", "t1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, _, err := parseWebhookAdd(tc.args)
+			if err == nil {
+				t.Fatalf("parseWebhookAdd(%v): expected an error", tc.args)
+			}
+		})
+	}
+}
+
+// --- tenant shred-pii (Task 6.2, audit A9.3): --yes is a hard requirement,
+// checked before any database round trip, since this operation is
+// irreversible. ---
+
+func TestParseTenantShredPIIRequiresYes(t *testing.T) {
+	t.Parallel()
+	_, err := parseTenantShredPII([]string{"--tenant", "tenant-1"})
+	if err == nil {
+		t.Fatal("parseTenantShredPII without --yes: expected an error")
+	}
+}
+
+func TestParseTenantShredPIIRequiresTenant(t *testing.T) {
+	t.Parallel()
+	_, err := parseTenantShredPII([]string{"--yes"})
+	if err == nil {
+		t.Fatal("parseTenantShredPII without --tenant: expected an error")
+	}
+}
+
+func TestParseTenantShredPIIValid(t *testing.T) {
+	t.Parallel()
+	tenantID, err := parseTenantShredPII([]string{"--tenant", "tenant-1", "--yes"})
+	if err != nil {
+		t.Fatalf("parseTenantShredPII: %v", err)
+	}
+	if tenantID != "tenant-1" {
+		t.Errorf("tenantID = %q, want tenant-1", tenantID)
+	}
+}

@@ -5,6 +5,13 @@
     state: present
     update_cache: true
 
+- name: Install the go-ledger per-IP rate limit zone (http scope, Task 5.2)
+  ansible.builtin.template:
+    src: ratelimit.conf.j2
+    dest: /etc/nginx/conf.d/ratelimit.conf
+    mode: "0644"
+  notify: Reload nginx
+
 - name: Install the go-ledger vhost
   ansible.builtin.template:
     src: go.sohag.pro.conf.j2

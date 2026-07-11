@@ -24,8 +24,8 @@ func TestAuditService_Verify_EmptyChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if !result.Valid || result.Checked != 0 || result.FirstBreakID != "" {
-		t.Errorf("result = %+v, want {Valid:true Checked:0 FirstBreakID:\"\"}", result)
+	if !result.Valid || result.Checked != 0 || result.FirstBreakID != "" || result.Pending != 0 {
+		t.Errorf("result = %+v, want {Valid:true Checked:0 FirstBreakID:\"\" Pending:0}", result)
 	}
 }
 
@@ -41,6 +41,9 @@ func TestAuditService_Verify_ValidChain(t *testing.T) {
 	audits := ledger.NewAuditService(repo)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "audit verify test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -58,6 +61,9 @@ func TestAuditService_Verify_ValidChain(t *testing.T) {
 			t.Fatalf("post %d: %v", i, err)
 		}
 	}
+	// Post only writes an audit_outbox row (ADR-017); drain the chainer so
+	// the chain actually exists before walking it.
+	drainChainer(t, pool, tenant)
 
 	result, err := audits.Verify(ctx, tenant)
 	if err != nil {
@@ -71,6 +77,9 @@ func TestAuditService_Verify_ValidChain(t *testing.T) {
 	}
 	if result.FirstBreakID != "" {
 		t.Errorf("first break id = %q, want empty on a valid chain", result.FirstBreakID)
+	}
+	if result.Pending != 0 {
+		t.Errorf("pending = %d, want 0 after draining", result.Pending)
 	}
 }
 
@@ -90,6 +99,9 @@ func TestAuditService_Verify_DetectsTamper(t *testing.T) {
 	audits := ledger.NewAuditService(repo)
 	ctx := context.Background()
 	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "audit verify test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
@@ -107,6 +119,9 @@ func TestAuditService_Verify_DetectsTamper(t *testing.T) {
 			t.Fatalf("post %d: %v", i, err)
 		}
 	}
+	// Post only writes an audit_outbox row (ADR-017); drain the chainer so
+	// there is an audit_log row to tamper with.
+	drainChainer(t, pool, tenant)
 
 	rows, err := repo.ListAuditForVerify(ctx, tenant)
 	if err != nil {

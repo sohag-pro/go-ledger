@@ -1,0 +1,149 @@
+name: Restore Verify
+
+# Weekly automated restore-and-verify (ADR-016, objective 5, "Automated
+# restore-and-verify"). A backup is not trusted until a restore has been
+# proven: this job restores the LATEST offsite pgBackRest backup into a
+# throwaway Postgres cluster on the CI runner (a different machine than the
+# one that wrote the backup) and runs cmd/verify-restore against it, checking
+# the ledger's own invariants (the double-entry balance, per currency, and
+# every tenant's tamper-evident audit hash chain). A failed restore or a
+# failed invariant check fails the build.
+#
+# Required repository secrets (owner-provisioned; see docs/ops/server-setup.md
+# and docs/adr/016-durability-and-disaster-recovery.md). Until these exist,
+# the "restore-verify" job is skipped and the workflow still finishes green
+# (see "check-provisioned" below), so an unprovisioned fork or a repo before
+# the offsite bucket is set up never red-builds on this schedule:
+#
+#   PGBACKREST_S3_ENDPOINT   the S3-compatible endpoint hostname
+#   PGBACKREST_S3_BUCKET     the bucket holding the pgBackRest repository
+#   PGBACKREST_S3_REGION     the bucket's region
+#   PGBACKREST_S3_KEY        a READ-ONLY access key for the repository
+#   PGBACKREST_S3_SECRET     the matching secret key
+#   PGBACKREST_CIPHER_PASS   the repository's AES-256 encryption passphrase
+#
+# The read-only key matters: this job only ever restores from the offsite
+# repository, it never writes to it, so the CI credential should not be able
+# to delete or overwrite a real backup even if the runner is compromised.
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # every Monday, 05:00 UTC
+  workflow_dispatch: {}
+
+env:
+  PGBACKREST_STANZA: go-ledger
+  PG_VERSION: "16"
+  # The role and database a physical pgBackRest restore brings back as part of
+  # the cluster's own files (see infra/ansible/group_vars/all.example.yml,
+  # pg_role and pg_database). The verifier only needs a way in, not the real
+  # production password: this job resets it locally, as the postgres OS user,
+  # after the restore.
+  PG_APP_ROLE: goledger
+  PG_APP_DATABASE: goledger
+
+jobs:
+  check-provisioned:
+    name: Check pgBackRest secrets are provisioned
+    runs-on: ubuntu-latest
+    outputs:
+      provisioned: ${{ steps.check.outputs.provisioned }}
+    steps:
+      - name: Check whether the offsite repository is configured
+        id: check
+        env:
+          PGBACKREST_S3_KEY: ${{ secrets.PGBACKREST_S3_KEY }}
+        run: |
+          if [ -z "$PGBACKREST_S3_KEY" ]; then
+            echo "restore-verify not provisioned, skipping"
+            echo "provisioned=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "provisioned=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  restore-verify:
+    name: Restore latest offsite backup and verify invariants
+    needs: check-provisioned
+    if: needs.check-provisioned.outputs.provisioned == 'true'
+    runs-on: ubuntu-latest
+    env:
+      PGBACKREST_S3_ENDPOINT: ${{ secrets.PGBACKREST_S3_ENDPOINT }}
+      PGBACKREST_S3_BUCKET: ${{ secrets.PGBACKREST_S3_BUCKET }}
+      PGBACKREST_S3_REGION: ${{ secrets.PGBACKREST_S3_REGION }}
+      PGBACKREST_S3_KEY: ${{ secrets.PGBACKREST_S3_KEY }}
+      PGBACKREST_S3_SECRET: ${{ secrets.PGBACKREST_S3_SECRET }}
+      PGBACKREST_CIPHER_PASS: ${{ secrets.PGBACKREST_CIPHER_PASS }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install PostgreSQL and pgBackRest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "postgresql-${PG_VERSION}" pgbackrest
+
+      - name: Write pgbackrest.conf from CI secrets
+        run: |
+          sudo install -d -m 0755 /etc/pgbackrest
+          sudo tee /etc/pgbackrest/pgbackrest.conf > /dev/null <<CONF
+          [global]
+          repo1-type=s3
+          repo1-s3-endpoint=${PGBACKREST_S3_ENDPOINT}
+          repo1-s3-bucket=${PGBACKREST_S3_BUCKET}
+          repo1-s3-region=${PGBACKREST_S3_REGION}
+          repo1-s3-key=${PGBACKREST_S3_KEY}
+          repo1-s3-key-secret=${PGBACKREST_S3_SECRET}
+          repo1-path=/go-ledger
+          repo1-cipher-type=aes-256-cbc
+          repo1-cipher-pass=${PGBACKREST_CIPHER_PASS}
+          process-max=2
+          log-level-console=info
+          log-level-file=detail
+
+          [${PGBACKREST_STANZA}]
+          pg1-path=/var/lib/postgresql/${PG_VERSION}/main
+          pg1-port=5432
+          CONF
+          sudo chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
+          sudo chmod 640 /etc/pgbackrest/pgbackrest.conf
+
+      - name: Restore the latest backup into a fresh local cluster
+        # --delta lets pgbackrest reuse what apt's fresh initdb already laid
+        # down where the checksums match, but a plain restore over a stopped,
+        # freshly initialized cluster is safe either way: there is no real
+        # data here to lose, only the throwaway cluster this job just
+        # installed a minute ago.
+        run: |
+          sudo systemctl stop postgresql
+          sudo -u postgres pgbackrest --stanza="${PGBACKREST_STANZA}" --delta --log-level-console=info restore
+
+      - name: Start the restored cluster
+        run: sudo systemctl start postgresql
+
+      - name: Wait for the restored cluster to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            if sudo -u postgres pg_isready -q; then exit 0; fi
+            sleep 2
+          done
+          echo "restored postgres never became ready"
+          sudo journalctl -u postgresql --no-pager | tail -n 200
+          exit 1
+
+      - name: Reset the app role's password for this run only
+        # The physical restore brings back the real goledger role and
+        # database exactly as they existed in the backup; it does not bring a
+        # password this job knows. Resetting it here uses local OS-level
+        # (peer/socket) access, the same access the runbook's restore
+        # procedure has, not a stored production secret.
+        run: |
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c \
+            "ALTER ROLE ${PG_APP_ROLE} WITH PASSWORD 'ci-restore-verify-throwaway';"
+
+      - name: Verify the restored ledger's invariants
+        env:
+          DATABASE_URL: postgres://${{ env.PG_APP_ROLE }}:ci-restore-verify-throwaway@localhost:5432/${{ env.PG_APP_DATABASE }}?sslmode=disable
+        run: go run ./cmd/verify-restore

@@ -14,6 +14,7 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/auth"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
@@ -53,12 +54,35 @@ type Deps struct {
 	Accounts     *ledger.AccountService
 	Transactions *ledger.TransactionService
 	Audit        *ledger.AuditService
-	Auth         *auth.Resolver
+	// Admin backs the /v1/admin operations (Task 2.2b): onboarding a tenant
+	// and issuing/rotating/revoking its api keys. Every /v1/admin/ path
+	// already requires domain.ScopeAdmin via auth.HumaMiddleware
+	// (RequiredHTTPScope), so the operations themselves add no further auth.
+	Admin *admin.Service
+	// Reports backs GET /v1/reports/trial-balance (Task 6.3, audit A9.2).
+	Reports *ledger.ReportService
+	// Disputes backs the /v1/disputes operations (Task 6.3, audit A9.2): a
+	// dispute/chargeback data model built on the reversal primitive.
+	Disputes *ledger.DisputeService
+	Auth     *auth.Resolver
 	// RateLimiter, if set, is registered immediately after the auth middleware
 	// (see New). It is optional: a zero Deps (spec generation, and tests that
 	// only exercise unauthenticated routes) leaves it nil and no rate-limit
 	// middleware is registered at all, rather than one that always fails open.
 	RateLimiter *auth.Limiter
+	// NegativeThrottle, if set, is passed straight through to
+	// auth.HumaMiddleware (Task 5.2, audit A2.5/A6.4): it caps failed-auth
+	// attempts per client IP BEFORE the resolver's database lookup runs, so a
+	// garbage-API-key flood cannot exhaust the connection pool. Optional for
+	// the same reason RateLimiter is: a nil value skips the gate entirely
+	// rather than failing closed.
+	NegativeThrottle *auth.NegativeThrottle
+	// Revision is the running binary's build revision (git short SHA; "dev"
+	// outside a real build), surfaced additively on GET /healthz (Task
+	// 5.6a). A zero value (spec generation, and tests that never care) just
+	// serializes as an empty string; it never affects the "ok" status the
+	// deploy health check depends on.
+	Revision string
 }
 
 // tenantFromCtx reads the tenant HumaMiddleware resolved from the caller's API
@@ -140,7 +164,7 @@ func New(router chi.Router, deps Deps) huma.API {
 	// matched operation's path rather than by chi-level routing (see
 	// docs/adr/012-api-authentication-and-hardening.md and
 	// internal/auth/middleware.go).
-	api.UseMiddleware(auth.HumaMiddleware(api, deps.Auth, slog.Default()))
+	api.UseMiddleware(auth.HumaMiddleware(api, deps.Auth, deps.NegativeThrottle, slog.Default()))
 
 	// Rate limiting is registered immediately after auth, never before: it
 	// reads the key auth.HumaMiddleware just resolved into the context
@@ -162,10 +186,13 @@ func New(router chi.Router, deps Deps) huma.API {
 // registerOperations wires every API operation. New endpoints get added here and
 // show up in the spec and playground automatically.
 func registerOperations(api huma.API, deps Deps) {
-	registerHealth(api)
+	registerHealth(api, deps.Revision)
 	registerAccounts(api, deps)
 	registerTransactions(api, deps)
 	registerAudit(api, deps)
+	registerAdmin(api, deps)
+	registerReports(api, deps)
+	registerDisputes(api, deps)
 }
 
 // SpecYAML builds the API on a throwaway router and serializes its OpenAPI spec
