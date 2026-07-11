@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sohag-pro/go-ledger/internal/fx"
 )
@@ -80,12 +81,12 @@ func TestAdminServiceInsertAndList(t *testing.T) {
 		t.Errorf("ListRates() %s/%s EffectiveSpreadBps = %d, want 25", base, quote, overridden.EffectiveSpreadBps)
 	}
 
-	markup, err := svc.SetMarkup(ctx, "", 50)
+	markup, err := svc.SetMarkup(ctx, "", int32Ptr(50))
 	if err != nil {
 		t.Fatalf("SetMarkup(global, 50) error = %v", err)
 	}
-	if markup.DefaultSpreadBps != 50 {
-		t.Errorf("SetMarkup() DefaultSpreadBps = %d, want 50", markup.DefaultSpreadBps)
+	if markup.DefaultSpreadBps == nil || *markup.DefaultSpreadBps != 50 {
+		t.Errorf("SetMarkup() DefaultSpreadBps = %v, want 50", markup.DefaultSpreadBps)
 	}
 
 	view, err := svc.GetMarkup(ctx, "")
@@ -95,8 +96,8 @@ func TestAdminServiceInsertAndList(t *testing.T) {
 	if view.Global == nil {
 		t.Fatalf("GetMarkup(global).Global = nil, want the row just set")
 	}
-	if view.Global.DefaultSpreadBps != 50 {
-		t.Errorf("GetMarkup(global).Global.DefaultSpreadBps = %d, want 50", view.Global.DefaultSpreadBps)
+	if view.Global.DefaultSpreadBps == nil || *view.Global.DefaultSpreadBps != 50 {
+		t.Errorf("GetMarkup(global).Global.DefaultSpreadBps = %v, want 50", view.Global.DefaultSpreadBps)
 	}
 
 	if _, err := svc.InsertRate(ctx, "", base, otherQuote, 110_5000_0000, nil); err != nil {
@@ -197,10 +198,10 @@ func TestListRatesResolvesEffectiveSpreadAgainstRequestedScope(t *testing.T) {
 		t.Fatalf("InsertRate(global, %s/%s) error = %v", base, quote, err)
 	}
 
-	if _, err := svc.SetMarkup(ctx, tenantID, 80); err != nil {
+	if _, err := svc.SetMarkup(ctx, tenantID, int32Ptr(80)); err != nil {
 		t.Fatalf("SetMarkup(tenant, 80) error = %v", err)
 	}
-	if _, err := svc.SetMarkup(ctx, "", 50); err != nil {
+	if _, err := svc.SetMarkup(ctx, "", int32Ptr(50)); err != nil {
 		t.Fatalf("SetMarkup(global, 50) error = %v", err)
 	}
 
@@ -247,9 +248,125 @@ func TestFXAdminUnknownTenantMapsToErrUnknownTenant(t *testing.T) {
 
 	t.Run("SetMarkup", func(t *testing.T) {
 		t.Parallel()
-		_, err := svc.SetMarkup(ctx, unknownTenant, 30)
+		_, err := svc.SetMarkup(ctx, unknownTenant, int32Ptr(30))
 		if !errors.Is(err, fx.ErrUnknownTenant) {
 			t.Errorf("SetMarkup(unknown tenant) error = %v, want it to wrap fx.ErrUnknownTenant", err)
 		}
 	})
+}
+
+// TestSetMarkupClearFallsBackToGlobal covers the AdminService side of the
+// fix for finding 2 (a tenant markup default could never be cleared): a
+// tenant sets its own override, a conversion for that tenant uses it, the
+// tenant then clears it (SetMarkup with a nil bps), and a conversion for
+// that tenant must go back to following the global default exactly the way
+// a tenant that never had an override of its own would, not keep using the
+// stale override or silently resolve to zero. GetMarkup must also surface
+// the cleared row distinctly from "no tenant row at all": Tenant is a
+// present *MarkupDefault whose own DefaultSpreadBps is nil.
+//
+// fx_markup_defaults' global tier is a single, database-wide "latest row
+// wins" value shared with every other test in this package, not partitioned
+// by currency pair or tenant, so this test never writes to the global scope
+// itself and never asserts an exact resolved number (either would race
+// against other parallel tests writing their own global default, exactly
+// the flake this test hit before this fix: comparing against a hardcoded
+// global value raced with provider_markup_test.go's own global writes).
+// Instead, it compares tenantA (whose override was just cleared) against a
+// second, freshly created tenantB that never had an override at all, both
+// resolving the SAME shared rate row moments apart: whatever the global
+// tier happens to be at read time, a correctly cleared tenant must resolve
+// to the identical value a no-override tenant does.
+func TestSetMarkupClearFallsBackToGlobal(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	svc := fx.NewAdminService(pool)
+
+	tenantA := newTestTenant(t, pool)
+	tenantB := newTestTenant(t, pool)
+	const base, quote = "CDG", "CDH"
+
+	// One global (tenant_id NULL) rate row for the pair, spread NULL so its
+	// effective spread always resolves through the markup-default chain;
+	// both tenants see this same row via ListRates' global fallback, since
+	// neither has a rate row of its own.
+	if _, err := svc.InsertRate(ctx, "", base, quote, 100_000_000, nil); err != nil {
+		t.Fatalf("InsertRate(global, %s/%s) error = %v", base, quote, err)
+	}
+
+	if _, err := svc.SetMarkup(ctx, tenantA, int32Ptr(80)); err != nil {
+		t.Fatalf("SetMarkup(tenantA, 80) error = %v", err)
+	}
+
+	ratesA, err := svc.ListRates(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("ListRates(tenantA) error = %v", err)
+	}
+	before, ok := findRateView(ratesA, base, quote)
+	if !ok {
+		t.Fatalf("ListRates(tenantA) missing %s/%s before clear", base, quote)
+	}
+	if before.EffectiveSpreadBps != 80 {
+		t.Fatalf("ListRates(tenantA) %s/%s EffectiveSpreadBps before clear = %d, want 80 (the tenant override)",
+			base, quote, before.EffectiveSpreadBps)
+	}
+
+	// tenantA clears its own override.
+	cleared, err := svc.SetMarkup(ctx, tenantA, nil)
+	if err != nil {
+		t.Fatalf("SetMarkup(tenantA, nil) error = %v", err)
+	}
+	if cleared.DefaultSpreadBps != nil {
+		t.Errorf("SetMarkup(tenantA, nil) DefaultSpreadBps = %v, want nil", *cleared.DefaultSpreadBps)
+	}
+
+	// Read both tenants through the SAME REPEATABLE READ transaction, so
+	// both queries see one consistent snapshot of the shared, package-wide
+	// fx_markup_defaults global tier: two separate READ COMMITTED queries a
+	// moment apart (the first cut of this test) is still wide enough for
+	// another parallel test's own global write to land in between and flip
+	// the "current" global row out from under the comparison, which is
+	// exactly the flake this snapshot avoids.
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatalf("begin snapshot tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	txSvc := fx.NewAdminService(tx)
+
+	ratesA, err = txSvc.ListRates(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("ListRates(tenantA) error = %v after clear", err)
+	}
+	afterA, ok := findRateView(ratesA, base, quote)
+	if !ok {
+		t.Fatalf("ListRates(tenantA) missing %s/%s after clear", base, quote)
+	}
+	ratesB, err := txSvc.ListRates(ctx, tenantB)
+	if err != nil {
+		t.Fatalf("ListRates(tenantB) error = %v", err)
+	}
+	neverOverridden, ok := findRateView(ratesB, base, quote)
+	if !ok {
+		t.Fatalf("ListRates(tenantB) missing %s/%s", base, quote)
+	}
+	if afterA.EffectiveSpreadBps != neverOverridden.EffectiveSpreadBps {
+		t.Errorf("tenantA EffectiveSpreadBps after clear = %d, tenantB (never overridden) EffectiveSpreadBps = %d, want them equal (a cleared tenant must resolve exactly like a tenant with no override of its own)",
+			afterA.EffectiveSpreadBps, neverOverridden.EffectiveSpreadBps)
+	}
+	if afterA.EffectiveSpreadBps == 80 {
+		t.Errorf("tenantA EffectiveSpreadBps after clear = 80, want it to have changed from the cleared override")
+	}
+
+	view, err := svc.GetMarkup(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("GetMarkup(tenantA) error = %v", err)
+	}
+	if view.Tenant == nil {
+		t.Fatalf("GetMarkup(tenantA).Tenant = nil, want a present row (the cleared row itself), not absent")
+	}
+	if view.Tenant.DefaultSpreadBps != nil {
+		t.Errorf("GetMarkup(tenantA).Tenant.DefaultSpreadBps = %v, want nil (a cleared row)", *view.Tenant.DefaultSpreadBps)
+	}
 }

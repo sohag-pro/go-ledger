@@ -97,7 +97,7 @@ type Dispute struct {
 type FxMarkupDefault struct {
 	ID               int64
 	TenantID         pgtype.UUID
-	DefaultSpreadBps int32
+	DefaultSpreadBps pgtype.Int4
 	Source           string
 	EffectiveAt      time.Time
 	CreatedAt        time.Time

@@ -66,15 +66,20 @@ func toFXRateBody(v fx.RateView) FXRateBody {
 // SetFXMarkupInput is the set-fx-markup request body.
 type SetFXMarkupInput struct {
 	Body struct {
-		TenantID         string `json:"tenant_id,omitempty" doc:"Tenant to scope this default to. Omit or empty for the global default."`
-		DefaultSpreadBps int32  `json:"default_spread_bps" minimum:"0" maximum:"9999" doc:"Default markup in basis points applied when a rate carries no spread"`
+		TenantID string `json:"tenant_id,omitempty" doc:"Tenant to scope this default to. Omit or empty for the global default."`
+		// DefaultSpreadBps is optional: omit it, or send it explicitly as
+		// null, to append a CLEARED row. For a tenant scope, a cleared row
+		// means the tenant drops its own override and follows the global
+		// default again; for the global scope it means no markup at all.
+		DefaultSpreadBps *int32 `json:"default_spread_bps,omitempty" minimum:"0" maximum:"9999" doc:"Default markup in basis points applied when a rate carries no spread. Omit or null to clear (tenant scope: follow the global default again; global scope: no markup)."`
 	}
 }
 
 // FXMarkupBody is the JSON shape of a markup default in the set-fx-markup
-// and get-fx-markup responses.
+// and get-fx-markup responses. DefaultSpreadBps is null when the row is a
+// CLEAR (see SetFXMarkupInput).
 type FXMarkupBody struct {
-	DefaultSpreadBps int32     `json:"default_spread_bps"`
+	DefaultSpreadBps *int32    `json:"default_spread_bps" doc:"Null when this row is a clear (tenant scope: following the global default again; global scope: no markup)"`
 	EffectiveAt      time.Time `json:"effective_at"`
 }
 

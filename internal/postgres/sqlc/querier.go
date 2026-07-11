@@ -94,11 +94,6 @@ type Querier interface {
 	// resolve effective_at's read-time fallback right after a fresh insert,
 	// without a second round trip (see Repository.txRepo.CreateTransaction).
 	CreateTransaction(ctx context.Context, arg CreateTransactionParams) (time.Time, error)
-	// The default markup for a conversion: the tenant's own default if it has
-	// one, else the global default. tenant_id = $1 matches the tenant's rows,
-	// tenant_id IS NULL always matches the global, and ORDER BY (tenant_id IS
-	// NULL) sorts the tenant tier ahead of global, then latest effective.
-	CurrentFXMarkupDefault(ctx context.Context, tenantID pgtype.UUID) (FxMarkupDefault, error)
 	// The latest quote for (base, quote) at or before now, preferring a
 	// tenant-specific row over the global default (Task 2.4, audit A3.3):
 	// tenant_id = $1 matches the tenant's own rows, and tenant_id IS NULL always
@@ -253,7 +248,10 @@ type Querier interface {
 	// fx_markup_defaults is append-only (ADR-020): a new default is a new row.
 	// tenant_id NULL is the global default, a non-NULL tenant_id is that tenant's
 	// override. effective_at is server-stamped via COALESCE(narg, now()) for the
-	// same clock-skew reason InsertFXRate stamps server-side.
+	// same clock-skew reason InsertFXRate stamps server-side. default_spread_bps
+	// is a nullable narg: a NULL value inserts a cleared row (the tenant follows
+	// the global default again), matching the nullable fx_rates.spread_bps
+	// pattern.
 	InsertFXMarkupDefault(ctx context.Context, arg InsertFXMarkupDefaultParams) (FxMarkupDefault, error)
 	// fx_rates is append-only (ADR-014): a new quote is a new row, never an
 	// update, so every rate ever applied to a transaction stays reconstructible.
@@ -305,6 +303,12 @@ type Querier interface {
 	// 4.1, audit A7.1): the delivery worker must read it back in full to sign
 	// every outbound payload.
 	InsertWebhookSubscription(ctx context.Context, arg InsertWebhookSubscriptionParams) error
+	// The latest env-seeded global row for a pair, used by fx.Seed to decide
+	// whether FX_RATES itself changed. Comparing against this (not the current
+	// winner) means an admin-API-written row is never clobbered by a re-seed:
+	// Seed only re-asserts an env rate when the FX_RATES entry differs from the
+	// last thing Seed itself wrote for that pair.
+	LatestEnvGlobalFXRate(ctx context.Context, arg LatestEnvGlobalFXRateParams) (LatestEnvGlobalFXRateRow, error)
 	// Every key for a tenant, oldest first, including revoked ones: the admin
 	// surface's list view (Task 2.2b) is meant to show a tenant's full key
 	// history, not just its live keys. Never selects key_hash: plaintext is

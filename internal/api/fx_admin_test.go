@@ -22,7 +22,7 @@ import (
 // pool, provisioning a fresh tenant with an admin-scoped key and a post-only
 // key. fx.AdminService wraps sqlc.Queries directly, not domain.Repository, so
 // (unlike newAdminTestRouter's fakeRepo) this needs the real database.
-func newFXAdminTestRouter(t *testing.T) (r chi.Router, adminKey, nonAdminKey string) {
+func newFXAdminTestRouter(t *testing.T) (r chi.Router, adminKey, nonAdminKey, tenantID string) {
 	t.Helper()
 	if authPoolErr != nil {
 		t.Skipf("skipping integration test: %v", authPoolErr)
@@ -35,8 +35,11 @@ func newFXAdminTestRouter(t *testing.T) (r chi.Router, adminKey, nonAdminKey str
 		t.Fatalf("create tenant: %v", err)
 	}
 
-	const adminPlaintext = "glk_fx-admin-test-admin-scoped-key" //nolint:gosec // test fixture key, not a real credential
-	const postOnlyPlaintext = "glk_fx-admin-test-post-only-key" //nolint:gosec // test fixture key, not a real credential
+	// Suffixed with the fresh tenant id so two calls to this helper (now
+	// more than one test function uses it) never hash to the same
+	// api_keys.key_hash and collide on its unique constraint.
+	adminPlaintext := "glk_fx-admin-test-admin-scoped-key-" + tenant //nolint:gosec // test fixture key, not a real credential
+	postOnlyPlaintext := "glk_fx-admin-test-post-only-key-" + tenant //nolint:gosec // test fixture key, not a real credential
 	if err := repo.InsertAPIKey(ctx,
 		domain.APIKey{TenantID: tenant, Name: "admin", Scopes: []domain.Scope{domain.ScopeAdmin}},
 		domain.HashAPIKey(adminPlaintext),
@@ -56,7 +59,7 @@ func newFXAdminTestRouter(t *testing.T) (r chi.Router, adminKey, nonAdminKey str
 		Auth:  auth.NewResolver(repo, time.Minute),
 		FX:    fx.NewAdminService(sharedAuthPool),
 	})
-	return router, adminPlaintext, postOnlyPlaintext
+	return router, adminPlaintext, postOnlyPlaintext, tenant
 }
 
 // TestFXAdminEndpoints covers the /v1/admin/fx surface end to end (ADR-020):
@@ -66,7 +69,7 @@ func newFXAdminTestRouter(t *testing.T) (r chi.Router, adminKey, nonAdminKey str
 // struct-tag validation (spread_bps out of range) also mapping to 422, and
 // every one of these being rejected with 403 for a non-admin key.
 func TestFXAdminEndpoints(t *testing.T) {
-	r, adminKey, nonAdminKey := newFXAdminTestRouter(t)
+	r, adminKey, nonAdminKey, _ := newFXAdminTestRouter(t)
 
 	t.Run("insert rate with no spread", func(t *testing.T) {
 		rec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/rates", map[string]any{
@@ -147,7 +150,7 @@ func TestFXAdminEndpoints(t *testing.T) {
 		if err := json.Unmarshal(getRec.Body.Bytes(), &out); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if out.Global == nil || out.Global.DefaultSpreadBps != 50 {
+		if out.Global == nil || out.Global.DefaultSpreadBps == nil || *out.Global.DefaultSpreadBps != 50 {
 			t.Errorf("Global = %+v, want DefaultSpreadBps 50", out.Global)
 		}
 	})
@@ -199,4 +202,125 @@ func TestFXAdminEndpoints(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestFXAdminMarkupClear covers the /v1/admin/fx/markup HTTP surface for
+// finding 2 (a tenant markup default could never be cleared): setting a
+// tenant override, confirming it is what a conversion for that tenant would
+// apply, then clearing it by POSTing with default_spread_bps omitted, and
+// confirming the tenant falls back to the global default rather than
+// keeping the old override or silently going to zero. get-fx-markup must
+// also render the cleared tenant row as a present object with a null
+// default_spread_bps, not as an absent "tenant" key.
+//
+// The global default here uses 50, the same magic value TestFXAdminEndpoints
+// uses: fx_markup_defaults' global tier is a single database-wide "latest
+// row wins" value, not scoped to one test, so both tests writing the same
+// value keeps each correct regardless of which one's write is literally the
+// latest at any given read.
+func TestFXAdminMarkupClear(t *testing.T) {
+	r, adminKey, _, tenantID := newFXAdminTestRouter(t)
+
+	setGlobalRec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/markup", map[string]any{
+		"default_spread_bps": 50,
+	})
+	if setGlobalRec.Code != http.StatusCreated {
+		t.Fatalf("set global markup status = %d, want 201 (%s)", setGlobalRec.Code, setGlobalRec.Body.String())
+	}
+
+	rateRec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/rates", map[string]any{
+		"tenant_id": tenantID, "base": "USD", "quote": "AUD", "mid_rate_e8": 100_000_000,
+	})
+	if rateRec.Code != http.StatusCreated {
+		t.Fatalf("insert tenant rate status = %d, want 201 (%s)", rateRec.Code, rateRec.Body.String())
+	}
+
+	setTenantRec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/markup", map[string]any{
+		"tenant_id": tenantID, "default_spread_bps": 80,
+	})
+	if setTenantRec.Code != http.StatusCreated {
+		t.Fatalf("set tenant markup status = %d, want 201 (%s)", setTenantRec.Code, setTenantRec.Body.String())
+	}
+
+	listBefore := doAs(t, r, adminKey, http.MethodGet, "/v1/admin/fx/rates?tenant_id="+tenantID, nil)
+	if listBefore.Code != http.StatusOK {
+		t.Fatalf("list rates status = %d, want 200 (%s)", listBefore.Code, listBefore.Body.String())
+	}
+	var listedBefore struct {
+		Rates []FXRateBody `json:"rates"`
+	}
+	if err := json.Unmarshal(listBefore.Body.Bytes(), &listedBefore); err != nil {
+		t.Fatalf("decode list before clear: %v", err)
+	}
+	beforeSpread, ok := effectiveSpreadFor(listedBefore.Rates, "USD", "AUD")
+	if !ok {
+		t.Fatalf("list rates before clear missing USD/AUD")
+	}
+	if beforeSpread != 80 {
+		t.Fatalf("USD/AUD effective spread before clear = %d, want 80 (the tenant override)", beforeSpread)
+	}
+
+	// Clear the tenant override: default_spread_bps is omitted entirely,
+	// which must decode as nil, not as the zero value 0.
+	clearRec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/markup", map[string]any{
+		"tenant_id": tenantID,
+	})
+	if clearRec.Code != http.StatusCreated {
+		t.Fatalf("clear tenant markup status = %d, want 201 (%s)", clearRec.Code, clearRec.Body.String())
+	}
+	var clearedBody FXMarkupBody
+	if err := json.Unmarshal(clearRec.Body.Bytes(), &clearedBody); err != nil {
+		t.Fatalf("decode clear response: %v", err)
+	}
+	if clearedBody.DefaultSpreadBps != nil {
+		t.Errorf("clear response DefaultSpreadBps = %v, want nil", *clearedBody.DefaultSpreadBps)
+	}
+
+	listAfter := doAs(t, r, adminKey, http.MethodGet, "/v1/admin/fx/rates?tenant_id="+tenantID, nil)
+	if listAfter.Code != http.StatusOK {
+		t.Fatalf("list rates status = %d, want 200 (%s)", listAfter.Code, listAfter.Body.String())
+	}
+	var listedAfter struct {
+		Rates []FXRateBody `json:"rates"`
+	}
+	if err := json.Unmarshal(listAfter.Body.Bytes(), &listedAfter); err != nil {
+		t.Fatalf("decode list after clear: %v", err)
+	}
+	afterSpread, ok := effectiveSpreadFor(listedAfter.Rates, "USD", "AUD")
+	if !ok {
+		t.Fatalf("list rates after clear missing USD/AUD")
+	}
+	if afterSpread != 50 {
+		t.Errorf("USD/AUD effective spread after clear = %d, want 50 (must fall back to the global default)", afterSpread)
+	}
+
+	getRec := doAs(t, r, adminKey, http.MethodGet, "/v1/admin/fx/markup?tenant_id="+tenantID, nil)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get markup status = %d, want 200 (%s)", getRec.Code, getRec.Body.String())
+	}
+	var getOut struct {
+		Global *FXMarkupBody `json:"global"`
+		Tenant *FXMarkupBody `json:"tenant"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getOut); err != nil {
+		t.Fatalf("decode get markup: %v", err)
+	}
+	if getOut.Tenant == nil {
+		t.Fatalf("get markup Tenant = nil, want a present object (the cleared row itself)")
+	}
+	if getOut.Tenant.DefaultSpreadBps != nil {
+		t.Errorf("get markup Tenant.DefaultSpreadBps = %v, want nil (a cleared row)", *getOut.Tenant.DefaultSpreadBps)
+	}
+}
+
+// effectiveSpreadFor returns the EffectiveSpreadBps for (base, quote) out of
+// a list-fx-rates response, so TestFXAdminMarkupClear can address one pair
+// without depending on slice order.
+func effectiveSpreadFor(rates []FXRateBody, base, quote string) (int32, bool) {
+	for _, r := range rates {
+		if r.Base == base && r.Quote == quote {
+			return r.EffectiveSpreadBps, true
+		}
+	}
+	return 0, false
 }

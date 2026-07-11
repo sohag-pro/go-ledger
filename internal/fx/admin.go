@@ -49,9 +49,23 @@ type RateView struct {
 }
 
 // MarkupDefault is a single default markup value with its effective time.
+// DefaultSpreadBps is nil when the row is a CLEAR (default_spread_bps NULL):
+// for a tenant scope that means "follow the global default again"; for the
+// global scope it means no markup at all (see migration 0031).
 type MarkupDefault struct {
-	DefaultSpreadBps int32
+	DefaultSpreadBps *int32
 	EffectiveAt      time.Time
+}
+
+// toMarkupDefault converts a nullable stored spread into a MarkupDefault,
+// nil when sp is not Valid (a cleared row).
+func toMarkupDefault(sp pgtype.Int4, effectiveAt time.Time) MarkupDefault {
+	md := MarkupDefault{EffectiveAt: effectiveAt}
+	if sp.Valid {
+		v := sp.Int32
+		md.DefaultSpreadBps = &v
+	}
+	return md
 }
 
 // MarkupView is the current markup defaults for a scope: the global default
@@ -158,21 +172,29 @@ func (s *AdminService) ListRates(ctx context.Context, tenantID string) ([]RateVi
 }
 
 // SetMarkup appends a markup-default row. tenantID "" is the global default.
-func (s *AdminService) SetMarkup(ctx context.Context, tenantID string, bps int32) (MarkupDefault, error) {
+// bps nil appends a CLEARED row (default_spread_bps NULL): for a tenant scope
+// that means the tenant drops its own override and follows the global
+// default again; for the global scope it means no markup at all. A present
+// bps is validated to [0, 10000) as before and stored as an explicit value.
+func (s *AdminService) SetMarkup(ctx context.Context, tenantID string, bps *int32) (MarkupDefault, error) {
 	tid, err := parseScope(tenantID)
 	if err != nil {
 		return MarkupDefault{}, err
 	}
-	if bps < 0 || bps >= 10000 {
-		return MarkupDefault{}, fmt.Errorf("%w: default_spread_bps out of range", ErrInvalidFXInput)
+	sp := pgtype.Int4{}
+	if bps != nil {
+		if *bps < 0 || *bps >= 10000 {
+			return MarkupDefault{}, fmt.Errorf("%w: default_spread_bps out of range", ErrInvalidFXInput)
+		}
+		sp = pgtype.Int4{Int32: *bps, Valid: true}
 	}
 	row, err := s.q.InsertFXMarkupDefault(ctx, sqlc.InsertFXMarkupDefaultParams{
-		TenantID: tid, DefaultSpreadBps: bps, Source: apiSource,
+		TenantID: tid, DefaultSpreadBps: sp, Source: apiSource,
 	})
 	if err != nil {
 		return MarkupDefault{}, mapFKErr(err)
 	}
-	return MarkupDefault{DefaultSpreadBps: row.DefaultSpreadBps, EffectiveAt: row.EffectiveAt}, nil
+	return toMarkupDefault(row.DefaultSpreadBps, row.EffectiveAt), nil
 }
 
 // GetMarkup returns the current global default and, when tenantID is set, that
@@ -191,14 +213,21 @@ func (s *AdminService) GetMarkup(ctx context.Context, tenantID string) (MarkupVi
 	var v MarkupView
 	g, err := s.q.GlobalFXMarkupDefault(ctx)
 	if err == nil {
-		v.Global = &MarkupDefault{DefaultSpreadBps: g.DefaultSpreadBps, EffectiveAt: g.EffectiveAt}
+		md := toMarkupDefault(g.DefaultSpreadBps, g.EffectiveAt)
+		v.Global = &md
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return MarkupView{}, err
 	}
 	if tenantID != "" {
 		t, err := s.q.TenantFXMarkupDefault(ctx, tid)
 		if err == nil {
-			v.Tenant = &MarkupDefault{DefaultSpreadBps: t.DefaultSpreadBps, EffectiveAt: t.EffectiveAt}
+			// A NULL tenant row (a clear) still surfaces here: Tenant is a
+			// present *MarkupDefault whose own DefaultSpreadBps is nil, so a
+			// caller can tell "the tenant explicitly cleared its override"
+			// (Tenant != nil, Tenant.DefaultSpreadBps == nil) apart from "the
+			// tenant never set one" (Tenant == nil).
+			md := toMarkupDefault(t.DefaultSpreadBps, t.EffectiveAt)
+			v.Tenant = &md
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return MarkupView{}, err
 		}
@@ -206,18 +235,16 @@ func (s *AdminService) GetMarkup(ctx context.Context, tenantID string) (MarkupVi
 	return v, nil
 }
 
+// resolveEffective mirrors dbRateProvider.resolveSpread (provider.go) so the
+// admin API's display of what a conversion would apply agrees with what it
+// actually applies at conversion time; both delegate to resolveMarkupDefault,
+// which is where the shared two-step (tenant, then global, honoring a
+// cleared row at either scope) precedence logic lives.
 func (s *AdminService) resolveEffective(ctx context.Context, tid pgtype.UUID, rowSpread pgtype.Int4) (int32, error) {
 	if rowSpread.Valid {
 		return rowSpread.Int32, nil
 	}
-	d, err := s.q.CurrentFXMarkupDefault(ctx, tid)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return d.DefaultSpreadBps, nil
+	return resolveMarkupDefault(ctx, s.q, tid)
 }
 
 func toRateView(tid pgtype.UUID, base, quote string, midE8 int64, sp pgtype.Int4, eff int32, source string, effAt time.Time) RateView {

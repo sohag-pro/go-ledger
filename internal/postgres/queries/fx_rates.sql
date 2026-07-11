@@ -39,6 +39,18 @@ WHERE base = $2 AND quote = $3
 ORDER BY (tenant_id IS NULL), effective_at DESC, id DESC
 LIMIT 1;
 
+-- name: LatestEnvGlobalFXRate :one
+-- The latest env-seeded global row for a pair, used by fx.Seed to decide
+-- whether FX_RATES itself changed. Comparing against this (not the current
+-- winner) means an admin-API-written row is never clobbered by a re-seed:
+-- Seed only re-asserts an env rate when the FX_RATES entry differs from the
+-- last thing Seed itself wrote for that pair.
+SELECT id, tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at, created_at
+FROM fx_rates
+WHERE base = $1 AND quote = $2 AND tenant_id IS NULL AND source = 'env' AND effective_at <= now()
+ORDER BY effective_at DESC, id DESC
+LIMIT 1;
+
 -- name: ListCurrentFXRates :many
 -- The current effective row per (base, quote) for a tenant plus the global
 -- defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts

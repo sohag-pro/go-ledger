@@ -34,16 +34,20 @@ func insertRateRaw(t *testing.T, q *sqlc.Queries, tenantID pgtype.UUID, base, qu
 }
 
 // insertMarkupDefault writes an fx_markup_defaults row, global when tenantID
-// is not Valid, tenant-owned otherwise. Unlike insertRateRaw, it does not
-// backdate effective_at: fx_markup_defaults' global (tenant_id NULL) row has
-// no per-pair partition (unlike fx_rates), so its "current" row is whatever
-// is latest across the whole shared table, full stop. A fixed backdate
-// margin can invert that ordering against a real (non-backdated) row written
-// moments later elsewhere in the suite (for example AdminService, which
-// deliberately lets the server stamp effective_at for the same clock-skew
-// reason documented on InsertFXRate), so this leaves effective_at unset and
-// lets the server's own now() win the same way.
-func insertMarkupDefault(t *testing.T, q *sqlc.Queries, tenantID pgtype.UUID, defaultSpreadBps int32) {
+// is not Valid, tenant-owned otherwise. defaultSpreadBps is a raw pgtype.Int4
+// so a case can write either an explicit value (Valid: true) or a CLEAR
+// (pgtype.Int4{}, i.e. Valid: false), the same way insertRateRaw above lets a
+// case write either a spread override or a NULL. Unlike insertRateRaw, it
+// does not backdate effective_at: fx_markup_defaults' global (tenant_id
+// NULL) row has no per-pair partition (unlike fx_rates), so its "current"
+// row is whatever is latest across the whole shared table, full stop. A
+// fixed backdate margin can invert that ordering against a real
+// (non-backdated) row written moments later elsewhere in the suite (for
+// example AdminService, which deliberately lets the server stamp
+// effective_at for the same clock-skew reason documented on InsertFXRate),
+// so this leaves effective_at unset and lets the server's own now() win the
+// same way.
+func insertMarkupDefault(t *testing.T, q *sqlc.Queries, tenantID pgtype.UUID, defaultSpreadBps pgtype.Int4) {
 	t.Helper()
 	if _, err := q.InsertFXMarkupDefault(context.Background(), sqlc.InsertFXMarkupDefaultParams{
 		TenantID:         tenantID,
@@ -53,6 +57,10 @@ func insertMarkupDefault(t *testing.T, q *sqlc.Queries, tenantID pgtype.UUID, de
 		t.Fatalf("insert fx markup default: %v", err)
 	}
 }
+
+// validSpread wraps v as a Valid pgtype.Int4, for the common case of
+// insertMarkupDefault writing an explicit (not cleared) value.
+func validSpread(v int32) pgtype.Int4 { return pgtype.Int4{Int32: v, Valid: true} }
 
 // TestProviderResolvesMarkupPrecedence covers the ADR-020 precedence chain a
 // conversion resolves its spread through: a per-pair override on the rate row
@@ -104,8 +112,8 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 			setup: func(t *testing.T, tenantID string) (domain.Currency, domain.Currency) {
 				tid := parseTenant(t, tenantID)
 				insertRateRaw(t, q, tid, "ABC", "DEF", 100_000_000, pgtype.Int4{Int32: 25, Valid: true})
-				insertMarkupDefault(t, q, tid, 40)
-				insertMarkupDefault(t, q, pgtype.UUID{}, 10)
+				insertMarkupDefault(t, q, tid, validSpread(40))
+				insertMarkupDefault(t, q, pgtype.UUID{}, validSpread(10))
 				return "ABC", "DEF"
 			},
 			want: 25,
@@ -116,7 +124,7 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 			name: "global default when no tenant default",
 			setup: func(t *testing.T, _ string) (domain.Currency, domain.Currency) {
 				insertRateRaw(t, q, pgtype.UUID{}, "MNO", "PQR", 100_000_000, pgtype.Int4{})
-				insertMarkupDefault(t, q, pgtype.UUID{}, 10)
+				insertMarkupDefault(t, q, pgtype.UUID{}, validSpread(10))
 				return "MNO", "PQR"
 			},
 			want: 10,
@@ -128,8 +136,8 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 			setup: func(t *testing.T, tenantID string) (domain.Currency, domain.Currency) {
 				tid := parseTenant(t, tenantID)
 				insertRateRaw(t, q, pgtype.UUID{}, "GHI", "JKL", 100_000_000, pgtype.Int4{})
-				insertMarkupDefault(t, q, tid, 40)
-				insertMarkupDefault(t, q, pgtype.UUID{}, 10)
+				insertMarkupDefault(t, q, tid, validSpread(40))
+				insertMarkupDefault(t, q, pgtype.UUID{}, validSpread(10))
 				return "GHI", "JKL"
 			},
 			want: 40,
@@ -143,10 +151,27 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 				tid := parseTenant(t, tenantID)
 				// Store YZA/BCD; the test requests the inverse BCD/YZA.
 				insertRateRaw(t, q, pgtype.UUID{}, "YZA", "BCD", 150_000_000, pgtype.Int4{})
-				insertMarkupDefault(t, q, tid, 40)
+				insertMarkupDefault(t, q, tid, validSpread(40))
 				return "BCD", "YZA"
 			},
 			want: 40,
+		},
+		{
+			// A tenant default exists, but the tenant's LATEST row is a
+			// clear (default_spread_bps NULL, ADR-020/migration 0031's
+			// fix): resolution must fall through to the global default, not
+			// treat the clear as an explicit zero or keep using the
+			// tenant's earlier (now-superseded) value.
+			name: "cleared tenant default falls back to global",
+			setup: func(t *testing.T, tenantID string) (domain.Currency, domain.Currency) {
+				tid := parseTenant(t, tenantID)
+				insertRateRaw(t, q, pgtype.UUID{}, "STU", "TUV", 100_000_000, pgtype.Int4{})
+				insertMarkupDefault(t, q, tid, validSpread(40)) // tenant sets an override
+				insertMarkupDefault(t, q, tid, pgtype.Int4{})   // tenant clears it (NULL)
+				insertMarkupDefault(t, q, pgtype.UUID{}, validSpread(10))
+				return "STU", "TUV"
+			},
+			want: 10,
 		},
 	}
 

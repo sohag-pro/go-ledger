@@ -124,12 +124,56 @@ func (p *dbRateProvider) resolveSpread(ctx context.Context, tenant pgtype.UUID, 
 	if rowSpread.Valid {
 		return rowSpread.Int32, nil
 	}
-	d, err := p.q.CurrentFXMarkupDefault(ctx, tenant)
+	return resolveMarkupDefault(ctx, p.q, tenant)
+}
+
+// resolveMarkupDefault resolves the markup default a conversion falls back to
+// when a rate row carries no per-pair spread override: the tenant's own
+// default if tenant is a valid scope AND that tenant's latest row is not
+// cleared (its value is non-NULL), else the global default if it exists and
+// is itself non-NULL, else zero.
+//
+// A tenant row can be CLEARED (default_spread_bps NULL): that means "this
+// tenant no longer has its own override, follow the global default again"
+// (see migration 0031 and ADR-020). Naively taking whatever
+// TenantFXMarkupDefault returns without checking Valid would make a cleared
+// row look like an explicit zero markup instead of "go look at the global
+// default," which is the bug this two-step lookup exists to avoid. A NULL
+// global row means no markup at all, i.e. zero: there is no further scope to
+// fall back to.
+//
+// This is shared by dbRateProvider.resolveSpread (this file) and
+// AdminService.resolveEffective (admin.go) so the two paths that resolve a
+// conversion's effective spread, one at conversion time and one for the
+// admin API's display of what a conversion would apply, can never drift
+// apart on the precedence rule itself.
+func resolveMarkupDefault(ctx context.Context, q *sqlc.Queries, tenant pgtype.UUID) (int32, error) {
+	if tenant.Valid {
+		t, err := q.TenantFXMarkupDefault(ctx, tenant)
+		switch {
+		case err == nil:
+			if t.DefaultSpreadBps.Valid {
+				return t.DefaultSpreadBps.Int32, nil
+			}
+			// The tenant's latest row is a clear (NULL): fall through to the
+			// global default below, exactly as if no tenant row existed.
+		case errors.Is(err, pgx.ErrNoRows):
+			// No tenant row at all: fall through to the global default.
+		default:
+			return 0, fmt.Errorf("fx: resolve tenant markup default: %w", err)
+		}
+	}
+
+	g, err := q.GlobalFXMarkupDefault(ctx)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("fx: resolve markup default: %w", err)
+		return 0, fmt.Errorf("fx: resolve global markup default: %w", err)
 	}
-	return d.DefaultSpreadBps, nil
+	if !g.DefaultSpreadBps.Valid {
+		// The global scope itself is cleared: no markup default anywhere.
+		return 0, nil
+	}
+	return g.DefaultSpreadBps.Int32, nil
 }

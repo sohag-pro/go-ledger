@@ -475,8 +475,11 @@ components:
       additionalProperties: false
       properties:
         default_spread_bps:
+          description: "Null when this row is a clear (tenant scope: following the global default again; global scope: no markup)"
           format: int32
-          type: integer
+          type:
+            - integer
+            - "null"
         effective_at:
           format: date-time
           type: string
@@ -835,7 +838,7 @@ components:
       additionalProperties: false
       properties:
         default_spread_bps:
-          description: Default markup in basis points applied when a rate carries no spread
+          description: "Default markup in basis points applied when a rate carries no spread. Omit or null to clear (tenant scope: follow the global default again; global scope: no markup)."
           format: int32
           maximum: 9999
           minimum: 0
@@ -843,8 +846,6 @@ components:
         tenant_id:
           description: Tenant to scope this default to. Omit or empty for the global default.
           type: string
-      required:
-        - default_spread_bps
       type: object
     SetTenantPolicyInputBody:
       additionalProperties: false
