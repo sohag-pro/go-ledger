@@ -219,11 +219,23 @@ jobs:
         # binary for one release.
         run: |
           sleep 3
-          if curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz; then
+          # A6.2: confirm the box is not just up (HTTP 200) but actually serving
+          # THIS build. /healthz reports the build revision stamped at build
+          # time (-X main.buildRevision=${GITHUB_SHA::7}); a silent binary-swap
+          # or restart failure that left the OLD binary running would still
+          # return 200 and pass a status-only check, so compare the served
+          # revision to what this pipeline just deployed and roll back on a
+          # mismatch too, not only on a non-200. Extraction is dependency-free
+          # (no jq): the body is {"status":"ok","revision":"<sha7>"}.
+          EXPECTED_REV="${GITHUB_SHA::7}"
+          HEALTH_BODY="$(curl --fail --silent --show-error --retry 5 --retry-delay 3 --retry-all-errors https://go.sohag.pro/healthz || true)"
+          SERVED_REV="$(printf '%s' "$HEALTH_BODY" | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')"
+          if [ -n "$HEALTH_BODY" ] && [ "$SERVED_REV" = "$EXPECTED_REV" ]; then
+            echo "health OK: serving revision ${SERVED_REV}"
             exit 0
           fi
 
-          echo "::error::health check failed after deploy; rolling back to the previous binary"
+          echo "::error::health check failed after deploy: served revision '${SERVED_REV:-none}' does not match the deployed '${EXPECTED_REV}' (or the app did not return 200), so the binary swap or restart did not take effect; rolling back to the previous binary"
           # This step's shell runs with -e (the GitHub Actions run: default),
           # so a naive `ssh ... || exit 1` right after it would still let -e
           # kill the script the instant the ssh command below returns
