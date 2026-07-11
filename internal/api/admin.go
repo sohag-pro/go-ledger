@@ -508,4 +508,6 @@ func registerAdmin(api huma.API, deps Deps) {
 		}
 		return &EmptyOutput{}, nil
 	})
+
+	registerFXAdmin(api, deps)
 }

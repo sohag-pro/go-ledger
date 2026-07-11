@@ -16,6 +16,7 @@ import (
 
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/auth"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
@@ -64,7 +65,10 @@ type Deps struct {
 	// Disputes backs the /v1/disputes operations (Task 6.3, audit A9.2): a
 	// dispute/chargeback data model built on the reversal primitive.
 	Disputes *ledger.DisputeService
-	Auth     *auth.Resolver
+	// FX backs the /v1/admin/fx operations (ADR-020): live rate and markup
+	// config. Optional like the other services; a zero Deps leaves it nil.
+	FX   *fx.AdminService
+	Auth *auth.Resolver
 	// RateLimiter, if set, is registered immediately after the auth middleware
 	// (see New). It is optional: a zero Deps (spec generation, and tests that
 	// only exercise unauthenticated routes) leaves it nil and no rate-limit
@@ -155,6 +159,7 @@ func New(router chi.Router, deps Deps) huma.API {
 		{Name: "admin: tenants", Description: "Onboard, suspend, close, or reactivate a tenant, and set its posting guardrails. Start here."},
 		{Name: "admin: keys", Description: "Issue, rotate, revoke, and list a tenant's api keys. Do this right after creating a tenant."},
 		{Name: "admin: webhooks", Description: "Register callback URLs to receive signed webhook deliveries for a tenant's posted transactions."},
+		{Name: "admin: fx", Description: "Set and read the live FX rate and markup config a conversion resolves against."},
 		{Name: "accounts", Description: "Create and manage the ledger accounts money moves between."},
 		{Name: "transactions", Description: "Post and reverse double-entry transactions."},
 		{Name: "reports", Description: "Read-only reporting and analytics over a tenant's ledger."},

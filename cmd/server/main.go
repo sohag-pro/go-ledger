@@ -549,7 +549,10 @@ func run(logger *slog.Logger) error {
 		// dispute-driven reversal goes through the identical screening,
 		// policy, account-status, and encryption checks a caller-initiated
 		// reversal does (Task 6.3, audit A9.2).
-		Disputes:         ledger.NewDisputeService(repo, transactions),
+		Disputes: ledger.NewDisputeService(repo, transactions),
+		// FX backs the /v1/admin/fx operations (ADR-020): live rate and markup
+		// config, over the same pool fx.NewDBProvider(pool) above already reads.
+		FX:               fx.NewAdminService(pool),
 		Auth:             resolver,
 		RateLimiter:      limiter,
 		NegativeThrottle: negativeThrottle,
