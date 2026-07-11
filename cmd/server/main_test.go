@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -85,6 +86,76 @@ func TestMaxBodyBytes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSlogLogger_KeyAndTenantEnrichment proves the follow-up F2 fix (audit
+// A6.3 partial): slogLogger installs a *auth.RequestLogInfo box on the
+// request's context before calling the wrapped handler, and, when something
+// downstream (the real chain being auth.HumaMiddleware, simulated here
+// directly since this test does not need a full huma pipeline) calls
+// auth.SetRequestLogInfo against that same context, the resulting log line
+// carries key_id and tenant_id. A request where nothing ever calls
+// SetRequestLogInfo (the unauthenticated/failed-auth shape) logs cleanly
+// with neither field present, and never panics.
+func TestSlogLogger_KeyAndTenantEnrichment(t *testing.T) {
+	t.Run("authenticated request carries key_id and tenant_id", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Mirrors what auth.HumaMiddleware does once a key resolves.
+			auth.SetRequestLogInfo(r.Context(), "key-abc-123", "tenant-xyz-789")
+			w.WriteHeader(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/transactions", nil)
+		rec := httptest.NewRecorder()
+		slogLogger(logger)(next).ServeHTTP(rec, req)
+
+		var line map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, buf.String())
+		}
+		if line["key_id"] != "key-abc-123" {
+			t.Errorf("key_id = %v, want %q", line["key_id"], "key-abc-123")
+		}
+		if line["tenant_id"] != "tenant-xyz-789" {
+			t.Errorf("tenant_id = %v, want %q", line["tenant_id"], "tenant-xyz-789")
+		}
+		if line["method"] != http.MethodGet || line["path"] != "/v1/transactions" {
+			t.Errorf("line = %v, missing expected method/path", line)
+		}
+	})
+
+	t.Run("unauthenticated request omits key_id and tenant_id without error", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+		next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/transactions", nil)
+		rec := httptest.NewRecorder()
+		slogLogger(logger)(next).ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rec.Code)
+		}
+		var line map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+			t.Fatalf("log line not JSON: %v (%q)", err, buf.String())
+		}
+		if _, ok := line["key_id"]; ok {
+			t.Errorf("line has key_id = %v, want absent for an unauthenticated request", line["key_id"])
+		}
+		if _, ok := line["tenant_id"]; ok {
+			t.Errorf("line has tenant_id = %v, want absent for an unauthenticated request", line["tenant_id"])
+		}
+		if line["status"] != float64(http.StatusUnauthorized) {
+			t.Errorf("status field = %v, want %d", line["status"], http.StatusUnauthorized)
+		}
+	})
 }
 
 // TestLoadConfig_ValidatesDefaultCurrency proves loadConfig fails fast on a

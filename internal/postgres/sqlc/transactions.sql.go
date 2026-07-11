@@ -155,17 +155,21 @@ FROM transactions
 WHERE tenant_id = $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
   AND ($3::timestamptz IS NULL OR created_at < $3)
-  AND ($4::text IS NULL OR reference = $4)
-  AND (created_at < $5
-       OR (created_at = $5 AND id < $6))
+  AND ($4::timestamptz IS NULL OR COALESCE(effective_at, created_at) >= $4)
+  AND ($5::timestamptz IS NULL OR COALESCE(effective_at, created_at) < $5)
+  AND ($6::text IS NULL OR reference = $6)
+  AND (created_at < $7
+       OR (created_at = $7 AND id < $8))
 ORDER BY created_at DESC, id DESC
-LIMIT $7
+LIMIT $9
 `
 
 type ListTransactionsParams struct {
 	TenantID       uuid.UUID
 	FromTs         pgtype.Timestamptz
 	ToTs           pgtype.Timestamptz
+	EffectiveFrom  pgtype.Timestamptz
+	EffectiveTo    pgtype.Timestamptz
 	Reference      pgtype.Text
 	AfterCreatedAt time.Time
 	AfterID        uuid.UUID
@@ -179,6 +183,16 @@ type ListTransactionsParams struct {
 // built dynamically per request. from_ts is inclusive (created_at >=),
 // to_ts is exclusive (created_at <): a half-open [from, to) window.
 //
+// effective_from/effective_to are the same half-open window, but over the
+// value date (Task 4.3's effective_at) rather than created_at (follow-up
+// F2): COALESCE(effective_at, created_at) is the same read-time fallback
+// used everywhere else effective_at is read (see assembleTransaction), so a
+// transaction posted with no explicit value date is filtered as if its value
+// date were its post time, never silently excluded from an effective_at
+// window that would otherwise match its created_at. Independent of
+// from_ts/to_ts: a caller may filter on created_at, effective_at, both, or
+// neither.
+//
 // Keyset paged by (created_at, id) descending, the identical cursor shape
 // AccountStatement already uses: after_created_at/after_id are the keyset
 // position, a far-future timestamp and the max uuid for the first page.
@@ -191,6 +205,8 @@ func (q *Queries) ListTransactions(ctx context.Context, arg ListTransactionsPara
 		arg.TenantID,
 		arg.FromTs,
 		arg.ToTs,
+		arg.EffectiveFrom,
+		arg.EffectiveTo,
 		arg.Reference,
 		arg.AfterCreatedAt,
 		arg.AfterID,

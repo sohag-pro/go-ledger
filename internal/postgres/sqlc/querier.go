@@ -388,6 +388,16 @@ type Querier interface {
 	// built dynamically per request. from_ts is inclusive (created_at >=),
 	// to_ts is exclusive (created_at <): a half-open [from, to) window.
 	//
+	// effective_from/effective_to are the same half-open window, but over the
+	// value date (Task 4.3's effective_at) rather than created_at (follow-up
+	// F2): COALESCE(effective_at, created_at) is the same read-time fallback
+	// used everywhere else effective_at is read (see assembleTransaction), so a
+	// transaction posted with no explicit value date is filtered as if its value
+	// date were its post time, never silently excluded from an effective_at
+	// window that would otherwise match its created_at. Independent of
+	// from_ts/to_ts: a caller may filter on created_at, effective_at, both, or
+	// neither.
+	//
 	// Keyset paged by (created_at, id) descending, the identical cursor shape
 	// AccountStatement already uses: after_created_at/after_id are the keyset
 	// position, a far-future timestamp and the max uuid for the first page.
@@ -412,15 +422,25 @@ type Querier interface {
 	// tries this delivery took (including the successful one), the same total
 	// MarkWebhookDeliveryFailed accumulates on the way here, so attempts always
 	// means "how many times this delivery was actually tried", not just "how
-	// many times it failed".
-	MarkWebhookDeliveryDelivered(ctx context.Context, arg MarkWebhookDeliveryDeliveredParams) error
+	// many times it failed". "AND status IN ('pending', 'failed')" guards
+	// against a state regression: in a two-leader window (SKIP LOCKED is
+	// defense in depth, not a guarantee, see ListDueWebhookDeliveries) two
+	// workers can pick up the same due row, and without this guard a slower
+	// worker's write could still land after a faster worker already reached a
+	// terminal outcome for it. Once a row is 'delivered' or 'dead', neither mark
+	// query can move it again: this returns 0 affected rows instead, which the
+	// caller (internal/webhook) treats as a no-op, not an error.
+	MarkWebhookDeliveryDelivered(ctx context.Context, arg MarkWebhookDeliveryDeliveredParams) (int64, error)
 	// A non-2xx response or transport error: the caller (internal/webhook)
 	// computes the new attempts count, the resulting status ('failed' to retry
 	// again later, or 'dead' once attempts reaches the configured max), the next
 	// backoff deadline, and the error text to record, all in Go (backoff and the
 	// max-attempts cap are application config, not schema), and this query just
-	// persists that decision.
-	MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) error
+	// persists that decision. "AND status IN ('pending', 'failed')" is the same
+	// terminal-state guard MarkWebhookDeliveryDelivered carries (see its doc
+	// comment): a delivery already 'delivered' (or already 'dead') can never be
+	// regressed by a late failure write from a second worker that raced this one.
+	MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) (int64, error)
 	// Atomically creates tenant_id's crypto_keys row at the given version,
 	// wrapping the CALLER-GENERATED candidate_wrapped_dek (ADR-018: only
 	// internal/crypto.Cipher ever holds the master key needed to produce one).

@@ -60,3 +60,39 @@ func TestKeyFromContext_Missing(t *testing.T) {
 		t.Fatalf("KeyFromContext = %+v, want zero value", got)
 	}
 }
+
+// TestSetRequestLogInfo_WritesThroughThePointer proves the write-back
+// mechanism follow-up F2 relies on (audit A6.3 partial): WithRequestLogInfo
+// installs a *RequestLogInfo on ctx, and SetRequestLogInfo, given any
+// context derived from it (mirroring how HumaMiddleware only ever sees a
+// context derived from the one the logging middleware built), mutates the
+// SAME box the original caller is still holding.
+func TestSetRequestLogInfo_WritesThroughThePointer(t *testing.T) {
+	t.Parallel()
+
+	info := &RequestLogInfo{}
+	ctx := WithRequestLogInfo(context.Background(), info)
+	// A further-derived context, the same shape ctx.Context() takes on by
+	// the time it reaches HumaMiddleware (see WithTenant/WithKey/huma.
+	// WithContext in HumaMiddleware).
+	derived := WithTenant(ctx, "tenant-derived")
+
+	SetRequestLogInfo(derived, "key-derived", "tenant-derived")
+
+	if info.KeyID != "key-derived" {
+		t.Errorf("KeyID = %q, want %q", info.KeyID, "key-derived")
+	}
+	if info.TenantID != "tenant-derived" {
+		t.Errorf("TenantID = %q, want %q", info.TenantID, "tenant-derived")
+	}
+}
+
+// TestSetRequestLogInfo_NoBoxIsNoop proves SetRequestLogInfo never panics or
+// errors when ctx carries no RequestLogInfo box at all, the normal shape for
+// any caller that never wired cmd/server's logging middleware (most tests,
+// including every other one in this package).
+func TestSetRequestLogInfo_NoBoxIsNoop(t *testing.T) {
+	t.Parallel()
+
+	SetRequestLogInfo(context.Background(), "key-1", "tenant-1") // must not panic
+}

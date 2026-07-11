@@ -988,23 +988,45 @@ func maxBodyBytes(limit int64) func(http.Handler) http.Handler {
 	}
 }
 
-// slogLogger logs one structured line per request: method, path, status, size,
-// duration, and the chi request id.
+// slogLogger logs one structured line per request: method, path, status,
+// size, duration, the chi request id, and, when the request authenticated
+// successfully, the resolved API key id and tenant id (follow-up F2, audit
+// A6.3 partial). Those two are best-effort: auth.HumaMiddleware resolves the
+// key and tenant deep inside huma's own request pipeline, on a context huma
+// derives internally (see huma.WithContext), not on r itself, so there is no
+// return value or r.Context() read after next.ServeHTTP that would see them
+// directly. Instead, a *auth.RequestLogInfo box is installed on r's context
+// here, BEFORE next.ServeHTTP runs; auth.SetRequestLogInfo (called from
+// HumaMiddleware once auth resolves) writes into that same box through the
+// pointer, and this middleware, holding the same pointer, reads whatever
+// landed in it once next.ServeHTTP returns. An unauthenticated or
+// failed-auth request simply leaves the box's fields at their zero value:
+// key_id and tenant_id are omitted from the log line rather than logged
+// empty, and nothing here can panic or error on that path. Never logs the
+// key's plaintext or hash, only its id.
 func slogLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			reqLog := &auth.RequestLogInfo{}
+			r = r.WithContext(auth.WithRequestLogInfo(r.Context(), reqLog))
 			next.ServeHTTP(ww, r)
-			logger.LogAttrs(
-				r.Context(), slog.LevelInfo, "http request",
+			attrs := []slog.Attr{
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Int("status", ww.Status()),
 				slog.Int("bytes", ww.BytesWritten()),
 				slog.Duration("elapsed", time.Since(start)),
 				slog.String("request_id", middleware.GetReqID(r.Context())),
-			)
+			}
+			if reqLog.KeyID != "" {
+				attrs = append(attrs, slog.String("key_id", reqLog.KeyID))
+			}
+			if reqLog.TenantID != "" {
+				attrs = append(attrs, slog.String("tenant_id", reqLog.TenantID))
+			}
+			logger.LogAttrs(r.Context(), slog.LevelInfo, "http request", attrs...)
 		})
 	}
 }

@@ -111,11 +111,13 @@ type ReverseTransactionOutput struct {
 // To follow the same half-open convention as domain.TransactionFilter: From
 // is inclusive, To is exclusive.
 type TransactionListInput struct {
-	From      string `query:"from" doc:"RFC3339 timestamp. Only transactions created at or after this time."`
-	To        string `query:"to" doc:"RFC3339 timestamp. Only transactions created strictly before this time."`
-	Reference string `query:"reference" doc:"Exact match on the transaction's reference."`
-	Limit     int    `query:"limit" default:"50" minimum:"1" maximum:"200" doc:"Max transactions per page"`
-	Cursor    string `query:"cursor" doc:"Opaque cursor from a previous page's next_cursor"`
+	From          string `query:"from" doc:"RFC3339 timestamp. Only transactions created at or after this time."`
+	To            string `query:"to" doc:"RFC3339 timestamp. Only transactions created strictly before this time."`
+	EffectiveFrom string `query:"effective_from" doc:"RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is at or after this time."`
+	EffectiveTo   string `query:"effective_to" doc:"RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is strictly before this time."`
+	Reference     string `query:"reference" doc:"Exact match on the transaction's reference."`
+	Limit         int    `query:"limit" default:"50" minimum:"1" maximum:"200" doc:"Max transactions per page"`
+	Cursor        string `query:"cursor" doc:"Opaque cursor from a previous page's next_cursor"`
 }
 
 // TransactionListOutput is one page of a tenant's transactions.
@@ -131,10 +133,12 @@ type TransactionListOutput struct {
 // audit A7.2). Unlike the list endpoint this is not paged: it returns every
 // matching transaction up to ledger.MaxExportRows in a single response.
 type TransactionExportInput struct {
-	From      string `query:"from" doc:"RFC3339 timestamp. Only transactions created at or after this time."`
-	To        string `query:"to" doc:"RFC3339 timestamp. Only transactions created strictly before this time."`
-	Reference string `query:"reference" doc:"Exact match on the transaction's reference."`
-	Format    string `query:"format" default:"csv" enum:"csv,json" doc:"csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."`
+	From          string `query:"from" doc:"RFC3339 timestamp. Only transactions created at or after this time."`
+	To            string `query:"to" doc:"RFC3339 timestamp. Only transactions created strictly before this time."`
+	EffectiveFrom string `query:"effective_from" doc:"RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is at or after this time."`
+	EffectiveTo   string `query:"effective_to" doc:"RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is strictly before this time."`
+	Reference     string `query:"reference" doc:"Exact match on the transaction's reference."`
+	Format        string `query:"format" default:"csv" enum:"csv,json" doc:"csv (default): one row per posting, with a header row. json: an array of the same transaction bodies GET /v1/transactions returns."`
 }
 
 // TransactionExportOutput is a raw csv or json export body (Task 4.4, audit
@@ -150,13 +154,14 @@ type TransactionExportOutput struct {
 }
 
 // parseTransactionFilter builds a domain.TransactionFilter from the list and
-// export endpoints' shared from/to/reference query params (Task 4.4, audit
-// A7.2). from and to are optional RFC3339 timestamps; an empty string leaves
-// that side of the filter unset. reference is an exact-match filter, also
-// optional: an empty string leaves it unset too, since Transaction.Validate
-// already rejects an empty, non-nil reference, so "" can never be a real
-// reference to match against.
-func parseTransactionFilter(from, to, reference string) (domain.TransactionFilter, error) {
+// export endpoints' shared from/to/effective_from/effective_to/reference
+// query params (Task 4.4, audit A7.2; effective_from/effective_to added by
+// follow-up F2, audit A1.3 partial). Each of the four timestamps is
+// optional RFC3339; an empty string leaves that side of the filter unset.
+// reference is an exact-match filter, also optional: an empty string leaves
+// it unset too, since Transaction.Validate already rejects an empty,
+// non-nil reference, so "" can never be a real reference to match against.
+func parseTransactionFilter(from, to, effectiveFrom, effectiveTo, reference string) (domain.TransactionFilter, error) {
 	var filter domain.TransactionFilter
 	if from != "" {
 		t, err := time.Parse(time.RFC3339Nano, from)
@@ -171,6 +176,20 @@ func parseTransactionFilter(from, to, reference string) (domain.TransactionFilte
 			return filter, huma.Error422UnprocessableEntity("to must be an RFC3339 timestamp")
 		}
 		filter.To = &t
+	}
+	if effectiveFrom != "" {
+		t, err := time.Parse(time.RFC3339Nano, effectiveFrom)
+		if err != nil {
+			return filter, huma.Error422UnprocessableEntity("effective_from must be an RFC3339 timestamp")
+		}
+		filter.EffectiveFrom = &t
+	}
+	if effectiveTo != "" {
+		t, err := time.Parse(time.RFC3339Nano, effectiveTo)
+		if err != nil {
+			return filter, huma.Error422UnprocessableEntity("effective_to must be an RFC3339 timestamp")
+		}
+		filter.EffectiveTo = &t
 	}
 	if reference != "" {
 		filter.Reference = &reference
@@ -431,11 +450,11 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:      http.MethodGet,
 		Path:        "/v1/transactions",
 		Summary:     "List transactions",
-		Description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive) and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page.",
+		Description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive), a value-date range (effective_from inclusive, effective_to exclusive, matched against effective_at, falling back to created_at when unset), and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page.",
 		Tags:        []string{"transactions"},
 		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *TransactionListInput) (*TransactionListOutput, error) {
-		filter, err := parseTransactionFilter(in.From, in.To, in.Reference)
+		filter, err := parseTransactionFilter(in.From, in.To, in.EffectiveFrom, in.EffectiveTo, in.Reference)
 		if err != nil {
 			return nil, err
 		}
@@ -474,11 +493,11 @@ func registerTransactions(api huma.API, deps Deps) {
 		Method:      http.MethodGet,
 		Path:        "/v1/transactions/export",
 		Summary:     "Export transactions",
-		Description: "Exports the tenant's transactions matching the same from/to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only.",
+		Description: "Exports the tenant's transactions matching the same from/to/effective_from/effective_to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only.",
 		Tags:        []string{"transactions"},
 		Security:    bearerSecurity,
 	}, func(ctx context.Context, in *TransactionExportInput) (*TransactionExportOutput, error) {
-		filter, err := parseTransactionFilter(in.From, in.To, in.Reference)
+		filter, err := parseTransactionFilter(in.From, in.To, in.EffectiveFrom, in.EffectiveTo, in.Reference)
 		if err != nil {
 			return nil, err
 		}

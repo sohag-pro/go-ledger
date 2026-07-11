@@ -58,6 +58,9 @@ services:
       - dev-app
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # alerts.yml sits next to prometheus.yml in the container too, so the
+      # rule_files: [alerts.yml] relative path in prometheus.yml resolves.
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "9091:9090"
 

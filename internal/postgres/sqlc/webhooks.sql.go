@@ -378,8 +378,9 @@ func (q *Queries) ListWebhookSubscriptionsByTenant(ctx context.Context, tenantID
 	return items, nil
 }
 
-const markWebhookDeliveryDelivered = `-- name: MarkWebhookDeliveryDelivered :exec
-UPDATE webhook_deliveries SET status = 'delivered', delivered_at = now(), attempts = $1 WHERE id = $2
+const markWebhookDeliveryDelivered = `-- name: MarkWebhookDeliveryDelivered :execrows
+UPDATE webhook_deliveries SET status = 'delivered', delivered_at = now(), attempts = $1
+WHERE id = $2 AND status IN ('pending', 'failed')
 `
 
 type MarkWebhookDeliveryDeliveredParams struct {
@@ -391,16 +392,26 @@ type MarkWebhookDeliveryDeliveredParams struct {
 // tries this delivery took (including the successful one), the same total
 // MarkWebhookDeliveryFailed accumulates on the way here, so attempts always
 // means "how many times this delivery was actually tried", not just "how
-// many times it failed".
-func (q *Queries) MarkWebhookDeliveryDelivered(ctx context.Context, arg MarkWebhookDeliveryDeliveredParams) error {
-	_, err := q.db.Exec(ctx, markWebhookDeliveryDelivered, arg.Attempts, arg.ID)
-	return err
+// many times it failed". "AND status IN ('pending', 'failed')" guards
+// against a state regression: in a two-leader window (SKIP LOCKED is
+// defense in depth, not a guarantee, see ListDueWebhookDeliveries) two
+// workers can pick up the same due row, and without this guard a slower
+// worker's write could still land after a faster worker already reached a
+// terminal outcome for it. Once a row is 'delivered' or 'dead', neither mark
+// query can move it again: this returns 0 affected rows instead, which the
+// caller (internal/webhook) treats as a no-op, not an error.
+func (q *Queries) MarkWebhookDeliveryDelivered(ctx context.Context, arg MarkWebhookDeliveryDeliveredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markWebhookDeliveryDelivered, arg.Attempts, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-const markWebhookDeliveryFailed = `-- name: MarkWebhookDeliveryFailed :exec
+const markWebhookDeliveryFailed = `-- name: MarkWebhookDeliveryFailed :execrows
 UPDATE webhook_deliveries
 SET status = $1, attempts = $2, next_attempt_at = $3, last_error = $4
-WHERE id = $5
+WHERE id = $5 AND status IN ('pending', 'failed')
 `
 
 type MarkWebhookDeliveryFailedParams struct {
@@ -416,16 +427,22 @@ type MarkWebhookDeliveryFailedParams struct {
 // again later, or 'dead' once attempts reaches the configured max), the next
 // backoff deadline, and the error text to record, all in Go (backoff and the
 // max-attempts cap are application config, not schema), and this query just
-// persists that decision.
-func (q *Queries) MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) error {
-	_, err := q.db.Exec(ctx, markWebhookDeliveryFailed,
+// persists that decision. "AND status IN ('pending', 'failed')" is the same
+// terminal-state guard MarkWebhookDeliveryDelivered carries (see its doc
+// comment): a delivery already 'delivered' (or already 'dead') can never be
+// regressed by a late failure write from a second worker that raced this one.
+func (q *Queries) MarkWebhookDeliveryFailed(ctx context.Context, arg MarkWebhookDeliveryFailedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markWebhookDeliveryFailed,
 		arg.Status,
 		arg.Attempts,
 		arg.NextAttemptAt,
 		arg.LastError,
 		arg.ID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setWebhookFanoutCursor = `-- name: SetWebhookFanoutCursor :exec

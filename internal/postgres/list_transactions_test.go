@@ -188,6 +188,106 @@ func TestListTransactionsPagination(t *testing.T) {
 	}
 }
 
+// TestListTransactionsEffectiveAtFilter proves EffectiveFrom/EffectiveTo
+// filter on the value date (effective_at), independent of created_at
+// (follow-up F2, audit A1.3 partial): three transactions posted back to back
+// (so created_at is roughly the same, strictly increasing but seconds apart
+// from the effective_at values below) each carry a distinct, explicit
+// effective_at far apart from one another and from created_at, so a
+// created_at-based filter would never coincidentally produce the same
+// result. A window that brackets only the middle transaction's effective_at
+// returns exactly that one; omitting EffectiveFrom/EffectiveTo entirely
+// still matches all three, exactly as before this filter existed.
+func TestListTransactionsEffectiveAtFilter(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "list transactions effective_at tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
+	other := &domain.Account{Name: "Other", Type: domain.Asset, Currency: "USD"}
+	for _, a := range []*domain.Account{cash, other} {
+		if err := repo.CreateAccount(ctx, tenant, a); err != nil {
+			t.Fatalf("create account: %v", err)
+		}
+	}
+
+	// Value dates a year apart, in reverse chronological posting order, so
+	// "posted order" and "effective_at order" deliberately disagree: this
+	// filter must go by effective_at, not by created_at or insertion order.
+	early := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	mid := time.Date(2021, 6, 15, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	post := func(effectiveAt time.Time, amount int64) string {
+		debit, err := domain.NewMoney(amount, "USD")
+		if err != nil {
+			t.Fatalf("new money: %v", err)
+		}
+		credit, err := domain.NewMoney(-amount, "USD")
+		if err != nil {
+			t.Fatalf("new money: %v", err)
+		}
+		ea := effectiveAt
+		txn := &domain.Transaction{
+			Postings: []domain.Posting{
+				{AccountID: cash.ID, Amount: debit},
+				{AccountID: other.ID, Amount: credit},
+			},
+			EffectiveAt: &ea,
+		}
+		if err := repo.CreateTransaction(ctx, tenant, txn); err != nil {
+			t.Fatalf("post transaction with effective_at %s: %v", effectiveAt, err)
+		}
+		return txn.ID
+	}
+
+	lateID := post(late, 10)
+	earlyID := post(early, 20)
+	midID := post(mid, 30)
+
+	// Unfiltered: all three, regardless of the effective_at/created_at
+	// mismatch.
+	all, err := repo.ListTransactions(ctx, tenant, domain.TransactionFilter{}, nil, 10)
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("unfiltered list = %d transactions, want 3", len(all))
+	}
+
+	// A window bracketing only mid's effective_at (2021-06-15) returns
+	// exactly mid: early (2020) is excluded by EffectiveFrom, late (2023) is
+	// excluded by EffectiveTo.
+	from := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
+	ranged, err := repo.ListTransactions(ctx, tenant, domain.TransactionFilter{EffectiveFrom: &from, EffectiveTo: &to}, nil, 10)
+	if err != nil {
+		t.Fatalf("list by effective_at range: %v", err)
+	}
+	if len(ranged) != 1 || ranged[0].Transaction.ID != midID {
+		t.Fatalf("effective_at range filter = %+v, want exactly transaction %s (mid)", ranged, midID)
+	}
+
+	// A window covering only early and mid excludes late.
+	toExcludeLate := time.Date(2022, 6, 1, 0, 0, 0, 0, time.UTC)
+	rangedTwo, err := repo.ListTransactions(ctx, tenant, domain.TransactionFilter{EffectiveTo: &toExcludeLate}, nil, 10)
+	if err != nil {
+		t.Fatalf("list by effective_to only: %v", err)
+	}
+	gotTwo := map[string]bool{}
+	for _, item := range rangedTwo {
+		gotTwo[item.Transaction.ID] = true
+	}
+	if len(rangedTwo) != 2 || !gotTwo[earlyID] || !gotTwo[midID] || gotTwo[lateID] {
+		t.Fatalf("effective_to-only filter = %+v, want exactly {early, mid}, not late", rangedTwo)
+	}
+}
+
 // TestListTransactionsTenantIsolation proves a tenant never sees another
 // tenant's transactions through ListTransactions, even unfiltered.
 func TestListTransactionsTenantIsolation(t *testing.T) {

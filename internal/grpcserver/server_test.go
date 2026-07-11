@@ -380,4 +380,71 @@ func TestGRPCListTransactions(t *testing.T) {
 			t.Fatalf("walked order = %v, want %v (no gap, no overlap, newest first)", walked, wantOrder)
 		}
 	})
+
+	// effective_from/effective_to filters on the value date, independent of
+	// created_at (follow-up F2, audit A1.3 partial): three fresh
+	// transactions, each carrying an explicit effective_at far apart from
+	// one another (and posted in an order that disagrees with those value
+	// dates), prove the filter goes by effective_at and not by post order or
+	// created_at.
+	t.Run("effective_from/effective_to filters on the value date, not created_at", func(t *testing.T) {
+		postWithEffectiveAt := func(key string, effectiveAt time.Time) string {
+			idemCtx := metadata.AppendToOutgoingContext(ctx, "idempotency-key", key)
+			resp, err := client.PostTransaction(idemCtx, &ledgerv1.PostTransactionRequest{
+				Currency: "USD",
+				Postings: []*ledgerv1.Posting{
+					{AccountId: a.Account.Id, Amount: 50},
+					{AccountId: b.Account.Id, Amount: -50},
+				},
+				EffectiveAt: effectiveAt.Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				t.Fatalf("post %s: %v", key, err)
+			}
+			return resp.Transaction.Id
+		}
+
+		early := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		mid := time.Date(2021, 6, 15, 0, 0, 0, 0, time.UTC)
+		late := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		// Posted late-value-date-first, deliberately disagreeing with
+		// effective_at order.
+		lateID := postWithEffectiveAt("grpc-effective-at-late", late)
+		earlyID := postWithEffectiveAt("grpc-effective-at-early", early)
+		midID := postWithEffectiveAt("grpc-effective-at-mid", mid)
+
+		resp, err := client.ListTransactions(ctx, &ledgerv1.ListTransactionsRequest{
+			EffectiveFrom: "2021-01-01T00:00:00Z",
+			EffectiveTo:   "2022-01-01T00:00:00Z",
+			Limit:         10,
+		})
+		if err != nil {
+			t.Fatalf("list by effective_at range: %v", err)
+		}
+		var gotIDs []string
+		for _, txn := range resp.Transactions {
+			gotIDs = append(gotIDs, txn.Id)
+		}
+		foundMid, foundEarly, foundLate := false, false, false
+		for _, id := range gotIDs {
+			switch id {
+			case midID:
+				foundMid = true
+			case earlyID:
+				foundEarly = true
+			case lateID:
+				foundLate = true
+			}
+		}
+		if !foundMid {
+			t.Errorf("effective_at range filter missing mid (%s): got %v", midID, gotIDs)
+		}
+		if foundEarly {
+			t.Errorf("effective_at range filter wrongly includes early (%s, before the window)", earlyID)
+		}
+		if foundLate {
+			t.Errorf("effective_at range filter wrongly includes late (%s, after the window)", lateID)
+		}
+	})
 }

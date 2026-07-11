@@ -237,6 +237,22 @@ func (f *fakeRepo) ListTransactions(_ context.Context, _ string, filter domain.T
 		if filter.To != nil && !createdAt.Before(*filter.To) {
 			continue
 		}
+		// effectiveAt mirrors the real query's COALESCE(effective_at,
+		// created_at) read-time fallback (follow-up F2, audit A1.3 partial):
+		// CreateTransaction above always resolves t.EffectiveAt to createdAt
+		// when the caller supplied none, so this fake never actually sees a
+		// nil t.EffectiveAt here, but the fallback is kept explicit anyway to
+		// mirror the real query's own defensiveness.
+		effectiveAt := createdAt
+		if t.EffectiveAt != nil {
+			effectiveAt = *t.EffectiveAt
+		}
+		if filter.EffectiveFrom != nil && effectiveAt.Before(*filter.EffectiveFrom) {
+			continue
+		}
+		if filter.EffectiveTo != nil && !effectiveAt.Before(*filter.EffectiveTo) {
+			continue
+		}
 		if filter.Reference != nil && (t.Reference == nil || *t.Reference != *filter.Reference) {
 			continue
 		}
@@ -2223,6 +2239,116 @@ func TestExportTransactions(t *testing.T) {
 		}
 		if len(bodies) != 1 || bodies[0].ID != ids[1] {
 			t.Fatalf("filtered export = %+v, want exactly transaction %s", bodies, ids[1])
+		}
+	})
+}
+
+// TestListAndExportTransactions_EffectiveAtFilter covers effective_from/
+// effective_to end to end over both GET /v1/transactions and GET
+// /v1/transactions/export (follow-up F2, audit A1.3 partial): three
+// transactions are posted with explicit, widely-spaced effective_at value
+// dates, in an order that deliberately disagrees with created_at (posted
+// oldest-value-date-last), so a filter that accidentally matched on
+// created_at instead would return the wrong set. An effective_from/
+// effective_to window bracketing only the middle one returns exactly that
+// one on both endpoints; omitting both params still returns all three, as
+// before this filter existed.
+func TestListAndExportTransactions_EffectiveAtFilter(t *testing.T) {
+	r := newAPIRouter(newFakeRepo())
+	cash := createAccount(t, r, "Cash", "asset")
+	other := createAccount(t, r, "Other", "asset")
+
+	post := func(key string, effectiveAt time.Time) string {
+		rec := do(t, r, http.MethodPost, "/v1/transactions", map[string]any{
+			"currency": "USD",
+			"postings": []map[string]any{
+				{"account_id": cash, "amount": 100},
+				{"account_id": other, "amount": -100},
+			},
+			"effective_at": effectiveAt.Format(time.RFC3339Nano),
+		}, map[string]string{"Idempotency-Key": key})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("post %s: %d (%s)", key, rec.Code, rec.Body.String())
+		}
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode post %s: %v", key, err)
+		}
+		return out.ID
+	}
+
+	early := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	mid := time.Date(2021, 6, 15, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Posted late-value-date-first: created_at order and effective_at order
+	// deliberately disagree.
+	lateID := post("effective-at-filter-late", late)
+	earlyID := post("effective-at-filter-early", early)
+	midID := post("effective-at-filter-mid", mid)
+
+	windowFrom := "2021-01-01T00:00:00Z"
+	windowTo := "2022-01-01T00:00:00Z"
+
+	t.Run("list: window bracketing only mid returns exactly mid", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions?effective_from="+windowFrom+"&effective_to="+windowTo, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out transactionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Transactions) != 1 || out.Transactions[0].ID != midID {
+			t.Fatalf("effective_at range filter = %+v, want exactly transaction %s (mid)", out.Transactions, midID)
+		}
+	})
+
+	t.Run("export: same window, same result, json format", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export?format=json&effective_from="+windowFrom+"&effective_to="+windowTo, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var bodies []TransactionBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &bodies); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(bodies) != 1 || bodies[0].ID != midID {
+			t.Fatalf("effective_at range export = %+v, want exactly transaction %s (mid)", bodies, midID)
+		}
+	})
+
+	t.Run("omitting effective_from/effective_to matches everything, as before", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+		}
+		var out transactionListResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := map[string]bool{}
+		for _, txn := range out.Transactions {
+			got[txn.ID] = true
+		}
+		if len(out.Transactions) != 3 || !got[earlyID] || !got[midID] || !got[lateID] {
+			t.Fatalf("unfiltered list = %+v, want exactly {early, mid, late}", out.Transactions)
+		}
+	})
+
+	t.Run("malformed effective_from is rejected with 422", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions?effective_from=not-a-timestamp", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("malformed effective_to on export is rejected with 422", func(t *testing.T) {
+		rec := do(t, r, http.MethodGet, "/v1/transactions/export?effective_to=not-a-timestamp", nil)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Errorf("status %d, want 422 (%s)", rec.Code, rec.Body.String())
 		}
 	})
 }

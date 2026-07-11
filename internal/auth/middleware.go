@@ -116,6 +116,14 @@ func HumaMiddleware(api huma.API, resolver *Resolver, throttle *NegativeThrottle
 			return
 		}
 
+		// Best-effort: writes back to the RequestLogInfo box cmd/server's
+		// access-log middleware installed before this request ever reached
+		// huma, if one is present (see SetRequestLogInfo's doc comment). A
+		// caller that bypasses that middleware, for example a test invoking
+		// HumaMiddleware directly, simply has no box installed and this is a
+		// silent no-op, never a nil dereference or an error.
+		SetRequestLogInfo(ctx.Context(), key.ID, key.TenantID)
+
 		newCtx := WithKey(WithTenant(ctx.Context(), key.TenantID), key)
 		next(huma.WithContext(ctx, newCtx))
 	}
@@ -177,6 +185,10 @@ func Middleware(resolver *Resolver, throttle *NegativeThrottle, log *slog.Logger
 				writeForbidden(w, insufficientErr.Reason())
 				return
 			}
+
+			// See HumaMiddleware's identical call for why this is
+			// best-effort and safe to call unconditionally.
+			SetRequestLogInfo(r.Context(), key.ID, key.TenantID)
 
 			ctx := WithKey(WithTenant(r.Context(), key.TenantID), key)
 			next.ServeHTTP(w, r.WithContext(ctx))

@@ -931,6 +931,8 @@ func (r *Repository) ListTransactions(ctx context.Context, tenantID string, filt
 			TenantID:       tid,
 			FromTs:         ptrToTimestamptz(filter.From),
 			ToTs:           ptrToTimestamptz(filter.To),
+			EffectiveFrom:  ptrToTimestamptz(filter.EffectiveFrom),
+			EffectiveTo:    ptrToTimestamptz(filter.EffectiveTo),
 			Reference:      reference,
 			AfterCreatedAt: afterTime,
 			AfterID:        afterID,

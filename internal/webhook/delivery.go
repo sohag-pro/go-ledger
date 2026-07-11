@@ -41,7 +41,14 @@ func (w *Worker) deliverBatch(ctx context.Context, db dbtx) (delivered, retried,
 		outcome, attemptErr := w.attemptOne(ctx, row)
 		switch outcome {
 		case outcomeDelivered:
-			if err := q.MarkWebhookDeliveryDelivered(ctx, sqlc.MarkWebhookDeliveryDeliveredParams{
+			// A 0 rows-affected result means a concurrent worker already
+			// carried this row to a terminal state (delivered or dead)
+			// before this write landed (see MarkWebhookDeliveryDelivered's
+			// doc comment): this write is simply discarded, not an error,
+			// and the counters below still reflect this worker's own HTTP
+			// outcome for observability, even though the DB row itself did
+			// not move.
+			if _, err := q.MarkWebhookDeliveryDelivered(ctx, sqlc.MarkWebhookDeliveryDeliveredParams{
 				ID:       row.ID,
 				Attempts: row.Attempts + 1,
 			}); err != nil {
@@ -49,7 +56,7 @@ func (w *Worker) deliverBatch(ctx context.Context, db dbtx) (delivered, retried,
 			}
 			delivered++
 		case outcomeDead:
-			if err := q.MarkWebhookDeliveryFailed(ctx, sqlc.MarkWebhookDeliveryFailedParams{
+			if _, err := q.MarkWebhookDeliveryFailed(ctx, sqlc.MarkWebhookDeliveryFailedParams{
 				ID:            row.ID,
 				Status:        string(domain.WebhookDeliveryDead),
 				Attempts:      row.Attempts + 1,
@@ -62,7 +69,7 @@ func (w *Worker) deliverBatch(ctx context.Context, db dbtx) (delivered, retried,
 		case outcomeRetry:
 			newAttempts := row.Attempts + 1
 			next := time.Now().UTC().Add(backoffFor(int(newAttempts), w.cfg.BackoffBase, w.cfg.BackoffCap))
-			if err := q.MarkWebhookDeliveryFailed(ctx, sqlc.MarkWebhookDeliveryFailedParams{
+			if _, err := q.MarkWebhookDeliveryFailed(ctx, sqlc.MarkWebhookDeliveryFailedParams{
 				ID:            row.ID,
 				Status:        string(domain.WebhookDeliveryFailed),
 				Attempts:      newAttempts,

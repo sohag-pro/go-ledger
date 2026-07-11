@@ -1,16 +1,48 @@
-# Prometheus alerting rules for go-ledger (Task 5.6a, audit A6.1).
+# Prometheus alerting rules for go-ledger (Task 5.6a, audit A6.1; extended by
+# follow-up F3, audit A6.1 gap closure).
 #
 # Load this alongside deploy/prometheus.yml (rule_files: ["alerts.yml"]) on
 # whatever Prometheus instance scrapes the "go-ledger" job. It covers the
 # async subsystems' operational gauges (internal/opsmetrics), the two
-# request-path signals metrics.go already records, and basic service
-# liveness.
+# request-path signals metrics.go already records, basic service liveness,
+# and (from follow-up F3 onward) an overall HTTP error-rate rule plus three
+# infrastructure rules for exporters this deployment does not scrape yet.
 #
 # Metric names here are the real, currently-registered ones (see
 # internal/metrics/metrics.go): transaction_post_duration_seconds and
 # transaction_post_serialization_retries_total predate this task,
 # ledger_audit_outbox_pending/lag_seconds, ledger_webhook_deliveries_dead/pending,
 # and ledger_balance_invariant_violations are the gauges added with it.
+# http_server_request_duration_seconds (used by LedgerHTTP5xxRateHigh below)
+# is not a go-ledger-specific gauge: it is the OpenTelemetry semantic
+# convention histogram "http.server.request.duration" that
+# otelhttp.NewHandler (cmd/server/main.go) records for every request, sanitized
+# to Prometheus naming by the OTel Prometheus exporter that metrics.go's
+# MeterProvider wires into the same registry Handler() serves. Verified
+# against go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.69.0
+# (internal/semconv/server.go: NewHTTPServer registers
+# httpconv.NewServerRequestDuration, name "http.server.request.duration", unit
+# "s", labeled with http.response.status_code among others), so this is a
+# real series scraped today, not a fabricated one.
+#
+# Three rules below (LedgerDiskSpaceLow, LedgerTLSCertExpiringSoon,
+# LedgerBackupAgeTooOld) reference metrics that do NOT exist in this
+# Prometheus yet: they depend on node_exporter, blackbox_exporter, and a
+# pgBackRest backup-age exporter/textfile metric respectively, none of which
+# deploy/prometheus.yml or docker-compose.yml scrape today. Each is commented
+# at the rule with what it needs; see docs/ops/server-setup.md for the
+# production provisioning gap. They are included so they are ready to load
+# the moment those exporters exist, not because they fire today.
+#
+# NOT covered by any rule here: the scheduled restore-and-verify job
+# (.github/workflows/restore-verify.yml, ADR-016) is a CI job that restores a
+# throwaway database and checks it, not a long-running process with a
+# Prometheus gauge; there is no metric it could update between runs, and a
+# true "is the balance-invariant canary itself still being collected"
+# staleness check would need internal/opsmetrics to start emitting a
+# last-collected timestamp gauge (a Go code change, out of scope for this
+# config-only follow-up). That CI job is the real coverage for scheduled
+# verify today; it is intentionally not represented as a Prometheus rule.
 groups:
   - name: go-ledger.rules
     rules:
@@ -119,3 +151,96 @@ groups:
           description: >-
             Prometheus has not successfully scraped {{ $labels.instance }}
             for 1 minute. The instance is unreachable or has crashed.
+
+      # --- Follow-up F3 additions (audit A6.1 gap closure) -----------------
+
+      # Overall HTTP error rate, from the OTel server instrumentation
+      # otelhttp.NewHandler wraps the router in (see the file header comment
+      # above for how http_server_request_duration_seconds gets onto this
+      # same /metrics endpoint). This is deliberately broader than
+      # LedgerPostLatencyP99High: it covers every route, not only posting,
+      # so a failing webhook endpoint, a broken reporting query, or a bad
+      # deploy that 500s on everything shows up here even when posting
+      # latency itself looks fine. 5% sustained over 5 minutes is a starting
+      # threshold; revisit once real production traffic mix is known.
+      - alert: LedgerHTTP5xxRateHigh
+        expr: >-
+          (
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated HTTP 5xx rate"
+          description: >-
+            Over {{ $value | humanizePercentage }} of HTTP responses on
+            {{ $labels.job }} were 5xx over the last 5 minutes, above the 5%
+            threshold. Check application logs for the failing route.
+
+      # Disk space low. PENDING: node_exporter is NOT currently scraped by
+      # any Prometheus config in this repo (deploy/prometheus.yml only
+      # scrapes the go-ledger app itself, and no ansible role provisions
+      # node_exporter; see docs/ops/server-setup.md). node_filesystem_*_bytes
+      # does not exist in this Prometheus's time series database today, so
+      # this rule cannot fire until node_exporter is added as a scrape
+      # target. Included ready to load the moment it is.
+      - alert: LedgerDiskSpaceLow
+        expr: >-
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}
+          < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low on {{ $labels.instance }}"
+          description: >-
+            Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has
+            had less than 10% free space for 10 minutes. Requires
+            node_exporter to be scraped; not wired up in this deployment yet
+            (see docs/ops/server-setup.md).
+
+      # TLS certificate expiry. PENDING: blackbox_exporter is NOT currently
+      # scraped either, same gap as the disk rule above.
+      # probe_ssl_earliest_cert_expiry does not exist in this Prometheus
+      # today; this rule cannot fire until a blackbox_exporter probe target
+      # for https://go.sohag.pro is configured and scraped.
+      - alert: LedgerTLSCertExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 14
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS certificate expiring soon"
+          description: >-
+            The TLS certificate probed at {{ $labels.instance }} expires in
+            under 14 days. Requires blackbox_exporter to be scraped; not
+            wired up in this deployment yet (see docs/ops/server-setup.md).
+
+      # Backup age too old (pgBackRest, ADR-016). PENDING: no metric exists
+      # for this yet anywhere. This deployment runs pgBackRest with
+      # continuous WAL archiving and a separate CI job
+      # (.github/workflows/restore-verify.yml) restores and verifies a
+      # throwaway database periodically, but neither one emits a Prometheus
+      # gauge for "seconds since the last successful backup". Getting one
+      # needs either a community pgBackRest exporter or a small script that
+      # writes a node_exporter textfile-collector metric (for example
+      # pgbackrest_backup_age_seconds) on a cron, plus node_exporter itself
+      # scraped. The expr below names the metric that integration would need
+      # to emit; it references nothing that exists today, so this rule
+      # cannot fire until that exporter/script is built.
+      - alert: LedgerBackupAgeTooOld
+        expr: pgbackrest_backup_age_seconds > 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last pgBackRest backup is too old"
+          description: >-
+            The most recent pgBackRest backup on {{ $labels.instance }} is
+            over 24 hours old, above the RPO this deployment targets
+            (docs/ops/server-setup.md, ADR-016). Requires a backup-age
+            exporter/textfile metric; not wired up yet.

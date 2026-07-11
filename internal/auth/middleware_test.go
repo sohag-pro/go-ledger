@@ -245,6 +245,78 @@ func TestHumaMiddleware_NilResolverFailsClosedOnV1(t *testing.T) {
 	}
 }
 
+// TestHumaMiddleware_WritesRequestLogInfoOnSuccess proves the follow-up F2
+// wiring (audit A6.3 partial): when the incoming request's context already
+// carries a *RequestLogInfo box (installed by cmd/server's slogLogger,
+// mimicked here directly via WithRequestLogInfo), a successful resolve
+// writes the resolved key id and tenant id into it, so the access-log
+// middleware, holding the same pointer, can read them back after the
+// request completes. This is the only thing that makes the write-back
+// observable from outside HumaMiddleware, since the tenant/key it injects
+// via huma.WithContext lives on a context this test's own req never sees.
+func TestHumaMiddleware_WritesRequestLogInfoOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	const plaintext = "glk_request-log-info-test-key"
+	key := domain.APIKey{ID: "key-log-info", TenantID: "tenant-log-info", Name: "test key", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeRead}}
+	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
+	mux, _ := newTestAPI(t, resolver)
+
+	info := &RequestLogInfo{}
+	req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	req = req.WithContext(WithRequestLogInfo(req.Context(), info))
+	req.Header.Set(authHeader, "Bearer "+plaintext)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if info.KeyID != key.ID {
+		t.Errorf("RequestLogInfo.KeyID = %q, want %q", info.KeyID, key.ID)
+	}
+	if info.TenantID != key.TenantID {
+		t.Errorf("RequestLogInfo.TenantID = %q, want %q", info.TenantID, key.TenantID)
+	}
+}
+
+// TestHumaMiddleware_RequestLogInfoUntouchedOnFailedAuth proves the
+// best-effort contract's other half: a request with no valid key never
+// writes to the box (it stays at its zero value, exactly what the access
+// log's "omit when absent" check expects), and, more importantly, a request
+// carrying NO box at all (the normal shape of any test or caller that never
+// wires cmd/server's slogLogger) does not panic or error: SetRequestLogInfo
+// is a silent no-op without one.
+func TestHumaMiddleware_RequestLogInfoUntouchedOnFailedAuth(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewResolver(newFakeLookup(nil), time.Minute)
+	mux, _ := newTestAPI(t, resolver)
+
+	info := &RequestLogInfo{}
+	req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	req = req.WithContext(WithRequestLogInfo(req.Context(), info))
+	req.Header.Set(authHeader, "Bearer glk_never-issued")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", rec.Code, rec.Body.String())
+	}
+	if info.KeyID != "" || info.TenantID != "" {
+		t.Errorf("RequestLogInfo = %+v, want zero value after failed auth", info)
+	}
+
+	// No box installed at all: must not panic.
+	reqNoBox := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	reqNoBox.Header.Set(authHeader, "Bearer "+"glk_never-issued")
+	recNoBox := httptest.NewRecorder()
+	mux.ServeHTTP(recNoBox, reqNoBox)
+	if recNoBox.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (%s)", recNoBox.Code, recNoBox.Body.String())
+	}
+}
+
 func TestIsV1Path(t *testing.T) {
 	t.Parallel()
 
