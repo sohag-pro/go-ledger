@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/sohag-pro/go-ledger/internal/fx"
 )
 
@@ -163,4 +165,91 @@ func TestAdminServiceInsertAndList(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestListRatesResolvesEffectiveSpreadAgainstRequestedScope guards the fix for
+// the bug where ListRates resolved a row's effective spread against the
+// WINNING ROW's own tenant_id instead of the requested scope. ListCurrentFXRates
+// can return a global-fallback row (tenant_id NULL) for a tenant-scoped
+// request when no tenant-specific rate row exists for that pair; resolving
+// against that NULL tenant_id skips the tenant's own markup default entirely
+// (CurrentFXMarkupDefault would only ever match the global row). Here the
+// tenant has its own markup default (80) that must win over the global
+// default (50), even though the only rate row for the pair is the global one.
+// This is safe to run in parallel with the rest of the package: fx_rates uses
+// a disjoint currency pair and fx_markup_defaults resolves a tenant-specific
+// row ahead of any global row regardless of insertion order or timing (see
+// CurrentFXMarkupDefault's ORDER BY), so concurrent global writes elsewhere
+// in the suite cannot change this tenant's result.
+func TestListRatesResolvesEffectiveSpreadAgainstRequestedScope(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	svc := fx.NewAdminService(pool)
+
+	tenantID := newTestTenant(t, pool)
+	const base, quote = "VWX", "VWY"
+
+	// Only a global rate row for this pair: no tenant-specific row exists, so
+	// ListCurrentFXRates must return the global-fallback row for a request
+	// scoped to tenantID.
+	if _, err := svc.InsertRate(ctx, "", base, quote, 100_000_000, nil); err != nil {
+		t.Fatalf("InsertRate(global, %s/%s) error = %v", base, quote, err)
+	}
+
+	if _, err := svc.SetMarkup(ctx, tenantID, 80); err != nil {
+		t.Fatalf("SetMarkup(tenant, 80) error = %v", err)
+	}
+	if _, err := svc.SetMarkup(ctx, "", 50); err != nil {
+		t.Fatalf("SetMarkup(global, 50) error = %v", err)
+	}
+
+	rates, err := svc.ListRates(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("ListRates(%s) error = %v", tenantID, err)
+	}
+	got, ok := findRateView(rates, base, quote)
+	if !ok {
+		t.Fatalf("ListRates(%s) missing %s/%s", tenantID, base, quote)
+	}
+	// Confirm this really is exercising the precedence-breaking scenario: the
+	// returned row must be the global fallback (empty TenantID), not a
+	// tenant-owned row, or the assertion below would prove nothing.
+	if got.TenantID != "" {
+		t.Fatalf("ListRates(%s) %s/%s TenantID = %q, want \"\" (the global fallback row)", tenantID, base, quote, got.TenantID)
+	}
+	if got.EffectiveSpreadBps != 80 {
+		t.Errorf("ListRates(%s) %s/%s EffectiveSpreadBps = %d, want 80 (the tenant's own markup default must win over the global default, even though the rate row itself is the global one)",
+			tenantID, base, quote, got.EffectiveSpreadBps)
+	}
+}
+
+// TestFXAdminUnknownTenantMapsToErrUnknownTenant covers mapFKErr: a write
+// scoped to a tenant id that is syntactically valid but does not exist in the
+// tenants table must fail the fx_rates/fx_markup_defaults foreign key and
+// come back as fx.ErrUnknownTenant, not a raw pgconn error, so handlers can
+// map it to 422 without inspecting Postgres error codes themselves.
+func TestFXAdminUnknownTenantMapsToErrUnknownTenant(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	svc := fx.NewAdminService(pool)
+
+	unknownTenant := uuid.NewString()
+
+	t.Run("InsertRate", func(t *testing.T) {
+		t.Parallel()
+		_, err := svc.InsertRate(ctx, unknownTenant, "VWZ", "VWQ", 100_000_000, nil)
+		if !errors.Is(err, fx.ErrUnknownTenant) {
+			t.Errorf("InsertRate(unknown tenant) error = %v, want it to wrap fx.ErrUnknownTenant", err)
+		}
+	})
+
+	t.Run("SetMarkup", func(t *testing.T) {
+		t.Parallel()
+		_, err := svc.SetMarkup(ctx, unknownTenant, 30)
+		if !errors.Is(err, fx.ErrUnknownTenant) {
+			t.Errorf("SetMarkup(unknown tenant) error = %v, want it to wrap fx.ErrUnknownTenant", err)
+		}
+	})
 }

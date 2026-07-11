@@ -142,7 +142,13 @@ func (s *AdminService) ListRates(ctx context.Context, tenantID string) ([]RateVi
 	}
 	out := make([]RateView, 0, len(rows))
 	for _, r := range rows {
-		eff, err := s.resolveEffective(ctx, r.TenantID, r.SpreadBps)
+		// Resolve against the REQUESTED scope (tid), not the winning row's own
+		// tenant_id: ListCurrentFXRates can return a global-fallback row
+		// (tenant_id NULL) for a tenant-scoped request, and resolving against
+		// that NULL would skip the tenant's own markup default. This mirrors
+		// InsertRate below and Provider.resolveSpread, which always resolve
+		// against the requested tenant.
+		eff, err := s.resolveEffective(ctx, tid, r.SpreadBps)
 		if err != nil {
 			return nil, err
 		}
@@ -172,6 +178,16 @@ func (s *AdminService) SetMarkup(ctx context.Context, tenantID string, bps int32
 // GetMarkup returns the current global default and, when tenantID is set, that
 // tenant's own override (nil if none).
 func (s *AdminService) GetMarkup(ctx context.Context, tenantID string) (MarkupView, error) {
+	// Validate the scope before running any query, so a malformed tenant id
+	// fails fast instead of after the global-default lookup has already run.
+	var tid pgtype.UUID
+	if tenantID != "" {
+		var err error
+		tid, err = parseScope(tenantID)
+		if err != nil {
+			return MarkupView{}, err
+		}
+	}
 	var v MarkupView
 	g, err := s.q.GlobalFXMarkupDefault(ctx)
 	if err == nil {
@@ -180,10 +196,6 @@ func (s *AdminService) GetMarkup(ctx context.Context, tenantID string) (MarkupVi
 		return MarkupView{}, err
 	}
 	if tenantID != "" {
-		tid, err := parseScope(tenantID)
-		if err != nil {
-			return MarkupView{}, err
-		}
 		t, err := s.q.TenantFXMarkupDefault(ctx, tid)
 		if err == nil {
 			v.Tenant = &MarkupDefault{DefaultSpreadBps: t.DefaultSpreadBps, EffectiveAt: t.EffectiveAt}
