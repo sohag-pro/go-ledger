@@ -57,7 +57,7 @@ make build
 
 ## Run a release binary
 
-Cross-platform binaries for the server and `ledgerctl` (darwin, linux, windows) are published on [GitHub Releases](https://github.com/sohag-pro/go-ledger/releases) for every tagged version. Download the one for your platform, then:
+Once a version is tagged, cross-platform binaries for the server and `ledgerctl` (darwin, linux, windows) are attached to that [GitHub Release](https://github.com/sohag-pro/go-ledger/releases). If no release is published yet, build from source (above) or use Docker Compose. When a release binary is available, download the one for your platform, then:
 
 ```sh
 ./go-ledger
