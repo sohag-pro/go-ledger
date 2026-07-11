@@ -192,11 +192,31 @@ jobs:
         # (same ceiling the running service already has), not root RCE,
         # even though go-ledger.new itself lives under deploy's own
         # ownership and is overwritten by this same pipeline every push.
+        # Best-effort: if the box has not yet been provisioned with the
+        # NOPASSWD sudoers rule + wrapper (the ansible app role installs them,
+        # and this pipeline does not run ansible), `sudo -n` fails fast without
+        # running anything. In that case we warn and continue, because the app
+        # applies migrations on boot (runMigrations in run()) when systemd
+        # restarts it below (single-instance, ADR-013). A genuine migration
+        # failure (the wrapper ran and goose errored) still aborts the deploy so
+        # the swap never happens. Provision the box (run the ansible app role)
+        # to get true pre-swap migration.
         run: |
           ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
             set -euo pipefail
             chmod 755 /opt/go-ledger/go-ledger.new
-            sudo -u goledger /usr/local/sbin/go-ledger-migrate
+            if out=$(sudo -n -u goledger /usr/local/sbin/go-ledger-migrate 2>&1); then
+              printf "%s\n" "$out"
+              echo "pre-swap migration applied"
+            else
+              printf "%s\n" "$out"
+              if printf "%s" "$out" | grep -qiE "password is required|terminal is required|not allowed|command not found|no such file"; then
+                echo "::warning::pre-swap migrate wrapper not provisioned on the box; relying on the app on-boot migration. Run the ansible app role to enable pre-swap migration."
+              else
+                echo "::error::pre-swap migration failed"
+                exit 1
+              fi
+            fi
           '
 
       - name: Swap binary and restart service
