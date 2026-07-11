@@ -102,12 +102,14 @@ type txn struct {
 // seeder ever destroying a real tenant's data if DEFAULT_TENANT_ID is ever
 // misconfigured to point at a live tenant instead of the demo one.
 //
-// The reset also clears any api-sourced global FX config (fx_rates and
-// fx_markup_defaults rows with tenant_id NULL and source 'api'): those are
-// process-wide, not owned by tenantID, so they would otherwise survive every
-// reset and let one demo visitor's tampering through the public FX admin
-// endpoints mis-price every other visitor's conversions. Env-seeded global
-// rows (source 'env', re-asserted at boot by fx.Seed) are left alone.
+// The reset also clears api-sourced FX config that would otherwise survive:
+// global rows (fx_rates and fx_markup_defaults with tenant_id NULL, source
+// 'api') plus the demo tenant's OWN api-sourced fx_rates (fx_rates is not in
+// the tenant-scoped delete loop below, and CurrentFXRate prefers a
+// tenant-owned row over the global one, so a tenant-scoped tampered rate would
+// otherwise persist and mis-price this tenant's conversions every reset).
+// Env-seeded global rows (source 'env', re-asserted at boot by fx.Seed) are
+// left alone.
 func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency, demoKeyHash string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
