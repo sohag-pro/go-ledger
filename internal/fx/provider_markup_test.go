@@ -34,14 +34,21 @@ func insertRateRaw(t *testing.T, q *sqlc.Queries, tenantID pgtype.UUID, base, qu
 }
 
 // insertMarkupDefault writes an fx_markup_defaults row, global when tenantID
-// is not Valid, tenant-owned otherwise.
+// is not Valid, tenant-owned otherwise. Unlike insertRateRaw, it does not
+// backdate effective_at: fx_markup_defaults' global (tenant_id NULL) row has
+// no per-pair partition (unlike fx_rates), so its "current" row is whatever
+// is latest across the whole shared table, full stop. A fixed backdate
+// margin can invert that ordering against a real (non-backdated) row written
+// moments later elsewhere in the suite (for example AdminService, which
+// deliberately lets the server stamp effective_at for the same clock-skew
+// reason documented on InsertFXRate), so this leaves effective_at unset and
+// lets the server's own now() win the same way.
 func insertMarkupDefault(t *testing.T, q *sqlc.Queries, tenantID pgtype.UUID, defaultSpreadBps int32) {
 	t.Helper()
 	if _, err := q.InsertFXMarkupDefault(context.Background(), sqlc.InsertFXMarkupDefaultParams{
 		TenantID:         tenantID,
 		DefaultSpreadBps: defaultSpreadBps,
 		Source:           "test",
-		EffectiveAt:      pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
 	}); err != nil {
 		t.Fatalf("insert fx markup default: %v", err)
 	}
@@ -61,15 +68,27 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 	q := sqlc.New(pool)
 	provider := fx.NewDBProvider(pool)
 
-	// fx_markup_defaults, unlike fx_rates, is not partitioned by currency
-	// pair: CurrentFXMarkupDefault's "tenant_id IS NULL" branch matches
-	// whatever the most recently inserted global default is, period, no
-	// matter which pair or tenant is asking. So "no default anywhere" only
-	// holds if it runs before any other case in this table has inserted a
-	// global default; it is deliberately first. Every other case's global
-	// insert (where present) uses the same value, 10, so their expectations
-	// stay correct regardless of exactly which global row (from this case or
-	// an earlier one) CurrentFXMarkupDefault actually picks.
+	// "No default anywhere" (a NULL rate spread resolving to zero rather than
+	// erroring, when neither a tenant nor a global markup default exists) is
+	// asserted once here from noDefaultSpreadBps/noDefaultErr, captured in
+	// TestMain (see probeNoDefaultAnywhere in provider_test.go) before any
+	// test could write to fx_markup_defaults. That table is shared,
+	// package-wide, and not partitioned by currency pair: whatever the most
+	// recently inserted global default is wins for every pair and tenant, so
+	// "nothing configured anywhere" can only ever be true once, at the very
+	// start of the process, before this test (and every other case in its own
+	// table below, which deliberately DO write global and tenant defaults)
+	// gets a chance to run.
+	if noDefaultErr != nil {
+		t.Fatalf("probeNoDefaultAnywhere() error = %v", noDefaultErr)
+	}
+	if noDefaultSpreadBps != 0 {
+		t.Errorf("probeNoDefaultAnywhere() spreadBps = %d, want 0 (no default configured anywhere yet)", noDefaultSpreadBps)
+	}
+
+	// Every case's global insert (where present) uses the same value, 10, so
+	// their expectations stay correct regardless of exactly which global row
+	// CurrentFXMarkupDefault actually picks among them.
 	tests := []struct {
 		name string
 		// setup seeds fx_rates and/or fx_markup_defaults for the given tenant
@@ -78,16 +97,6 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 		setup func(t *testing.T, tenantID string) (base, quote domain.Currency)
 		want  int32
 	}{
-		{
-			// NULL spread, no default anywhere yet: resolves to zero rather
-			// than erroring. Must run first (see comment above).
-			name: "zero when no default anywhere",
-			setup: func(t *testing.T, _ string) (domain.Currency, domain.Currency) {
-				insertRateRaw(t, q, pgtype.UUID{}, "STU", "VWX", 100_000_000, pgtype.Int4{})
-				return "STU", "VWX"
-			},
-			want: 0,
-		},
 		{
 			// A rate row with an explicit spread wins outright, even if a
 			// tenant and global default also exist.
