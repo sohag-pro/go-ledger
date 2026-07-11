@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <meta name="theme-color" content="#16202E" />
 <title>go-ledger console</title>
-<meta name="description" content="A small developer console for the go-ledger API: create accounts, post transactions, and read balances and statements." />
+<meta name="description" content="The go-ledger operator console: create accounts, post transactions, manage tenants and api keys, configure webhooks and policy, and read reports, all against the live public API." />
 <link rel="icon" type="image/png" href="/static/logo.png" />
 <link rel="apple-touch-icon" href="/static/logo.png" />
 <link rel="preload" href="/static/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin />
@@ -36,9 +36,14 @@
   .unit { display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
 
   h1 { font-family:'Space Grotesk',sans-serif; font-size:clamp(1.5rem,3vw,2rem); letter-spacing:-0.02em; color:var(--paper); margin:8px 0 4px; }
-  .lede { color:var(--muted); margin:0 0 12px; max-width:60ch; }
+  .lede { color:var(--muted); margin:0 0 12px; max-width:65ch; }
   .banner { margin:0 0 24px; max-width:70ch; font-size:13.5px; color:var(--amber);
     background:rgba(232,163,61,0.08); border:1px solid rgba(232,163,61,0.32); border-radius:10px; padding:10px 14px; }
+  .banner[hidden] { display:none; }
+
+  .section-head { margin:36px 0 4px; }
+  .section-head h2 { font-family:'Space Grotesk',sans-serif; color:var(--paper); margin:0 0 4px; font-size:1.3rem; }
+  .section-head p { color:var(--muted); font-size:13.5px; margin:0 0 16px; max-width:72ch; }
 
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr)); gap:18px; }
   .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px; }
@@ -60,6 +65,12 @@
   .btn.sm { padding:6px 11px; font-size:13px; }
   .btn.danger { background:rgba(244,117,107,0.14); color:var(--red); border:1px solid rgba(244,117,107,0.4); }
   .row-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+  .field-inline { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .field-inline > input, .field-inline > select { width:auto; flex:1; min-width:180px; }
+  .checks { display:flex; gap:14px; flex-wrap:wrap; margin:6px 0 4px; }
+  .checks label { display:inline-flex; align-items:center; gap:6px; color:var(--text); font-size:13.5px; margin:0; }
+  .checks input { width:auto; }
+  .filters { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-top:6px; }
 
   .posting-row { display:grid; grid-template-columns:2fr 1fr 2fr auto; gap:8px; align-items:end; margin-bottom:8px; }
   @media (max-width:560px){ .posting-row{ grid-template-columns:1fr 1fr; } }
@@ -67,7 +78,7 @@
   .sumline { font-family:'JetBrains Mono',monospace; font-size:13px; margin-top:10px; color:var(--muted); }
   .sumline.ok { color:var(--teal); } .sumline.bad { color:var(--amber); }
 
-  #rd-table { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .scroll-x { overflow-x:auto; -webkit-overflow-scrolling:touch; }
   table { width:100%; border-collapse:collapse; font-size:13.5px; margin-top:8px; }
   th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
   @media (max-width:560px){ th,td{ padding:6px 7px; font-size:12.5px; } }
@@ -75,11 +86,23 @@
   td.num,th.num { text-align:right; font-family:'JetBrains Mono',monospace; }
   .pos { color:var(--teal); } .neg { color:var(--red); }
 
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.03em; }
+  .pill.active { background:rgba(45,212,191,0.16); color:var(--teal); }
+  .pill.suspended, .pill.open, .pill.frozen { background:rgba(232,163,61,0.16); color:var(--amber); }
+  .pill.closed, .pill.revoked, .pill.resolved_rejected { background:rgba(244,117,107,0.16); color:var(--red); }
+  .pill.resolved_reversed { background:rgba(0,173,216,0.16); color:var(--cyan); }
+
   .out { margin-top:14px; font-family:'JetBrains Mono',monospace; font-size:12.5px; white-space:pre-wrap; word-break:break-word;
     background:var(--surface-2); border:1px solid var(--line); border-radius:9px; padding:11px 13px; max-height:240px; overflow:auto; }
   .out.err { border-color:rgba(244,117,107,0.5); color:#ffd3cd; }
   .out:empty { display:none; }
   .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+
+  .reveal { margin-top:14px; border:1px solid rgba(232,163,61,0.5); background:rgba(232,163,61,0.08); border-radius:10px; padding:12px 14px; }
+  .reveal strong { color:var(--paper); font-size:13.5px; }
+  .reveal .plaintext { font-family:'JetBrains Mono',monospace; font-size:13px; word-break:break-all;
+    background:var(--surface-2); border:1px solid var(--line); border-radius:8px; padding:9px 11px; margin:8px 0; user-select:all; }
+  .reveal .note { color:var(--amber); font-size:12.5px; margin:4px 0 0; }
 
   /* collapsible card */
   .card-toggle { display:flex; align-items:center; justify-content:space-between; width:100%;
@@ -98,6 +121,8 @@
     padding:14px 18px; border-bottom:1px solid var(--line); }
   .modal-head strong { font-family:'Space Grotesk',sans-serif; color:var(--paper); font-size:1rem; }
   .modal-body { overflow:auto; -webkit-overflow-scrolling:touch; padding:6px 18px 18px; }
+
+  #app[hidden] { display:none; }
 </style>
 </head>
 <body>
@@ -118,61 +143,235 @@
   </header>
 
   <main class="wrap">
-    <h1>API console</h1>
-    <p class="lede">A small console for the live API. Create accounts, post a balanced transaction by picking accounts from a dropdown, and read balances and statements. Everything here calls the same public API at <span class="mono">/v1</span>.</p>
-    <p class="banner">Public demo: the ledger resets every 4 hours to fresh, realistic sample data. Anything you create is cleared on the next reset. Requests here authenticate with a public demo API key scoped to this demo tenant, so there is nothing private to protect.</p>
+    <h1>Operator console</h1>
+    <p class="lede">A browseable front end for the live go-ledger API: the ledger views (accounts, transactions, balances, statements) plus the operator surface (tenants, api keys, webhooks, policy) and read-only reporting. Every call here goes straight to the same public <span class="mono">/v1</span> and <span class="mono">/v1/admin</span> endpoints anyone can call directly; this page adds no logic of its own.</p>
 
-    <div class="grid">
-      <!-- Create account -->
-      <section class="card collapsible">
-        <button class="card-toggle" id="ac-toggle" type="button" aria-expanded="false">Create account <span class="chev">+</span></button>
-        <div class="collapsible-body" id="ac-body" hidden>
-        <label for="ac-name">Name</label>
-        <input id="ac-name" placeholder="Cash" />
-        <label for="ac-type">Type</label>
-        <select id="ac-type">
-          <option value="asset">asset</option>
-          <option value="liability">liability</option>
-          <option value="equity">equity</option>
-          <option value="income">income</option>
-          <option value="expense">expense</option>
-        </select>
-        <label for="ac-currency">Currency</label>
-        <input id="ac-currency" class="mono" value="USD" maxlength="3" style="text-transform:uppercase;" />
-        <div class="row-actions">
-          <button class="btn" id="ac-create">Create account</button>
-          <button class="btn ghost sm" id="ac-refresh">Refresh list</button>
-        </div>
-        <div class="out" id="ac-out"></div>
-        </div>
-      </section>
+    <p class="banner" id="demo-banner" hidden>Public demo: the ledger resets every 4 hours to fresh, realistic sample data. Anything you create here, including tenants and keys, is cleared on the next reset. Admin panels are public in this demo too: there is nothing durable to protect between resets, and the demo key is rate limited.</p>
 
-      <!-- Read -->
-      <section class="card">
-        <h2>Read</h2>
-        <label for="rd-account">Account</label>
-        <select id="rd-account" class="acct-select"></select>
-        <div class="row-actions">
-          <button class="btn ghost sm" id="rd-balance">Balance</button>
-          <button class="btn ghost sm" id="rd-statement">Statement</button>
+    <section class="card span" id="session-card">
+      <h2>Session</h2>
+      <div id="key-row" hidden>
+        <label for="admin-key-input">Admin API key</label>
+        <div class="field-inline">
+          <input id="admin-key-input" type="password" class="mono" placeholder="glk_..." autocomplete="off" spellcheck="false" />
+          <button class="btn ghost sm" id="admin-key-toggle" type="button">Show</button>
+          <button class="btn sm" id="admin-key-save" type="button">Save</button>
+          <button class="btn ghost sm" id="admin-key-clear" type="button">Clear</button>
         </div>
-        <div class="out" id="rd-out"></div>
-      </section>
+        <p class="hint">Stored only in this browser, in local storage under <span class="mono">goledger_admin_key</span>. Sent only to this server, as an Authorization: Bearer header on every request. Never sent to any other origin and never logged by this page.</p>
+      </div>
+      <div id="session-status" class="hint"></div>
+      <div id="tenant-row" hidden style="margin-top:14px;">
+        <label for="tenant-select">Current tenant</label>
+        <div class="field-inline">
+          <select id="tenant-select"></select>
+          <button class="btn ghost sm" id="tenant-refresh" type="button">Refresh tenants</button>
+        </div>
+        <p class="hint">The admin panels below (api keys, webhooks, policy) act on this tenant. Ledger and reporting views always reflect the tenant your active api key itself belongs to, since those endpoints take no tenant parameter of their own; switching tenant here still re-runs any reporting view you have already loaded, and updates the admin panels to the newly selected tenant.</p>
+      </div>
+      <div class="out" id="session-out"></div>
+    </section>
 
-      <!-- Post transaction -->
-      <section class="card span">
-        <h2>Post transaction</h2>
-        <p class="hint" style="margin-bottom:4px;">Currency is taken from the first posting's account. Postings must sum to zero: positive = debit, negative = credit. <span id="tx-currency-note" style="color:var(--teal);"></span></p>
-        <div id="tx-rows" style="margin-top:8px;"></div>
-        <div class="row-actions">
-          <button class="btn ghost sm" id="tx-add">+ Add posting</button>
-        </div>
-        <div class="sumline" id="tx-sum"></div>
-        <div class="row-actions">
-          <button class="btn" id="tx-post">Post transaction</button>
-        </div>
-        <div class="out" id="tx-out"></div>
-      </section>
+    <div id="app" hidden>
+
+      <div class="section-head">
+        <h2>Ledger</h2>
+        <p>Create accounts, post a balanced transaction by picking accounts from a dropdown, and read balances and statements. Scoped to your active key's tenant.</p>
+      </div>
+      <div class="grid">
+        <!-- Create account -->
+        <section class="card collapsible">
+          <button class="card-toggle" id="ac-toggle" type="button" aria-expanded="false">Create account <span class="chev">+</span></button>
+          <div class="collapsible-body" id="ac-body" hidden>
+          <label for="ac-name">Name</label>
+          <input id="ac-name" placeholder="Cash" />
+          <label for="ac-type">Type</label>
+          <select id="ac-type">
+            <option value="asset">asset</option>
+            <option value="liability">liability</option>
+            <option value="equity">equity</option>
+            <option value="income">income</option>
+            <option value="expense">expense</option>
+          </select>
+          <label for="ac-currency">Currency</label>
+          <input id="ac-currency" class="mono" value="USD" maxlength="3" style="text-transform:uppercase;" />
+          <div class="row-actions">
+            <button class="btn" id="ac-create">Create account</button>
+            <button class="btn ghost sm" id="ac-refresh">Refresh list</button>
+          </div>
+          <div class="out" id="ac-out"></div>
+          </div>
+        </section>
+
+        <!-- Read -->
+        <section class="card">
+          <h2>Read</h2>
+          <label for="rd-account">Account</label>
+          <select id="rd-account" class="acct-select"></select>
+          <div class="row-actions">
+            <button class="btn ghost sm" id="rd-balance">Balance</button>
+            <button class="btn ghost sm" id="rd-statement">Statement</button>
+          </div>
+          <div class="out" id="rd-out"></div>
+        </section>
+
+        <!-- Post transaction -->
+        <section class="card span">
+          <h2>Post transaction</h2>
+          <p class="hint" style="margin-bottom:4px;">Currency is taken from the first posting's account. Postings must sum to zero: positive = debit, negative = credit. <span id="tx-currency-note" style="color:var(--teal);"></span></p>
+          <div id="tx-rows" style="margin-top:8px;"></div>
+          <div class="row-actions">
+            <button class="btn ghost sm" id="tx-add">+ Add posting</button>
+          </div>
+          <div class="sumline" id="tx-sum"></div>
+          <div class="row-actions">
+            <button class="btn" id="tx-post">Post transaction</button>
+          </div>
+          <div class="out" id="tx-out"></div>
+        </section>
+      </div>
+
+      <div class="section-head">
+        <h2>Admin</h2>
+        <p>Manage tenants, api keys, webhook subscriptions, and posting policy. Every route here requires the admin scope; the server is the real gate, this page's panels are shown as soon as a key is present, and any 403 is surfaced plainly rather than hidden.</p>
+      </div>
+      <div class="grid">
+        <!-- Tenants -->
+        <section class="card span">
+          <h2>Tenants</h2>
+          <div class="field-inline">
+            <input id="tn-name" placeholder="Tenant name" />
+            <button class="btn sm" id="tn-create" type="button">Create tenant</button>
+            <button class="btn ghost sm" id="tn-refresh" type="button">Refresh</button>
+          </div>
+          <div class="scroll-x" id="tn-table"></div>
+          <div class="out" id="tn-out"></div>
+        </section>
+
+        <!-- API keys -->
+        <section class="card span">
+          <h2>API keys</h2>
+          <p class="hint">For tenant: <strong id="key-tenant-label">(none selected)</strong></p>
+          <label for="key-name">Name</label>
+          <input id="key-name" placeholder="e.g. backend service key" maxlength="200" />
+          <label>Scopes</label>
+          <div class="checks">
+            <label><input type="checkbox" class="key-scope" value="read" checked /> read</label>
+            <label><input type="checkbox" class="key-scope" value="post" /> post</label>
+            <label><input type="checkbox" class="key-scope" value="admin" /> admin</label>
+          </div>
+          <label for="key-expires">Expires at (optional)</label>
+          <input id="key-expires" type="datetime-local" />
+          <div class="row-actions">
+            <button class="btn sm" id="key-issue" type="button">Issue key</button>
+            <button class="btn ghost sm" id="key-refresh" type="button">Refresh list</button>
+          </div>
+          <div id="key-reveal"></div>
+          <div class="scroll-x" id="key-table"></div>
+          <div class="out" id="key-out"></div>
+        </section>
+
+        <!-- Webhooks -->
+        <section class="card span">
+          <h2>Webhook subscriptions</h2>
+          <p class="hint">For tenant: <strong id="wh-tenant-label">(none selected)</strong></p>
+          <label for="wh-url">Callback URL</label>
+          <input id="wh-url" placeholder="https://example.com/webhooks/go-ledger" />
+          <label for="wh-events">Event types (optional)</label>
+          <input id="wh-events" placeholder="transaction.created, transaction.reversed" />
+          <p class="hint">Comma separated action names. Leave blank to receive every action.</p>
+          <div class="row-actions">
+            <button class="btn sm" id="wh-create" type="button">Create subscription</button>
+            <button class="btn ghost sm" id="wh-refresh" type="button">Refresh list</button>
+          </div>
+          <div id="wh-reveal"></div>
+          <div class="scroll-x" id="wh-table"></div>
+          <div class="out" id="wh-out"></div>
+        </section>
+
+        <!-- Policy -->
+        <section class="card span">
+          <h2>Tenant policy</h2>
+          <p class="hint">For tenant: <strong id="pol-tenant-label">(none selected)</strong>. This always writes the full policy: an empty field clears (unlimits) that guardrail instead of leaving a previous value in place.</p>
+          <div class="filters">
+            <div>
+              <label for="pol-max-tx">Max transaction amount</label>
+              <input id="pol-max-tx" class="mono" placeholder="0 = unlimited (minor units)" />
+            </div>
+            <div>
+              <label for="pol-daily">Daily volume limit</label>
+              <input id="pol-daily" class="mono" placeholder="0 = unlimited (minor units)" />
+            </div>
+            <div>
+              <label for="pol-currencies">Allowed currencies</label>
+              <input id="pol-currencies" class="mono" placeholder="USD, EUR" style="text-transform:uppercase;" />
+            </div>
+          </div>
+          <div class="row-actions">
+            <button class="btn sm" id="pol-save" type="button">Save policy</button>
+          </div>
+          <div class="out" id="pol-out"></div>
+        </section>
+      </div>
+
+      <div class="section-head">
+        <h2>Reporting</h2>
+        <p>Read-only views for your active key's tenant: the double-entry balance proof, a filterable transaction list, and disputes.</p>
+      </div>
+      <div class="grid">
+        <!-- Trial balance -->
+        <section class="card span">
+          <h2>Trial balance</h2>
+          <p class="hint">The balance proof: each currency's net posted total, which must be zero, and every account's derived balance.</p>
+          <div class="row-actions">
+            <button class="btn ghost sm" id="tb-load" type="button">Load trial balance</button>
+          </div>
+          <div class="scroll-x" id="tb-currencies"></div>
+          <div class="scroll-x" id="tb-accounts"></div>
+          <div class="out" id="tb-out"></div>
+        </section>
+
+        <!-- Transactions -->
+        <section class="card span">
+          <h2>Transactions</h2>
+          <div class="filters">
+            <div><label for="txr-from">From</label><input id="txr-from" type="datetime-local" /></div>
+            <div><label for="txr-to">To</label><input id="txr-to" type="datetime-local" /></div>
+            <div><label for="txr-eff-from">Effective from</label><input id="txr-eff-from" type="datetime-local" /></div>
+            <div><label for="txr-eff-to">Effective to</label><input id="txr-eff-to" type="datetime-local" /></div>
+            <div><label for="txr-ref">Reference</label><input id="txr-ref" placeholder="exact match" /></div>
+          </div>
+          <div class="row-actions">
+            <button class="btn ghost sm" id="txr-search" type="button">Search</button>
+          </div>
+          <div class="scroll-x" id="txr-table"></div>
+          <div class="row-actions" id="txr-more-row" hidden>
+            <button class="btn ghost sm" id="txr-more" type="button">Load more</button>
+          </div>
+          <div class="out" id="txr-out"></div>
+        </section>
+
+        <!-- Disputes -->
+        <section class="card span">
+          <h2>Disputes</h2>
+          <label for="disp-status">Status</label>
+          <select id="disp-status">
+            <option value="">All</option>
+            <option value="open">open</option>
+            <option value="resolved_reversed">resolved_reversed</option>
+            <option value="resolved_rejected">resolved_rejected</option>
+          </select>
+          <div class="row-actions">
+            <button class="btn ghost sm" id="disp-load" type="button">Load disputes</button>
+          </div>
+          <div class="scroll-x" id="disp-table"></div>
+          <div class="row-actions" id="disp-more-row" hidden>
+            <button class="btn ghost sm" id="disp-more" type="button">Load more</button>
+          </div>
+          <div class="out" id="disp-out"></div>
+        </section>
+      </div>
+
     </div>
   </main>
 
@@ -191,11 +390,26 @@
 (function () {
   "use strict";
   var UNIT_KEY = "goledger.amountUnit";
-  var DECIMALS = 2; // v1 is single-currency, 2-decimal
+  var STORAGE_KEY = "goledger_admin_key";
+  var DECIMALS = 2; // v1 ledger amounts are 2-decimal minor units
   var DEMO_API_KEY = "glk_demo_public_key_reset_every_4h";
+
+  var state = {
+    demoMode: false,
+    defaultTenantId: "",
+    activeKey: "",
+    currentTenantId: "",
+    tenants: [],
+    txrCursor: null,
+    dispCursor: null
+  };
   var accounts = [];
 
   var $ = function (id) { return document.getElementById(id); };
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
   function unit() { return localStorage.getItem(UNIT_KEY) || "cents"; }
 
   // ---- amount conversion (console-only; the API always uses minor units) ----
@@ -221,33 +435,174 @@
   }
   function amountPlaceholder() { return unit() === "cents" ? "10000" : "100.00"; }
 
-  // ---- API helpers ----
-  function show(el, data, isErr) {
-    el.classList.toggle("err", !!isErr);
-    el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  // ---- clipboard ----
+  function copyText(text, btn) {
+    var old = btn.textContent;
+    var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = old; }, 1200); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(function () { btn.textContent = "Copy failed"; setTimeout(function () { btn.textContent = old; }, 1500); });
+    } else {
+      btn.textContent = "Select and copy";
+      setTimeout(function () { btn.textContent = old; }, 1500);
+    }
   }
+
+  // ---- API helper ----
+  // Every call below uses a path relative to this origin ("/v1/...",
+  // "/console/config"); the active key is never sent anywhere else. This
+  // guard fails loudly if a future edit ever turns a path into an absolute
+  // URL by mistake.
   function api(method, path, body) {
+    if (path.charAt(0) !== "/") throw new Error("refusing to call a non-relative path: " + path);
     var opts = { method: method, headers: {} };
-    opts.headers["Authorization"] = "Bearer " + DEMO_API_KEY;
+    opts.headers["Authorization"] = "Bearer " + state.activeKey;
     if (method === "POST" && path.indexOf("/v1/transactions") === 0) {
       opts.headers["Idempotency-Key"] = crypto.randomUUID();
     }
-    if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     return fetch(path, opts).then(function (res) {
       return res.text().then(function (t) {
         var json = null; try { json = t ? JSON.parse(t) : null; } catch (e) {}
         if (!res.ok) {
-          var msg = json && (json.detail || json.title) ? (json.title || "") + (json.detail ? ": " + json.detail : "") : (t || res.status);
-          if (res.status === 401) msg = "Unauthorized (401): the console's demo API key was rejected. " + msg;
-          if (res.status === 429) msg = "Rate limited (429): the demo key hit its request limit, try again shortly. " + msg;
-          throw new Error(msg);
+          var msg = json && (json.detail || json.title) ? (json.title || "") + (json.detail ? ": " + json.detail : "") : (t || String(res.status));
+          if (res.status === 401) msg = "Unauthorized (401): the active api key was rejected. " + msg;
+          if (res.status === 403) msg = "Forbidden (403): this key lacks admin scope. " + msg;
+          if (res.status === 429) msg = "Rate limited (429): this key hit its request limit, try again shortly. " + msg;
+          var err = new Error(msg); err.status = res.status; throw err;
         }
         return json;
       });
     });
   }
+  function show(el, data, isErr) {
+    el.classList.toggle("err", !!isErr);
+    el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  }
+  function renderTable(host, headers, rowsHtml) {
+    if (!rowsHtml.length) { host.innerHTML = "<p class='hint'>No rows.</p>"; return; }
+    var head = "<thead><tr>" + headers.map(function (h) { return "<th>" + h + "</th>"; }).join("") + "</tr></thead>";
+    host.innerHTML = "<table>" + head + "<tbody>" + rowsHtml.join("") + "</tbody></table>";
+  }
+  function toISO(inputEl) {
+    if (!inputEl.value) return "";
+    var d = new Date(inputEl.value);
+    return isNaN(d.getTime()) ? "" : d.toISOString();
+  }
 
-  // ---- accounts + dropdowns ----
+  // ==== bootstrap: mode + auth ====
+  function keyReady() { return state.demoMode || !!(state.activeKey && state.activeKey.trim()); }
+
+  function boot() {
+    fetch("/console/config").then(function (r) { return r.json(); }).then(function (cfg) {
+      state.demoMode = !!cfg.demo_mode;
+      state.defaultTenantId = cfg.default_tenant_id || "";
+      state.currentTenantId = state.defaultTenantId;
+      if (state.demoMode) {
+        state.activeKey = DEMO_API_KEY;
+        $("demo-banner").removeAttribute("hidden");
+        $("key-row").setAttribute("hidden", "");
+      } else {
+        $("demo-banner").setAttribute("hidden", "");
+        $("key-row").removeAttribute("hidden");
+        var saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) { state.activeKey = saved; $("admin-key-input").value = saved; }
+      }
+      renderSession();
+      applyReadiness();
+    }).catch(function (e) {
+      show($("session-out"), "Could not load /console/config: " + e.message, true);
+    });
+  }
+
+  function renderSession() {
+    if (state.demoMode) {
+      $("session-status").textContent = "Active key: the public demo key, scoped to the demo tenant.";
+    } else if (state.activeKey) {
+      $("session-status").textContent = "Active key: saved in this browser (ends " + state.activeKey.slice(-4) + ").";
+    } else {
+      $("session-status").textContent = "No key set. Enter an admin api key above to use this console.";
+    }
+  }
+
+  function applyReadiness() {
+    if (keyReady()) {
+      $("tenant-row").removeAttribute("hidden");
+      $("app").removeAttribute("hidden");
+      initApp();
+    } else {
+      $("tenant-row").setAttribute("hidden", "");
+      $("app").setAttribute("hidden", "");
+    }
+  }
+
+  // ---- admin key controls (prod mode only) ----
+  $("admin-key-toggle").addEventListener("click", function () {
+    var input = $("admin-key-input");
+    var showing = input.type === "text";
+    input.type = showing ? "password" : "text";
+    $("admin-key-toggle").textContent = showing ? "Show" : "Hide";
+  });
+  $("admin-key-save").addEventListener("click", function () {
+    var v = $("admin-key-input").value.trim();
+    if (v) { localStorage.setItem(STORAGE_KEY, v); } else { localStorage.removeItem(STORAGE_KEY); }
+    state.activeKey = v;
+    renderSession();
+    applyReadiness();
+  });
+  $("admin-key-clear").addEventListener("click", function () {
+    localStorage.removeItem(STORAGE_KEY);
+    state.activeKey = "";
+    $("admin-key-input").value = "";
+    renderSession();
+    applyReadiness();
+  });
+
+  // ==== tenant selector ====
+  function populateTenantSelect() {
+    return api("GET", "/v1/admin/tenants").then(function (r) {
+      state.tenants = (r && r.tenants) || [];
+    }).catch(function () {
+      state.tenants = state.defaultTenantId ? [{ id: state.defaultTenantId, name: "(default tenant)", status: "active" }] : [];
+    }).then(function () {
+      var sel = $("tenant-select");
+      var keep = state.currentTenantId;
+      sel.innerHTML = "";
+      state.tenants.forEach(function (t) {
+        var o = document.createElement("option");
+        o.value = t.id;
+        o.textContent = t.name + " (" + t.status + ")";
+        sel.appendChild(o);
+      });
+      var stillValid = state.tenants.some(function (t) { return t.id === keep; });
+      if (stillValid) { sel.value = keep; } else if (state.tenants.length) { sel.value = state.tenants[0].id; }
+      state.currentTenantId = sel.value || state.defaultTenantId;
+      updateTenantLabels();
+    });
+  }
+  function updateTenantLabels() {
+    var t = state.tenants.find(function (x) { return x.id === state.currentTenantId; });
+    var label = t ? t.name + " (" + t.id.slice(0, 8) + ")" : (state.currentTenantId || "(none selected)");
+    ["key-tenant-label", "wh-tenant-label", "pol-tenant-label"].forEach(function (id) {
+      $(id).textContent = label;
+    });
+  }
+  $("tenant-select").addEventListener("change", function () {
+    state.currentTenantId = $("tenant-select").value;
+    updateTenantLabels();
+    // Re-scope admin sub-panels and any reporting view already loaded to the
+    // newly selected tenant. Ledger + reporting endpoints take no tenant
+    // parameter of their own (see the hint text above the selector): they
+    // always reflect the active key's own tenant, not this selection.
+    loadKeys();
+    loadWebhooks();
+    if ($("txr-table").children.length) searchTransactions(null);
+    if ($("disp-table").children.length) loadDisputes(null);
+  });
+  $("tenant-refresh").addEventListener("click", function () {
+    populateTenantSelect().then(function () { show($("session-out"), state.tenants.length + " tenant(s) loaded"); });
+  });
+
+  // ==== ledger: accounts + dropdowns ====
   function fillSelect(sel) {
     var keep = sel.value;
     sel.innerHTML = "";
@@ -266,7 +621,6 @@
     });
   }
 
-  // ---- create account ----
   $("ac-create").addEventListener("click", function () {
     var body = { name: $("ac-name").value.trim(), type: $("ac-type").value, currency: $("ac-currency").value.trim().toUpperCase() };
     api("POST", "/v1/accounts", body)
@@ -274,10 +628,9 @@
       .catch(function (e) { show($("ac-out"), e.message, true); });
   });
   $("ac-refresh").addEventListener("click", function () {
-    refreshAccounts().then(function () { show($("ac-out"), accounts.length + " account(s) loaded"); });
+    refreshAccounts().then(function () { show($("ac-out"), accounts.length + " account(s) loaded"); })
+      .catch(function (e) { show($("ac-out"), e.message, true); });
   });
-
-  // collapsible create-account card (collapsed initially)
   $("ac-toggle").addEventListener("click", function () {
     var body = $("ac-body"); var willOpen = body.hasAttribute("hidden");
     if (willOpen) { body.removeAttribute("hidden"); } else { body.setAttribute("hidden", ""); }
@@ -295,15 +648,13 @@
     if (amount != null) amt.value = amount;
     amt.addEventListener("input", updateSum);
     var desc = document.createElement("input"); desc.className = "tx-desc"; desc.placeholder = "description (optional)"; desc.maxLength = 256;
-    var del = document.createElement("button"); del.className = "btn danger sm"; del.textContent = "Remove";
+    var del = document.createElement("button"); del.className = "btn danger sm"; del.type = "button"; del.textContent = "Remove";
     del.addEventListener("click", function () { row.remove(); updateSum(); updateTxCurrencyNote(); });
     [labeled("Account", acct), labeled("Amount", amt), labeled("Description", desc), del].forEach(function (n) { row.appendChild(n); });
     $("tx-rows").appendChild(row);
     updateSum();
     updateTxCurrencyNote();
   }
-
-  // The transaction's currency is the first posting account's currency; no field.
   function txCurrency() {
     var first = document.querySelector("#tx-rows .tx-acct");
     if (!first || !first.value) return null;
@@ -333,7 +684,6 @@
     el.className = "sumline " + (total === 0 ? "ok" : "bad");
   }
   $("tx-add").addEventListener("click", function () { addRow(); });
-
   $("tx-post").addEventListener("click", function () {
     var postings = [], err = null;
     document.querySelectorAll("#tx-rows .posting-row").forEach(function (row) {
@@ -364,7 +714,6 @@
       .catch(function (e) { show($("rd-out"), e.message, true); });
   });
 
-  // ---- statement modal ----
   function openModal() { $("stmt-modal").removeAttribute("hidden"); }
   function closeModal() { $("stmt-modal").setAttribute("hidden", ""); }
   $("stmt-close").addEventListener("click", closeModal);
@@ -400,7 +749,7 @@
     (s.entries || []).forEach(function (e) {
       var tr = document.createElement("tr");
       tr.innerHTML = "<td class='mono' style='font-size:12px'>" + new Date(e.created_at).toLocaleString() + "</td>" +
-        "<td>" + (e.description || "") + "</td>" +
+        "<td>" + esc(e.description || "") + "</td>" +
         "<td class='num " + (e.amount < 0 ? "neg" : "pos") + "'>" + fromMinor(e.amount) + "</td>" +
         "<td class='num'>" + fromMinor(e.running_balance) + "</td>";
       tb.appendChild(tr);
@@ -413,10 +762,294 @@
     }
     $("stmt-title").textContent = "Statement for " + stmtLabel + " (" + stmtCount + " entr" + (stmtCount === 1 ? "y" : "ies") + ", newest first)";
     if (s.next_cursor) {
-      var more = document.createElement("button"); more.className = "btn ghost sm more"; more.style.marginTop = "10px";
+      var more = document.createElement("button"); more.className = "btn ghost sm more"; more.type = "button"; more.style.marginTop = "10px";
       more.textContent = "Load more"; more.addEventListener("click", loadStatement);
       host.appendChild(more);
     }
+  }
+
+  // ==== admin: tenants ====
+  function loadTenants() {
+    return populateTenantSelect().then(function () {
+      var rows = state.tenants.map(function (t) {
+        var actions = ["active", "suspended", "closed"].filter(function (s) { return s !== t.status; }).map(function (s) {
+          return "<button class='btn ghost sm' data-tenant-id='" + t.id + "' data-tenant-status='" + s + "'>set " + s + "</button>";
+        }).join(" ");
+        return "<tr><td class='mono' style='font-size:12px' title='" + t.id + "'>" + t.id.slice(0, 8) + "</td>" +
+          "<td>" + esc(t.name) + "</td>" +
+          "<td><span class='pill " + t.status + "'>" + t.status + "</span></td>" +
+          "<td>" + actions + "</td></tr>";
+      });
+      renderTable($("tn-table"), ["ID", "Name", "Status", "Actions"], rows);
+    });
+  }
+  $("tn-create").addEventListener("click", function () {
+    var name = $("tn-name").value.trim();
+    if (!name) { show($("tn-out"), "enter a tenant name", true); return; }
+    api("POST", "/v1/admin/tenants", { name: name })
+      .then(function (t) { show($("tn-out"), t); $("tn-name").value = ""; return loadTenants(); })
+      .catch(function (e) { show($("tn-out"), e.message, true); });
+  });
+  $("tn-refresh").addEventListener("click", function () {
+    loadTenants().then(function () { show($("tn-out"), state.tenants.length + " tenant(s) loaded"); })
+      .catch(function (e) { show($("tn-out"), e.message, true); });
+  });
+  $("tn-table").addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-tenant-id]");
+    if (!btn) return;
+    var id = btn.getAttribute("data-tenant-id"), status = btn.getAttribute("data-tenant-status");
+    api("POST", "/v1/admin/tenants/" + id + "/status", { status: status })
+      .then(function () { show($("tn-out"), "tenant " + id + " set to " + status); return loadTenants(); })
+      .catch(function (e2) { show($("tn-out"), e2.message, true); });
+  });
+
+  // ==== admin: api keys ====
+  function loadKeys() {
+    if (!state.currentTenantId) return Promise.resolve();
+    return api("GET", "/v1/admin/keys?tenant_id=" + encodeURIComponent(state.currentTenantId))
+      .then(function (r) {
+        var rows = (r.keys || []).map(function (k) {
+          var revoked = !!k.revoked_at;
+          var actions = "<button class='btn ghost sm' data-key-id='" + k.id + "' data-key-action='rotate'>rotate</button>" +
+            (revoked ? "" : " <button class='btn danger sm' data-key-id='" + k.id + "' data-key-action='revoke'>revoke</button>");
+          return "<tr><td class='mono' style='font-size:12px' title='" + k.id + "'>" + k.id.slice(0, 8) + "</td>" +
+            "<td>" + esc(k.name) + "</td>" +
+            "<td>" + esc(k.scopes.join(", ")) + "</td>" +
+            "<td>" + (k.expires_at ? new Date(k.expires_at).toLocaleString() : "never") + "</td>" +
+            "<td>" + (k.last_used_at ? new Date(k.last_used_at).toLocaleString() : "never") + "</td>" +
+            "<td>" + (revoked ? "<span class='pill revoked'>revoked</span>" : "<span class='pill active'>active</span>") + "</td>" +
+            "<td>" + actions + "</td></tr>";
+        });
+        renderTable($("key-table"), ["ID", "Name", "Scopes", "Expires", "Last used", "Status", "Actions"], rows);
+      });
+  }
+  function showReveal(host, label, plaintext) {
+    host.innerHTML = "";
+    var box = document.createElement("div"); box.className = "reveal";
+    var strong = document.createElement("strong"); strong.textContent = label; box.appendChild(strong);
+    var pre = document.createElement("div"); pre.className = "plaintext mono"; pre.textContent = plaintext; box.appendChild(pre);
+    var row = document.createElement("div"); row.className = "row-actions";
+    var copyBtn = document.createElement("button"); copyBtn.type = "button"; copyBtn.className = "btn ghost sm"; copyBtn.textContent = "Copy";
+    copyBtn.addEventListener("click", function () { copyText(plaintext, copyBtn); });
+    var dismissBtn = document.createElement("button"); dismissBtn.type = "button"; dismissBtn.className = "btn ghost sm"; dismissBtn.textContent = "Dismiss";
+    dismissBtn.addEventListener("click", function () { host.innerHTML = ""; });
+    row.appendChild(copyBtn); row.appendChild(dismissBtn); box.appendChild(row);
+    var note = document.createElement("p"); note.className = "note";
+    note.textContent = "Shown once. It will not be shown again by this console or by the server. Store it now.";
+    box.appendChild(note);
+    host.appendChild(box);
+  }
+  $("key-issue").addEventListener("click", function () {
+    if (!state.currentTenantId) { show($("key-out"), "pick a current tenant first", true); return; }
+    var name = $("key-name").value.trim();
+    if (!name) { show($("key-out"), "enter a key name", true); return; }
+    var scopes = Array.prototype.slice.call(document.querySelectorAll(".key-scope:checked")).map(function (i) { return i.value; });
+    if (!scopes.length) { show($("key-out"), "pick at least one scope", true); return; }
+    var body = { tenant_id: state.currentTenantId, name: name, scopes: scopes };
+    var expires = toISO($("key-expires"));
+    if (expires) body.expires_at = expires;
+    api("POST", "/v1/admin/keys", body)
+      .then(function (k) {
+        showReveal($("key-reveal"), "Issued key " + k.name, k.plaintext);
+        $("key-name").value = "";
+        show($("key-out"), "key issued: " + k.id);
+        return loadKeys();
+      })
+      .catch(function (e) { show($("key-out"), e.message, true); });
+  });
+  $("key-refresh").addEventListener("click", function () {
+    loadKeys().then(function () { show($("key-out"), "keys refreshed"); })
+      .catch(function (e) { show($("key-out"), e.message, true); });
+  });
+  $("key-table").addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-key-id]");
+    if (!btn) return;
+    var id = btn.getAttribute("data-key-id"), action = btn.getAttribute("data-key-action");
+    if (action === "rotate") {
+      api("POST", "/v1/admin/keys/" + id + "/rotate")
+        .then(function (k) {
+          showReveal($("key-reveal"), "Rotated key " + k.name, k.plaintext);
+          show($("key-out"), "key " + id + " rotated to " + k.id);
+          return loadKeys();
+        })
+        .catch(function (e2) { show($("key-out"), e2.message, true); });
+    } else if (action === "revoke") {
+      api("POST", "/v1/admin/keys/" + id + "/revoke")
+        .then(function () { show($("key-out"), "key " + id + " revoked"); return loadKeys(); })
+        .catch(function (e2) { show($("key-out"), e2.message, true); });
+    }
+  });
+
+  // ==== admin: webhooks ====
+  function loadWebhooks() {
+    if (!state.currentTenantId) return Promise.resolve();
+    return api("GET", "/v1/admin/webhooks?tenant_id=" + encodeURIComponent(state.currentTenantId))
+      .then(function (r) {
+        var rows = (r.subscriptions || []).map(function (s) {
+          return "<tr><td class='mono' style='font-size:12px' title='" + s.id + "'>" + s.id.slice(0, 8) + "</td>" +
+            "<td>" + esc(s.url) + "</td>" +
+            "<td>" + esc((s.event_types || []).join(", ") || "all") + "</td>" +
+            "<td>" + (s.active ? "<span class='pill active'>active</span>" : "<span class='pill closed'>inactive</span>") + "</td>" +
+            "<td>" + new Date(s.created_at).toLocaleString() + "</td>" +
+            "<td><button class='btn danger sm' data-webhook-id='" + s.id + "'>delete</button></td></tr>";
+        });
+        renderTable($("wh-table"), ["ID", "URL", "Events", "Status", "Created", "Actions"], rows);
+      });
+  }
+  $("wh-create").addEventListener("click", function () {
+    if (!state.currentTenantId) { show($("wh-out"), "pick a current tenant first", true); return; }
+    var url = $("wh-url").value.trim();
+    if (!url) { show($("wh-out"), "enter a callback url", true); return; }
+    var events = $("wh-events").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    var body = { tenant_id: state.currentTenantId, url: url };
+    if (events.length) body.event_types = events;
+    api("POST", "/v1/admin/webhooks", body)
+      .then(function (s) {
+        showReveal($("wh-reveal"), "Signing secret for " + s.url, s.secret);
+        $("wh-url").value = ""; $("wh-events").value = "";
+        show($("wh-out"), "subscription created: " + s.id);
+        return loadWebhooks();
+      })
+      .catch(function (e) { show($("wh-out"), e.message, true); });
+  });
+  $("wh-refresh").addEventListener("click", function () {
+    loadWebhooks().then(function () { show($("wh-out"), "webhooks refreshed"); })
+      .catch(function (e) { show($("wh-out"), e.message, true); });
+  });
+  $("wh-table").addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-webhook-id]");
+    if (!btn) return;
+    var id = btn.getAttribute("data-webhook-id");
+    api("DELETE", "/v1/admin/webhooks/" + id)
+      .then(function () { show($("wh-out"), "subscription " + id + " deleted"); return loadWebhooks(); })
+      .catch(function (e2) { show($("wh-out"), e2.message, true); });
+  });
+
+  // ==== admin: policy ====
+  $("pol-save").addEventListener("click", function () {
+    if (!state.currentTenantId) { show($("pol-out"), "pick a current tenant first", true); return; }
+    var body = {};
+    var maxTx = $("pol-max-tx").value.trim();
+    var daily = $("pol-daily").value.trim();
+    var currencies = $("pol-currencies").value.trim();
+    if (maxTx) {
+      var m = parseInt(maxTx, 10);
+      if (isNaN(m) || m < 0) { show($("pol-out"), "max transaction amount must be a non negative integer", true); return; }
+      body.max_transaction_amount = m;
+    }
+    if (daily) {
+      var d = parseInt(daily, 10);
+      if (isNaN(d) || d < 0) { show($("pol-out"), "daily volume limit must be a non negative integer", true); return; }
+      body.daily_volume_limit = d;
+    }
+    if (currencies) {
+      body.allowed_currencies = currencies.split(",").map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
+    }
+    api("POST", "/v1/admin/tenants/" + state.currentTenantId + "/policy", body)
+      .then(function () { show($("pol-out"), "policy saved for tenant " + state.currentTenantId); })
+      .catch(function (e) { show($("pol-out"), e.message, true); });
+  });
+
+  // ==== reporting: trial balance ====
+  $("tb-load").addEventListener("click", function () {
+    api("GET", "/v1/reports/trial-balance")
+      .then(function (tb) {
+        var curRows = (tb.currencies || []).map(function (c) {
+          return "<tr><td>" + esc(c.currency) + "</td><td class='num'>" + fromMinor(c.net) + "</td>" +
+            "<td>" + (c.imbalance ? "<span class='pill closed'>imbalance</span>" : "<span class='pill active'>balanced</span>") + "</td></tr>";
+        });
+        renderTable($("tb-currencies"), ["Currency", "Net", "Status"], curRows);
+        var acctRows = (tb.accounts || []).map(function (a) {
+          return "<tr><td class='mono' style='font-size:12px' title='" + a.account_id + "'>" + a.account_id.slice(0, 8) + "</td>" +
+            "<td>" + esc(a.name) + "</td><td>" + esc(a.type) + "</td><td>" + esc(a.currency) + "</td>" +
+            "<td>" + (a.is_system ? "yes" : "no") + "</td>" +
+            "<td class='num " + (a.balance < 0 ? "neg" : "pos") + "'>" + fromMinor(a.balance) + "</td></tr>";
+        });
+        renderTable($("tb-accounts"), ["Account", "Name", "Type", "Currency", "System", "Balance"], acctRows);
+        show($("tb-out"), "loaded");
+      })
+      .catch(function (e) { show($("tb-out"), e.message, true); });
+  });
+
+  // ==== reporting: transactions ====
+  function searchTransactions(cursor) {
+    var q = new URLSearchParams();
+    var from = toISO($("txr-from")), to = toISO($("txr-to"));
+    var effFrom = toISO($("txr-eff-from")), effTo = toISO($("txr-eff-to"));
+    var ref = $("txr-ref").value.trim();
+    if (from) q.set("from", from);
+    if (to) q.set("to", to);
+    if (effFrom) q.set("effective_from", effFrom);
+    if (effTo) q.set("effective_to", effTo);
+    if (ref) q.set("reference", ref);
+    if (cursor) q.set("cursor", cursor);
+    return api("GET", "/v1/transactions?" + q.toString())
+      .then(function (r) {
+        var rows = (r.transactions || []).map(function (t) {
+          var postings = (t.postings || []).map(function (p) {
+            return p.account_id.slice(0, 8) + ": " + fromMinor(p.amount) + " " + p.currency;
+          }).join("; ");
+          return "<tr><td class='mono' style='font-size:12px' title='" + t.id + "'>" + t.id.slice(0, 8) + "</td>" +
+            "<td>" + new Date(t.effective_at).toLocaleString() + "</td>" +
+            "<td>" + esc(t.reference || "") + "</td>" +
+            "<td>" + (t.reverses_transaction_id ? "reversal" : "") + "</td>" +
+            "<td class='mono' style='font-size:12px'>" + esc(postings) + "</td></tr>";
+        });
+        if (!cursor) { renderTable($("txr-table"), ["ID", "Effective at", "Reference", "Kind", "Postings"], rows); }
+        else {
+          var tbody = $("txr-table").querySelector("tbody");
+          if (tbody) rows.forEach(function (h) { tbody.insertAdjacentHTML("beforeend", h); });
+          else renderTable($("txr-table"), ["ID", "Effective at", "Reference", "Kind", "Postings"], rows);
+        }
+        state.txrCursor = r.next_cursor;
+        $("txr-more-row").toggleAttribute("hidden", !state.txrCursor);
+        show($("txr-out"), ((r.transactions || []).length) + " row(s) loaded");
+      })
+      .catch(function (e) { show($("txr-out"), e.message, true); });
+  }
+  $("txr-search").addEventListener("click", function () { searchTransactions(null); });
+  $("txr-more").addEventListener("click", function () { searchTransactions(state.txrCursor); });
+
+  // ==== reporting: disputes ====
+  function loadDisputes(cursor) {
+    var q = new URLSearchParams();
+    var status = $("disp-status").value;
+    if (status) q.set("status", status);
+    if (cursor) q.set("cursor", cursor);
+    return api("GET", "/v1/disputes?" + q.toString())
+      .then(function (r) {
+        var rows = (r.disputes || []).map(function (d) {
+          return "<tr><td class='mono' style='font-size:12px' title='" + d.id + "'>" + d.id.slice(0, 8) + "</td>" +
+            "<td class='mono' style='font-size:12px' title='" + d.transaction_id + "'>" + d.transaction_id.slice(0, 8) + "</td>" +
+            "<td><span class='pill " + d.status + "'>" + d.status + "</span></td>" +
+            "<td>" + esc(d.reason) + "</td>" +
+            "<td>" + new Date(d.created_at).toLocaleString() + "</td>" +
+            "<td>" + (d.resolved_at ? new Date(d.resolved_at).toLocaleString() : "") + "</td></tr>";
+        });
+        if (!cursor) { renderTable($("disp-table"), ["ID", "Transaction", "Status", "Reason", "Created", "Resolved"], rows); }
+        else {
+          var tbody = $("disp-table").querySelector("tbody");
+          if (tbody) rows.forEach(function (h) { tbody.insertAdjacentHTML("beforeend", h); });
+          else renderTable($("disp-table"), ["ID", "Transaction", "Status", "Reason", "Created", "Resolved"], rows);
+        }
+        state.dispCursor = r.next_cursor;
+        $("disp-more-row").toggleAttribute("hidden", !state.dispCursor);
+        show($("disp-out"), ((r.disputes || []).length) + " row(s) loaded");
+      })
+      .catch(function (e) { show($("disp-out"), e.message, true); });
+  }
+  $("disp-load").addEventListener("click", function () { loadDisputes(null); });
+  $("disp-more").addEventListener("click", function () { loadDisputes(state.dispCursor); });
+
+  // ==== app init (runs once a key is present) ====
+  function initApp() {
+    $("tx-rows").innerHTML = "";
+    addRow(); addRow();
+    refreshAccounts().then(updateTxCurrencyNote).catch(function (e) { show($("ac-out"), e.message, true); });
+    loadTenants().then(function () {
+      loadKeys();
+      loadWebhooks();
+    }).catch(function (e) { show($("tn-out"), e.message, true); });
   }
 
   // ---- unit preference (localStorage, console only) ----
@@ -429,8 +1062,7 @@
   });
 
   // ---- init ----
-  addRow(); addRow();
-  refreshAccounts().then(updateTxCurrencyNote).catch(function (e) { show($("ac-out"), e.message, true); });
+  boot();
 })();
 </script>
 </body>

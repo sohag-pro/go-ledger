@@ -48,7 +48,7 @@ func TestRoutes(t *testing.T) {
 			method:     http.MethodGet,
 			path:       "/console",
 			wantStatus: http.StatusOK,
-			wantBody:   "API console",
+			wantBody:   "Operator console",
 		},
 		{
 			name:       "healthz still works alongside web routes",
@@ -100,6 +100,39 @@ func TestIndexNoEmDashes(t *testing.T) {
 	for _, r := range string(indexHTML) {
 		if r == enDash || r == emDash {
 			t.Fatalf("index.html contains a banned dash %U", r)
+		}
+	}
+}
+
+func TestConsoleNoEmDashes(t *testing.T) {
+	// Same guard as TestIndexNoEmDashes, over the operator console page.
+	const enDash, emDash rune = 0x2013, 0x2014
+	for _, r := range string(consoleHTML) {
+		if r == enDash || r == emDash {
+			t.Fatalf("console.html contains a banned dash %U", r)
+		}
+	}
+}
+
+func TestConsoleReferencesOperatorEndpoints(t *testing.T) {
+	// The console (ADR-019) is an operator console: it must wire up the mode
+	// signal, the admin panels (tenants, keys, webhooks implied by the admin
+	// surface), the read-only reporting endpoints, and persist an entered
+	// admin key under a stable localStorage key name. Guard the served body
+	// for each so a rewrite can't silently drop one of these integrations.
+	body := string(consoleHTML)
+	for _, want := range []string{
+		"/console/config",
+		"/v1/admin/tenants",
+		"/v1/admin/keys",
+		"/v1/admin/webhooks",
+		"/v1/reports/trial-balance",
+		"/v1/transactions",
+		"/v1/disputes",
+		"goledger_admin_key",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("console.html missing reference to %q", want)
 		}
 	}
 }
