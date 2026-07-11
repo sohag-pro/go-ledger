@@ -1870,7 +1870,7 @@ paths:
         - reports
   /v1/transactions:
     get:
-      description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive) and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
+      description: "Lists the tenant's transactions, newest first, optionally filtered by a created_at date range (from inclusive, to exclusive), a value-date range (effective_from inclusive, effective_to exclusive, matched against effective_at, falling back to created_at when unset), and/or an exact reference match. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
       operationId: list-transactions
       parameters:
         - description: RFC3339 timestamp. Only transactions created at or after this time.
@@ -1886,6 +1886,20 @@ paths:
           name: to
           schema:
             description: RFC3339 timestamp. Only transactions created strictly before this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is at or after this time.
+          explode: false
+          in: query
+          name: effective_from
+          schema:
+            description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is strictly before this time.
+          explode: false
+          in: query
+          name: effective_to
+          schema:
+            description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is strictly before this time.
             type: string
         - description: Exact match on the transaction's reference.
           explode: false
@@ -2011,7 +2025,7 @@ paths:
         - transactions
   /v1/transactions/export:
     get:
-      description: "Exports the tenant's transactions matching the same from/to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only."
+      description: "Exports the tenant's transactions matching the same from/to/effective_from/effective_to/reference filters as GET /v1/transactions, as csv (default, one row per posting) or json (an array of transaction bodies). Not paged: bounded instead at a fixed row cap, so a tenant with a longer matching history than the cap gets only the newest rows up to it, reported via the Export-Truncated response header. gRPC has no equivalent RPC: a streaming CSV export does not fit its single-response model, so export stays REST-only."
       operationId: export-transactions
       parameters:
         - description: RFC3339 timestamp. Only transactions created at or after this time.
@@ -2027,6 +2041,20 @@ paths:
           name: to
           schema:
             description: RFC3339 timestamp. Only transactions created strictly before this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is at or after this time.
+          explode: false
+          in: query
+          name: effective_from
+          schema:
+            description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is at or after this time.
+            type: string
+        - description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is strictly before this time.
+          explode: false
+          in: query
+          name: effective_to
+          schema:
+            description: RFC3339 timestamp. Only transactions whose value date (effective_at, falling back to created_at when unset) is strictly before this time.
             type: string
         - description: Exact match on the transaction's reference.
           explode: false

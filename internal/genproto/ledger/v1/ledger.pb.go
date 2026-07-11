@@ -1240,11 +1240,17 @@ func (x *GetTransactionResponse) GetTransaction() *Transaction {
 }
 
 // ListTransactionsRequest lists the tenant's transactions, newest first,
-// keyset paged by cursor, optionally filtered by a from/to created_at range
-// and/or an exact reference match (Task 4.4, audit A7.2), mirroring GET
-// /v1/transactions. from and to are RFC3339 timestamps; from is inclusive,
-// to is exclusive. Export has no gRPC equivalent: a streaming CSV export
-// does not fit gRPC's single-response model, so it stays REST-only.
+// keyset paged by cursor, optionally filtered by a from/to created_at range,
+// an effective_from/effective_to value-date range, and/or an exact
+// reference match (Task 4.4, audit A7.2; effective_from/effective_to added
+// by follow-up F2, audit A1.3 partial), mirroring GET /v1/transactions.
+// from, to, effective_from, and effective_to are RFC3339 timestamps; each
+// pair is inclusive on the from side, exclusive on the to side.
+// effective_from/effective_to match against effective_at, falling back to
+// created_at when a transaction has none, the same read-time fallback used
+// everywhere else effective_at is read. Export has no gRPC equivalent: a
+// streaming CSV export does not fit gRPC's single-response model, so it
+// stays REST-only.
 type ListTransactionsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	From          string                 `protobuf:"bytes,1,opt,name=from,proto3" json:"from,omitempty"`
@@ -1252,6 +1258,8 @@ type ListTransactionsRequest struct {
 	Reference     string                 `protobuf:"bytes,3,opt,name=reference,proto3" json:"reference,omitempty"`
 	Limit         int32                  `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`
 	Cursor        string                 `protobuf:"bytes,5,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	EffectiveFrom string                 `protobuf:"bytes,6,opt,name=effective_from,json=effectiveFrom,proto3" json:"effective_from,omitempty"`
+	EffectiveTo   string                 `protobuf:"bytes,7,opt,name=effective_to,json=effectiveTo,proto3" json:"effective_to,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1317,6 +1325,20 @@ func (x *ListTransactionsRequest) GetLimit() int32 {
 func (x *ListTransactionsRequest) GetCursor() string {
 	if x != nil {
 		return x.Cursor
+	}
+	return ""
+}
+
+func (x *ListTransactionsRequest) GetEffectiveFrom() string {
+	if x != nil {
+		return x.EffectiveFrom
+	}
+	return ""
+}
+
+func (x *ListTransactionsRequest) GetEffectiveTo() string {
+	if x != nil {
+		return x.EffectiveTo
 	}
 	return ""
 }
@@ -2086,13 +2108,15 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\x15GetTransactionRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"R\n" +
 	"\x16GetTransactionResponse\x128\n" +
-	"\vtransaction\x18\x01 \x01(\v2\x16.ledger.v1.TransactionR\vtransaction\"\x89\x01\n" +
+	"\vtransaction\x18\x01 \x01(\v2\x16.ledger.v1.TransactionR\vtransaction\"\xd3\x01\n" +
 	"\x17ListTransactionsRequest\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\tR\x04from\x12\x0e\n" +
 	"\x02to\x18\x02 \x01(\tR\x02to\x12\x1c\n" +
 	"\treference\x18\x03 \x01(\tR\treference\x12\x14\n" +
 	"\x05limit\x18\x04 \x01(\x05R\x05limit\x12\x16\n" +
-	"\x06cursor\x18\x05 \x01(\tR\x06cursor\"w\n" +
+	"\x06cursor\x18\x05 \x01(\tR\x06cursor\x12%\n" +
+	"\x0eeffective_from\x18\x06 \x01(\tR\reffectiveFrom\x12!\n" +
+	"\feffective_to\x18\a \x01(\tR\veffectiveTo\"w\n" +
 	"\x18ListTransactionsResponse\x12:\n" +
 	"\ftransactions\x18\x01 \x03(\v2\x16.ledger.v1.TransactionR\ftransactions\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +

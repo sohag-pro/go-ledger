@@ -34,6 +34,16 @@ WHERE tenant_id = $1 AND id = $2;
 -- built dynamically per request. from_ts is inclusive (created_at >=),
 -- to_ts is exclusive (created_at <): a half-open [from, to) window.
 --
+-- effective_from/effective_to are the same half-open window, but over the
+-- value date (Task 4.3's effective_at) rather than created_at (follow-up
+-- F2): COALESCE(effective_at, created_at) is the same read-time fallback
+-- used everywhere else effective_at is read (see assembleTransaction), so a
+-- transaction posted with no explicit value date is filtered as if its value
+-- date were its post time, never silently excluded from an effective_at
+-- window that would otherwise match its created_at. Independent of
+-- from_ts/to_ts: a caller may filter on created_at, effective_at, both, or
+-- neither.
+--
 -- Keyset paged by (created_at, id) descending, the identical cursor shape
 -- AccountStatement already uses: after_created_at/after_id are the keyset
 -- position, a far-future timestamp and the max uuid for the first page.
@@ -49,6 +59,8 @@ FROM transactions
 WHERE tenant_id = sqlc.arg(tenant_id)
   AND (sqlc.narg('from_ts')::timestamptz IS NULL OR created_at >= sqlc.narg('from_ts'))
   AND (sqlc.narg('to_ts')::timestamptz IS NULL OR created_at < sqlc.narg('to_ts'))
+  AND (sqlc.narg('effective_from')::timestamptz IS NULL OR COALESCE(effective_at, created_at) >= sqlc.narg('effective_from'))
+  AND (sqlc.narg('effective_to')::timestamptz IS NULL OR COALESCE(effective_at, created_at) < sqlc.narg('effective_to'))
   AND (sqlc.narg('reference')::text IS NULL OR reference = sqlc.narg('reference'))
   AND (created_at < sqlc.arg(after_created_at)
        OR (created_at = sqlc.arg(after_created_at) AND id < sqlc.arg(after_id)))

@@ -162,17 +162,25 @@ message GetTransactionResponse {
 }
 
 // ListTransactionsRequest lists the tenant's transactions, newest first,
-// keyset paged by cursor, optionally filtered by a from/to created_at range
-// and/or an exact reference match (Task 4.4, audit A7.2), mirroring GET
-// /v1/transactions. from and to are RFC3339 timestamps; from is inclusive,
-// to is exclusive. Export has no gRPC equivalent: a streaming CSV export
-// does not fit gRPC's single-response model, so it stays REST-only.
+// keyset paged by cursor, optionally filtered by a from/to created_at range,
+// an effective_from/effective_to value-date range, and/or an exact
+// reference match (Task 4.4, audit A7.2; effective_from/effective_to added
+// by follow-up F2, audit A1.3 partial), mirroring GET /v1/transactions.
+// from, to, effective_from, and effective_to are RFC3339 timestamps; each
+// pair is inclusive on the from side, exclusive on the to side.
+// effective_from/effective_to match against effective_at, falling back to
+// created_at when a transaction has none, the same read-time fallback used
+// everywhere else effective_at is read. Export has no gRPC equivalent: a
+// streaming CSV export does not fit gRPC's single-response model, so it
+// stays REST-only.
 message ListTransactionsRequest {
   string from = 1;
   string to = 2;
   string reference = 3;
   int32 limit = 4;
   string cursor = 5;
+  string effective_from = 6;
+  string effective_to = 7;
 }
 message ListTransactionsResponse {
   repeated Transaction transactions = 1;

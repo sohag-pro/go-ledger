@@ -433,14 +433,16 @@ func (s *Server) GetTransaction(ctx context.Context, req *ledgerv1.GetTransactio
 }
 
 // parseTransactionFilter builds a domain.TransactionFilter from
-// ListTransactionsRequest's from/to/reference fields (Task 4.4, audit A7.2).
-// from and to are optional RFC3339 timestamps; an empty string leaves that
-// side of the filter unset, mirroring the REST layer's identical helper
-// (internal/api/transactions.go's parseTransactionFilter): kept as its own
-// small copy here rather than shared, the same as this package's page-limit
-// constants above, since a proto string field and a huma query tag are not
-// worth threading one shared helper through.
-func parseTransactionFilter(from, to, reference string) (domain.TransactionFilter, error) {
+// ListTransactionsRequest's from/to/effective_from/effective_to/reference
+// fields (Task 4.4, audit A7.2; effective_from/effective_to added by
+// follow-up F2, audit A1.3 partial). Each of the four timestamps is
+// optional RFC3339; an empty string leaves that side of the filter unset,
+// mirroring the REST layer's identical helper (internal/api/transactions.
+// go's parseTransactionFilter): kept as its own small copy here rather than
+// shared, the same as this package's page-limit constants above, since a
+// proto string field and a huma query tag are not worth threading one
+// shared helper through.
+func parseTransactionFilter(from, to, effectiveFrom, effectiveTo, reference string) (domain.TransactionFilter, error) {
 	var filter domain.TransactionFilter
 	if from != "" {
 		t, err := time.Parse(time.RFC3339Nano, from)
@@ -456,6 +458,20 @@ func parseTransactionFilter(from, to, reference string) (domain.TransactionFilte
 		}
 		filter.To = &t
 	}
+	if effectiveFrom != "" {
+		t, err := time.Parse(time.RFC3339Nano, effectiveFrom)
+		if err != nil {
+			return filter, errors.New("effective_from must be an RFC3339 timestamp")
+		}
+		filter.EffectiveFrom = &t
+	}
+	if effectiveTo != "" {
+		t, err := time.Parse(time.RFC3339Nano, effectiveTo)
+		if err != nil {
+			return filter, errors.New("effective_to must be an RFC3339 timestamp")
+		}
+		filter.EffectiveTo = &t
+	}
 	if reference != "" {
 		filter.Reference = &reference
 	}
@@ -464,12 +480,14 @@ func parseTransactionFilter(from, to, reference string) (domain.TransactionFilte
 
 // ListTransactions returns a page of the tenant's transactions, newest
 // first, keyset paged by cursor, optionally filtered by a from/to
-// created_at range and/or an exact reference match (Task 4.4, audit A7.2),
-// mirroring GET /v1/transactions. Export has no gRPC equivalent: a
-// streaming CSV export does not fit gRPC's single-response model, so it
-// stays REST-only (see internal/api/transactions.go's export handler).
+// created_at range, an effective_from/effective_to value-date range, and/or
+// an exact reference match (Task 4.4, audit A7.2; effective_from/
+// effective_to added by follow-up F2, audit A1.3 partial), mirroring GET
+// /v1/transactions. Export has no gRPC equivalent: a streaming CSV export
+// does not fit gRPC's single-response model, so it stays REST-only (see
+// internal/api/transactions.go's export handler).
 func (s *Server) ListTransactions(ctx context.Context, req *ledgerv1.ListTransactionsRequest) (*ledgerv1.ListTransactionsResponse, error) {
-	filter, err := parseTransactionFilter(req.From, req.To, req.Reference)
+	filter, err := parseTransactionFilter(req.From, req.To, req.EffectiveFrom, req.EffectiveTo, req.Reference)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}

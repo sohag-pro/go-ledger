@@ -34,10 +34,20 @@ type StatementCursor struct {
 // (created_at < To), the half-open window a caller expects from a from/to
 // range, so a transaction landing exactly on the To boundary is never
 // double-counted across two adjacent calls that tile the same range.
+//
+// EffectiveFrom/EffectiveTo are the same half-open window, but over the
+// value date (Task 4.3's effective_at) instead of created_at (follow-up F2,
+// audit A1.3 partial): they filter on COALESCE(effective_at, created_at),
+// the same read-time fallback used everywhere else effective_at is read, so
+// a transaction posted with no explicit value date is filtered as if its
+// value date were its post time. Independent of From/To: a caller may set
+// either pair, both, or neither.
 type TransactionFilter struct {
-	From      *time.Time
-	To        *time.Time
-	Reference *string
+	From          *time.Time
+	To            *time.Time
+	EffectiveFrom *time.Time
+	EffectiveTo   *time.Time
+	Reference     *string
 }
 
 // TransactionListItem is one row of a keyset-paged transaction list (Task
