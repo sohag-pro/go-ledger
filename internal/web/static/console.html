@@ -773,11 +773,11 @@
     return populateTenantSelect().then(function () {
       var rows = state.tenants.map(function (t) {
         var actions = ["active", "suspended", "closed"].filter(function (s) { return s !== t.status; }).map(function (s) {
-          return "<button class='btn ghost sm' data-tenant-id='" + t.id + "' data-tenant-status='" + s + "'>set " + s + "</button>";
+          return "<button class='btn ghost sm' data-tenant-id='" + esc(t.id) + "' data-tenant-status='" + s + "'>set " + s + "</button>";
         }).join(" ");
-        return "<tr><td class='mono' style='font-size:12px' title='" + t.id + "'>" + t.id.slice(0, 8) + "</td>" +
+        return "<tr><td class='mono' style='font-size:12px' title='" + esc(t.id) + "'>" + esc(t.id.slice(0, 8)) + "</td>" +
           "<td>" + esc(t.name) + "</td>" +
-          "<td><span class='pill " + t.status + "'>" + t.status + "</span></td>" +
+          "<td><span class='pill " + esc(t.status) + "'>" + esc(t.status) + "</span></td>" +
           "<td>" + actions + "</td></tr>";
       });
       renderTable($("tn-table"), ["ID", "Name", "Status", "Actions"], rows);
@@ -810,9 +810,9 @@
       .then(function (r) {
         var rows = (r.keys || []).map(function (k) {
           var revoked = !!k.revoked_at;
-          var actions = "<button class='btn ghost sm' data-key-id='" + k.id + "' data-key-action='rotate'>rotate</button>" +
-            (revoked ? "" : " <button class='btn danger sm' data-key-id='" + k.id + "' data-key-action='revoke'>revoke</button>");
-          return "<tr><td class='mono' style='font-size:12px' title='" + k.id + "'>" + k.id.slice(0, 8) + "</td>" +
+          var actions = "<button class='btn ghost sm' data-key-id='" + esc(k.id) + "' data-key-action='rotate'>rotate</button>" +
+            (revoked ? "" : " <button class='btn danger sm' data-key-id='" + esc(k.id) + "' data-key-action='revoke'>revoke</button>");
+          return "<tr><td class='mono' style='font-size:12px' title='" + esc(k.id) + "'>" + esc(k.id.slice(0, 8)) + "</td>" +
             "<td>" + esc(k.name) + "</td>" +
             "<td>" + esc(k.scopes.join(", ")) + "</td>" +
             "<td>" + (k.expires_at ? new Date(k.expires_at).toLocaleString() : "never") + "</td>" +
@@ -886,12 +886,12 @@
     return api("GET", "/v1/admin/webhooks?tenant_id=" + encodeURIComponent(state.currentTenantId))
       .then(function (r) {
         var rows = (r.subscriptions || []).map(function (s) {
-          return "<tr><td class='mono' style='font-size:12px' title='" + s.id + "'>" + s.id.slice(0, 8) + "</td>" +
+          return "<tr><td class='mono' style='font-size:12px' title='" + esc(s.id) + "'>" + esc(s.id.slice(0, 8)) + "</td>" +
             "<td>" + esc(s.url) + "</td>" +
             "<td>" + esc((s.event_types || []).join(", ") || "all") + "</td>" +
             "<td>" + (s.active ? "<span class='pill active'>active</span>" : "<span class='pill closed'>inactive</span>") + "</td>" +
             "<td>" + new Date(s.created_at).toLocaleString() + "</td>" +
-            "<td><button class='btn danger sm' data-webhook-id='" + s.id + "'>delete</button></td></tr>";
+            "<td><button class='btn danger sm' data-webhook-id='" + esc(s.id) + "'>delete</button></td></tr>";
         });
         renderTable($("wh-table"), ["ID", "URL", "Events", "Status", "Created", "Actions"], rows);
       });
@@ -960,7 +960,7 @@
         });
         renderTable($("tb-currencies"), ["Currency", "Net", "Status"], curRows);
         var acctRows = (tb.accounts || []).map(function (a) {
-          return "<tr><td class='mono' style='font-size:12px' title='" + a.account_id + "'>" + a.account_id.slice(0, 8) + "</td>" +
+          return "<tr><td class='mono' style='font-size:12px' title='" + esc(a.account_id) + "'>" + esc(a.account_id.slice(0, 8)) + "</td>" +
             "<td>" + esc(a.name) + "</td><td>" + esc(a.type) + "</td><td>" + esc(a.currency) + "</td>" +
             "<td>" + (a.is_system ? "yes" : "no") + "</td>" +
             "<td class='num " + (a.balance < 0 ? "neg" : "pos") + "'>" + fromMinor(a.balance) + "</td></tr>";
@@ -989,7 +989,7 @@
           var postings = (t.postings || []).map(function (p) {
             return p.account_id.slice(0, 8) + ": " + fromMinor(p.amount) + " " + p.currency;
           }).join("; ");
-          return "<tr><td class='mono' style='font-size:12px' title='" + t.id + "'>" + t.id.slice(0, 8) + "</td>" +
+          return "<tr><td class='mono' style='font-size:12px' title='" + esc(t.id) + "'>" + esc(t.id.slice(0, 8)) + "</td>" +
             "<td>" + new Date(t.effective_at).toLocaleString() + "</td>" +
             "<td>" + esc(t.reference || "") + "</td>" +
             "<td>" + (t.reverses_transaction_id ? "reversal" : "") + "</td>" +
@@ -1019,9 +1019,9 @@
     return api("GET", "/v1/disputes?" + q.toString())
       .then(function (r) {
         var rows = (r.disputes || []).map(function (d) {
-          return "<tr><td class='mono' style='font-size:12px' title='" + d.id + "'>" + d.id.slice(0, 8) + "</td>" +
-            "<td class='mono' style='font-size:12px' title='" + d.transaction_id + "'>" + d.transaction_id.slice(0, 8) + "</td>" +
-            "<td><span class='pill " + d.status + "'>" + d.status + "</span></td>" +
+          return "<tr><td class='mono' style='font-size:12px' title='" + esc(d.id) + "'>" + esc(d.id.slice(0, 8)) + "</td>" +
+            "<td class='mono' style='font-size:12px' title='" + esc(d.transaction_id) + "'>" + esc(d.transaction_id.slice(0, 8)) + "</td>" +
+            "<td><span class='pill " + esc(d.status) + "'>" + esc(d.status) + "</span></td>" +
             "<td>" + esc(d.reason) + "</td>" +
             "<td>" + new Date(d.created_at).toLocaleString() + "</td>" +
             "<td>" + (d.resolved_at ? new Date(d.resolved_at).toLocaleString() : "") + "</td></tr>";
