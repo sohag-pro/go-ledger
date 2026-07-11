@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"reflect"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -84,11 +86,50 @@ type GetFXMarkupInput struct {
 	TenantID string `query:"tenant_id" doc:"Tenant whose override to return alongside the global default. Omit for global only."`
 }
 
+// nullableFXMarkupBody wraps *FXMarkupBody so its OpenAPI schema is "the
+// FXMarkupBody schema, or null" (anyOf), matching what GetMarkup actually
+// returns: no global default set yet, or no tenant override, legitimately
+// come back as JSON null rather than an object. huma's own "nullable:true"
+// struct tag panics at Register time for a field typed as a $ref to an
+// object schema ("nullable is not supported for..."), since it only knows
+// how to fold null into a scalar/array type, not a $ref; SchemaProvider is
+// huma's documented escape hatch for a case like this.
+type nullableFXMarkupBody struct {
+	*FXMarkupBody
+}
+
+// Schema implements huma.SchemaProvider.
+func (nullableFXMarkupBody) Schema(r huma.Registry) *huma.Schema {
+	ref := r.Schema(reflect.TypeOf(FXMarkupBody{}), true, "FXMarkupBody")
+	return &huma.Schema{AnyOf: []*huma.Schema{ref, {Type: "null"}}}
+}
+
+// MarshalJSON renders the wrapped pointer exactly as *FXMarkupBody would:
+// the object, or JSON null.
+func (n nullableFXMarkupBody) MarshalJSON() ([]byte, error) {
+	return json.Marshal(n.FXMarkupBody)
+}
+
+// UnmarshalJSON is the mirror of MarshalJSON, for symmetry and for tests or
+// clients that decode a get-fx-markup response back into this type.
+func (n *nullableFXMarkupBody) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		n.FXMarkupBody = nil
+		return nil
+	}
+	v := new(FXMarkupBody)
+	if err := json.Unmarshal(data, v); err != nil {
+		return err
+	}
+	n.FXMarkupBody = v
+	return nil
+}
+
 // GetFXMarkupOutput is the get-fx-markup response.
 type GetFXMarkupOutput struct {
 	Body struct {
-		Global *FXMarkupBody `json:"global"`
-		Tenant *FXMarkupBody `json:"tenant"`
+		Global nullableFXMarkupBody `json:"global"`
+		Tenant nullableFXMarkupBody `json:"tenant"`
 	}
 }
 
@@ -168,10 +209,10 @@ func registerFXAdmin(api huma.API, deps Deps) {
 		}
 		out := &GetFXMarkupOutput{}
 		if v.Global != nil {
-			out.Body.Global = &FXMarkupBody{DefaultSpreadBps: v.Global.DefaultSpreadBps, EffectiveAt: v.Global.EffectiveAt}
+			out.Body.Global = nullableFXMarkupBody{FXMarkupBody: &FXMarkupBody{DefaultSpreadBps: v.Global.DefaultSpreadBps, EffectiveAt: v.Global.EffectiveAt}}
 		}
 		if v.Tenant != nil {
-			out.Body.Tenant = &FXMarkupBody{DefaultSpreadBps: v.Tenant.DefaultSpreadBps, EffectiveAt: v.Tenant.EffectiveAt}
+			out.Body.Tenant = nullableFXMarkupBody{FXMarkupBody: &FXMarkupBody{DefaultSpreadBps: v.Tenant.DefaultSpreadBps, EffectiveAt: v.Tenant.EffectiveAt}}
 		}
 		return out, nil
 	})

@@ -161,9 +161,21 @@ func TestFXAdminEndpoints(t *testing.T) {
 		}
 	})
 
-	t.Run("spread out of range is 422 via huma validation", func(t *testing.T) {
+	t.Run("spread at the excluded upper bound (10000) is 422 via huma validation", func(t *testing.T) {
+		// Valid range is [0, 10000): 10000 itself is the first invalid value,
+		// so it must be rejected as clearly as the 20000 case further out of
+		// range would be.
 		rec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/rates", map[string]any{
-			"base": "USD", "quote": "GBP", "mid_rate_e8": 100_000_000, "spread_bps": 20_000,
+			"base": "USD", "quote": "GBP", "mid_rate_e8": 100_000_000, "spread_bps": 10_000,
+		})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("scoped write to an unknown tenant is 422", func(t *testing.T) {
+		rec := doAs(t, r, adminKey, http.MethodPost, "/v1/admin/fx/rates", map[string]any{
+			"tenant_id": newUUID(t), "base": "USD", "quote": "CAD", "mid_rate_e8": 100_000_000,
 		})
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body.String())
