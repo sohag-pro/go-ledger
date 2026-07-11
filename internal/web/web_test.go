@@ -48,7 +48,7 @@ func TestRoutes(t *testing.T) {
 			method:     http.MethodGet,
 			path:       "/console",
 			wantStatus: http.StatusOK,
-			wantBody:   "Operator console",
+			wantBody:   "go-ledger console",
 		},
 		{
 			name:       "healthz still works alongside web routes",
