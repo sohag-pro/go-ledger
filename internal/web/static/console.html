@@ -1581,7 +1581,8 @@ function boot() {
     const finish = () => {
       if (!state.tenants.some(t => t.id === state.adminTenant) && state.tenants.length) state.adminTenant = state.tenants[0].id;
       go("overview");
-      if (!state.gsDismissed && state.gsDone.length === 0) { state.gsOpen = true; renderGettingStarted(); }
+      if (!state.gsDismissed && !localStorage.getItem("gl_gs_seen")) { state.gsOpen = true; renderGettingStarted(); }
+      localStorage.setItem("gl_gs_seen", "1");
     };
     if (keyReady()) reloadTenantsThen(finish); else finish();
   }).catch(e => {
