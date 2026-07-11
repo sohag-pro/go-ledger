@@ -251,15 +251,34 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 // (source 'env', the shape fx.Seed writes from FX_RATES at boot) must
 // survive untouched, so the demo's configured rates still apply right after
 // a reset.
+//
+// It also proves two more scopes the reset must get right, since CurrentFXRate
+// prefers a tenant-owned fx_rates row over the global one: an api-sourced
+// fx_rates row owned by the demo tenant itself (not global, and not in the
+// tenant-scoped delete loop above either, since fx_rates is not one of the
+// tables that loop clears) must also be gone after reset, or a visitor could
+// POST a garbage rate scoped to the demo tenant id and have it survive every
+// reset and mis-price every demo conversion. And an api-sourced
+// fx_markup_defaults row belonging to a DIFFERENT, unrelated tenant must
+// survive: the markup delete clears source='api' rows globally, and scoping
+// it to "global or demo tenant" must not widen to "every tenant."
 func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
 	ctx := context.Background()
 	tenant := uuid.New()
+	otherTenant := uuid.New()
 	now := time.Now()
 
 	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
 		t.Fatalf("seed: %v", err)
+	}
+	// otherTenant is a stand-in for an unrelated, live (non-demo) tenant: its
+	// own api-sourced markup default must not be touched by the demo reset.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, name) VALUES ($1, 'other-tenant') ON CONFLICT (id) DO NOTHING`,
+		otherTenant); err != nil {
+		t.Fatalf("insert other tenant: %v", err)
 	}
 
 	// A tampered global rate and markup, as an anonymous demo visitor could
@@ -273,6 +292,22 @@ func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 		`INSERT INTO fx_markup_defaults (default_spread_bps, source, effective_at)
 		 VALUES (9999, 'api', now())`); err != nil {
 		t.Fatalf("insert tampered api markup default: %v", err)
+	}
+	// A tampered rate scoped to the demo TENANT itself, as a visitor could
+	// post by supplying the demo tenant id in the request body. CurrentFXRate
+	// prefers this over the global row, so it must not survive a reset either.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO fx_rates (tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at)
+		 VALUES ($1, 'USD', 'CAD', 1, 9999, 'api', now())`, tenant); err != nil {
+		t.Fatalf("insert tampered tenant-scoped api fx rate: %v", err)
+	}
+	// A legitimate api-sourced markup default belonging to some other,
+	// unrelated tenant: not global, not the demo tenant, so the reset must
+	// leave it alone.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO fx_markup_defaults (tenant_id, default_spread_bps, source, effective_at)
+		 VALUES ($1, 75, 'api', now())`, otherTenant); err != nil {
+		t.Fatalf("insert other tenant api markup default: %v", err)
 	}
 	// A legitimate env-seeded global rate and markup, standing in for what
 	// fx.Seed writes from FX_RATES at process boot: this must survive.
@@ -291,10 +326,15 @@ func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 		t.Fatalf("re-seed over tampered global fx config: %v", err)
 	}
 
-	var apiRateCount, envRateCount, apiMarkupCount, envMarkupCount int
+	var apiRateCount, tenantAPIRateCount, envRateCount, apiMarkupCount, otherTenantMarkupCount, envMarkupCount int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'EUR' AND source = 'api'").Scan(&apiRateCount); err != nil {
 		t.Fatalf("count api fx rates: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'CAD' AND tenant_id = $1 AND source = 'api'",
+		tenant).Scan(&tenantAPIRateCount); err != nil {
+		t.Fatalf("count tenant-scoped api fx rates: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'GBP' AND source = 'env'").Scan(&envRateCount); err != nil {
@@ -305,6 +345,11 @@ func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 		t.Fatalf("count api markup defaults: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM fx_markup_defaults WHERE tenant_id = $1 AND default_spread_bps = 75 AND source = 'api'",
+		otherTenant).Scan(&otherTenantMarkupCount); err != nil {
+		t.Fatalf("count other-tenant api markup defaults: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM fx_markup_defaults WHERE default_spread_bps = 50 AND source = 'env'").Scan(&envMarkupCount); err != nil {
 		t.Fatalf("count env markup defaults: %v", err)
 	}
@@ -312,11 +357,17 @@ func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 	if apiRateCount != 0 {
 		t.Errorf("api-sourced global fx rate survived reset: %d rows remain, want 0", apiRateCount)
 	}
+	if tenantAPIRateCount != 0 {
+		t.Errorf("api-sourced demo-tenant-scoped fx rate survived reset: %d rows remain, want 0", tenantAPIRateCount)
+	}
 	if envRateCount != 1 {
 		t.Errorf("env-sourced global fx rate did not survive reset: got %d rows, want 1", envRateCount)
 	}
 	if apiMarkupCount != 0 {
 		t.Errorf("api-sourced global fx markup default survived reset: %d rows remain, want 0", apiMarkupCount)
+	}
+	if otherTenantMarkupCount != 1 {
+		t.Errorf("other tenant's api-sourced fx markup default did not survive reset: got %d rows, want 1", otherTenantMarkupCount)
 	}
 	if envMarkupCount != 1 {
 		t.Errorf("env-sourced global fx markup default did not survive reset: got %d rows, want 1", envMarkupCount)

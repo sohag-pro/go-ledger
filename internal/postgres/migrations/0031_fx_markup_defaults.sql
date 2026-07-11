@@ -71,10 +71,15 @@ CREATE POLICY tenant_isolation ON fx_markup_defaults
 -- belongs to, so the global default is the only value this backfill can
 -- attribute to an arbitrary rate row without also joining tenant_id, which
 -- would be more precise but is not needed since the pre-existing behavior
--- (before ADR-020) never had tenant-specific markup defaults either.
+-- (before ADR-020) never had tenant-specific markup defaults either. The
+-- subquery does NOT filter out a NULL default_spread_bps: the latest global
+-- row can itself be a CLEAR (a NULL value, meaning "no markup", i.e. 0), and
+-- picking the latest row regardless of its value, then letting the outer
+-- COALESCE map a NULL to 0, is what makes a cleared global freeze to 0
+-- instead of resurrecting an older superseded non-null value.
 UPDATE fx_rates r SET spread_bps = COALESCE(
     (SELECT default_spread_bps FROM fx_markup_defaults
-     WHERE tenant_id IS NULL AND default_spread_bps IS NOT NULL AND effective_at <= now()
+     WHERE tenant_id IS NULL AND effective_at <= now()
      ORDER BY effective_at DESC, id DESC LIMIT 1), 0)
 WHERE r.spread_bps IS NULL;
 ALTER TABLE fx_rates ALTER COLUMN spread_bps SET NOT NULL;

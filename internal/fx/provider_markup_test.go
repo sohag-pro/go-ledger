@@ -96,7 +96,7 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 
 	// Every case's global insert (where present) uses the same value, 10, so
 	// their expectations stay correct regardless of exactly which global row
-	// CurrentFXMarkupDefault actually picks among them.
+	// GlobalFXMarkupDefault actually picks among them.
 	tests := []struct {
 		name string
 		// setup seeds fx_rates and/or fx_markup_defaults for the given tenant

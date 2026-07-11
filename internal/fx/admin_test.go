@@ -174,14 +174,16 @@ func TestAdminServiceInsertAndList(t *testing.T) {
 // can return a global-fallback row (tenant_id NULL) for a tenant-scoped
 // request when no tenant-specific rate row exists for that pair; resolving
 // against that NULL tenant_id skips the tenant's own markup default entirely
-// (CurrentFXMarkupDefault would only ever match the global row). Here the
+// (resolveMarkupDefault would only ever check GlobalFXMarkupDefault). Here the
 // tenant has its own markup default (80) that must win over the global
 // default (50), even though the only rate row for the pair is the global one.
 // This is safe to run in parallel with the rest of the package: fx_rates uses
 // a disjoint currency pair and fx_markup_defaults resolves a tenant-specific
 // row ahead of any global row regardless of insertion order or timing (see
-// CurrentFXMarkupDefault's ORDER BY), so concurrent global writes elsewhere
-// in the suite cannot change this tenant's result.
+// resolveMarkupDefault's tenant-then-global precedence, backed by
+// TenantFXMarkupDefault's and GlobalFXMarkupDefault's own ORDER BY), so
+// concurrent global writes elsewhere in the suite cannot change this
+// tenant's result.
 func TestListRatesResolvesEffectiveSpreadAgainstRequestedScope(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)

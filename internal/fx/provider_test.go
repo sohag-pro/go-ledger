@@ -37,7 +37,7 @@ var (
 	// spread for a disjoint, freshly seeded rate row, taken once in
 	// runWithContainer right after migrations and before m.Run() starts any
 	// test. fx_markup_defaults is shared and append-only across the whole
-	// package, with no per-currency-pair partition (CurrentFXMarkupDefault
+	// package, with no per-currency-pair partition (GlobalFXMarkupDefault
 	// matches whatever the most recently inserted global default is, for
 	// every pair and tenant), so "nothing configured anywhere" can only be
 	// observed live once per process, at this exact moment; every later test
