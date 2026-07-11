@@ -154,7 +154,22 @@ type config struct {
 	adminBootstrap           bool
 }
 
+// loadConfig loads the server's configuration from the environment, running
+// interactive first-run Postgres setup (ADR-019) when DATABASE_URL is unset
+// and a real terminal is attached to stdin. isInteractive() is the single
+// TTY check for this whole feature; see loadConfigWithTTY for the injectable
+// core this delegates to.
 func loadConfig() (config, error) {
+	return loadConfigWithTTY(isInteractive())
+}
+
+// loadConfigWithTTY is loadConfig's testable core: interactive is normally
+// isInteractive()'s result, but a test can force either branch without a
+// real terminal. When databaseURL is empty and interactive is false (the
+// non-interactive path: docker, systemd, CI, or a plain pipe), this is
+// byte-for-byte the fail-fast behavior that existed before ADR-019: a clear
+// "DATABASE_URL is required" error, never a hang waiting on input.
+func loadConfigWithTTY(interactive bool) (config, error) {
 	cfg := config{
 		port:        getenv("PORT", "8080"),
 		metricsAddr: getenv("METRICS_ADDR", "127.0.0.1:9090"),
@@ -265,7 +280,23 @@ func loadConfig() (config, error) {
 		adminBootstrap: getenvBool("ADMIN_BOOTSTRAP", true),
 	}
 	if cfg.databaseURL == "" {
-		return config{}, errors.New("DATABASE_URL is required")
+		if !interactive {
+			return config{}, errors.New("DATABASE_URL is required")
+		}
+		// Interactive first-run setup (ADR-019): only reached when stdin is
+		// a real terminal, never in docker/systemd/CI. Prompts for the
+		// connection, tests it, and offers to save it for next time.
+		dbURL, save, savePath, err := runInteractiveSetup(os.Stdin, os.Stdout, readPasswordFromStdin, pingDB)
+		if err != nil {
+			return config{}, fmt.Errorf("interactive setup: %w", err)
+		}
+		if save {
+			if err := saveDatabaseURL(savePath, dbURL); err != nil {
+				return config{}, fmt.Errorf("save database url to %s: %w", savePath, err)
+			}
+			_, _ = fmt.Fprintf(os.Stdout, "Saved to %s\n", savePath)
+		}
+		cfg.databaseURL = dbURL
 	}
 	// A zero or negative ttl would stamp every idempotency key pre-expired,
 	// silently disabling replay protection for every retry: fail fast at
