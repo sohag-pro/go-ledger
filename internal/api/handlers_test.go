@@ -711,6 +711,20 @@ func (f *fakeRepo) RevokeAPIKey(_ context.Context, id string) error {
 	return domain.ErrAPIKeyNotFound
 }
 
+// SetAPIKeyScopesByHash overwrites the stored scopes for the key at keyHash,
+// mirroring the real repository's ADR-019-follow-up reconciliation method: a
+// no-op (not an error) if keyHash has no matching row, the same as the real
+// UPDATE affecting zero rows.
+func (f *fakeRepo) SetAPIKeyScopesByHash(_ context.Context, keyHash string, scopes []domain.Scope) error {
+	k, ok := f.apiKeys[keyHash]
+	if !ok {
+		return nil
+	}
+	k.Scopes = scopes
+	f.apiKeys[keyHash] = k
+	return nil
+}
+
 func (f *fakeRepo) CreateTenant(_ context.Context, tenantID, name string) error {
 	if _, exists := f.tenants[tenantID]; exists {
 		return domain.ErrTenantAlreadyExists

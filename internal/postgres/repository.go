@@ -1554,6 +1554,22 @@ func (r *Repository) TouchAPIKeyLastUsed(ctx context.Context, id string, when ti
 	return nil
 }
 
+// SetAPIKeyScopesByHash overwrites the scopes of the api_keys row matching
+// keyHash to exactly scopes (ADR-019 follow-up): unlike InsertAPIKey, which
+// is insert-or-ignore on the unique key_hash, this always applies, so it is
+// how a caller reconciles an already-existing key's scopes (for example the
+// demo key's, on every boot) without needing that row's id. A hash with no
+// matching row affects zero rows and returns nil.
+func (r *Repository) SetAPIKeyScopesByHash(ctx context.Context, keyHash string, scopes []domain.Scope) error {
+	if err := r.q.SetAPIKeyScopesByHash(ctx, sqlc.SetAPIKeyScopesByHashParams{
+		KeyHash: keyHash,
+		Scopes:  scopesToStrings(scopes),
+	}); err != nil {
+		return fmt.Errorf("postgres: set api key scopes by hash: %w", err)
+	}
+	return nil
+}
+
 // scopesFromStrings converts the raw text[] scopes column to []domain.Scope.
 // It does not validate each element against Scope.Valid(): the
 // api_keys_scopes_valid CHECK constraint (migration 0012) already guarantees

@@ -421,6 +421,16 @@ type Repository interface {
 	// fail the request that triggered it.
 	TouchAPIKeyLastUsed(ctx context.Context, id string, when time.Time) error
 
+	// SetAPIKeyScopesByHash overwrites the scopes of the (unrevoked or
+	// revoked, unfiltered) api_keys row matching keyHash to exactly scopes.
+	// It is a no-op affecting zero rows if no row matches keyHash. This
+	// exists for cmd/server's demo-key provisioning (ADR-019 follow-up):
+	// InsertAPIKey is insert-or-ignore on the unique key_hash, so a demo key
+	// row already provisioned from a previous boot never gets its scopes
+	// updated by a plain re-insert; this lets the caller reconcile it
+	// afterward, keyed by the same hash, without needing the row's id.
+	SetAPIKeyScopesByHash(ctx context.Context, keyHash string, scopes []Scope) error
+
 	// CreateTenant inserts a new tenant row, active by default. It returns
 	// ErrTenantAlreadyExists if tenantID already has a row.
 	CreateTenant(ctx context.Context, tenantID, name string) error

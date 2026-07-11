@@ -822,6 +822,13 @@ func runMigrateCommand(args []string, logger *slog.Logger) error {
 type apiKeyStore interface {
 	InsertAPIKey(ctx context.Context, k domain.APIKey, keyHash string) error
 	CreateTenant(ctx context.Context, tenantID, name string) error
+	// SetAPIKeyScopesByHash reconciles the demo key's scopes on every boot
+	// (see provisionAPIKeys): InsertAPIKey's insert-or-ignore on key_hash
+	// means a demo key row surviving from a previous boot never has its
+	// scopes touched by a plain re-insert, so a deployment that already had
+	// a demo key row before DEMO_MODE gained admin scope (or lost it) would
+	// otherwise keep the row's stale scopes forever.
+	SetAPIKeyScopesByHash(ctx context.Context, keyHash string, scopes []domain.Scope) error
 }
 
 // demoKeyScopes returns the scopes the demo key is provisioned with. In demo
@@ -847,6 +854,18 @@ func demoKeyScopes(demoMode bool) []domain.Scope {
 // api_keys). The key plaintext is never logged, only the fact that a key is
 // active (ADR-012).
 func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger *slog.Logger) error {
+	// The demo key is always reconciled, whether or not DEMO_MODE is on
+	// (review fix, ADR-019 follow-up): provisionKey's InsertAPIKey is
+	// insert-or-ignore on the unique key_hash, so a demo key row surviving
+	// from a previous boot (for example a deployment that already has one
+	// with the pre-admin-scope {read,post} set) would never have its scopes
+	// touched by a plain re-insert, and demo-mode's admin elevation would be
+	// a silent no-op forever. SetAPIKeyScopesByHash below runs unconditionally
+	// so the row's scopes always match demoKeyScopes(cfg.demoMode) exactly,
+	// including correctly DROPPING admin if a deployment flips out of demo
+	// mode. It is keyed by the demo key's known plaintext hash, so it never
+	// needs the row's generated id.
+	demoKeyHash := domain.HashAPIKey(cfg.demoAPIKey)
 	if cfg.demoMode {
 		demoRPM := demoAPIKeyRateLimitRPM
 		if err := provisionKey(ctx, store, domain.APIKey{
@@ -858,6 +877,9 @@ func provisionAPIKeys(ctx context.Context, store apiKeyStore, cfg config, logger
 			return fmt.Errorf("provision demo api key: %w", err)
 		}
 		logger.Info("demo api key active", "tenant", cfg.defaultTenant, "rate_limit_rpm", demoRPM)
+	}
+	if err := store.SetAPIKeyScopesByHash(ctx, demoKeyHash, demoKeyScopes(cfg.demoMode)); err != nil {
+		return fmt.Errorf("reconcile demo api key scopes: %w", err)
 	}
 
 	if cfg.loadTestKey == "" {
@@ -968,6 +990,22 @@ func provisionAdminKey(ctx context.Context, store apiKeyStore, adminSvc adminKey
 
 	plaintext, key, err := adminSvc.IssueKey(ctx, cfg.defaultTenant, "bootstrap-admin", []domain.Scope{domain.ScopeAdmin}, nil)
 	if err != nil {
+		// A suspended or closed default tenant (review fix): IssueKey fails
+		// closed with a *domain.TenantNotActiveError via
+		// requireActiveTenant, same as it would for any other tenant. That is
+		// correct for the admin API, but here it is boot-time provisioning:
+		// letting it propagate as a fatal error out of run() would mean an
+		// operator who suspends the default tenant while it holds no live
+		// admin key bricks the ENTIRE server on the next restart, not just the
+		// admin surface. Treat it as nothing to provision instead: log a
+		// warning and let boot continue. The tenant can be reactivated and
+		// this function will mint the bootstrap key on the following restart.
+		var tenantErr *domain.TenantNotActiveError
+		if errors.As(err, &tenantErr) {
+			logger.Warn("default tenant not active, skipping admin bootstrap key provisioning",
+				"tenant", cfg.defaultTenant, "status", tenantErr.Status)
+			return nil
+		}
 		return fmt.Errorf("provision admin key: issue key: %w", err)
 	}
 	logger.Info("provisioned bootstrap admin key: store it now, it will not be shown again",

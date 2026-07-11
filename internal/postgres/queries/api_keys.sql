@@ -57,3 +57,16 @@ WHERE api_keys.key_hash = $1 AND api_keys.revoked_at IS NULL;
 -- throttled from the auth resolver (Task 2.2): not every request, so this is
 -- not a write on the hot path of every authenticated call.
 UPDATE api_keys SET last_used_at = $2 WHERE id = $1;
+
+-- name: SetAPIKeyScopesByHash :exec
+-- Reconciles an already-existing key's scopes to exactly the given set, keyed
+-- by hash rather than id (ADR-019 follow-up, review fix): InsertAPIKey is
+-- insert-or-ignore on the unique key_hash, so a demo key row left over from a
+-- previous boot never has its scopes touched by a plain re-insert. cmd/server
+-- calls this right after provisioning the demo key, keyed by
+-- domain.HashAPIKey of its known plaintext, so the row's scopes always match
+-- demoKeyScopes(cfg.demoMode): it gains admin scope when demo mode turns on,
+-- and correctly loses it when a deployment flips out of demo mode. A hash
+-- with no matching row affects zero rows, which is fine: the INSERT that
+-- runs immediately before this in provisioning order creates it first.
+UPDATE api_keys SET scopes = $2 WHERE key_hash = $1;

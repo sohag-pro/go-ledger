@@ -449,20 +449,31 @@ func hasScope(scopes []domain.Scope, want domain.Scope) bool {
 // tests below can use one fake for both roles instead of standing up a real
 // admin.Service and database.
 type fakeKeyStore struct {
-	byHash  map[string]domain.APIKey
-	tenants map[string]bool
+	byHash map[string]domain.APIKey
+	// tenants tracks status directly rather than a bare bool, so a test can
+	// suspend or close a tenant (see setTenantStatus) and have IssueKey below
+	// gate on it exactly the way admin.Service.requireActiveTenant does,
+	// without standing up a real admin.Service and database.
+	tenants map[string]domain.TenantStatus
 }
 
 func newFakeKeyStore() *fakeKeyStore {
-	return &fakeKeyStore{byHash: map[string]domain.APIKey{}, tenants: map[string]bool{}}
+	return &fakeKeyStore{byHash: map[string]domain.APIKey{}, tenants: map[string]domain.TenantStatus{}}
 }
 
 func (s *fakeKeyStore) CreateTenant(_ context.Context, tenantID, _ string) error {
-	if s.tenants[tenantID] {
+	if _, exists := s.tenants[tenantID]; exists {
 		return domain.ErrTenantAlreadyExists
 	}
-	s.tenants[tenantID] = true
+	s.tenants[tenantID] = domain.TenantActive
 	return nil
+}
+
+// setTenantStatus overrides tenantID's status directly (it must already
+// exist via CreateTenant), for tests that need to exercise IssueKey's
+// active-tenant gate against a suspended or closed tenant.
+func (s *fakeKeyStore) setTenantStatus(tenantID string, status domain.TenantStatus) {
+	s.tenants[tenantID] = status
 }
 
 func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash string) error {
@@ -485,17 +496,19 @@ func (s *fakeKeyStore) InsertAPIKey(_ context.Context, k domain.APIKey, keyHash 
 	return nil
 }
 
-// GetAPIKeyByHash defaults an unset TenantStatus to active: this fake has no
-// tenants table of its own, and every key provisionAPIKeys inserts here
-// stands for a tenant that exists and is active (the case these tests cover;
-// tenant status gating itself is tested in internal/auth against a fake that
-// tracks status explicitly).
+// GetAPIKeyByHash looks up the stored key's tenant status from s.tenants,
+// defaulting an unrecognized tenant (one never created via CreateTenant, the
+// common case in tests that predate tenant-status gating) to active: every
+// key provisionAPIKeys inserts here stands for a tenant that exists and is
+// active unless a test explicitly suspends or closes it via setTenantStatus.
 func (s *fakeKeyStore) GetAPIKeyByHash(_ context.Context, hash string) (domain.APIKey, error) {
 	k, ok := s.byHash[hash]
 	if !ok {
 		return domain.APIKey{}, domain.ErrAPIKeyNotFound
 	}
-	if k.TenantStatus == "" {
+	if status, ok := s.tenants[k.TenantID]; ok {
+		k.TenantStatus = status
+	} else {
 		k.TenantStatus = domain.TenantActive
 	}
 	return k, nil
@@ -504,6 +517,20 @@ func (s *fakeKeyStore) GetAPIKeyByHash(_ context.Context, hash string) (domain.A
 // TouchAPIKeyLastUsed is a no-op: these provisioning tests do not assert on
 // last_used_at, which is covered in internal/auth's own tests.
 func (s *fakeKeyStore) TouchAPIKeyLastUsed(_ context.Context, _ string, _ time.Time) error {
+	return nil
+}
+
+// SetAPIKeyScopesByHash overwrites the stored scopes for the key at hash,
+// mirroring the real repository's ADR-019-follow-up reconciliation method
+// closely enough for provisionAPIKeys's own tests: a no-op (not an error) if
+// hash has no matching row, the same as the real UPDATE affecting zero rows.
+func (s *fakeKeyStore) SetAPIKeyScopesByHash(_ context.Context, hash string, scopes []domain.Scope) error {
+	k, ok := s.byHash[hash]
+	if !ok {
+		return nil
+	}
+	k.Scopes = scopes
+	s.byHash[hash] = k
 	return nil
 }
 
@@ -523,10 +550,17 @@ func (s *fakeKeyStore) ListKeys(_ context.Context, tenantID string) ([]domain.AP
 
 // IssueKey mints and stores a fresh key for tenantID, mirroring
 // admin.Service.IssueKey closely enough for provisionAdminKey's own tests:
-// generates a real plaintext/hash pair via domain.GenerateAPIKey and inserts
-// it through InsertAPIKey above, so a duplicate insert is caught the same
-// way a real one would be.
+// it fails closed with a *domain.TenantNotActiveError against a suspended or
+// closed tenant, the same gate real admin.Service.requireActiveTenant
+// applies (this is what lets TestProvisionAdminKey_SuspendedTenant below
+// exercise that path without a real admin.Service and database), and
+// otherwise generates a real plaintext/hash pair via domain.GenerateAPIKey
+// and inserts it through InsertAPIKey above, so a duplicate insert is caught
+// the same way a real one would be.
 func (s *fakeKeyStore) IssueKey(ctx context.Context, tenantID, name string, scopes []domain.Scope, expiresAt *time.Time) (string, domain.APIKey, error) {
+	if status, ok := s.tenants[tenantID]; ok && status != domain.TenantActive {
+		return "", domain.APIKey{}, &domain.TenantNotActiveError{TenantID: tenantID, Status: status}
+	}
 	plaintext, hash, err := domain.GenerateAPIKey()
 	if err != nil {
 		return "", domain.APIKey{}, err
@@ -821,5 +855,84 @@ func TestProvisionAdminKey_ProdModeProvisionsOnceAndIsIdempotent(t *testing.T) {
 	}
 	if logBuf.Len() != 0 {
 		t.Errorf("log on second boot = %q, want nothing (admin key already exists)", logBuf.String())
+	}
+}
+
+// TestProvisionAdminKey_SuspendedDefaultTenantDoesNotBrickBoot proves the
+// review fix for the first Task 2 gap (ADR-019 follow-up): an operator can
+// suspend the default tenant (for example accidentally, or while it holds no
+// live admin key) at any time. Before this fix, admin.Service.IssueKey's
+// *domain.TenantNotActiveError propagated straight out of provisionAdminKey,
+// and run() treats any error from it as fatal, so the NEXT server restart
+// would refuse to boot at all until an operator noticed and reactivated the
+// tenant by hand. provisionAdminKey must instead treat this as nothing to
+// provision: log a warning and return nil so boot continues.
+func TestProvisionAdminKey_SuspendedDefaultTenantDoesNotBrickBoot(t *testing.T) {
+	const tenant = "00000000-0000-0000-0000-0000000000ff"
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	store := newFakeKeyStore()
+	cfg := config{defaultTenant: tenant, demoMode: false, adminBootstrap: true}
+
+	// The tenant already exists (mirroring provisionAdminKey's own
+	// CreateTenant call finding domain.ErrTenantAlreadyExists on a real
+	// restart) but is suspended, and holds no admin key yet: exactly the
+	// state an operator can put the default tenant into.
+	if err := store.CreateTenant(context.Background(), tenant, "suspended tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store.setTenantStatus(tenant, domain.TenantSuspended)
+
+	if err := provisionAdminKey(context.Background(), store, store, cfg, logger); err != nil {
+		t.Fatalf("provisionAdminKey against a suspended tenant returned an error (would brick server boot on restart): %v", err)
+	}
+	if got := len(store.byHash); got != 0 {
+		t.Errorf("api key rows = %d, want 0 (nothing provisioned into a suspended tenant)", got)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "default tenant not active") {
+		t.Errorf("log = %q, want a warning naming the default tenant as not active", logs)
+	}
+	if !strings.Contains(logs, "level=WARN") {
+		t.Errorf("log = %q, want a WARN-level line, not silence or an ERROR", logs)
+	}
+}
+
+// fakeFailingIssuer is an adminKeyIssuer whose IssueKey always fails with a
+// plain, unrelated error (never *domain.TenantNotActiveError), used by
+// TestProvisionAdminKey_OtherIssueKeyErrorsStayFatal to prove the review
+// fix's errors.As check is narrow: only a suspended/closed tenant is
+// swallowed as a warning, every other IssueKey failure (a real database
+// error, for example) must still propagate and fail boot.
+type fakeFailingIssuer struct{}
+
+func (fakeFailingIssuer) ListKeys(_ context.Context, _ string) ([]domain.APIKey, error) {
+	return nil, nil
+}
+
+func (fakeFailingIssuer) IssueKey(_ context.Context, _, _ string, _ []domain.Scope, _ *time.Time) (string, domain.APIKey, error) {
+	return "", domain.APIKey{}, errors.New("boom: some unrelated database error")
+}
+
+// TestProvisionAdminKey_OtherIssueKeyErrorsStayFatal proves the review fix
+// does not overreach: a non-TenantNotActiveError failure from IssueKey must
+// still return an error out of provisionAdminKey (and so still fail boot in
+// run()), exactly as before this fix.
+func TestProvisionAdminKey_OtherIssueKeyErrorsStayFatal(t *testing.T) {
+	const tenant = "00000000-0000-0000-0000-0000000000ff1"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := newFakeKeyStore() // used only for its CreateTenant
+
+	err := provisionAdminKey(context.Background(), store, fakeFailingIssuer{}, config{
+		defaultTenant:  tenant,
+		demoMode:       false,
+		adminBootstrap: true,
+	}, logger)
+	if err == nil {
+		t.Fatal("provisionAdminKey with a non-TenantNotActiveError IssueKey failure returned nil, want a fatal error")
+	}
+	var tenantErr *domain.TenantNotActiveError
+	if errors.As(err, &tenantErr) {
+		t.Errorf("err = %v unexpectedly matched *domain.TenantNotActiveError; want it to have stayed a plain fatal error", err)
 	}
 }

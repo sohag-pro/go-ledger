@@ -182,3 +182,86 @@ func TestProvisionAdminKey_ProdBoot_ProvisionsOnceAndIsIdempotent(t *testing.T) 
 		t.Errorf("key id changed across the second boot: got %q, want the same key %q minted on the first boot", keysAfterSecondBoot[0].ID, mintedKeyID)
 	}
 }
+
+// TestProvisionAPIKeys_ReconcilesExistingDemoKeyScopes proves the review fix
+// for the second Task 2 gap (ADR-019 follow-up): InsertAPIKey is
+// insert-or-ignore on the unique key_hash, so on a deployment that already
+// has a demo key row (the shape go.sohag.pro was in before ADR-019 shipped),
+// re-provisioning used to hit the existing hash, swallow the unique
+// violation, and never touch the row's scopes, so the demo key's admin
+// elevation never actually activated. provisionAPIKeys must now reconcile
+// the demo key's scopes on every boot regardless: a pre-existing {read,post}
+// row gains admin once DEMO_MODE is on, and a deployment that later flips
+// DEMO_MODE back off has that admin scope correctly dropped again.
+func TestProvisionAPIKeys_ReconcilesExistingDemoKeyScopes(t *testing.T) {
+	dsn := startAdminProvisionTestPostgres(t)
+	ctx := context.Background()
+
+	pool, err := postgres.NewPool(ctx, dsn, 5)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	defer pool.Close()
+	repo := postgres.NewRepository(pool)
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	demoKeyHash := domain.HashAPIKey("glk_integration_test_demo_key_reconcile")
+
+	cfg := config{
+		defaultTenant: "00000000-0000-0000-0000-000000000001",
+		demoAPIKey:    "glk_integration_test_demo_key_reconcile",
+	}
+
+	// Simulate a deployment that already has a demo key row from before
+	// ADR-019 shipped: created directly through the repository, with the
+	// pre-admin scopes {read,post}, bypassing provisionAPIKeys entirely.
+	if err := repo.CreateTenant(ctx, cfg.defaultTenant, "reconcile test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if err := repo.InsertAPIKey(ctx, domain.APIKey{
+		TenantID: cfg.defaultTenant,
+		Name:     "demo",
+		Scopes:   []domain.Scope{domain.ScopeRead, domain.ScopePost},
+	}, domain.HashAPIKey(cfg.demoAPIKey)); err != nil {
+		t.Fatalf("pre-insert existing demo key: %v", err)
+	}
+
+	// Booting in demo mode must reconcile the existing row's scopes to
+	// include admin, not silently leave it at {read,post} because the insert
+	// hit a unique violation on the already-existing hash. Read the row
+	// straight from the repository rather than through auth.Resolver: the
+	// resolver caches a resolved key for its TTL, which would make the
+	// second read below observe a stale cached scope set instead of the
+	// reconciled row.
+	demoCfg := cfg
+	demoCfg.demoMode = true
+	if err := provisionAPIKeys(ctx, repo, demoCfg, logger); err != nil {
+		t.Fatalf("provisionAPIKeys (demo mode): %v", err)
+	}
+	key, err := repo.GetAPIKeyByHash(ctx, demoKeyHash)
+	if err != nil {
+		t.Fatalf("get demo key by hash after demo-mode reconcile: %v", err)
+	}
+	if !key.HasScope(domain.ScopeAdmin) {
+		t.Errorf("demo key scopes after demo-mode reconcile = %v, want admin included (pre-existing row must be reconciled, not left at its old scopes)", key.Scopes)
+	}
+
+	// Booting with demo mode back off must reconcile the same row back down
+	// to {read,post}: a deployment that flips out of demo mode must not keep
+	// an admin-scoped demo key lingering forever.
+	nonDemoCfg := cfg
+	nonDemoCfg.demoMode = false
+	if err := provisionAPIKeys(ctx, repo, nonDemoCfg, logger); err != nil {
+		t.Fatalf("provisionAPIKeys (non-demo mode): %v", err)
+	}
+	key, err = repo.GetAPIKeyByHash(ctx, demoKeyHash)
+	if err != nil {
+		t.Fatalf("get demo key by hash after non-demo-mode reconcile: %v", err)
+	}
+	if key.HasScope(domain.ScopeAdmin) {
+		t.Errorf("demo key scopes after non-demo-mode reconcile = %v, want admin scope dropped", key.Scopes)
+	}
+	wantScopes := []domain.Scope{domain.ScopeRead, domain.ScopePost}
+	if len(key.Scopes) != len(wantScopes) {
+		t.Errorf("demo key scopes after non-demo-mode reconcile = %v, want exactly %v", key.Scopes, wantScopes)
+	}
+}
