@@ -1801,11 +1801,15 @@ func (r *Repository) InsertFXRate(ctx context.Context, tenantID *string, base, q
 	}
 
 	params := sqlc.InsertFXRateParams{
-		TenantID:    pgTenantID,
-		Base:        string(base),
-		Quote:       string(quote),
-		MidRateE8:   midRateE8,
-		SpreadBps:   spreadBps,
+		TenantID:  pgTenantID,
+		Base:      string(base),
+		Quote:     string(quote),
+		MidRateE8: midRateE8,
+		// This entry point always takes an explicit spread (validated above,
+		// never NULL): ADR-020's nullable spread_bps is for a row that
+		// deliberately falls back to the markup default, which this signature
+		// has no way to express. Valid: true marks it a per-pair override.
+		SpreadBps:   pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:      source,
 		EffectiveAt: pgEffectiveAt,
 	}

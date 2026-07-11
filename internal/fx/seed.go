@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
@@ -93,7 +94,13 @@ func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 		current, err := q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{Base: e.base, Quote: e.quote})
 		switch {
 		case err == nil:
-			if current.MidRateE8 == e.midE8 && current.SpreadBps == e.spreadBps {
+			// current.SpreadBps is now nullable (ADR-020); every row Seed
+			// itself ever writes carries a valid, explicit spread (see the
+			// InsertFXRate call below), so comparing Valid too means a
+			// current row left NULL by some other writer (an admin default
+			// fallback) is correctly treated as "different" rather than
+			// panicking or silently matching on the zero value.
+			if current.MidRateE8 == e.midE8 && current.SpreadBps.Valid && current.SpreadBps.Int32 == e.spreadBps {
 				continue // unchanged since the last seed: do not duplicate it
 			}
 		case errors.Is(err, pgx.ErrNoRows):
@@ -109,7 +116,9 @@ func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 			Base:      e.base,
 			Quote:     e.quote,
 			MidRateE8: e.midE8,
-			SpreadBps: e.spreadBps,
+			// Env-seeded rates are explicit overrides (Valid: true), never a
+			// fall-through to the markup default (ADR-020).
+			SpreadBps: pgtype.Int4{Int32: e.spreadBps, Valid: true},
 			Source:    envSource,
 			// EffectiveAt left at its zero value (Valid: false, i.e. NULL):
 			// the query's COALESCE(sqlc.narg('effective_at'), now()) then

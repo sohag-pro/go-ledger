@@ -112,7 +112,7 @@ func insertRate(t *testing.T, q *sqlc.Queries, base, quote string, midE8 int64, 
 		Base:        base,
 		Quote:       quote,
 		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
+		SpreadBps:   pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:      "test",
 		EffectiveAt: pgtype.Timestamptz{Time: effectiveAt, Valid: true},
 	}); err != nil {
@@ -134,7 +134,7 @@ func insertTenantRate(t *testing.T, q *sqlc.Queries, tenantID, base, quote strin
 		Base:        base,
 		Quote:       quote,
 		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
+		SpreadBps:   pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:      "test",
 		EffectiveAt: pgtype.Timestamptz{Time: effectiveAt, Valid: true},
 	}); err != nil {
@@ -250,8 +250,8 @@ func TestCurrentFXRate_TiebreakAndAppend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentFXRate() error = %v", err)
 	}
-	if row.MidRateE8 != 200_000_000 || row.SpreadBps != 20 {
-		t.Errorf("CurrentFXRate() = {mid: %d, spread: %d}, want the later-inserted row {mid: 200000000, spread: 20} "+
+	if row.MidRateE8 != 200_000_000 || !row.SpreadBps.Valid || row.SpreadBps.Int32 != 20 {
+		t.Errorf("CurrentFXRate() = {mid: %d, spread: %v}, want the later-inserted row {mid: 200000000, spread: 20} "+
 			"(effective_at tie should break on id DESC)", row.MidRateE8, row.SpreadBps)
 	}
 

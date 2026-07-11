@@ -94,12 +94,21 @@ type Dispute struct {
 	ResolvedAt              pgtype.Timestamptz
 }
 
+type FxMarkupDefault struct {
+	ID               int64
+	TenantID         pgtype.UUID
+	DefaultSpreadBps int32
+	Source           string
+	EffectiveAt      time.Time
+	CreatedAt        time.Time
+}
+
 type FxRate struct {
 	ID          int64
 	Base        string
 	Quote       string
 	MidRateE8   int64
-	SpreadBps   int32
+	SpreadBps   pgtype.Int4
 	Source      string
 	EffectiveAt time.Time
 	CreatedAt   time.Time

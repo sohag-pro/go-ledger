@@ -49,7 +49,7 @@ func seedFXRate(t *testing.T, quote string, midRateE8 int64, spreadBps int32) {
 	}
 	q := sqlc.New(sharedPool)
 	if _, err := q.InsertFXRate(context.Background(), sqlc.InsertFXRateParams{
-		Base: "USD", Quote: quote, MidRateE8: midRateE8, SpreadBps: spreadBps,
+		Base: "USD", Quote: quote, MidRateE8: midRateE8, SpreadBps: pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source: "test",
 		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
 		// "effective_at <= now()" gate runs on the database SERVER's clock,

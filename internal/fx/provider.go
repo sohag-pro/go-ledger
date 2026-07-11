@@ -66,10 +66,14 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 
 	direct, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: pgTenantID, Base: string(base), Quote: string(quote)})
 	if err == nil {
+		spread, sErr := p.resolveSpread(ctx, pgTenantID, direct.SpreadBps)
+		if sErr != nil {
+			return domain.FXQuote{}, 0, sErr
+		}
 		return domain.FXQuote{
 			Base: base, Quote: quote, MidRateE8: direct.MidRateE8,
 			RateID: direct.ID, Source: direct.Source, EffectiveAt: direct.EffectiveAt,
-		}, direct.SpreadBps, nil
+		}, spread, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return domain.FXQuote{}, 0, fmt.Errorf("fx: lookup %s/%s: %w", base, quote, err)
@@ -99,10 +103,33 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 	// stays exact integer division throughout.
 	invertedMidE8 := (domain.RateScale * domain.RateScale) / inverse.MidRateE8
 
+	spread, sErr := p.resolveSpread(ctx, pgTenantID, inverse.SpreadBps)
+	if sErr != nil {
+		return domain.FXQuote{}, 0, sErr
+	}
 	return domain.FXQuote{
 		Base: base, Quote: quote, MidRateE8: invertedMidE8,
 		// Provenance is the row that was actually found and inverted: there is
 		// no separate stored row for this direction (see FXQuote's doc comment).
 		RateID: inverse.ID, Source: inverse.Source, EffectiveAt: inverse.EffectiveAt,
-	}, inverse.SpreadBps, nil
+	}, spread, nil
+}
+
+// resolveSpread turns a rate row's nullable spread into the concrete spread a
+// conversion applies (ADR-020 precedence): a per-pair override if the row
+// carries one, else the tenant's markup default, else the global default, else
+// zero. Called for whichever row Rate actually found (direct or inverse), so
+// the precedence lives in one place.
+func (p *dbRateProvider) resolveSpread(ctx context.Context, tenant pgtype.UUID, rowSpread pgtype.Int4) (int32, error) {
+	if rowSpread.Valid {
+		return rowSpread.Int32, nil
+	}
+	d, err := p.q.CurrentFXMarkupDefault(ctx, tenant)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("fx: resolve markup default: %w", err)
+	}
+	return d.DefaultSpreadBps, nil
 }

@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -56,7 +57,7 @@ func (q *Queries) CurrentFXRate(ctx context.Context, arg CurrentFXRateParams) (F
 
 const insertFXRate = `-- name: InsertFXRate :one
 INSERT INTO fx_rates (tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at)
-VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()))
+VALUES ($1, $2, $3, $4, $6::integer, $5, COALESCE($7::timestamptz, now()))
 RETURNING id, base, quote, mid_rate_e8, spread_bps, source, effective_at, created_at, tenant_id
 `
 
@@ -65,8 +66,8 @@ type InsertFXRateParams struct {
 	Base        string
 	Quote       string
 	MidRateE8   int64
-	SpreadBps   int32
 	Source      string
+	SpreadBps   pgtype.Int4
 	EffectiveAt pgtype.Timestamptz
 }
 
@@ -93,8 +94,8 @@ func (q *Queries) InsertFXRate(ctx context.Context, arg InsertFXRateParams) (FxR
 		arg.Base,
 		arg.Quote,
 		arg.MidRateE8,
-		arg.SpreadBps,
 		arg.Source,
+		arg.SpreadBps,
 		arg.EffectiveAt,
 	)
 	var i FxRate
@@ -110,4 +111,61 @@ func (q *Queries) InsertFXRate(ctx context.Context, arg InsertFXRateParams) (FxR
 		&i.TenantID,
 	)
 	return i, err
+}
+
+const listCurrentFXRates = `-- name: ListCurrentFXRates :many
+SELECT DISTINCT ON (base, quote)
+    id, tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at, created_at
+FROM fx_rates
+WHERE (tenant_id = $1 OR tenant_id IS NULL)
+  AND effective_at <= now()
+ORDER BY base, quote, (tenant_id IS NULL), effective_at DESC, id DESC
+`
+
+type ListCurrentFXRatesRow struct {
+	ID          int64
+	TenantID    pgtype.UUID
+	Base        string
+	Quote       string
+	MidRateE8   int64
+	SpreadBps   pgtype.Int4
+	Source      string
+	EffectiveAt time.Time
+	CreatedAt   time.Time
+}
+
+// The current effective row per (base, quote) for a tenant plus the global
+// defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts
+// a tenant-owned row (tenant_id IS NULL = false, sorts first) ahead of a
+// global row, then latest effective, matching CurrentFXRate's precedence.
+// Pass tenant_id NULL to list globals only (tenant_id = NULL is never true, so
+// only the tenant_id IS NULL rows match).
+func (q *Queries) ListCurrentFXRates(ctx context.Context, tenantID pgtype.UUID) ([]ListCurrentFXRatesRow, error) {
+	rows, err := q.db.Query(ctx, listCurrentFXRates, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCurrentFXRatesRow
+	for rows.Next() {
+		var i ListCurrentFXRatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Base,
+			&i.Quote,
+			&i.MidRateE8,
+			&i.SpreadBps,
+			&i.Source,
+			&i.EffectiveAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

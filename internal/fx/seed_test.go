@@ -45,8 +45,8 @@ func TestSeed_ParsesExactValues(t *testing.T) {
 	if eur.MidRateE8 != 92_000_000 {
 		t.Errorf("USD/EUR MidRateE8 = %d, want 92000000 (0.9200 scaled by 1e8)", eur.MidRateE8)
 	}
-	if eur.SpreadBps != 25 {
-		t.Errorf("USD/EUR SpreadBps = %d, want 25", eur.SpreadBps)
+	if !eur.SpreadBps.Valid || eur.SpreadBps.Int32 != 25 {
+		t.Errorf("USD/EUR SpreadBps = %v, want 25", eur.SpreadBps)
 	}
 
 	bdt, err := q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{Base: "USD", Quote: "BDT"})
@@ -56,8 +56,8 @@ func TestSeed_ParsesExactValues(t *testing.T) {
 	if bdt.MidRateE8 != 11_050_000_000 {
 		t.Errorf("USD/BDT MidRateE8 = %d, want 11050000000 (110.50 scaled by 1e8)", bdt.MidRateE8)
 	}
-	if bdt.SpreadBps != 50 {
-		t.Errorf("USD/BDT SpreadBps = %d, want 50", bdt.SpreadBps)
+	if !bdt.SpreadBps.Valid || bdt.SpreadBps.Int32 != 50 {
+		t.Errorf("USD/BDT SpreadBps = %v, want 50", bdt.SpreadBps)
 	}
 }
 
