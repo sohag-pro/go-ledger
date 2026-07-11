@@ -115,3 +115,112 @@ services:
       PORT: "8080"
     ports:
       - "8080:8080"
+
+  # --- One-command run profiles (ADR-019, "One-command run") ----------------
+  # `demo` and `local` are the two newcomer-facing profiles. Both bring up a
+  # dedicated postgres, run the `migrate` subcommand once as an init step
+  # (reusing the same one-shot entry point the deploy pipeline uses ahead of
+  # a binary swap, see runMigrateCommand in cmd/server/main.go), and only then
+  # start the app via depends_on: condition: service_completed_successfully.
+  # Each profile uses its own container, volume, and service names so the two
+  # never collide if both happened to be started; both still publish 8080 and
+  # 5432 on the host, so do not run `demo` and `local` at the same time (or
+  # alongside `dev` / `load-test`, which publish the same ports too).
+  #
+  #   docker compose --profile demo up   # seeded, public admin, resets often
+  #   docker compose --profile local up  # empty, prints a bootstrap admin key
+  demo-postgres:
+    image: postgres:16
+    container_name: go-ledger-demo-postgres
+    profiles: ["demo"]
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    ports:
+      - "5432:5432"
+    volumes:
+      - go-ledger-demo-postgres-data:/var/lib/postgresql/data
+
+  demo-migrate:
+    build: .
+    container_name: go-ledger-demo-migrate
+    profiles: ["demo"]
+    depends_on:
+      demo-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@demo-postgres:5432/ledger?sslmode=disable
+    command: ["migrate"]
+    restart: "no"
+
+  demo-app:
+    build: .
+    container_name: go-ledger-demo-app
+    profiles: ["demo"]
+    depends_on:
+      demo-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@demo-postgres:5432/ledger?sslmode=disable
+      DEMO_MODE: "true"
+      SEED_ENABLED: "true"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+
+  local-postgres:
+    image: postgres:16
+    container_name: go-ledger-local-postgres
+    profiles: ["local"]
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    ports:
+      - "5432:5432"
+    volumes:
+      - go-ledger-local-postgres-data:/var/lib/postgresql/data
+
+  local-migrate:
+    build: .
+    container_name: go-ledger-local-migrate
+    profiles: ["local"]
+    depends_on:
+      local-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@local-postgres:5432/ledger?sslmode=disable
+    command: ["migrate"]
+    restart: "no"
+
+  local-app:
+    build: .
+    container_name: go-ledger-local-app
+    profiles: ["local"]
+    depends_on:
+      local-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://ledger:ledger@local-postgres:5432/ledger?sslmode=disable
+      SEED_ENABLED: "false"
+      PORT: "8080"
+      # DEMO_MODE is left unset here on purpose: production mode, so the
+      # server provisions and prints a bootstrap admin key on first boot
+      # instead of a public demo admin.
+    ports:
+      - "8080:8080"
+
+volumes:
+  go-ledger-demo-postgres-data:
+  go-ledger-local-postgres-data:
