@@ -167,3 +167,66 @@ func parseTenant(t *testing.T, tenantID string) pgtype.UUID {
 	}
 	return pgtype.UUID{Bytes: tid, Valid: true}
 }
+
+// TestListCurrentFXRates covers ListCurrentFXRates's DISTINCT ON collapse: one
+// row per (base, quote) pair, with a tenant-owned row taking precedence over
+// a global one for the same pair, matching CurrentFXRate's own precedence.
+// Two pairs are seeded, each disjoint from every other test in this package
+// (fx_rates is a shared, package-wide table): one with only a global rate,
+// one with both a global and a tenant-specific rate for the tenant under
+// test.
+func TestListCurrentFXRates(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	q := sqlc.New(pool)
+
+	tenantID := newTestTenant(t, pool)
+	tid := parseTenant(t, tenantID)
+
+	// Global-only pair: no tenant-specific row exists for it, so the global
+	// rate is the only candidate and must be the one returned.
+	insertRateRaw(t, q, pgtype.UUID{}, "PQZ", "XYQ", 100_000_000, pgtype.Int4{Int32: 15, Valid: true})
+
+	// Contested pair: both a global row and this tenant's own row exist. The
+	// tenant's row carries a different mid so the test can tell which one
+	// ListCurrentFXRates actually returned.
+	insertRateRaw(t, q, pgtype.UUID{}, "HJK", "LMN", 200_000_000, pgtype.Int4{Int32: 20, Valid: true})
+	insertRateRaw(t, q, tid, "HJK", "LMN", 250_000_000, pgtype.Int4{Int32: 30, Valid: true})
+
+	rows, err := q.ListCurrentFXRates(ctx, tid)
+	if err != nil {
+		t.Fatalf("ListCurrentFXRates(%s) error = %v", tenantID, err)
+	}
+
+	got := make(map[string]sqlc.ListCurrentFXRatesRow, len(rows))
+	for _, r := range rows {
+		key := r.Base + "/" + r.Quote
+		if _, dup := got[key]; dup {
+			t.Fatalf("ListCurrentFXRates(%s) returned more than one row for %s", tenantID, key)
+		}
+		got[key] = r
+	}
+
+	globalOnly, ok := got["PQZ/XYQ"]
+	if !ok {
+		t.Fatalf("ListCurrentFXRates(%s) missing PQZ/XYQ", tenantID)
+	}
+	if globalOnly.MidRateE8 != 100_000_000 {
+		t.Errorf("PQZ/XYQ MidRateE8 = %d, want %d", globalOnly.MidRateE8, 100_000_000)
+	}
+	if globalOnly.TenantID.Valid {
+		t.Errorf("PQZ/XYQ TenantID = %v, want the global (invalid/NULL) row", globalOnly.TenantID)
+	}
+
+	contested, ok := got["HJK/LMN"]
+	if !ok {
+		t.Fatalf("ListCurrentFXRates(%s) missing HJK/LMN", tenantID)
+	}
+	if contested.MidRateE8 != 250_000_000 {
+		t.Errorf("HJK/LMN MidRateE8 = %d, want %d (the tenant-specific row)", contested.MidRateE8, 250_000_000)
+	}
+	if !contested.TenantID.Valid || contested.TenantID.Bytes != tid.Bytes {
+		t.Errorf("HJK/LMN TenantID = %v, want tenant %s", contested.TenantID, tenantID)
+	}
+}

@@ -28,10 +28,30 @@ CREATE TABLE fx_markup_defaults (
 CREATE INDEX fx_markup_defaults_current
     ON fx_markup_defaults (tenant_id, effective_at DESC, id DESC);
 
+-- fx_markup_defaults.tenant_id is nullable the same way fx_rates.tenant_id is
+-- (NULL means the global default markup, visible to every tenant), so it gets
+-- the same tenant_isolation policy: a global row is always visible and
+-- insertable regardless of the app.tenant_id GUC, a tenant-specific row
+-- follows the usual per-tenant rule (migration 0024).
+ALTER TABLE fx_markup_defaults ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fx_markup_defaults FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON fx_markup_defaults
+    USING (tenant_id IS NULL
+           OR current_setting('app.tenant_id', true) IS NULL
+           OR current_setting('app.tenant_id', true) = ''
+           OR tenant_id::text = current_setting('app.tenant_id', true))
+    WITH CHECK (tenant_id IS NULL
+           OR current_setting('app.tenant_id', true) IS NULL
+           OR current_setting('app.tenant_id', true) = ''
+           OR tenant_id::text = current_setting('app.tenant_id', true));
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
+DROP POLICY IF EXISTS tenant_isolation ON fx_markup_defaults;
+ALTER TABLE fx_markup_defaults NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE fx_markup_defaults DISABLE ROW LEVEL SECURITY;
 DROP TABLE fx_markup_defaults;
 -- Any NULL override must become a concrete 0 before spread_bps can be NOT NULL
 -- again, so the down path never fails on existing data.
