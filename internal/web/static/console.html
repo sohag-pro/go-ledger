@@ -805,7 +805,8 @@ function renderFXSettings() {
   loadFXMarkup();
 }
 function loadFXRates() {
-  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
+  const scope = fxRateScope();
+  const q = scope ? "?tenant_id=" + encodeURIComponent(scope) : "";
   api("GET", "/v1/admin/fx/rates" + q).then(r => {
     const rows = r.rates || [];
     const host = $("#fxRatesTable");
@@ -814,13 +815,14 @@ function loadFXRates() {
       <td>${x.tenant_id ? '<span class="badge cyan">tenant</span>' : '<span class="badge grey">global</span>'}</td>
       <td class="mono">${esc(x.base)}/${esc(x.quote)}</td>
       <td class="num mono">${esc(fromRateE8(x.mid_rate_e8))}</td>
-      <td class="num">${x.effective_spread_bps}${x.spread_bps == null ? ' <span class="subtle">(default)</span>' : ''}</td>
+      <td class="num">${esc(x.effective_spread_bps)}${x.spread_bps == null ? ' <span class="subtle">(default)</span>' : ''}</td>
       <td>${esc(new Date(x.effective_at).toLocaleString())}</td>
     </tr>`).join("")}</tbody></table>`;
   }).catch(e => { $("#fxRatesTable").innerHTML = `<p class="neg">${esc(e.message)}</p>`; });
 }
 function loadFXMarkup() {
-  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
+  const scope = fxMarkupScope();
+  const q = scope ? "?tenant_id=" + encodeURIComponent(scope) : "";
   api("GET", "/v1/admin/fx/markup" + q).then(r => {
     const g = r.global ? r.global.default_spread_bps + " bps (" + (r.global.default_spread_bps / 100).toFixed(2) + "%)" : "not set";
     const t = r.tenant ? r.tenant.default_spread_bps + " bps (" + (r.tenant.default_spread_bps / 100).toFixed(2) + "%)" : "none";
