@@ -2,8 +2,18 @@
 # the compose network is reachable at go-ledger-dev-app:9090 because the dev app
 # sets METRICS_ADDR=0.0.0.0:9090 (the app default 127.0.0.1:9090 is not
 # reachable across containers).
+#
+# rule_files loads deploy/alerts.yml (Task 5.6a, extended by follow-up F3):
+# docker-compose.yml mounts both files into the prometheus container's
+# /etc/prometheus/ directory, so the relative path here is just the filename.
+# This makes the dev/compose Prometheus load and evaluate the rules; it does
+# not, by itself, page anyone (no Alertmanager is configured here), and it
+# does not exist in production at all yet (see docs/ops/server-setup.md).
 global:
   scrape_interval: 15s
+
+rule_files:
+  - alerts.yml
 
 scrape_configs:
   - job_name: go-ledger
