@@ -695,6 +695,41 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           </div>
         </div>
 
+        <div class="card section-gap" style="max-width:640px" id="fxRatesCard" hidden>
+          <h2 style="font-size:14.5px;margin:0 0 6px">Exchange rates</h2>
+          <p class="subtle" style="margin:0 0 14px">Mid rates for currency pairs. The effective spread is the per-pair override if set, otherwise the markup default.</p>
+          <div class="checks" style="margin-bottom:12px">
+            <label><input type="radio" name="fxRateScope" value="global" checked> Global default</label>
+            <label><input type="radio" name="fxRateScope" value="tenant"> Current tenant</label>
+          </div>
+          <div class="scroll-x" id="fxRatesTable"></div>
+          <form id="fxRateForm" style="margin-top:14px">
+            <div class="form-row">
+              <div class="field"><label for="fxBase">Base</label><input id="fxBase" class="mono" maxlength="3" placeholder="USD" style="text-transform:uppercase"></div>
+              <div class="field"><label for="fxQuote">Quote</label><input id="fxQuote" class="mono" maxlength="3" placeholder="EUR" style="text-transform:uppercase"></div>
+              <div class="field"><label for="fxMid">Mid rate</label><input id="fxMid" placeholder="0.92000000"></div>
+              <div class="field"><label for="fxSpread">Spread override (bps)</label><input id="fxSpread" type="number" min="0" max="9999" placeholder="optional"></div>
+            </div>
+            <button class="btn primary sm" type="submit">Save rate</button>
+            <div class="hint" id="fxRateOut" style="margin-top:8px"></div>
+          </form>
+        </div>
+
+        <div class="card section-gap" style="max-width:640px" id="fxMarkupCard" hidden>
+          <h2 style="font-size:14.5px;margin:0 0 6px">Markup fee</h2>
+          <p class="subtle" style="margin:0 0 14px">The default markup applied to any conversion whose rate carries no per-pair spread. 100 bps = 1.00%.</p>
+          <div id="fxMarkupCurrent" class="hint" style="margin-bottom:12px"></div>
+          <div class="checks" style="margin-bottom:12px">
+            <label><input type="radio" name="fxMarkupScope" value="global" checked> Global default</label>
+            <label><input type="radio" name="fxMarkupScope" value="tenant"> Current tenant</label>
+          </div>
+          <form id="fxMarkupForm">
+            <div class="field" style="max-width:220px"><label for="fxMarkupBps">Default markup (bps)</label><input id="fxMarkupBps" type="number" min="0" max="9999" placeholder="50"></div>
+            <button class="btn primary sm" type="submit">Save markup</button>
+            <div class="hint" id="fxMarkupOut" style="margin-top:8px"></div>
+          </form>
+        </div>
+
         <div class="card section-gap" style="max-width:560px">
           <h2 style="font-size:14.5px;margin:0 0 10px">About</h2>
           <p style="margin:0;color:var(--muted)">
@@ -740,6 +775,57 @@ function toMinor(str) {
   const frac = ((parts[1] || "") + "0".repeat(DECIMALS)).slice(0, DECIMALS);
   const n = parseInt(whole, 10) * Math.pow(10, DECIMALS) + parseInt(frac || "0", 10);
   return neg ? -n : n;
+}
+// Parse a decimal string to integer mid_rate_e8 (1e8 scale), no float on the
+// money path: scale by string, same idea as toMinor but 8 fractional digits.
+function toRateE8(str) {
+  str = String(str == null ? "" : str).trim();
+  if (str === "" || str === "-") return null;
+  if (!/^-?\d+(\.\d+)?$/.test(str)) return NaN;
+  const neg = str[0] === "-"; if (neg) str = str.slice(1);
+  const parts = str.split("."), whole = parts[0] || "0";
+  const frac = ((parts[1] || "") + "00000000").slice(0, 8);
+  const n = parseInt(whole, 10) * 100000000 + parseInt(frac || "0", 10);
+  return neg ? -n : n;
+}
+function fromRateE8(n) {
+  const neg = n < 0; n = Math.abs(n);
+  const s = String(n).padStart(9, "0");
+  return (neg ? "-" : "") + s.slice(0, -8) + "." + s.slice(-8);
+}
+function fxRateScope() { const el = document.querySelector('input[name="fxRateScope"]:checked'); return el && el.value === "tenant" ? state.adminTenant : ""; }
+function fxMarkupScope() { const el = document.querySelector('input[name="fxMarkupScope"]:checked'); return el && el.value === "tenant" ? state.adminTenant : ""; }
+
+function renderFXSettings() {
+  const show = adminUnlocked();
+  $("#fxRatesCard").hidden = !show;
+  $("#fxMarkupCard").hidden = !show;
+  if (!show) return;
+  loadFXRates();
+  loadFXMarkup();
+}
+function loadFXRates() {
+  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
+  api("GET", "/v1/admin/fx/rates" + q).then(r => {
+    const rows = r.rates || [];
+    const host = $("#fxRatesTable");
+    if (!rows.length) { host.innerHTML = `<p class="subtle">No rates set yet.</p>`; return; }
+    host.innerHTML = `<table><thead><tr><th>Scope</th><th>Pair</th><th class="num">Mid</th><th class="num">Spread (bps)</th><th>When</th></tr></thead><tbody>${rows.map(x => `<tr>
+      <td>${x.tenant_id ? '<span class="badge cyan">tenant</span>' : '<span class="badge grey">global</span>'}</td>
+      <td class="mono">${esc(x.base)}/${esc(x.quote)}</td>
+      <td class="num mono">${esc(fromRateE8(x.mid_rate_e8))}</td>
+      <td class="num">${x.effective_spread_bps}${x.spread_bps == null ? ' <span class="subtle">(default)</span>' : ''}</td>
+      <td>${esc(new Date(x.effective_at).toLocaleString())}</td>
+    </tr>`).join("")}</tbody></table>`;
+  }).catch(e => { $("#fxRatesTable").innerHTML = `<p class="neg">${esc(e.message)}</p>`; });
+}
+function loadFXMarkup() {
+  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
+  api("GET", "/v1/admin/fx/markup" + q).then(r => {
+    const g = r.global ? r.global.default_spread_bps + " bps (" + (r.global.default_spread_bps / 100).toFixed(2) + "%)" : "not set";
+    const t = r.tenant ? r.tenant.default_spread_bps + " bps (" + (r.tenant.default_spread_bps / 100).toFixed(2) + "%)" : "none";
+    $("#fxMarkupCurrent").innerHTML = `Global default: <strong>${esc(g)}</strong>. Current tenant override: <strong>${esc(t)}</strong>.`;
+  }).catch(e => { $("#fxMarkupCurrent").innerHTML = `<span class="neg">${esc(e.message)}</span>`; });
 }
 function money(minor) {
   const n = (typeof minor === "number" ? minor : 0) / Math.pow(10, DECIMALS);
@@ -1312,6 +1398,7 @@ function renderSettings() {
   const pill = $("#setModePill"), note = $("#setModeNote");
   if (state.mode === "demo") { pill.className = "pill demo"; pill.textContent = "Demo"; note.textContent = "Public demo server, resets every four hours."; }
   else { pill.className = "pill prod"; pill.textContent = "Production"; note.textContent = "Live server. Admin actions need an admin key."; }
+  renderFXSettings();
 }
 
 /* ---------- router ---------- */
@@ -1577,6 +1664,35 @@ $("#clearKeyBtn").addEventListener("click", () => {
   toast("Key cleared", "ok");
 });
 $("#setTenant").addEventListener("change", (e) => { switchAdminTenant(e.target.value); renderSettings(); });
+
+$("#fxRateForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const scope = fxRateScope();
+  if (document.querySelector('input[name="fxRateScope"]:checked').value === "tenant" && !state.adminTenant) { toast("Pick an admin tenant first.", "err"); return; }
+  const midE8 = toRateE8($("#fxMid").value);
+  if (midE8 == null || isNaN(midE8) || midE8 <= 0) { toast("Enter a positive mid rate.", "err"); return; }
+  const body = { base: $("#fxBase").value.trim().toUpperCase(), quote: $("#fxQuote").value.trim().toUpperCase(), mid_rate_e8: midE8 };
+  if (scope) body.tenant_id = scope;
+  const sp = $("#fxSpread").value.trim();
+  if (sp !== "") body.spread_bps = parseInt(sp, 10);
+  api("POST", "/v1/admin/fx/rates", body).then(() => { toast("Rate saved", "ok"); $("#fxRateForm").reset(); loadFXRates(); })
+    .catch(err => { toast(err.message, "err"); $("#fxRateOut").innerHTML = `<span class="neg">${esc(err.message)}</span>`; });
+});
+$("#fxMarkupForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const scope = fxMarkupScope();
+  if (document.querySelector('input[name="fxMarkupScope"]:checked').value === "tenant" && !state.adminTenant) { toast("Pick an admin tenant first.", "err"); return; }
+  const bps = parseInt($("#fxMarkupBps").value, 10);
+  if (isNaN(bps) || bps < 0 || bps >= 10000) { toast("Enter a markup in the range 0 to 9999 bps.", "err"); return; }
+  const body = { default_spread_bps: bps };
+  if (scope) body.tenant_id = scope;
+  api("POST", "/v1/admin/fx/markup", body).then(() => { toast("Markup saved", "ok"); $("#fxMarkupForm").reset(); loadFXMarkup(); })
+    .catch(err => { toast(err.message, "err"); $("#fxMarkupOut").innerHTML = `<span class="neg">${esc(err.message)}</span>`; });
+});
+document.addEventListener("change", (e) => {
+  if (e.target.name === "fxRateScope") loadFXRates();
+  if (e.target.name === "fxMarkupScope") loadFXMarkup();
+});
 
 /* ---------- boot ---------- */
 function reloadTenantsThen(done) {
