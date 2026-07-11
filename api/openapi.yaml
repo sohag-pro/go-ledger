@@ -239,6 +239,36 @@ components:
         - name
         - type
       type: object
+    CreateFXRateInputBody:
+      additionalProperties: false
+      properties:
+        base:
+          description: Base currency, 3 uppercase letters
+          pattern: ^[A-Z]{3}$
+          type: string
+        mid_rate_e8:
+          description: Mid rate, quote units per base unit, scaled by 1e8
+          format: int64
+          minimum: 1
+          type: integer
+        quote:
+          description: Quote currency, 3 uppercase letters
+          pattern: ^[A-Z]{3}$
+          type: string
+        spread_bps:
+          description: Optional per-pair markup in basis points. Omit to use the applicable markup default.
+          format: int32
+          maximum: 9999
+          minimum: 0
+          type: integer
+        tenant_id:
+          description: Tenant to scope this rate to. Omit or empty for the global default.
+          type: string
+      required:
+        - base
+        - quote
+        - mid_rate_e8
+      type: object
     CreateTenantInputBody:
       additionalProperties: false
       properties:
@@ -441,6 +471,75 @@ components:
         - effective_at
         - rate_id
       type: object
+    FXMarkupBody:
+      additionalProperties: false
+      properties:
+        default_spread_bps:
+          description: "Null when this row is a clear (tenant scope: following the global default again; global scope: no markup)"
+          format: int32
+          type:
+            - integer
+            - "null"
+        effective_at:
+          format: date-time
+          type: string
+      required:
+        - default_spread_bps
+        - effective_at
+      type: object
+    FXRateBody:
+      additionalProperties: false
+      properties:
+        base:
+          type: string
+        effective_at:
+          format: date-time
+          type: string
+        effective_spread_bps:
+          description: "Spread a conversion would actually apply: override, else default, else 0"
+          format: int32
+          type: integer
+        mid_rate_e8:
+          format: int64
+          type: integer
+        quote:
+          type: string
+        source:
+          type: string
+        spread_bps:
+          description: Per-pair override, null when the row uses the markup default
+          format: int32
+          type:
+            - integer
+            - "null"
+        tenant_id:
+          description: Tenant id, empty for the global default
+          type: string
+      required:
+        - tenant_id
+        - base
+        - quote
+        - mid_rate_e8
+        - spread_bps
+        - effective_spread_bps
+        - source
+        - effective_at
+      type: object
+    GetFXMarkupOutputBody:
+      additionalProperties: false
+      properties:
+        global:
+          anyOf:
+            - $ref: "#/components/schemas/FXMarkupBody"
+            - type: "null"
+        tenant:
+          anyOf:
+            - $ref: "#/components/schemas/FXMarkupBody"
+            - type: "null"
+      required:
+        - global
+        - tenant
+      type: object
     HealthOutputBody:
       additionalProperties: false
       properties:
@@ -609,6 +708,18 @@ components:
         - disputes
         - next_cursor
       type: object
+    ListFXRatesOutputBody:
+      additionalProperties: false
+      properties:
+        rates:
+          items:
+            $ref: "#/components/schemas/FXRateBody"
+          type:
+            - array
+            - "null"
+      required:
+        - rates
+      type: object
     ListKeysOutputBody:
       additionalProperties: false
       properties:
@@ -722,6 +833,19 @@ components:
           type: string
       required:
         - status
+      type: object
+    SetFXMarkupInputBody:
+      additionalProperties: false
+      properties:
+        default_spread_bps:
+          description: "Default markup in basis points applied when a rate carries no spread. Omit or null to clear (tenant scope: follow the global default again; global scope: no markup)."
+          format: int32
+          maximum: 9999
+          minimum: 0
+          type: integer
+        tenant_id:
+          description: Tenant to scope this default to. Omit or empty for the global default.
+          type: string
       type: object
     SetTenantPolicyInputBody:
       additionalProperties: false
@@ -1329,6 +1453,120 @@ paths:
       summary: Freeze, close, or reactivate an account
       tags:
         - accounts
+  /v1/admin/fx/markup:
+    get:
+      description: Returns the current global default markup and, when tenant_id is given, that tenant's own override (null if it has none).
+      operationId: get-fx-markup
+      parameters:
+        - description: Tenant whose override to return alongside the global default. Omit for global only.
+          explode: false
+          in: query
+          name: tenant_id
+          schema:
+            description: Tenant whose override to return alongside the global default. Omit for global only.
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetFXMarkupOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Get the default FX markup
+      tags:
+        - "admin: fx"
+    post:
+      description: Appends a default markup (basis points) applied to any conversion whose rate carries no per-pair spread. tenant_id omitted or empty sets the global default; a tenant_id scopes it to that tenant. Append-only.
+      operationId: set-fx-markup
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetFXMarkupInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FXMarkupBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Set the default FX markup
+      tags:
+        - "admin: fx"
+  /v1/admin/fx/rates:
+    get:
+      description: Returns the current effective rate per pair for the given tenant (its overrides plus the global defaults), each with the spread a conversion would actually apply.
+      operationId: list-fx-rates
+      parameters:
+        - description: Tenant whose overrides to include alongside the global defaults. Omit for globals only.
+          explode: false
+          in: query
+          name: tenant_id
+          schema:
+            description: Tenant whose overrides to include alongside the global defaults. Omit for globals only.
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListFXRatesOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List current FX rates
+      tags:
+        - "admin: fx"
+    post:
+      description: "Appends a rate for a directed pair (base to quote). tenant_id omitted or empty sets the global default; a tenant_id scopes it to that tenant, which the provider resolves ahead of the global default. spread_bps is an optional per-pair markup; omit it to fall back to the markup default. Append-only: this never updates an existing row."
+      operationId: create-fx-rate
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFXRateInputBody"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FXRateBody"
+          description: Created
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Set an FX rate
+      tags:
+        - "admin: fx"
   /v1/admin/keys:
     get:
       description: "Lists every key for a tenant, live and revoked, oldest first. Never includes a plaintext: that is shown once, at issue or rotate time, and is never recoverable afterward."
@@ -2217,6 +2455,8 @@ tags:
     name: "admin: keys"
   - description: Register callback URLs to receive signed webhook deliveries for a tenant's posted transactions.
     name: "admin: webhooks"
+  - description: Set and read the live FX rate and markup config a conversion resolves against.
+    name: "admin: fx"
   - description: Create and manage the ledger accounts money moves between.
     name: accounts
   - description: Post and reverse double-entry transactions.

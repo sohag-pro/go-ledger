@@ -695,6 +695,45 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           </div>
         </div>
 
+        <div class="card section-gap" style="max-width:640px" id="fxRatesCard" hidden>
+          <h2 style="font-size:14.5px;margin:0 0 6px">Exchange rates</h2>
+          <p class="subtle" style="margin:0 0 14px">Mid rates for currency pairs. The effective spread is the per-pair override if set, otherwise the markup default.</p>
+          <div class="checks" style="margin-bottom:12px">
+            <label><input type="radio" name="fxRateScope" value="global" checked> Global default</label>
+            <label><input type="radio" name="fxRateScope" value="tenant"> Current tenant</label>
+          </div>
+          <div class="scroll-x" id="fxRatesTable"></div>
+          <form id="fxRateForm" style="margin-top:14px">
+            <div class="form-row">
+              <div class="field"><label for="fxBase">Base</label><input id="fxBase" class="mono" maxlength="3" placeholder="USD" style="text-transform:uppercase"></div>
+              <div class="field"><label for="fxQuote">Quote</label><input id="fxQuote" class="mono" maxlength="3" placeholder="EUR" style="text-transform:uppercase"></div>
+              <div class="field"><label for="fxMid">Mid rate</label><input id="fxMid" placeholder="0.92000000"></div>
+              <div class="field"><label for="fxSpread">Spread override (bps)</label><input id="fxSpread" type="number" min="0" max="9999" placeholder="optional"></div>
+            </div>
+            <button class="btn primary sm" type="submit">Save rate</button>
+            <div class="hint" id="fxRateOut" style="margin-top:8px"></div>
+          </form>
+        </div>
+
+        <div class="card section-gap" style="max-width:640px" id="fxMarkupCard" hidden>
+          <h2 style="font-size:14.5px;margin:0 0 6px">Markup fee</h2>
+          <p class="subtle" style="margin:0 0 14px">The default markup applied to any conversion whose rate carries no per-pair spread. 100 bps = 1.00%.</p>
+          <div id="fxMarkupCurrent" class="hint" style="margin-bottom:12px"></div>
+          <div class="checks" style="margin-bottom:12px">
+            <label><input type="radio" name="fxMarkupScope" value="global" checked> Global default</label>
+            <label><input type="radio" name="fxMarkupScope" value="tenant"> Current tenant</label>
+          </div>
+          <form id="fxMarkupForm">
+            <div class="field" style="max-width:220px">
+              <label for="fxMarkupBps">Default markup (bps)</label>
+              <input id="fxMarkupBps" type="number" min="0" max="9999" placeholder="50">
+              <div class="hint">Leave empty to clear and follow the global default.</div>
+            </div>
+            <button class="btn primary sm" type="submit">Save markup</button>
+            <div class="hint" id="fxMarkupOut" style="margin-top:8px"></div>
+          </form>
+        </div>
+
         <div class="card section-gap" style="max-width:560px">
           <h2 style="font-size:14.5px;margin:0 0 10px">About</h2>
           <p style="margin:0;color:var(--muted)">
@@ -740,6 +779,79 @@ function toMinor(str) {
   const frac = ((parts[1] || "") + "0".repeat(DECIMALS)).slice(0, DECIMALS);
   const n = parseInt(whole, 10) * Math.pow(10, DECIMALS) + parseInt(frac || "0", 10);
   return neg ? -n : n;
+}
+// Parse a decimal string to integer mid_rate_e8 (1e8 scale), no float on the
+// money path: scale by string, same idea as toMinor but 8 fractional digits.
+// The e8 value is built by concatenating the whole and 8-padded fractional
+// digit strings and parsing that as one integer, rather than
+// parseInt(whole)*1e8 + parseInt(frac), which is JS double arithmetic and
+// silently loses precision once the result exceeds Number.MAX_SAFE_INTEGER
+// (~9.0e7 as a rate). BigInt does the concatenated parse exactly (arbitrary
+// precision, no float involved anywhere); the result is only ever handed
+// back as a Number after confirming it fits in the safe integer range, so a
+// value that would corrupt is rejected (NaN) instead of silently truncated.
+function toRateE8(str) {
+  str = String(str == null ? "" : str).trim();
+  if (str === "" || str === "-") return null;
+  if (!/^-?\d+(\.\d+)?$/.test(str)) return NaN;
+  const neg = str[0] === "-"; if (neg) str = str.slice(1);
+  const parts = str.split("."), whole = parts[0] || "0";
+  const frac = ((parts[1] || "") + "00000000").slice(0, 8);
+  const digits = (whole + frac).replace(/^0+(?=\d)/, "");
+  let big;
+  try { big = BigInt(digits); } catch (e) { return NaN; }
+  if (big > BigInt(Number.MAX_SAFE_INTEGER)) return NaN;
+  const n = Number(big);
+  return neg ? -n : n;
+}
+function fromRateE8(n) {
+  const neg = n < 0; n = Math.abs(n);
+  const s = String(n).padStart(9, "0");
+  return (neg ? "-" : "") + s.slice(0, -8) + "." + s.slice(-8);
+}
+function fxRateScope() { const el = document.querySelector('input[name="fxRateScope"]:checked'); return el && el.value === "tenant" ? state.adminTenant : ""; }
+function fxMarkupScope() { const el = document.querySelector('input[name="fxMarkupScope"]:checked'); return el && el.value === "tenant" ? state.adminTenant : ""; }
+
+function renderFXSettings() {
+  const show = adminUnlocked();
+  $("#fxRatesCard").hidden = !show;
+  $("#fxMarkupCard").hidden = !show;
+  if (!show) return;
+  loadFXRates();
+  loadFXMarkup();
+}
+function loadFXRates() {
+  const scope = fxRateScope();
+  const q = scope ? "?tenant_id=" + encodeURIComponent(scope) : "";
+  api("GET", "/v1/admin/fx/rates" + q).then(r => {
+    const rows = r.rates || [];
+    const host = $("#fxRatesTable");
+    if (!rows.length) { host.innerHTML = `<p class="subtle">No rates set yet.</p>`; return; }
+    host.innerHTML = `<table><thead><tr><th>Scope</th><th>Pair</th><th class="num">Mid</th><th class="num">Spread (bps)</th><th>When</th></tr></thead><tbody>${rows.map(x => `<tr>
+      <td>${x.tenant_id ? '<span class="badge cyan">tenant</span>' : '<span class="badge grey">global</span>'}</td>
+      <td class="mono">${esc(x.base)}/${esc(x.quote)}</td>
+      <td class="num mono">${esc(fromRateE8(x.mid_rate_e8))}</td>
+      <td class="num">${esc(x.effective_spread_bps)}${x.spread_bps == null ? ' <span class="subtle">(default)</span>' : ''}</td>
+      <td>${esc(new Date(x.effective_at).toLocaleString())}</td>
+    </tr>`).join("")}</tbody></table>`;
+  }).catch(e => { $("#fxRatesTable").innerHTML = `<p class="neg">${esc(e.message)}</p>`; });
+}
+// fmtMarkupBps renders a concrete markup value; display only (percent shown
+// to 2 decimal places), never fed back into a request body.
+function fmtMarkupBps(bps) { return bps + " bps (" + (bps / 100).toFixed(2) + "%)"; }
+function loadFXMarkup() {
+  const scope = fxMarkupScope();
+  const q = scope ? "?tenant_id=" + encodeURIComponent(scope) : "";
+  api("GET", "/v1/admin/fx/markup" + q).then(r => {
+    // r.global/r.tenant present with default_spread_bps: null means a CLEARED
+    // row, not "unset": for the global scope that is no markup at all (0);
+    // for a tenant scope it means the tenant dropped its own override and
+    // follows the global default again. The object being absent entirely
+    // (null) is the separate "never set anything" case.
+    const g = !r.global ? "not set" : (r.global.default_spread_bps == null ? "no markup (0)" : fmtMarkupBps(r.global.default_spread_bps));
+    const t = !r.tenant ? "none" : (r.tenant.default_spread_bps == null ? "cleared, follows global" : fmtMarkupBps(r.tenant.default_spread_bps));
+    $("#fxMarkupCurrent").innerHTML = `Global default: <strong>${esc(g)}</strong>. Current tenant override: <strong>${esc(t)}</strong>.`;
+  }).catch(e => { $("#fxMarkupCurrent").innerHTML = `<span class="neg">${esc(e.message)}</span>`; });
 }
 function money(minor) {
   const n = (typeof minor === "number" ? minor : 0) / Math.pow(10, DECIMALS);
@@ -1312,6 +1424,7 @@ function renderSettings() {
   const pill = $("#setModePill"), note = $("#setModeNote");
   if (state.mode === "demo") { pill.className = "pill demo"; pill.textContent = "Demo"; note.textContent = "Public demo server, resets every four hours."; }
   else { pill.className = "pill prod"; pill.textContent = "Production"; note.textContent = "Live server. Admin actions need an admin key."; }
+  renderFXSettings();
 }
 
 /* ---------- router ---------- */
@@ -1577,6 +1690,51 @@ $("#clearKeyBtn").addEventListener("click", () => {
   toast("Key cleared", "ok");
 });
 $("#setTenant").addEventListener("change", (e) => { switchAdminTenant(e.target.value); renderSettings(); });
+
+$("#fxRateForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const scope = fxRateScope();
+  if (document.querySelector('input[name="fxRateScope"]:checked').value === "tenant" && !state.adminTenant) { toast("Pick an admin tenant first.", "err"); return; }
+  const midE8 = toRateE8($("#fxMid").value);
+  if (midE8 == null || isNaN(midE8) || midE8 <= 0) { toast("Enter a positive mid rate.", "err"); return; }
+  const body = { base: $("#fxBase").value.trim().toUpperCase(), quote: $("#fxQuote").value.trim().toUpperCase(), mid_rate_e8: midE8 };
+  if (scope) body.tenant_id = scope;
+  const sp = $("#fxSpread").value.trim();
+  if (sp !== "") {
+    // type="number" still lets an operator type "1e3" (exponent notation is
+    // a valid HTML number value); parseInt("1e3", 10) silently returns 1, so
+    // require plain digits before trusting the field at all.
+    if (!/^\d+$/.test(sp)) { toast("Spread override must be a plain whole number (no decimals, no e-notation).", "err"); return; }
+    const spVal = parseInt(sp, 10);
+    if (spVal > 9999) { toast("Spread override must be between 0 and 9999 bps.", "err"); return; }
+    body.spread_bps = spVal;
+  }
+  api("POST", "/v1/admin/fx/rates", body).then(() => { toast("Rate saved", "ok"); $("#fxRateForm").reset(); loadFXRates(); })
+    .catch(err => { toast(err.message, "err"); $("#fxRateOut").innerHTML = `<span class="neg">${esc(err.message)}</span>`; });
+});
+$("#fxMarkupForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const scope = fxMarkupScope();
+  if (document.querySelector('input[name="fxMarkupScope"]:checked').value === "tenant" && !state.adminTenant) { toast("Pick an admin tenant first.", "err"); return; }
+  const raw = $("#fxMarkupBps").value.trim();
+  const body = {};
+  if (scope) body.tenant_id = scope;
+  // Empty is meaningful now (the markup default is clearable): omit
+  // default_spread_bps entirely so the server clears the override for this
+  // scope, rather than treating an empty field as an error.
+  if (raw !== "") {
+    if (!/^\d+$/.test(raw)) { toast("Markup must be a plain whole number of bps (no decimals, no e-notation).", "err"); return; }
+    const bps = parseInt(raw, 10);
+    if (bps > 9999) { toast("Enter a markup in the range 0 to 9999 bps.", "err"); return; }
+    body.default_spread_bps = bps;
+  }
+  api("POST", "/v1/admin/fx/markup", body).then(() => { toast(raw === "" ? "Markup cleared" : "Markup saved", "ok"); $("#fxMarkupForm").reset(); loadFXMarkup(); })
+    .catch(err => { toast(err.message, "err"); $("#fxMarkupOut").innerHTML = `<span class="neg">${esc(err.message)}</span>`; });
+});
+document.addEventListener("change", (e) => {
+  if (e.target.name === "fxRateScope") loadFXRates();
+  if (e.target.name === "fxMarkupScope") loadFXMarkup();
+});
 
 /* ---------- boot ---------- */
 function reloadTenantsThen(done) {

@@ -214,6 +214,9 @@ type Querier interface {
 	// so the cursor read and its eventual advance (SetWebhookFanoutCursor) never
 	// race a concurrent fan-out pass.
 	GetWebhookFanoutCursorForUpdate(ctx context.Context) (int64, error)
+	// The current global default only (tenant_id IS NULL), so the console can
+	// show it distinctly from a tenant override.
+	GlobalFXMarkupDefault(ctx context.Context) (FxMarkupDefault, error)
 	// scopes and expires_at (Task 2.2b) are now written on insert: the admin
 	// surface (internal/admin) is what actually sets them to something other
 	// than the column default. Every pre-2.2b caller (cmd/server's demo and
@@ -242,6 +245,14 @@ type Querier interface {
 	// defaults (the database server's now() and pg_current_xact_id(), see
 	// migration 0015): no chain read, no hash computed, here.
 	InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxParams) error
+	// fx_markup_defaults is append-only (ADR-020): a new default is a new row.
+	// tenant_id NULL is the global default, a non-NULL tenant_id is that tenant's
+	// override. effective_at is server-stamped via COALESCE(narg, now()) for the
+	// same clock-skew reason InsertFXRate stamps server-side. default_spread_bps
+	// is a nullable narg: a NULL value inserts a cleared row (the tenant follows
+	// the global default again), matching the nullable fx_rates.spread_bps
+	// pattern.
+	InsertFXMarkupDefault(ctx context.Context, arg InsertFXMarkupDefaultParams) (FxMarkupDefault, error)
 	// fx_rates is append-only (ADR-014): a new quote is a new row, never an
 	// update, so every rate ever applied to a transaction stays reconstructible.
 	// tenant_id NULL makes this the global default rate for the pair; a non-NULL
@@ -292,6 +303,12 @@ type Querier interface {
 	// 4.1, audit A7.1): the delivery worker must read it back in full to sign
 	// every outbound payload.
 	InsertWebhookSubscription(ctx context.Context, arg InsertWebhookSubscriptionParams) error
+	// The latest env-seeded global row for a pair, used by fx.Seed to decide
+	// whether FX_RATES itself changed. Comparing against this (not the current
+	// winner) means an admin-API-written row is never clobbered by a re-seed:
+	// Seed only re-asserts an env rate when the FX_RATES entry differs from the
+	// last thing Seed itself wrote for that pair.
+	LatestEnvGlobalFXRate(ctx context.Context, arg LatestEnvGlobalFXRateParams) (LatestEnvGlobalFXRateRow, error)
 	// Every key for a tenant, oldest first, including revoked ones: the admin
 	// surface's list view (Task 2.2b) is meant to show a tenant's full key
 	// history, not just its live keys. Never selects key_hash: plaintext is
@@ -347,6 +364,13 @@ type Querier interface {
 	// the same reason GetLastAuditHash does: it is the one order the chainer
 	// itself guarantees is monotonic across any failover.
 	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
+	// The current effective row per (base, quote) for a tenant plus the global
+	// defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts
+	// a tenant-owned row (tenant_id IS NULL = false, sorts first) ahead of a
+	// global row, then latest effective, matching CurrentFXRate's precedence.
+	// Pass tenant_id NULL to list globals only (tenant_id = NULL is never true, so
+	// only the tenant_id IS NULL rows match).
+	ListCurrentFXRates(ctx context.Context, tenantID pgtype.UUID) ([]ListCurrentFXRatesRow, error)
 	// Filtered, keyset-paged list of a tenant's disputes, newest first (Task
 	// 6.3, audit A9.2). status is an optional filter via sqlc.narg: NULL
 	// disables it (every status is returned). Keyset paged by (created_at, id)
@@ -572,6 +596,9 @@ type Querier interface {
 	// mirror image of its debits within each currency (the balance invariant),
 	// so counting only debits avoids double-counting the same movement.
 	TenantDailyDebits(ctx context.Context, tenantID uuid.UUID) ([]TenantDailyDebitsRow, error)
+	// The current default owned by exactly this tenant (no global fallback), so
+	// the console can show whether the tenant has its own override at all.
+	TenantFXMarkupDefault(ctx context.Context, tenantID pgtype.UUID) (FxMarkupDefault, error)
 	// Updates last_used_at for a single key by id. Called best-effort and
 	// throttled from the auth resolver (Task 2.2): not every request, so this is
 	// not a write on the hot path of every authenticated call.

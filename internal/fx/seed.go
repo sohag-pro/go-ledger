@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
@@ -58,14 +59,27 @@ var ErrMalformedFXRate = errors.New("fx: malformed FX_RATES entry")
 //
 // fx_rates never gets an UPDATE from this function: InsertFXRate is always a
 // plain INSERT (ADR-014's append-only history). What Seed guards against
-// instead is piling up rows that say exactly what the current row already
-// says, which matters because Seed is expected to run every time the
-// process starts, not just once. Before inserting, it compares the parsed
-// (mid_rate_e8, spread_bps) against CurrentFXRate for that pair: if they
-// match, the row is redundant and Seed skips it; if they differ (including
-// when there is no current row yet), Seed inserts, so a genuine change in
-// FX_RATES between deploys still lands as a new row and the pair's history
-// still grows the way a real rate change would.
+// instead is piling up rows that say exactly what the last thing Seed itself
+// wrote for that pair already says, which matters because Seed is expected
+// to run every time the process starts, not just once. Before inserting, it
+// compares the parsed (mid_rate_e8, spread_bps) against
+// LatestEnvGlobalFXRate for that pair, the latest row Seed itself last
+// wrote (source 'env', tenant_id NULL): if they match, the row is redundant
+// and Seed skips it; if they differ (including when there is no env row yet)
+// Seed inserts, so a genuine change in FX_RATES between deploys still lands
+// as a new row and the pair's history still grows the way a real rate
+// change would.
+//
+// This deliberately does NOT compare against CurrentFXRate (the current
+// WINNER for the pair, tenant-owned or global). The admin API is a second
+// writer of fx_rates (ADR-020): once an operator sets a rate through it,
+// that row becomes the winner, and it differs from FX_RATES by design (that
+// is the point of overriding it). Comparing against the winner would make
+// Seed see "differs from env" on every subsequent boot and re-insert the
+// stale env value with a fresh effective_at, which then wins again and
+// silently reverts the operator's change. Comparing against the last env
+// row instead means Seed only ever reacts to FX_RATES itself changing,
+// never to another writer's row.
 func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -88,16 +102,22 @@ func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 		// Seed always writes and reads the global default row (tenant_id
 		// NULL): FX_RATES is process-wide configuration, not any one
 		// tenant's rate (Task 2.4, audit A3.3). A zero-value pgtype.UUID
-		// (Valid: false) is NULL both as the CurrentFXRate lookup param and
-		// as the InsertFXRate value below.
-		current, err := q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{Base: e.base, Quote: e.quote})
+		// (Valid: false) is NULL both as the LatestEnvGlobalFXRate lookup
+		// (implicitly, via its own tenant_id IS NULL clause) and as the
+		// InsertFXRate value below.
+		lastEnv, err := q.LatestEnvGlobalFXRate(ctx, sqlc.LatestEnvGlobalFXRateParams{Base: e.base, Quote: e.quote})
 		switch {
 		case err == nil:
-			if current.MidRateE8 == e.midE8 && current.SpreadBps == e.spreadBps {
+			// Env entries always carry an explicit spread (see the
+			// InsertFXRate call below, which always passes Valid: true), so
+			// comparing Valid too means a prior env row somehow left NULL
+			// (should not happen, but is not assumed) is correctly treated
+			// as "different" rather than panicking or silently matching.
+			if lastEnv.MidRateE8 == e.midE8 && lastEnv.SpreadBps.Valid && lastEnv.SpreadBps.Int32 == e.spreadBps {
 				continue // unchanged since the last seed: do not duplicate it
 			}
 		case errors.Is(err, pgx.ErrNoRows):
-			// no current row for this pair yet: fall through to insert
+			// no prior env row for this pair yet: fall through to insert
 		default:
 			return fmt.Errorf("fx: seed lookup %s/%s: %w", e.base, e.quote, err)
 		}
@@ -109,7 +129,9 @@ func Seed(ctx context.Context, db sqlc.DBTX, raw string) error {
 			Base:      e.base,
 			Quote:     e.quote,
 			MidRateE8: e.midE8,
-			SpreadBps: e.spreadBps,
+			// Env-seeded rates are explicit overrides (Valid: true), never a
+			// fall-through to the markup default (ADR-020).
+			SpreadBps: pgtype.Int4{Int32: e.spreadBps, Valid: true},
 			Source:    envSource,
 			// EffectiveAt left at its zero value (Valid: false, i.e. NULL):
 			// the query's COALESCE(sqlc.narg('effective_at'), now()) then

@@ -33,7 +33,7 @@ func seedConvertRate(t *testing.T, pool *pgxpool.Pool, quote domain.Currency, mi
 		Base:      "USD",
 		Quote:     string(quote),
 		MidRateE8: midE8,
-		SpreadBps: spreadBps,
+		SpreadBps: pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:    "test",
 		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
 		// "effective_at <= now()" gate runs on the database SERVER's clock, so
@@ -63,7 +63,7 @@ func seedTenantConvertRate(t *testing.T, pool *pgxpool.Pool, tenantID string, ba
 		Base:      string(base),
 		Quote:     string(quote),
 		MidRateE8: midE8,
-		SpreadBps: spreadBps,
+		SpreadBps: pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:    "test-tenant",
 		// Same past safety margin as seedConvertRate above, and for the same
 		// clock-skew reason (Task 2.4 remediation).

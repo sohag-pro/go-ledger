@@ -66,10 +66,14 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 
 	direct, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: pgTenantID, Base: string(base), Quote: string(quote)})
 	if err == nil {
+		spread, sErr := p.resolveSpread(ctx, pgTenantID, direct.SpreadBps)
+		if sErr != nil {
+			return domain.FXQuote{}, 0, sErr
+		}
 		return domain.FXQuote{
 			Base: base, Quote: quote, MidRateE8: direct.MidRateE8,
 			RateID: direct.ID, Source: direct.Source, EffectiveAt: direct.EffectiveAt,
-		}, direct.SpreadBps, nil
+		}, spread, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return domain.FXQuote{}, 0, fmt.Errorf("fx: lookup %s/%s: %w", base, quote, err)
@@ -99,10 +103,77 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 	// stays exact integer division throughout.
 	invertedMidE8 := (domain.RateScale * domain.RateScale) / inverse.MidRateE8
 
+	spread, sErr := p.resolveSpread(ctx, pgTenantID, inverse.SpreadBps)
+	if sErr != nil {
+		return domain.FXQuote{}, 0, sErr
+	}
 	return domain.FXQuote{
 		Base: base, Quote: quote, MidRateE8: invertedMidE8,
 		// Provenance is the row that was actually found and inverted: there is
 		// no separate stored row for this direction (see FXQuote's doc comment).
 		RateID: inverse.ID, Source: inverse.Source, EffectiveAt: inverse.EffectiveAt,
-	}, inverse.SpreadBps, nil
+	}, spread, nil
+}
+
+// resolveSpread turns a rate row's nullable spread into the concrete spread a
+// conversion applies (ADR-020 precedence): a per-pair override if the row
+// carries one, else the tenant's markup default, else the global default, else
+// zero. Called for whichever row Rate actually found (direct or inverse), so
+// the precedence lives in one place.
+func (p *dbRateProvider) resolveSpread(ctx context.Context, tenant pgtype.UUID, rowSpread pgtype.Int4) (int32, error) {
+	if rowSpread.Valid {
+		return rowSpread.Int32, nil
+	}
+	return resolveMarkupDefault(ctx, p.q, tenant)
+}
+
+// resolveMarkupDefault resolves the markup default a conversion falls back to
+// when a rate row carries no per-pair spread override: the tenant's own
+// default if tenant is a valid scope AND that tenant's latest row is not
+// cleared (its value is non-NULL), else the global default if it exists and
+// is itself non-NULL, else zero.
+//
+// A tenant row can be CLEARED (default_spread_bps NULL): that means "this
+// tenant no longer has its own override, follow the global default again"
+// (see migration 0031 and ADR-020). Naively taking whatever
+// TenantFXMarkupDefault returns without checking Valid would make a cleared
+// row look like an explicit zero markup instead of "go look at the global
+// default," which is the bug this two-step lookup exists to avoid. A NULL
+// global row means no markup at all, i.e. zero: there is no further scope to
+// fall back to.
+//
+// This is shared by dbRateProvider.resolveSpread (this file) and
+// AdminService.resolveEffective (admin.go) so the two paths that resolve a
+// conversion's effective spread, one at conversion time and one for the
+// admin API's display of what a conversion would apply, can never drift
+// apart on the precedence rule itself.
+func resolveMarkupDefault(ctx context.Context, q *sqlc.Queries, tenant pgtype.UUID) (int32, error) {
+	if tenant.Valid {
+		t, err := q.TenantFXMarkupDefault(ctx, tenant)
+		switch {
+		case err == nil:
+			if t.DefaultSpreadBps.Valid {
+				return t.DefaultSpreadBps.Int32, nil
+			}
+			// The tenant's latest row is a clear (NULL): fall through to the
+			// global default below, exactly as if no tenant row existed.
+		case errors.Is(err, pgx.ErrNoRows):
+			// No tenant row at all: fall through to the global default.
+		default:
+			return 0, fmt.Errorf("fx: resolve tenant markup default: %w", err)
+		}
+	}
+
+	g, err := q.GlobalFXMarkupDefault(ctx)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("fx: resolve global markup default: %w", err)
+	}
+	if !g.DefaultSpreadBps.Valid {
+		// The global scope itself is cleared: no markup default anywhere.
+		return 0, nil
+	}
+	return g.DefaultSpreadBps.Int32, nil
 }

@@ -32,6 +32,22 @@ import (
 var (
 	sharedPool *pgxpool.Pool
 	poolErr    error
+
+	// noDefaultSpreadBps and noDefaultErr capture Provider.Rate's resolved
+	// spread for a disjoint, freshly seeded rate row, taken once in
+	// runWithContainer right after migrations and before m.Run() starts any
+	// test. fx_markup_defaults is shared and append-only across the whole
+	// package, with no per-currency-pair partition (GlobalFXMarkupDefault
+	// matches whatever the most recently inserted global default is, for
+	// every pair and tenant), so "nothing configured anywhere" can only be
+	// observed live once per process, at this exact moment; every later test
+	// (including any that legitimately write a global markup default, such
+	// as TestAdminServiceInsertAndList in admin_test.go) makes it
+	// unobservable for the rest of the run. TestProviderResolvesMarkupPrecedence
+	// asserts against these captured values instead of performing its own
+	// live check.
+	noDefaultSpreadBps int32
+	noDefaultErr       error
 )
 
 func TestMain(m *testing.M) {
@@ -78,7 +94,25 @@ func runWithContainer(m *testing.M) int {
 	}
 	defer pool.Close()
 	sharedPool = pool
+	noDefaultSpreadBps, noDefaultErr = probeNoDefaultAnywhere(ctx, pool)
 	return m.Run()
+}
+
+// probeNoDefaultAnywhere resolves the spread for a disjoint, freshly seeded
+// rate row via the real Provider, before any test has had a chance to write
+// to fx_markup_defaults (see the noDefaultSpreadBps doc comment above for
+// why this must happen here rather than in a live test assertion).
+func probeNoDefaultAnywhere(ctx context.Context, pool *pgxpool.Pool) (int32, error) {
+	q := sqlc.New(pool)
+	if _, err := q.InsertFXRate(ctx, sqlc.InsertFXRateParams{
+		Base: "ZZP", Quote: "ZZQ", MidRateE8: 100_000_000,
+		Source:      "test",
+		EffectiveAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(-2 * time.Second), Valid: true},
+	}); err != nil {
+		return 0, fmt.Errorf("probe insert fx rate: %w", err)
+	}
+	_, spreadBps, err := fx.NewDBProvider(pool).Rate(ctx, uuid.NewString(), "ZZP", "ZZQ")
+	return spreadBps, err
 }
 
 func migrate(dsn string) error {
@@ -112,7 +146,7 @@ func insertRate(t *testing.T, q *sqlc.Queries, base, quote string, midE8 int64, 
 		Base:        base,
 		Quote:       quote,
 		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
+		SpreadBps:   pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:      "test",
 		EffectiveAt: pgtype.Timestamptz{Time: effectiveAt, Valid: true},
 	}); err != nil {
@@ -134,7 +168,7 @@ func insertTenantRate(t *testing.T, q *sqlc.Queries, tenantID, base, quote strin
 		Base:        base,
 		Quote:       quote,
 		MidRateE8:   midE8,
-		SpreadBps:   spreadBps,
+		SpreadBps:   pgtype.Int4{Int32: spreadBps, Valid: true},
 		Source:      "test",
 		EffectiveAt: pgtype.Timestamptz{Time: effectiveAt, Valid: true},
 	}); err != nil {
@@ -250,8 +284,8 @@ func TestCurrentFXRate_TiebreakAndAppend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentFXRate() error = %v", err)
 	}
-	if row.MidRateE8 != 200_000_000 || row.SpreadBps != 20 {
-		t.Errorf("CurrentFXRate() = {mid: %d, spread: %d}, want the later-inserted row {mid: 200000000, spread: 20} "+
+	if row.MidRateE8 != 200_000_000 || !row.SpreadBps.Valid || row.SpreadBps.Int32 != 20 {
+		t.Errorf("CurrentFXRate() = {mid: %d, spread: %v}, want the later-inserted row {mid: 200000000, spread: 20} "+
 			"(effective_at tie should break on id DESC)", row.MidRateE8, row.SpreadBps)
 	}
 

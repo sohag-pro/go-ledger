@@ -10,6 +10,7 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/crypto"
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/ledger"
 )
 
@@ -197,6 +198,13 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("from_account and to_account must differ")
 	case errors.Is(err, domain.ErrSameCurrencyConversion):
 		return huma.Error422UnprocessableEntity("from_account and to_account must have different currencies")
+	// fx.ErrInvalidFXInput and fx.ErrUnknownTenant (ADR-020) are the admin
+	// FX config surface's own validation errors (bad currency, non-positive
+	// rate, spread out of range, base equal to quote, or a scoped write
+	// naming a tenant that does not exist): well-formed requests that fail a
+	// check, so they map to 422 like the rest of this group.
+	case errors.Is(err, fx.ErrInvalidFXInput), errors.Is(err, fx.ErrUnknownTenant):
+		return huma.Error422UnprocessableEntity(err.Error())
 	// crypto.ErrTenantKeyShredded (Task 6.2, audit A9.3 review; ADR-018): with
 	// per-tenant DEKs now versioned, Encrypt no longer fails closed just
 	// because a tenant's PII was erased, it mints a fresh version and keeps

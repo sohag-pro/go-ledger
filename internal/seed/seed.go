@@ -101,6 +101,15 @@ type txn struct {
 // ADR-015, "Safe-by-default deployment"). This is the guard against the
 // seeder ever destroying a real tenant's data if DEFAULT_TENANT_ID is ever
 // misconfigured to point at a live tenant instead of the demo one.
+//
+// The reset also clears api-sourced FX config that would otherwise survive:
+// global rows (fx_rates and fx_markup_defaults with tenant_id NULL, source
+// 'api') plus the demo tenant's OWN api-sourced fx_rates (fx_rates is not in
+// the tenant-scoped delete loop below, and CurrentFXRate prefers a
+// tenant-owned row over the global one, so a tenant-scoped tampered rate would
+// otherwise persist and mis-price this tenant's conversions every reset).
+// Env-seeded global rows (source 'env', re-asserted at boot by fx.Seed) are
+// left alone.
 func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency, demoKeyHash string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -190,6 +199,34 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 		if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE tenant_id = $1", tid); err != nil {
 			return fmt.Errorf("seed: clear %s: %w", table, err)
 		}
+	}
+
+	// The public demo exposes the FX admin endpoints (internal/api/fx_admin.go)
+	// with no auth in demo mode, so any anonymous visitor can POST a global
+	// markup or a garbage global mid rate through them. Those rows are global
+	// (tenant_id NULL), not scoped to the demo tenant, so the tenant-scoped
+	// loop above never touches them and, unlike the tenant's own data, they
+	// would otherwise survive every reset and mis-price every other visitor's
+	// conversions. Clear only source='api' rows (the admin-API write path,
+	// internal/fx/admin.go's apiSource): source='env' rows are re-asserted at
+	// every boot from FX_RATES by fx.Seed, so they are left alone and the
+	// demo's configured rates still apply right after a reset. fx_rates is
+	// NOT in the tenant-scoped delete loop above, so a tenant-scoped api row
+	// (an anonymous visitor can POST /v1/admin/fx/rates with tenant_id set to
+	// the demo tenant) is not covered by that loop either: CurrentFXRate
+	// prefers a tenant-owned row over the global one, so a garbage tenant
+	// rate would otherwise survive every reset and mis-price every demo
+	// conversion. Clear both the global and the demo tenant's own api-sourced
+	// rows here.
+	if _, err := tx.Exec(ctx, "DELETE FROM fx_rates WHERE tenant_id IS NULL AND source = 'api'"); err != nil {
+		return fmt.Errorf("seed: clear api-sourced global fx rates: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM fx_rates WHERE tenant_id = $1 AND source = 'api'", tid); err != nil {
+		return fmt.Errorf("seed: clear api-sourced demo tenant fx rates: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM fx_markup_defaults WHERE source = 'api' AND (tenant_id IS NULL OR tenant_id = $1)", tid); err != nil {
+		return fmt.Errorf("seed: clear api-sourced fx markup defaults: %w", err)
 	}
 
 	accounts := []struct {

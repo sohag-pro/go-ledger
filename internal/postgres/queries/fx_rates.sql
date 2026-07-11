@@ -17,7 +17,7 @@
 -- unscheduled case; an explicit future effective_at (a scheduled rate) is
 -- unaffected, since the caller still supplies it directly.
 INSERT INTO fx_rates (tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at)
-VALUES ($1, $2, $3, $4, $5, $6, COALESCE(sqlc.narg('effective_at')::timestamptz, now()))
+VALUES ($1, $2, $3, $4, sqlc.narg('spread_bps')::integer, $5, COALESCE(sqlc.narg('effective_at')::timestamptz, now()))
 RETURNING *;
 
 -- name: CurrentFXRate :one
@@ -38,3 +38,29 @@ WHERE base = $2 AND quote = $3
   AND effective_at <= now()
 ORDER BY (tenant_id IS NULL), effective_at DESC, id DESC
 LIMIT 1;
+
+-- name: LatestEnvGlobalFXRate :one
+-- The latest env-seeded global row for a pair, used by fx.Seed to decide
+-- whether FX_RATES itself changed. Comparing against this (not the current
+-- winner) means an admin-API-written row is never clobbered by a re-seed:
+-- Seed only re-asserts an env rate when the FX_RATES entry differs from the
+-- last thing Seed itself wrote for that pair.
+SELECT id, tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at, created_at
+FROM fx_rates
+WHERE base = $1 AND quote = $2 AND tenant_id IS NULL AND source = 'env' AND effective_at <= now()
+ORDER BY effective_at DESC, id DESC
+LIMIT 1;
+
+-- name: ListCurrentFXRates :many
+-- The current effective row per (base, quote) for a tenant plus the global
+-- defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts
+-- a tenant-owned row (tenant_id IS NULL = false, sorts first) ahead of a
+-- global row, then latest effective, matching CurrentFXRate's precedence.
+-- Pass tenant_id NULL to list globals only (tenant_id = NULL is never true, so
+-- only the tenant_id IS NULL rows match).
+SELECT DISTINCT ON (base, quote)
+    id, tenant_id, base, quote, mid_rate_e8, spread_bps, source, effective_at, created_at
+FROM fx_rates
+WHERE (tenant_id = $1 OR tenant_id IS NULL)
+  AND effective_at <= now()
+ORDER BY base, quote, (tenant_id IS NULL), effective_at DESC, id DESC;

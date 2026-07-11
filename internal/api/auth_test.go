@@ -318,7 +318,7 @@ func TestConvertCrossTenantIsolation_Postgres(t *testing.T) {
 		Base:      "USD",
 		Quote:     "PLN",
 		MidRateE8: 100_000_000,
-		SpreadBps: 0,
+		SpreadBps: pgtype.Int4{Int32: 0, Valid: true},
 		Source:    "test",
 		// A small past safety margin, not exactly time.Now(): CurrentFXRate's
 		// "effective_at <= now()" gate runs on the database SERVER's clock, so
