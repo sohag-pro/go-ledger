@@ -101,6 +101,13 @@ type txn struct {
 // ADR-015, "Safe-by-default deployment"). This is the guard against the
 // seeder ever destroying a real tenant's data if DEFAULT_TENANT_ID is ever
 // misconfigured to point at a live tenant instead of the demo one.
+//
+// The reset also clears any api-sourced global FX config (fx_rates and
+// fx_markup_defaults rows with tenant_id NULL and source 'api'): those are
+// process-wide, not owned by tenantID, so they would otherwise survive every
+// reset and let one demo visitor's tampering through the public FX admin
+// endpoints mis-price every other visitor's conversions. Env-seeded global
+// rows (source 'env', re-asserted at boot by fx.Seed) are left alone.
 func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency, demoKeyHash string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -190,6 +197,26 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 		if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE tenant_id = $1", tid); err != nil {
 			return fmt.Errorf("seed: clear %s: %w", table, err)
 		}
+	}
+
+	// The public demo exposes the FX admin endpoints (internal/api/fx_admin.go)
+	// with no auth in demo mode, so any anonymous visitor can POST a global
+	// markup or a garbage global mid rate through them. Those rows are global
+	// (tenant_id NULL), not scoped to the demo tenant, so the tenant-scoped
+	// loop above never touches them and, unlike the tenant's own data, they
+	// would otherwise survive every reset and mis-price every other visitor's
+	// conversions. Clear only source='api' rows (the admin-API write path,
+	// internal/fx/admin.go's apiSource): source='env' rows are re-asserted at
+	// every boot from FX_RATES by fx.Seed, so they are left alone and the
+	// demo's configured rates still apply right after a reset. fx_rates is
+	// additionally scoped to tenant_id IS NULL: a tenant-scoped api row
+	// belongs to the demo tenant itself and is covered by that tenant's own
+	// data lifecycle, not this global-config cleanup.
+	if _, err := tx.Exec(ctx, "DELETE FROM fx_rates WHERE tenant_id IS NULL AND source = 'api'"); err != nil {
+		return fmt.Errorf("seed: clear api-sourced global fx rates: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM fx_markup_defaults WHERE source = 'api'"); err != nil {
+		return fmt.Errorf("seed: clear api-sourced fx markup defaults: %w", err)
 	}
 
 	accounts := []struct {

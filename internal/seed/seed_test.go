@@ -239,3 +239,86 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 		t.Errorf("audit_outbox not cleared on reset: %d rows remain", outboxCount)
 	}
 }
+
+// TestSeedClearsAPISourcedGlobalFXConfig proves the reset removes a global
+// (tenant_id NULL) fx_rates or fx_markup_defaults row written through the
+// admin API (source 'api'), the fix for the finding that a demo visitor could
+// POST a global markup of 9999 bps or a garbage global mid rate through the
+// public FX admin endpoints and have it survive every reset, mispricing
+// every other visitor's conversions. tenant_id NULL rows are process-wide,
+// not owned by any one tenant, so the tenant-scoped delete loop above never
+// reaches them: this is the only thing that does. An env-sourced global row
+// (source 'env', the shape fx.Seed writes from FX_RATES at boot) must
+// survive untouched, so the demo's configured rates still apply right after
+// a reset.
+func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tenant := uuid.New()
+	now := time.Now()
+
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// A tampered global rate and markup, as an anonymous demo visitor could
+	// post through the unauthenticated admin endpoints in demo mode.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO fx_rates (base, quote, mid_rate_e8, spread_bps, source, effective_at)
+		 VALUES ('USD', 'EUR', 1, 9999, 'api', now())`); err != nil {
+		t.Fatalf("insert tampered api fx rate: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO fx_markup_defaults (default_spread_bps, source, effective_at)
+		 VALUES (9999, 'api', now())`); err != nil {
+		t.Fatalf("insert tampered api markup default: %v", err)
+	}
+	// A legitimate env-seeded global rate and markup, standing in for what
+	// fx.Seed writes from FX_RATES at process boot: this must survive.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO fx_rates (base, quote, mid_rate_e8, spread_bps, source, effective_at)
+		 VALUES ('USD', 'GBP', 92000000, 25, 'env', now())`); err != nil {
+		t.Fatalf("insert env fx rate: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO fx_markup_defaults (default_spread_bps, source, effective_at)
+		 VALUES (50, 'env', now())`); err != nil {
+		t.Fatalf("insert env markup default: %v", err)
+	}
+
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("re-seed over tampered global fx config: %v", err)
+	}
+
+	var apiRateCount, envRateCount, apiMarkupCount, envMarkupCount int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'EUR' AND source = 'api'").Scan(&apiRateCount); err != nil {
+		t.Fatalf("count api fx rates: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'GBP' AND source = 'env'").Scan(&envRateCount); err != nil {
+		t.Fatalf("count env fx rates: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM fx_markup_defaults WHERE default_spread_bps = 9999 AND source = 'api'").Scan(&apiMarkupCount); err != nil {
+		t.Fatalf("count api markup defaults: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM fx_markup_defaults WHERE default_spread_bps = 50 AND source = 'env'").Scan(&envMarkupCount); err != nil {
+		t.Fatalf("count env markup defaults: %v", err)
+	}
+
+	if apiRateCount != 0 {
+		t.Errorf("api-sourced global fx rate survived reset: %d rows remain, want 0", apiRateCount)
+	}
+	if envRateCount != 1 {
+		t.Errorf("env-sourced global fx rate did not survive reset: got %d rows, want 1", envRateCount)
+	}
+	if apiMarkupCount != 0 {
+		t.Errorf("api-sourced global fx markup default survived reset: %d rows remain, want 0", apiMarkupCount)
+	}
+	if envMarkupCount != 1 {
+		t.Errorf("env-sourced global fx markup default did not survive reset: got %d rows, want 1", envMarkupCount)
+	}
+}
