@@ -313,7 +313,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
         <button class="tenant-btn" id="tenantBtn" aria-haspopup="listbox" aria-expanded="false">
           <span id="tenantBtnName">tenant</span> <span class="chev" aria-hidden="true">&#9662;</span>
         </button>
-        <div class="tenant-menu" id="tenantMenu" role="listbox" aria-label="Switch admin tenant"></div>
+        <div class="tenant-menu" id="tenantMenu" role="listbox" aria-label="Switch tenant"></div>
       </div>
       <span class="pill demo" id="modePill">Demo</span>
       <div class="spacer"></div>
@@ -682,9 +682,9 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
         <div class="card section-gap" style="max-width:560px">
           <h2 style="font-size:14.5px;margin:0 0 14px">Workspace</h2>
           <div class="field" style="max-width:280px">
-            <label for="setTenant">Admin tenant</label>
+            <label for="setTenant">Current tenant</label>
             <select id="setTenant"></select>
-            <div class="hint">Scopes the Admin panels (keys, webhooks, policy). Ledger and reporting views always reflect the tenant your active key belongs to.</div>
+            <div class="hint">Scopes the whole console to this tenant: the ledger and reporting views as well as the admin panels. With an admin key the server isolates each view to the selected tenant; a non-admin key stays on its own tenant.</div>
           </div>
           <div class="field">
             <label>Mode</label>
@@ -880,6 +880,9 @@ const emptyArt = `<svg class="art" width="72" height="52" viewBox="0 0 72 52" fi
 function api(method, path, body) {
   if (path.charAt(0) !== "/") throw new Error("refusing to call a non-relative path: " + path);
   const opts = { method, headers: { Authorization: "Bearer " + state.activeKey } };
+  // Scope every /v1 call to the selected tenant. The server honors this only
+  // for an admin-scoped key (ADR-021); a non-admin key stays on its own tenant.
+  if (state.adminTenant && path.indexOf("/v1") === 0) opts.headers["X-Act-As-Tenant"] = state.adminTenant;
   if (method === "POST" && path.indexOf("/v1/transactions") === 0) opts.headers["Idempotency-Key"] = crypto.randomUUID();
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   return fetch(path, opts).then((res) => res.text().then((t) => {
@@ -1516,13 +1519,12 @@ document.addEventListener("change", (e) => {
 function switchAdminTenant(id) {
   state.adminTenant = id;
   localStorage.setItem("gl_tenant", id);
-  renderTopbar();
+  // The selected tenant now scopes the whole console: admin panels via
+  // tenant_id, and ledger/reporting via the X-Act-As-Tenant header (ADR-021).
+  // Re-render the current view so its data reflects the new tenant.
   updateTenantLabels();
-  if (state.view === "tenants") renderTenants();
-  else if (state.view === "apikeys") loadKeys();
-  else if (state.view === "webhooks") loadWebhooks();
-  else if (state.view === "policy") renderPolicy();
-  toast("Admin tenant: " + tenantName());
+  go(state.view);
+  toast("Tenant: " + tenantName());
 }
 function updateTenantLabels() {
   $("#keysTenant").textContent = tenantName();
