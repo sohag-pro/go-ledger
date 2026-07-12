@@ -241,6 +241,11 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
 .view.active{display:block}
 .section-gap{margin-top:24px}
 .subtle{color:var(--faint);font-size:12px}
+.help{border-left:3px solid var(--cyan);background:var(--cyan-soft);border-radius:6px;padding:11px 14px;margin:0 0 16px;font-size:12.5px;color:var(--muted);line-height:1.65}
+.help strong{color:var(--text)}
+.help code{font-family:var(--mono);font-size:12px;background:var(--bg-deep);border:1px solid var(--line-strong);border-radius:4px;padding:1px 5px}
+.help p{margin:0 0 8px}
+.help p:last-child{margin-bottom:0}
 .pos{color:var(--teal)}
 .neg{color:var(--red)}
 .overlay{display:none;position:fixed;inset:0;background:rgba(10,15,22,.6);z-index:35}
@@ -697,7 +702,12 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
 
         <div class="card section-gap" style="max-width:640px" id="fxRatesCard" hidden>
           <h2 style="font-size:14.5px;margin:0 0 6px">Exchange rates</h2>
-          <p class="subtle" style="margin:0 0 14px">Mid rates for currency pairs. The effective spread is the per-pair override if set, otherwise the markup default.</p>
+          <p class="subtle" style="margin:0 0 12px">The price for turning one currency into another. Add one pair at a time.</p>
+          <div class="help">
+            <p><strong>How to add rates.</strong> A rate covers one currency pair. Fill in Base, Quote, and the Mid rate, then press Save rate. To add more pairs, just fill the form again with the next pair (for example USD to GBP, then EUR to BDT). Every pair you save shows up in the table above.</p>
+            <p><strong>What is the mid rate?</strong> It is how many units of the Quote currency one unit of the Base currency buys. Example: Base <code>USD</code>, Quote <code>EUR</code>, Mid rate <code>0.9200</code> means 1 USD = 0.92 EUR. You only add one direction; the reverse (EUR to USD) is worked out for you automatically.</p>
+            <p><strong>Spread override</strong> is optional. It is a per-pair markup in basis points (100 bps = 1%). Leave it empty and the pair uses the Markup fee default set below. Fill it to charge a different markup on just this one pair.</p>
+          </div>
           <div class="checks" style="margin-bottom:12px">
             <label><input type="radio" name="fxRateScope" value="global" checked> Global default</label>
             <label><input type="radio" name="fxRateScope" value="tenant"> Current tenant</label>
@@ -717,7 +727,12 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
 
         <div class="card section-gap" style="max-width:640px" id="fxMarkupCard" hidden>
           <h2 style="font-size:14.5px;margin:0 0 6px">Markup fee</h2>
-          <p class="subtle" style="margin:0 0 14px">The default markup applied to any conversion whose rate carries no per-pair spread. 100 bps = 1.00%.</p>
+          <p class="subtle" style="margin:0 0 12px">Your cut on a currency conversion.</p>
+          <div class="help">
+            <p><strong>What it is.</strong> When someone converts money, the ledger gives them a little less than the true (mid) rate. That difference is your markup, your revenue on the conversion. It is set in basis points (bps): <code>100 bps = 1.00%</code>, so <code>50 bps = 0.50%</code> and <code>25 bps = 0.25%</code>.</p>
+            <p><strong>Example.</strong> The USD to EUR mid rate is 0.9200 and the markup is 50 bps. A customer converting 100.00 USD receives 100 x 0.9200 x (1 minus 0.0050) = <strong>91.54 EUR</strong>. At the pure mid rate they would get 92.00 EUR, so the <strong>0.46 EUR</strong> difference is your fee.</p>
+            <p><strong>Where it applies.</strong> This default is used by any pair that has no Spread override of its own (see Exchange rates above). The global default applies to every tenant; a Current tenant override applies to just the selected tenant. Leave the field empty and Save to clear a tenant override so it follows the global default again.</p>
+          </div>
           <div id="fxMarkupCurrent" class="hint" style="margin-bottom:12px"></div>
           <div class="checks" style="margin-bottom:12px">
             <label><input type="radio" name="fxMarkupScope" value="global" checked> Global default</label>
