@@ -17,16 +17,17 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/fx"
 )
 
-// demoTenantName is the realistic entity name stamped on the demo tenant each
-// reset, so the console shows a real-looking business rather than a placeholder.
-const demoTenantName = "Northwind Payments"
-
+// The demo runs three tenants, each a different persona so a visitor can relate:
+// a personal budget (the default tenant), a bank's own books, and a company's
+// books. The two non-default ids are fixed and high enough to stay clear of the
+// demo tenant (...001) and the load-test tenants (offset 200, see cmd/server).
 const (
-	spendingTxns = 95 // postings on Spending and Checking
-	incomeTxns   = 95 // postings on Income and Checking
-	savingsTxns  = 95 // postings on Savings and Checking
-	historyDays  = 90 // transactions spread across this many past days
+	bankTenantID    = "00000000-0000-0000-0000-000000000011"
+	companyTenantID = "00000000-0000-0000-0000-000000000012"
 )
+
+// historyDays is how far back seeded transactions are spread.
+const historyDays = 90
 
 // category is a labeled amount range in minor units (cents).
 type category struct {
@@ -34,50 +35,140 @@ type category struct {
 	min, max int64
 }
 
-// Weighted by repetition: common, small items appear more often than monthly bills.
-var (
-	spendingCats = []category{
-		{"Groceries", 2500, 9500},
-		{"Groceries", 2500, 9500},
-		{"Groceries", 2500, 9500},
-		{"Coffee", 350, 750},
-		{"Coffee", 350, 750},
-		{"Coffee", 350, 750},
-		{"Coffee", 350, 750},
-		{"Dining out", 1800, 7500},
-		{"Dining out", 1800, 7500},
-		{"Transport", 200, 1800},
-		{"Transport", 200, 1800},
-		{"Transport", 200, 1800},
-		{"Pharmacy", 800, 4000},
-		{"Clothing", 2500, 12000},
-		{"Streaming subscription", 999, 1999},
-		{"Electricity bill", 3500, 9000},
-		{"Internet bill", 4000, 6000},
-		{"Phone bill", 2000, 4500},
-		{"Gym membership", 3000, 5000},
-		{"Rent", 110000, 140000},
+// acct is one account in a theme's chart of accounts. cur empty means the
+// theme's own currency; a non-empty cur (the foreign accounts) overrides it.
+type acct struct {
+	name, typ, cur string
+}
+
+// flow is a repeated double-entry pattern: count transactions, each debiting
+// the debit account and crediting the credit account by an amount drawn from
+// cats. Debit is the positive leg, credit the negative, so every generated
+// transaction sums to zero in the theme currency.
+type flow struct {
+	debit, credit string
+	count         int
+	cats          []category
+}
+
+// theme is one demo tenant: its id, display name, home currency, chart of
+// accounts, and the flows that generate its backdated history.
+type theme struct {
+	id, name, currency string
+	accounts           []acct
+	flows              []flow
+}
+
+// foreignAccounts are the blank multi-currency accounts every demo tenant
+// holds, so there is somewhere to convert into out of the box (the USD-hub
+// currencies, ADR-022). They carry no flows, so they start at a zero balance.
+var foreignAccounts = []acct{
+	{"Euro Account", "asset", "EUR"},
+	{"Taka Account", "asset", "BDT"},
+	{"Ringgit Account", "asset", "MYR"},
+}
+
+// personalTheme is a person's everyday budget: salary in, rent and living costs
+// out, some saved and invested, a credit card paid down.
+func personalTheme(id, currency string) theme {
+	return theme{
+		id: id, name: "Ava Thompson", currency: currency,
+		accounts: []acct{
+			{"Checking", "asset", ""},
+			{"Savings", "asset", ""},
+			{"Investments", "asset", ""},
+			{"Credit Card", "liability", ""},
+			{"Salary", "income", ""},
+			{"Other Income", "income", ""},
+			{"Housing", "expense", ""},
+			{"Living Expenses", "expense", ""},
+		},
+		flows: []flow{
+			{"Checking", "Salary", 6, []category{{"Monthly salary", 320000, 380000}}},
+			{"Checking", "Other Income", 22, []category{
+				{"Interest", 200, 2000}, {"Cashback reward", 100, 1500}, {"Dividend", 1500, 12000},
+			}},
+			{"Housing", "Checking", 3, []category{{"Rent", 110000, 140000}}},
+			{"Living Expenses", "Checking", 55, []category{
+				{"Groceries", 2500, 9500},
+				{"Coffee", 350, 750},
+				{"Dining out", 1800, 7500},
+				{"Transport", 200, 1800},
+				{"Pharmacy", 800, 4000},
+				{"Electricity bill", 3500, 9000},
+				{"Internet bill", 4000, 6000},
+				{"Phone bill", 2000, 4500},
+			}},
+			{"Living Expenses", "Credit Card", 25, []category{
+				{"Online order", 1500, 20000},
+				{"Clothing", 2500, 12000},
+				{"Dining out", 1800, 7500},
+				{"Streaming subscription", 999, 1999},
+			}},
+			{"Credit Card", "Checking", 3, []category{{"Credit card payment", 50000, 150000}}},
+			{"Savings", "Checking", 6, []category{{"Monthly savings transfer", 20000, 60000}}},
+			{"Investments", "Checking", 4, []category{{"Investment contribution", 30000, 100000}}},
+		},
 	}
-	incomeCats = []category{
-		{"Freelance project", 50000, 200000},
-		{"Interest", 200, 2000},
-		{"Interest", 200, 2000},
-		{"Cashback reward", 100, 1500},
-		{"Cashback reward", 100, 1500},
-		{"Dividend", 1500, 12000},
-		{"Tax refund", 80000, 250000},
-		{"Gift received", 5000, 30000},
-		{"Monthly salary", 320000, 380000},
-		{"Monthly salary", 320000, 380000},
+}
+
+// bankTheme is a bank's own general ledger: customer deposits and withdrawals,
+// loans out and repaid, interest and fee income, operating costs, and capital.
+func bankTheme(id string) theme {
+	return theme{
+		id: id, name: "Harbor National Bank", currency: "USD",
+		accounts: []acct{
+			{"Cash Reserves", "asset", ""},
+			{"Loans Receivable", "asset", ""},
+			{"Customer Deposits", "liability", ""},
+			{"Interest Income", "income", ""},
+			{"Fee Income", "income", ""},
+			{"Operating Expenses", "expense", ""},
+			{"Share Capital", "equity", ""},
+		},
+		flows: []flow{
+			{"Cash Reserves", "Customer Deposits", 45, []category{{"Customer deposit", 50000, 5000000}}},
+			{"Customer Deposits", "Cash Reserves", 30, []category{{"Customer withdrawal", 20000, 2000000}}},
+			{"Loans Receivable", "Cash Reserves", 15, []category{{"Loan disbursement", 500000, 20000000}}},
+			{"Cash Reserves", "Loans Receivable", 22, []category{{"Loan repayment", 50000, 1000000}}},
+			{"Cash Reserves", "Interest Income", 25, []category{{"Loan interest", 10000, 300000}}},
+			{"Cash Reserves", "Fee Income", 30, []category{
+				{"Account fee", 500, 5000}, {"Wire transfer fee", 1500, 4000}, {"Overdraft fee", 2500, 6000},
+			}},
+			{"Operating Expenses", "Cash Reserves", 20, []category{
+				{"Staff salaries", 200000, 800000}, {"Branch rent", 150000, 400000}, {"Utilities", 20000, 80000},
+			}},
+			{"Cash Reserves", "Share Capital", 2, []category{{"Capital contribution", 5000000, 20000000}}},
+		},
 	}
-	savingsCats = []category{
-		{"Auto-save round-up", 100, 2000},
-		{"Auto-save round-up", 100, 2000},
-		{"Auto-save round-up", 100, 2000},
-		{"Monthly savings transfer", 20000, 60000},
-		{"Goal contribution", 5000, 25000},
+}
+
+// companyTheme is a trading company's books: invoices raised and collected,
+// stock bought on credit and paid for, payroll, rent, and owner capital.
+func companyTheme(id string) theme {
+	return theme{
+		id: id, name: "Brightpeak Trading Ltd", currency: "USD",
+		accounts: []acct{
+			{"Cash", "asset", ""},
+			{"Accounts Receivable", "asset", ""},
+			{"Accounts Payable", "liability", ""},
+			{"Sales Revenue", "income", ""},
+			{"Cost of Goods Sold", "expense", ""},
+			{"Payroll Expense", "expense", ""},
+			{"Rent Expense", "expense", ""},
+			{"Owner Equity", "equity", ""},
+		},
+		flows: []flow{
+			{"Accounts Receivable", "Sales Revenue", 40, []category{{"Invoice raised", 50000, 800000}}},
+			{"Cash", "Accounts Receivable", 35, []category{{"Invoice paid", 50000, 800000}}},
+			{"Cost of Goods Sold", "Accounts Payable", 30, []category{{"Inventory purchase", 30000, 400000}}},
+			{"Accounts Payable", "Cash", 25, []category{{"Supplier payment", 30000, 400000}}},
+			{"Payroll Expense", "Cash", 6, []category{{"Monthly payroll", 200000, 600000}}},
+			{"Rent Expense", "Cash", 3, []category{{"Office rent", 80000, 150000}}},
+			{"Cash", "Owner Equity", 2, []category{{"Owner capital", 1000000, 5000000}}},
+		},
 	}
-)
+}
 
 // posting is one leg of a seeded transaction.
 type posting struct {
@@ -92,68 +183,85 @@ type txn struct {
 	legs [2]posting
 }
 
-// Seed resets the tenant's ledger and repopulates it with four personal-finance
-// accounts and a few hundred backdated transactions. It is atomic: everything
-// happens in one database transaction, so the API never observes a half-seeded
-// ledger. now is the reference time (the most recent possible transaction).
-// currency is the ISO 4217 code stamped on every seeded account and posting
-// (ADR-014, "New-account default currency is env-configured"); an empty
-// currency falls back to "USD" so a direct caller that does not care about
-// multi-currency still gets a valid, single-currency demo ledger.
+// Seed resets one tenant with the personal-finance theme and repopulates it
+// with a realistic, backdated history. It is atomic: everything happens in one
+// database transaction, so the API never observes a half-seeded ledger. Kept
+// for direct callers and tests; the server uses Demo to seed all three demo
+// tenants. now is the reference time (the most recent possible transaction).
+// currency is the ISO 4217 code stamped on the personal accounts and their
+// postings; an empty currency falls back to "USD".
 //
 // demoKeyHash is the SHA-256 hash (domain.HashAPIKey) of the demo api key.
-// Before any destructive reset, Seed checks whether tenantID holds an api key
-// other than that one; if it does, Seed refuses and wipes nothing (see
-// ADR-015, "Safe-by-default deployment"). This is the guard against the
-// seeder ever destroying a real tenant's data if DEFAULT_TENANT_ID is ever
-// misconfigured to point at a live tenant instead of the demo one.
-//
-// The reset also clears api-sourced FX config that would otherwise survive:
-// global rows (fx_rates and fx_markup_defaults with tenant_id NULL, source
-// 'api') plus the demo tenant's OWN api-sourced fx_rates (fx_rates is not in
-// the tenant-scoped delete loop below, and CurrentFXRate prefers a
-// tenant-owned row over the global one, so a tenant-scoped tampered rate would
-// otherwise persist and mis-price this tenant's conversions every reset).
-// Env-seeded global rows (source 'env', re-asserted at boot by fx.Seed) are
-// left alone.
+// Before any destructive reset, Seed checks whether the tenant holds an api key
+// other than that one; if it does, Seed refuses and wipes nothing (ADR-015,
+// "Safe-by-default deployment"), the guard against ever destroying a real
+// tenant's data if a tenant id is misconfigured to point at a live tenant.
 func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Time, currency, demoKeyHash string) error {
-	tid, err := uuid.Parse(tenantID)
-	if err != nil {
-		return fmt.Errorf("seed: parse tenant id: %w", err)
-	}
 	if currency == "" {
 		currency = "USD"
 	}
-	rng := rand.New(rand.NewSource(now.UnixNano())) //nolint:gosec // demo data, not crypto
+	return seedTenant(ctx, pool, personalTheme(tenantID, currency), now, demoKeyHash)
+}
 
-	checking, savings, income, spending := newID(), newID(), newID(), newID()
+// Demo resets all three demo tenants: the personal budget on
+// defaultTenantID, plus a bank and a company on their own fixed ids. Each is
+// reset and repopulated in its own transaction, so a failure on one is reported
+// without half-seeding the others.
+func Demo(ctx context.Context, pool *pgxpool.Pool, defaultTenantID string, now time.Time, currency, demoKeyHash string) error {
+	if currency == "" {
+		currency = "USD"
+	}
+	themes := []theme{
+		personalTheme(defaultTenantID, currency),
+		bankTheme(bankTenantID),
+		companyTheme(companyTenantID),
+	}
+	for _, th := range themes {
+		if err := seedTenant(ctx, pool, th, now, demoKeyHash); err != nil {
+			return fmt.Errorf("seed demo tenant %q: %w", th.name, err)
+		}
+	}
+	return nil
+}
+
+// seedTenant resets th.id and repopulates it from th's accounts and flows.
+func seedTenant(ctx context.Context, pool *pgxpool.Pool, th theme, now time.Time, demoKeyHash string) error {
+	tid, err := uuid.Parse(th.id)
+	if err != nil {
+		return fmt.Errorf("seed: parse tenant id: %w", err)
+	}
+	rng := rand.New(rand.NewSource(now.UnixNano() ^ int64(len(th.name)))) //nolint:gosec // demo data, not crypto
 	accountsAt := now.AddDate(0, 0, -(historyDays + 1))
 
-	// Build the transactions. Signed double-entry: positive debit, negative credit.
+	// Resolve the chart of accounts (themed accounts plus the shared foreign
+	// accounts) and assign each a fresh id keyed by name, so the flows can
+	// reference accounts by name.
+	accounts := make([]acct, 0, len(th.accounts)+len(foreignAccounts))
+	accounts = append(accounts, th.accounts...)
+	accounts = append(accounts, foreignAccounts...)
+	idByName := make(map[string]string, len(accounts))
+	curByName := make(map[string]string, len(accounts))
+	for _, a := range accounts {
+		idByName[a.name] = newID()
+		cur := a.cur
+		if cur == "" {
+			cur = th.currency
+		}
+		curByName[a.name] = cur
+	}
+
+	// Build the transactions from the flows. Signed double-entry: positive
+	// debit, negative credit; both legs in the theme currency.
 	var txns []txn
-	for i := 0; i < spendingTxns; i++ {
-		c := spendingCats[rng.Intn(len(spendingCats))]
-		amt := c.min + rng.Int63n(c.max-c.min+1)
-		// spend: Spending up (debit), Checking down (credit)
-		txns = append(txns, txn{randTime(rng, now), [2]posting{
-			{spending, amt, c.desc}, {checking, -amt, c.desc},
-		}})
-	}
-	for i := 0; i < incomeTxns; i++ {
-		c := incomeCats[rng.Intn(len(incomeCats))]
-		amt := c.min + rng.Int63n(c.max-c.min+1)
-		// earn: Checking up (debit), Income up as credit (negative)
-		txns = append(txns, txn{randTime(rng, now), [2]posting{
-			{checking, amt, c.desc}, {income, -amt, c.desc},
-		}})
-	}
-	for i := 0; i < savingsTxns; i++ {
-		c := savingsCats[rng.Intn(len(savingsCats))]
-		amt := c.min + rng.Int63n(c.max-c.min+1)
-		// save: Savings up (debit), Checking down (credit)
-		txns = append(txns, txn{randTime(rng, now), [2]posting{
-			{savings, amt, c.desc}, {checking, -amt, c.desc},
-		}})
+	for _, f := range th.flows {
+		for i := 0; i < f.count; i++ {
+			c := f.cats[rng.Intn(len(f.cats))]
+			amt := c.min + rng.Int63n(c.max-c.min+1)
+			txns = append(txns, txn{randTime(rng, now), [2]posting{
+				{idByName[f.debit], amt, c.desc},
+				{idByName[f.credit], -amt, c.desc},
+			}})
+		}
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -164,28 +272,28 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 
 	// Ensure the tenant row exists before writing any tenant-owned data:
 	// accounts_tenant_fk and transactions_tenant_fk (migration 0011, Task 2.1)
-	// require it. This is the demo tenant, reset on a schedule, so its name is
+	// require it. This is a demo tenant, reset on a schedule, so its name is
 	// stamped to a realistic entity name on every reset (it is not a real
 	// customer whose name an operator would set); DO UPDATE SET name keeps it
 	// looking like a real business in the console rather than a placeholder.
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO tenants (id, name) VALUES ($1, $2)
 		 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
-		tid, demoTenantName); err != nil {
+		tid, th.name); err != nil {
 		return fmt.Errorf("seed: ensure tenant row: %w", err)
 	}
 
 	// Refuse to touch a tenant that holds any api key other than the demo key,
-	// before any destructive statement runs. A misconfigured DEFAULT_TENANT_ID
-	// pointed at a live tenant must never lose data to a periodic demo reset.
+	// before any destructive statement runs. A misconfigured tenant id pointed
+	// at a live tenant must never lose data to a periodic demo reset.
 	var foreignKeys int
 	if err := tx.QueryRow(ctx,
 		"SELECT count(*) FROM api_keys WHERE tenant_id = $1 AND key_hash != $2",
 		tid, demoKeyHash).Scan(&foreignKeys); err != nil {
-		return fmt.Errorf("seed: check api keys for tenant %s: %w", tenantID, err)
+		return fmt.Errorf("seed: check api keys for tenant %s: %w", th.id, err)
 	}
 	if foreignKeys > 0 {
-		return fmt.Errorf("seed: refusing to reset tenant %s: it holds %d api key(s) other than the demo key", tenantID, foreignKeys)
+		return fmt.Errorf("seed: refusing to reset tenant %s: it holds %d api key(s) other than the demo key", th.id, foreignKeys)
 	}
 
 	// audit_log is append-only, guarded by a trigger that rejects UPDATE/DELETE.
@@ -210,65 +318,44 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	// The public demo exposes the FX admin endpoints (internal/api/fx_admin.go)
 	// with no auth in demo mode, so any anonymous visitor can POST a global
 	// markup or a garbage global mid rate through them. Those rows are global
-	// (tenant_id NULL), not scoped to the demo tenant, so the tenant-scoped
-	// loop above never touches them and, unlike the tenant's own data, they
-	// would otherwise survive every reset and mis-price every other visitor's
-	// conversions. Clear only source='api' rows (the admin-API write path,
-	// internal/fx/admin.go's apiSource): source='env' rows are re-asserted at
-	// every boot from FX_RATES by fx.Seed, so they are left alone and the
-	// demo's configured rates still apply right after a reset. fx_rates is
-	// NOT in the tenant-scoped delete loop above, so a tenant-scoped api row
-	// (an anonymous visitor can POST /v1/admin/fx/rates with tenant_id set to
-	// the demo tenant) is not covered by that loop either: CurrentFXRate
-	// prefers a tenant-owned row over the global one, so a garbage tenant
-	// rate would otherwise survive every reset and mis-price every demo
-	// conversion. Clear both the global and the demo tenant's own api-sourced
-	// rows here.
+	// (tenant_id NULL), not scoped to a tenant, so the tenant-scoped loop above
+	// never touches them and they would otherwise survive every reset and
+	// mis-price every visitor's conversions. Clear only source='api' rows (the
+	// admin-API write path, internal/fx/admin.go's apiSource): source='env'
+	// rows are re-asserted at every boot from FX_RATES by fx.Seed, so they are
+	// left alone. fx_rates is not in the tenant-scoped delete loop, so the
+	// tenant's own api-sourced rows (an anonymous visitor can POST with a
+	// tenant_id) are cleared here too, since CurrentFXRate prefers a
+	// tenant-owned row over the global one.
 	if _, err := tx.Exec(ctx, "DELETE FROM fx_rates WHERE tenant_id IS NULL AND source = 'api'"); err != nil {
 		return fmt.Errorf("seed: clear api-sourced global fx rates: %w", err)
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM fx_rates WHERE tenant_id = $1 AND source = 'api'", tid); err != nil {
-		return fmt.Errorf("seed: clear api-sourced demo tenant fx rates: %w", err)
+		return fmt.Errorf("seed: clear api-sourced tenant fx rates: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM fx_markup_defaults WHERE source = 'api' AND (tenant_id IS NULL OR tenant_id = $1)", tid); err != nil {
 		return fmt.Errorf("seed: clear api-sourced fx markup defaults: %w", err)
 	}
 
-	// Prefill the demo tenant with starter FX rates and a 1 percent markup so
-	// the Exchange rates page is not empty. Runs right after the clears above,
-	// on the same api source they target, so each reset re-prefills a fresh
-	// snapshot (demo only; see fx.PrefillDemoRates).
-	if err := fx.PrefillDemoRates(ctx, fx.NewAdminService(tx), tid.String()); err != nil {
+	// Prefill this tenant with starter FX rates and a 1 percent markup so the
+	// Exchange rates page is not empty (demo only; see fx.PrefillDemoRates).
+	if err := fx.PrefillDemoRates(ctx, fx.NewAdminService(tx), th.id); err != nil {
 		return fmt.Errorf("seed: prefill demo fx rates: %w", err)
 	}
 
-	accounts := []struct {
-		id, name, typ, cur string
-	}{
-		{checking, "Checking", "asset", currency},
-		{savings, "Savings", "asset", currency},
-		{income, "Income", "income", currency},
-		{spending, "Spending", "expense", currency},
-		// Blank foreign-currency accounts so the demo has somewhere to convert
-		// into out of the box (no postings, so a zero balance). Named like real
-		// multi-currency accounts a business would hold.
-		{newID(), "Euro Account", "asset", "EUR"},
-		{newID(), "Taka Account", "asset", "BDT"},
-		{newID(), "Ringgit Account", "asset", "MYR"},
-	}
 	for _, a := range accounts {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO accounts (id, tenant_id, name, type, currency, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
-			a.id, tid, a.name, a.typ, a.cur, accountsAt); err != nil {
+			idByName[a.name], tid, a.name, a.typ, curByName[a.name], accountsAt); err != nil {
 			return fmt.Errorf("seed: insert account %s: %w", a.name, err)
 		}
 	}
 
 	// transactions no longer carries a currency column (ADR-014, migration
-	// 0010): currency lives on each posting instead, since an FX transaction
-	// spans two currencies. Every seeded leg below stamps the same currency,
-	// since the demo ledger is single-currency by construction.
+	// 0010): currency lives on each posting instead. Every flow leg is in the
+	// theme currency; the foreign accounts carry no flows, so no cross-currency
+	// posting is seeded here.
 	for _, t := range txns {
 		txID := newID()
 		if _, err := tx.Exec(ctx,
@@ -280,7 +367,7 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO postings (id, tenant_id, transaction_id, account_id, amount, description, currency, created_at)
 				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-				newID(), tid, txID, leg.accountID, leg.amount, leg.desc, currency, t.at); err != nil {
+				newID(), tid, txID, leg.accountID, leg.amount, leg.desc, th.currency, t.at); err != nil {
 				return fmt.Errorf("seed: insert posting: %w", err)
 			}
 		}

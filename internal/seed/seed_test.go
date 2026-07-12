@@ -115,13 +115,13 @@ func TestSeed(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Seven accounts (four USD plus blank EUR, BDT, MYR).
+	// Eleven accounts (eight personal USD plus blank EUR, BDT, MYR).
 	accts, err := repo.ListAccounts(ctx, tenant.String(), 100)
 	if err != nil {
 		t.Fatalf("list accounts: %v", err)
 	}
-	if len(accts) != 7 {
-		t.Fatalf("got %d accounts, want 7", len(accts))
+	if len(accts) != 11 {
+		t.Fatalf("got %d accounts, want 11", len(accts))
 	}
 
 	// The ledger nets to zero across every account: the core invariant holds even
@@ -413,5 +413,48 @@ func TestSeedPrefillsDemoTenantFX(t *testing.T) {
 	}
 	if mv.Tenant == nil || mv.Tenant.DefaultSpreadBps == nil || *mv.Tenant.DefaultSpreadBps != 100 {
 		t.Fatalf("demo tenant markup = %+v, want a 100 bps default", mv.Tenant)
+	}
+}
+
+// TestSeedDemo proves Demo seeds all three demo tenants (personal, bank,
+// company) with their realistic names, non-empty charts of accounts, and
+// backdated history. It is not parallel: Demo writes the two fixed bank and
+// company tenant ids, which must not race another test using Demo.
+func TestSeedDemo(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	personal := uuid.New()
+	now := time.Now()
+
+	if err := seed.Demo(ctx, pool, personal.String(), now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("Demo: %v", err)
+	}
+
+	want := map[string]string{
+		personal.String():                      "Ava Thompson",
+		"00000000-0000-0000-0000-000000000011": "Harbor National Bank",
+		"00000000-0000-0000-0000-000000000012": "Brightpeak Trading Ltd",
+	}
+	for id, name := range want {
+		var gotName string
+		if err := pool.QueryRow(ctx, "SELECT name FROM tenants WHERE id = $1", id).Scan(&gotName); err != nil {
+			t.Fatalf("read tenant %s: %v", id, err)
+		}
+		if gotName != name {
+			t.Errorf("tenant %s name = %q, want %q", id, gotName, name)
+		}
+		var acctCount, txCount int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM accounts WHERE tenant_id = $1", id).Scan(&acctCount); err != nil {
+			t.Fatalf("count accounts %s: %v", id, err)
+		}
+		if acctCount == 0 {
+			t.Errorf("tenant %s (%s) has no accounts", name, id)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM transactions WHERE tenant_id = $1", id).Scan(&txCount); err != nil {
+			t.Fatalf("count transactions %s: %v", id, err)
+		}
+		if txCount == 0 {
+			t.Errorf("tenant %s (%s) has no backdated transactions", name, id)
+		}
 	}
 }

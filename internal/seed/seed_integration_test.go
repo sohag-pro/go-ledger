@@ -41,8 +41,8 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 		`SELECT count(*) FROM accounts WHERE tenant_id = $1`, tenant).Scan(&acctCount); err != nil {
 		t.Fatalf("count accounts: %v", err)
 	}
-	if acctCount != 7 {
-		t.Errorf("account count = %d, want 7", acctCount)
+	if acctCount != 11 {
+		t.Errorf("account count = %d, want 11", acctCount)
 	}
 
 	var txnCount int
@@ -50,10 +50,10 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 		`SELECT count(*) FROM transactions WHERE tenant_id = $1`, tenant).Scan(&txnCount); err != nil {
 		t.Fatalf("count transactions: %v", err)
 	}
-	// The seeder documents ~285 (95 spending + 95 income + 95 savings); assert a
-	// range rather than the exact figure in case the mix is ever rebalanced.
-	if txnCount < 200 || txnCount > 350 {
-		t.Errorf("transaction count = %d, want roughly 285 (200 to 350)", txnCount)
+	// The personal theme generates roughly 124 transactions; assert a range
+	// rather than the exact figure in case the flow mix is ever rebalanced.
+	if txnCount < 80 || txnCount > 200 {
+		t.Errorf("transaction count = %d, want roughly 124 (80 to 200)", txnCount)
 	}
 
 	// The double-entry invariant, checked per transaction: every seeded
@@ -113,8 +113,8 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 		`SELECT count(*) FROM accounts WHERE tenant_id = $1`, tenant).Scan(&acctCount); err != nil {
 		t.Fatalf("count accounts: %v", err)
 	}
-	if acctCount != 7 {
-		t.Errorf("account count after two Seed calls = %d, want 7 (reset, not duplicated)", acctCount)
+	if acctCount != 11 {
+		t.Errorf("account count after two Seed calls = %d, want 11 (reset, not duplicated)", acctCount)
 	}
 
 	var txnCount int
@@ -122,8 +122,8 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 		`SELECT count(*) FROM transactions WHERE tenant_id = $1`, tenant).Scan(&txnCount); err != nil {
 		t.Fatalf("count transactions: %v", err)
 	}
-	if txnCount < 200 || txnCount > 350 {
-		t.Errorf("transaction count after two Seed calls = %d, want roughly 285 (200 to 350), not doubled", txnCount)
+	if txnCount < 80 || txnCount > 200 {
+		t.Errorf("transaction count after two Seed calls = %d, want roughly 124 (80 to 200), not doubled", txnCount)
 	}
 }
 

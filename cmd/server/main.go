@@ -1058,7 +1058,7 @@ func provisionAdminKey(ctx context.Context, store apiKeyStore, adminSvc adminKey
 func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant, currency string, interval time.Duration, demoKeyHash string) {
 	doSeed := func() {
 		start := time.Now()
-		if err := seed.Seed(ctx, pool, tenant, time.Now(), currency, demoKeyHash); err != nil {
+		if err := seed.Demo(ctx, pool, tenant, time.Now(), currency, demoKeyHash); err != nil {
 			logger.Error("demo seed failed", "error", err)
 			return
 		}
