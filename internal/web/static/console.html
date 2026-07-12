@@ -479,12 +479,14 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
             <div class="field" style="max-width:260px">
               <label for="cvAmount">Amount <span class="subtle" id="cvFromCur"></span></label>
               <input id="cvAmount" placeholder="100.00">
+              <div class="hint" id="cvFromBal"></div>
             </div>
             <div class="balance-bar" id="cvPreview" role="status" aria-live="polite">
               <span>Recipient gets:</span>
               <span class="bal" id="cvConverted">-</span>
               <span class="note" id="cvNote">Pick two accounts and an amount</span>
             </div>
+            <div class="hint" id="cvVia" style="margin-top:6px;color:var(--cyan)" hidden></div>
             <button class="btn primary lg" type="submit" id="cvSubmit" disabled>Convert</button>
           </form>
           <div class="hint" id="cvOut" style="margin-top:12px"></div>
@@ -1526,15 +1528,27 @@ function renderSettings() {
 // quote=to), or the inverse of a stored (to,from) pair. Returns null when no
 // rate covers the pair, matching the server (it derives only the inverse, not
 // cross pairs). Client-side estimate only; the server does the authoritative math.
-function fxQuoteFor(fromCur, toCur) {
+function fxLegMid(fromCur, toCur) {
   const rates = state.fxRates || [];
-  const direct = rates.find(r => r.base === fromCur && r.quote === toCur);
-  if (direct) return { midE8: direct.mid_rate_e8, spread: direct.effective_spread_bps };
-  const inv = rates.find(r => r.base === toCur && r.quote === fromCur);
-  if (inv && inv.mid_rate_e8 > 0) {
-    // 1e8 * 1e8 / mid, as BigInt so large rates stay exact.
-    const invE8 = Number((100000000n * 100000000n) / BigInt(inv.mid_rate_e8));
-    return { midE8: invE8, spread: inv.effective_spread_bps };
+  const d = rates.find(r => r.base === fromCur && r.quote === toCur);
+  if (d) return { midE8: d.mid_rate_e8, spread: d.effective_spread_bps };
+  const i = rates.find(r => r.base === toCur && r.quote === fromCur);
+  if (i && i.mid_rate_e8 > 0) return { midE8: Number((100000000n * 100000000n) / BigInt(i.mid_rate_e8)), spread: i.effective_spread_bps };
+  return null;
+}
+function fxQuoteFor(fromCur, toCur) {
+  // Direct pair, then its inverse, then (ADR-022) the USD hub: compose the two
+  // USD legs, with the markup taken from the base-to-USD leg, mirroring the
+  // server so the estimate matches what the conversion posts.
+  const direct = fxLegMid(fromCur, toCur);
+  if (direct) return { midE8: direct.midE8, spread: direct.spread, via: null };
+  const hub = "USD";
+  if (fromCur !== hub && toCur !== hub) {
+    const fromLeg = fxLegMid(fromCur, hub), toLeg = fxLegMid(hub, toCur);
+    if (fromLeg && toLeg) {
+      const cross = Number((BigInt(fromLeg.midE8) * BigInt(toLeg.midE8)) / 100000000n);
+      if (cross > 0) return { midE8: cross, spread: fromLeg.spread, via: hub };
+    }
   }
   return null;
 }
@@ -1547,6 +1561,7 @@ function renderConvert() {
     api("GET", "/v1/admin/fx/rates" + (state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : ""))
       .then(r => { state.fxRates = r.rates || []; }).catch(() => { state.fxRates = state.fxRates || []; })
   ]).then(() => {
+    refreshBalances().catch(() => {});
     const opts = state.accounts.map(a => `<option value="${esc(a.id)}">${esc(a.name)} (${esc(a.currency)})</option>`).join("");
     const from = $("#cvFrom"), to = $("#cvTo");
     const kf = from.value, kt = to.value;
@@ -1558,8 +1573,12 @@ function renderConvert() {
 }
 function updateConvertPreview() {
   const fromA = cvAccount($("#cvFrom").value), toA = cvAccount($("#cvTo").value);
-  const bar = $("#cvPreview"), note = $("#cvNote"), out = $("#cvConverted"), submit = $("#cvSubmit");
+  const bar = $("#cvPreview"), note = $("#cvNote"), out = $("#cvConverted"), submit = $("#cvSubmit"), via = $("#cvVia");
   $("#cvFromCur").textContent = fromA ? "(" + fromA.currency + ")" : "";
+  // Show the from account's current balance so the amount is easy to pick.
+  const bal = fromA && state.balances[fromA.id];
+  $("#cvFromBal").textContent = fromA ? (bal ? "Balance: " + money(bal.balance) + " " + fromA.currency : "Balance: (loading)") : "";
+  via.hidden = true;
   const src = toMinor($("#cvAmount").value);
   const setBad = (msg) => { bar.className = "balance-bar bad"; out.textContent = "-"; note.textContent = msg; submit.disabled = true; };
   if (!fromA || !toA) { return setBad("Pick two accounts"); }
@@ -1576,6 +1595,10 @@ function updateConvertPreview() {
   bar.className = "balance-bar ok";
   out.textContent = money(conv) + " " + toA.currency;
   note.textContent = "estimated at " + fromRateE8(q.midE8) + " minus " + fmtMarkupBps(q.spread) + " markup";
+  if (q.via) {
+    via.hidden = false;
+    via.textContent = "No direct rate for " + fromA.currency + " to " + toA.currency + ", so it is routed through " + q.via + " (" + fromA.currency + " to " + q.via + " rate and markup, then " + q.via + " to " + toA.currency + ").";
+  }
   submit.disabled = conv <= 0;
 }
 
