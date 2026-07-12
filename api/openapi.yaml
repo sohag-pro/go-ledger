@@ -34,6 +34,10 @@ components:
           type: boolean
         name:
           type: string
+        rolled_up_balance:
+          description: Balance including all descendants, in minor units
+          format: int64
+          type: integer
         type:
           description: "One of: asset, liability, equity, income, expense"
           type: string
@@ -44,6 +48,7 @@ components:
         - currency
         - is_system
         - balance
+        - rolled_up_balance
       type: object
     AccountBody:
       additionalProperties: false
@@ -60,6 +65,11 @@ components:
           type: integer
         name:
           type: string
+        parent_id:
+          description: Parent account id, null for a root
+          type:
+            - string
+            - "null"
         party_reference:
           description: Optional external customer/party id, for linking to an external KYC system. Omitted when unset.
           type: string
@@ -78,6 +88,73 @@ components:
         - type
         - currency
         - status
+        - parent_id
+      type: object
+    AccountTreeNode:
+      additionalProperties: false
+      properties:
+        currency:
+          description: ISO 4217 code, e.g. USD
+          type: string
+        depth:
+          format: int64
+          type: integer
+        id:
+          description: Account id (UUID)
+          type: string
+        min_balance:
+          description: Optional minimum balance floor, in minor units. Omitted when unset.
+          format: int64
+          type: integer
+        name:
+          type: string
+        own_balance:
+          description: This account's own balance, in minor units
+          format: int64
+          type: integer
+        parent_id:
+          description: Parent account id, null for a root
+          type:
+            - string
+            - "null"
+        party_reference:
+          description: Optional external customer/party id, for linking to an external KYC system. Omitted when unset.
+          type: string
+        party_type:
+          description: Optional free-text party classification, e.g. individual or business. Omitted when unset.
+          type: string
+        rolled_up_balance:
+          description: Balance including all descendants, in minor units
+          format: int64
+          type: integer
+        status:
+          description: "One of: active, frozen, closed"
+          type: string
+        type:
+          description: "One of: asset, liability, equity, income, expense"
+          type: string
+      required:
+        - depth
+        - own_balance
+        - rolled_up_balance
+        - id
+        - name
+        - type
+        - currency
+        - status
+        - parent_id
+      type: object
+    AccountTreeOutputBody:
+      additionalProperties: false
+      properties:
+        accounts:
+          items:
+            $ref: "#/components/schemas/AccountTreeNode"
+          type:
+            - array
+            - "null"
+      required:
+        - accounts
       type: object
     AccountsOutputBody:
       additionalProperties: false
@@ -217,6 +294,10 @@ components:
           description: Human-readable account name
           maxLength: 200
           minLength: 1
+          type: string
+        parent_id:
+          description: Optional parent account id. The parent must be the same tenant and currency.
+          format: uuid
           type: string
         party_reference:
           description: Optional external customer/party id (KYC linkage). Omit if not linked to an external party system.
@@ -821,6 +902,14 @@ components:
       required:
         - action
       type: object
+    SetAccountParentInputBody:
+      additionalProperties: false
+      properties:
+        parent_id:
+          description: New parent account id. Omit or send null to clear (make it a root).
+          format: uuid
+          type: string
+      type: object
     SetAccountStatusInputBody:
       additionalProperties: false
       properties:
@@ -1192,6 +1281,28 @@ paths:
       summary: Create an account
       tags:
         - accounts
+  /v1/accounts/tree:
+    get:
+      description: Returns every account for the tenant in parent-before-child order, each with its depth, own balance, and balance rolled up over its subtree.
+      operationId: list-account-tree
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountTreeOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List accounts as a hierarchy
+      tags:
+        - accounts
   /v1/accounts/{id}:
     get:
       operationId: get-account
@@ -1272,6 +1383,7 @@ paths:
         - accounts
   /v1/accounts/{id}/balance:
     get:
+      description: Returns the account's own derived balance. With rollup=true (ADR-023), returns the balance summed over this account and every descendant in its hierarchy instead.
       operationId: get-account-balance
       parameters:
         - description: Account id
@@ -1282,6 +1394,13 @@ paths:
             description: Account id
             format: uuid
             type: string
+        - description: When true, return the balance rolled up over this account and all its descendants.
+          explode: false
+          in: query
+          name: rollup
+          schema:
+            description: When true, return the balance rolled up over this account and all its descendants.
+            type: boolean
       responses:
         "200":
           content:
@@ -1298,6 +1417,43 @@ paths:
       security:
         - bearerAuth: []
       summary: Get an account's balance
+      tags:
+        - accounts
+  /v1/accounts/{id}/parent:
+    post:
+      description: Moves the account under a new parent, or clears its parent when parent_id is omitted or null. The parent must be the same tenant and currency; a cycle or self-parent is rejected with 422.
+      operationId: set-account-parent
+      parameters:
+        - description: Account id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Account id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAccountParentInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Set or clear an account's parent
       tags:
         - accounts
   /v1/accounts/{id}/statement:

@@ -106,6 +106,20 @@ func (f *fakeRepo) CreateAccount(_ context.Context, _ string, a *domain.Account)
 	if err := a.Validate(); err != nil {
 		return err
 	}
+	// Mirrors the real repository's parent FK / accounts_hierarchy_guard
+	// trigger (ADR-023): a parent_id set at create time must name an
+	// existing account of the same currency (a fresh account has no
+	// children yet, so a cycle cannot arise here; self-parent is already
+	// rejected by a.Validate above).
+	if a.ParentID != nil {
+		parent, ok := f.accounts[*a.ParentID]
+		if !ok {
+			return domain.ErrParentNotFound
+		}
+		if parent.Currency != a.Currency {
+			return domain.ErrInvalidHierarchy
+		}
+	}
 	f.accounts[a.ID] = *a
 	return nil
 }

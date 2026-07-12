@@ -32,6 +32,8 @@ type AccountBody struct {
 	// the actual party/KYC system is external.
 	PartyReference *string `json:"party_reference,omitempty" doc:"Optional external customer/party id, for linking to an external KYC system. Omitted when unset."`
 	PartyType      *string `json:"party_type,omitempty" doc:"Optional free-text party classification, e.g. individual or business. Omitted when unset."`
+	// ParentID is this account's parent in the hierarchy (ADR-023), null for a root.
+	ParentID *string `json:"parent_id" nullable:"true" doc:"Parent account id, null for a root"`
 }
 
 func toAccountBody(a domain.Account) AccountBody {
@@ -44,6 +46,7 @@ func toAccountBody(a domain.Account) AccountBody {
 		MinBalance:     a.MinBalance,
 		PartyReference: a.PartyReference,
 		PartyType:      a.PartyType,
+		ParentID:       a.ParentID,
 	}
 }
 
@@ -65,6 +68,11 @@ type CreateAccountInput struct {
 		// external and out of scope for this service.
 		PartyReference *string `json:"party_reference,omitempty" maxLength:"256" doc:"Optional external customer/party id (KYC linkage). Omit if not linked to an external party system."`
 		PartyType      *string `json:"party_type,omitempty" maxLength:"256" doc:"Optional free-text party classification, e.g. individual or business."`
+		// ParentID (ADR-023) optionally nests the new account under an
+		// existing one at creation time. The parent must be the same tenant
+		// and currency; an unknown parent or a hierarchy violation is
+		// rejected with 422 (see toHumaErr).
+		ParentID *string `json:"parent_id,omitempty" format:"uuid" doc:"Optional parent account id. The parent must be the same tenant and currency."`
 	}
 }
 
@@ -77,6 +85,15 @@ type SetAccountStatusInput struct {
 	}
 }
 
+// SetAccountParentInput is the set-account-parent request: a path id plus
+// the new (or cleared) parent id (ADR-023).
+type SetAccountParentInput struct {
+	ID   string `path:"id" format:"uuid" doc:"Account id"`
+	Body struct {
+		ParentID *string `json:"parent_id,omitempty" format:"uuid" doc:"New parent account id. Omit or send null to clear (make it a root)."`
+	}
+}
+
 // AccountOutput wraps an account in a response.
 type AccountOutput struct {
 	Body AccountBody
@@ -84,6 +101,15 @@ type AccountOutput struct {
 
 type accountIDInput struct {
 	ID string `path:"id" format:"uuid" doc:"Account id"`
+}
+
+// balanceInput is the get-account-balance request: a path id plus an
+// optional rollup flag (ADR-023). Kept separate from accountIDInput (which
+// the statement and other by-id ops still use) so this flag only affects the
+// balance op.
+type balanceInput struct {
+	ID     string `path:"id" format:"uuid" doc:"Account id"`
+	Rollup bool   `query:"rollup" doc:"When true, return the balance rolled up over this account and all its descendants."`
 }
 
 // ListAccountsInput is the list-accounts request: a capped limit, no cursor.
@@ -96,6 +122,23 @@ type AccountsOutput struct {
 	Body struct {
 		Accounts []AccountBody `json:"accounts"`
 	}
+}
+
+// AccountTreeOutput is the list-account-tree response (ADR-023).
+type AccountTreeOutput struct {
+	Body struct {
+		Accounts []AccountTreeNode `json:"accounts"`
+	}
+}
+
+// AccountTreeNode is one row of the account hierarchy: the account, its
+// depth from a root, its own balance, and the balance rolled up over its
+// whole subtree (ADR-023).
+type AccountTreeNode struct {
+	AccountBody
+	Depth           int   `json:"depth"`
+	OwnBalance      int64 `json:"own_balance" doc:"This account's own balance, in minor units"`
+	RolledUpBalance int64 `json:"rolled_up_balance" doc:"Balance including all descendants, in minor units"`
 }
 
 // BalanceOutput is the account balance response.
@@ -224,7 +267,7 @@ func registerAccounts(api huma.API, deps Deps) {
 			PartyReference: in.Body.PartyReference,
 			PartyType:      in.Body.PartyType,
 		}
-		if err := deps.Accounts.Create(ctx, tenant, acct, nil); err != nil {
+		if err := deps.Accounts.Create(ctx, tenant, acct, in.Body.ParentID); err != nil {
 			return nil, toHumaErr(err)
 		}
 		return &AccountOutput{Body: toAccountBody(*acct)}, nil
@@ -250,6 +293,42 @@ func registerAccounts(api huma.API, deps Deps) {
 		out.Body.Accounts = make([]AccountBody, 0, len(accts))
 		for _, a := range accts {
 			out.Body.Accounts = append(out.Body.Accounts, toAccountBody(a))
+		}
+		return out, nil
+	})
+
+	// list-account-tree is registered at a static path ("/v1/accounts/tree",
+	// ADR-023), and registered before get-account below, so a request for
+	// "tree" is never mistaken for get-account's {id} wildcard: chi/huma
+	// route on the exact static path first regardless of registration order,
+	// but registering it first here keeps the two ops visually unambiguous
+	// (see TestAccountTreePathDoesNotHitGetAccount).
+	huma.Register(api, huma.Operation{
+		OperationID: "list-account-tree",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts/tree",
+		Summary:     "List accounts as a hierarchy",
+		Description: "Returns every account for the tenant in parent-before-child order, each with its depth, own balance, and balance rolled up over its subtree.",
+		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, _ *struct{}) (*AccountTreeOutput, error) {
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		nodes, err := deps.Accounts.Tree(ctx, tenant)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		out := &AccountTreeOutput{}
+		out.Body.Accounts = make([]AccountTreeNode, 0, len(nodes))
+		for _, n := range nodes {
+			out.Body.Accounts = append(out.Body.Accounts, AccountTreeNode{
+				AccountBody:     toAccountBody(n.Account),
+				Depth:           n.Depth,
+				OwnBalance:      n.OwnBalance,
+				RolledUpBalance: n.RolledUpBalance,
+			})
 		}
 		return out, nil
 	})
@@ -294,18 +373,45 @@ func registerAccounts(api huma.API, deps Deps) {
 	})
 
 	huma.Register(api, huma.Operation{
-		OperationID: "get-account-balance",
-		Method:      http.MethodGet,
-		Path:        "/v1/accounts/{id}/balance",
-		Summary:     "Get an account's balance",
-		Tags:        []string{"accounts"},
-		Security:    bearerSecurity,
-	}, func(ctx context.Context, in *accountIDInput) (*BalanceOutput, error) {
+		OperationID:  "set-account-parent",
+		Method:       http.MethodPost,
+		Path:         "/v1/accounts/{id}/parent",
+		Summary:      "Set or clear an account's parent",
+		Description:  "Moves the account under a new parent, or clears its parent when parent_id is omitted or null. The parent must be the same tenant and currency; a cycle or self-parent is rejected with 422.",
+		Tags:         []string{"accounts"},
+		MaxBodyBytes: MaxRequestBodyBytes,
+		Security:     bearerSecurity,
+	}, func(ctx context.Context, in *SetAccountParentInput) (*AccountOutput, error) {
 		tenant, err := tenantFromCtx(ctx)
 		if err != nil {
 			return nil, err
 		}
-		bal, err := deps.Accounts.Balance(ctx, tenant, in.ID)
+		acct, err := deps.Accounts.SetParent(ctx, tenant, in.ID, in.Body.ParentID)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		return &AccountOutput{Body: toAccountBody(acct)}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "get-account-balance",
+		Method:      http.MethodGet,
+		Path:        "/v1/accounts/{id}/balance",
+		Summary:     "Get an account's balance",
+		Description: "Returns the account's own derived balance. With rollup=true (ADR-023), returns the balance summed over this account and every descendant in its hierarchy instead.",
+		Tags:        []string{"accounts"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, in *balanceInput) (*BalanceOutput, error) {
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var bal domain.Money
+		if in.Rollup {
+			bal, err = deps.Accounts.RolledUpBalance(ctx, tenant, in.ID)
+		} else {
+			bal, err = deps.Accounts.Balance(ctx, tenant, in.ID)
+		}
 		if err != nil {
 			return nil, toHumaErr(err)
 		}

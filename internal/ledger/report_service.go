@@ -19,6 +19,18 @@ type CurrencyBalance struct {
 	Imbalance bool
 }
 
+// TrialBalanceAccount is one account's identity, derived balance, and
+// (ADR-023) the balance rolled up over its whole subtree, embedding
+// domain.AccountBalance so existing field access (a.AccountID, a.Balance,
+// a.Name, a.Type, a.Currency, a.IsSystem) keeps working unchanged.
+// RolledUpBalance is additive display only: it double-counts a parent and
+// its descendants on purpose, so it must never be used in place of Balance
+// for the balance-proof check below, which stays computed from own balances.
+type TrialBalanceAccount struct {
+	domain.AccountBalance
+	RolledUpBalance int64
+}
+
 // TrialBalance is a tenant's full balance proof (Task 6.3, audit A9.2): each
 // currency's net posted total (Currencies, which must each be zero) and
 // every account's derived balance (Accounts, including system/clearing
@@ -26,7 +38,7 @@ type CurrencyBalance struct {
 // value actually sits.
 type TrialBalance struct {
 	Currencies []CurrencyBalance
-	Accounts   []domain.AccountBalance
+	Accounts   []TrialBalanceAccount
 }
 
 // ReportService is the application service backing GET
@@ -44,7 +56,11 @@ func NewReportService(repo domain.Repository) *ReportService {
 
 // TrialBalance returns tenantID's full balance proof: each currency's net
 // posted total (flagged as an imbalance if nonzero) and every account's
-// derived balance.
+// derived balance, plus (ADR-023) each account's balance rolled up over its
+// subtree. The per-currency nets above are computed from TrialBalanceByCurrency
+// (own balances only, unchanged): rollups double-count a parent and its
+// descendants by design, so they stay a display-only addition on Accounts and
+// never feed the zero-proof.
 func (s *ReportService) TrialBalance(ctx context.Context, tenantID string) (TrialBalance, error) {
 	totals, err := s.repo.TrialBalanceByCurrency(ctx, tenantID)
 	if err != nil {
@@ -54,6 +70,18 @@ func (s *ReportService) TrialBalance(ctx context.Context, tenantID string) (Tria
 	if err != nil {
 		return TrialBalance{}, err
 	}
+	// Reuse the same tree rollup Tree/AccountService.buildTree uses: one
+	// query (AllAccountBalances) covers the same account universe
+	// TrialBalanceAccounts does (both include system/clearing accounts), so
+	// building the rollup map here costs nothing beyond that one extra read.
+	rows, err := s.repo.AllAccountBalances(ctx, tenantID)
+	if err != nil {
+		return TrialBalance{}, err
+	}
+	rolledUp := make(map[string]int64, len(rows))
+	for _, n := range buildTree(rows) {
+		rolledUp[n.Account.ID] = n.RolledUpBalance
+	}
 	currencies := make([]CurrencyBalance, 0, len(totals))
 	for _, t := range totals {
 		currencies = append(currencies, CurrencyBalance{
@@ -62,5 +90,12 @@ func (s *ReportService) TrialBalance(ctx context.Context, tenantID string) (Tria
 			Imbalance: t.Net != 0,
 		})
 	}
-	return TrialBalance{Currencies: currencies, Accounts: accounts}, nil
+	accountRows := make([]TrialBalanceAccount, 0, len(accounts))
+	for _, a := range accounts {
+		accountRows = append(accountRows, TrialBalanceAccount{
+			AccountBalance:  a,
+			RolledUpBalance: rolledUp[a.AccountID],
+		})
+	}
+	return TrialBalance{Currencies: currencies, Accounts: accountRows}, nil
 }
