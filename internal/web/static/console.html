@@ -59,7 +59,7 @@ button{font-family:inherit;font-size:inherit;color:inherit;cursor:pointer}
 .app{display:flex;min-height:100vh}
 .sidebar{position:fixed;inset:0 auto 0 0;width:var(--sidebar-w);background:var(--bg-deep);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:20px 14px;gap:4px;overflow-y:auto;z-index:40}
 .main{flex:1;margin-left:var(--sidebar-w);display:flex;flex-direction:column;min-width:0}
-.content{padding:28px 36px 64px;max-width:980px;width:100%}
+.content{padding:28px 36px 64px;max-width:1180px;width:100%}
 
 /* ---------- sidebar ---------- */
 .logo{display:flex;align-items:center;gap:10px;padding:4px 10px 18px}
@@ -240,6 +240,10 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
 .view{display:none}
 .view.active{display:block}
 .section-gap{margin-top:24px}
+.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start;margin-top:10px}
+.settings-grid > .card{margin:0;max-width:none;width:100%}
+.settings-grid .span2{grid-column:1 / -1}
+@media (max-width:860px){.settings-grid{grid-template-columns:1fr}}
 .subtle{color:var(--faint);font-size:12px}
 .help{border-left:3px solid var(--cyan);background:var(--cyan-soft);border-radius:6px;padding:11px 14px;margin:0 0 16px;font-size:12.5px;color:var(--muted);line-height:1.65}
 .help strong{color:var(--text)}
@@ -664,7 +668,8 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
         <h1>Settings</h1>
         <p class="page-sub">Local to this browser. Nothing here is sent anywhere except with your API calls.</p>
 
-        <div class="card" style="max-width:560px" id="apiKeyCard">
+        <div class="settings-grid">
+        <div class="card" id="apiKeyCard">
           <h2 style="font-size:14.5px;margin:0 0 14px">API key</h2>
           <form id="settingsKeyForm">
             <div class="field">
@@ -679,12 +684,12 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           </form>
         </div>
 
-        <div class="card section-gap" style="max-width:560px" id="demoKeyCard" hidden>
+        <div class="card" id="demoKeyCard" hidden>
           <h2 style="font-size:14.5px;margin:0 0 10px">API key</h2>
           <p style="margin:0;color:var(--muted)">This is the public demo. The console uses the shared, rate-limited demo key automatically, so there is nothing to set here. On your own server this card lets you paste an admin key.</p>
         </div>
 
-        <div class="card section-gap" style="max-width:560px">
+        <div class="card">
           <h2 style="font-size:14.5px;margin:0 0 14px">Workspace</h2>
           <div class="field" style="max-width:280px">
             <label for="setTenant">Current tenant</label>
@@ -700,13 +705,14 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           </div>
         </div>
 
-        <div class="card section-gap" style="max-width:640px" id="fxRatesCard" hidden>
+        <div class="card span2" id="fxRatesCard" hidden>
           <h2 style="font-size:14.5px;margin:0 0 6px">Exchange rates</h2>
           <p class="subtle" style="margin:0 0 12px">The price for turning one currency into another. Add one pair at a time.</p>
           <div class="help">
             <p><strong>How to add rates.</strong> A rate covers one currency pair. Fill in Base, Quote, and the Mid rate, then press Save rate. To add more pairs, just fill the form again with the next pair (for example USD to GBP, then EUR to BDT). Every pair you save shows up in the table above.</p>
             <p><strong>What is the mid rate?</strong> It is how many units of the Quote currency one unit of the Base currency buys. Example: Base <code>USD</code>, Quote <code>EUR</code>, Mid rate <code>0.9200</code> means 1 USD = 0.92 EUR. You only add one direction; the reverse (EUR to USD) is worked out for you automatically.</p>
             <p><strong>Spread override</strong> is optional. It is a per-pair markup in basis points (100 bps = 1%). Leave it empty and the pair uses the Markup fee default set below. Fill it to charge a different markup on just this one pair.</p>
+            <p class="subtle" style="margin-top:2px"><strong>Demo note.</strong> In the public demo, every tenant is prefilled with USD-based rates for EUR, MYR, BDT, and INR plus a 1% markup. Those are a real snapshot captured once, not updated in real time.</p>
           </div>
           <div class="checks" style="margin-bottom:12px">
             <label><input type="radio" name="fxRateScope" value="global" checked> Global default</label>
@@ -725,7 +731,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           </form>
         </div>
 
-        <div class="card section-gap" style="max-width:640px" id="fxMarkupCard" hidden>
+        <div class="card span2" id="fxMarkupCard" hidden>
           <h2 style="font-size:14.5px;margin:0 0 6px">Markup fee</h2>
           <p class="subtle" style="margin:0 0 12px">Your cut on a currency conversion.</p>
           <div class="help">
@@ -749,13 +755,14 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           </form>
         </div>
 
-        <div class="card section-gap" style="max-width:560px">
+        <div class="card span2">
           <h2 style="font-size:14.5px;margin:0 0 10px">About</h2>
-          <p style="margin:0;color:var(--muted)">
+          <p style="margin:0;color:var(--muted);max-width:90ch">
             go-ledger is an open-source, multi-tenant, double-entry payment ledger written in Go.
             Every transaction is a set of postings that sums to zero, so money is never created or lost, only moved.
             Source and docs at <a href="https://go.sohag.pro" target="_blank" rel="noopener">go.sohag.pro</a>.
           </p>
+        </div>
         </div>
       </section>
 
