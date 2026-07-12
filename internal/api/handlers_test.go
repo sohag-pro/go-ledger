@@ -515,6 +515,104 @@ func (f *fakeRepo) ListAuditByAccount(_ context.Context, _, accountID string, af
 	return out, nil
 }
 
+// SetAccountParent mirrors the real repository's ADR-023 semantics closely
+// enough for handler tests: self-parent and a cycle are rejected with
+// domain.ErrInvalidHierarchy (walking up from the proposed parent), an
+// unknown parentID with domain.ErrParentNotFound, and a currency mismatch
+// with domain.ErrInvalidHierarchy, matching the real accounts_hierarchy_guard
+// trigger's three rejections. Returns rows=0, nil for an unknown accountID
+// (mirroring the real UPDATE ... WHERE tenant_id AND id matching zero rows,
+// rather than an error).
+func (f *fakeRepo) SetAccountParent(_ context.Context, _, accountID string, parentID *string) (int64, error) {
+	a, ok := f.accounts[accountID]
+	if !ok {
+		return 0, nil
+	}
+	if parentID != nil {
+		if *parentID == accountID {
+			return 0, domain.ErrInvalidHierarchy
+		}
+		parent, ok := f.accounts[*parentID]
+		if !ok {
+			return 0, domain.ErrParentNotFound
+		}
+		if parent.Currency != a.Currency {
+			return 0, domain.ErrInvalidHierarchy
+		}
+		// Walk up from the proposed parent; reaching accountID is a cycle.
+		for cur := &parent; ; {
+			if cur.ID == accountID {
+				return 0, domain.ErrInvalidHierarchy
+			}
+			if cur.ParentID == nil {
+				break
+			}
+			next, ok := f.accounts[*cur.ParentID]
+			if !ok {
+				break
+			}
+			cur = &next
+		}
+	}
+	a.ParentID = parentID
+	f.accounts[accountID] = a
+	return 1, nil
+}
+
+// RolledUpBalance mirrors the real repository's ADR-023 recursive subtree sum:
+// accountID plus every descendant found by walking children (accounts whose
+// ParentID points into the subtree already gathered), same-currency by
+// construction (the hierarchy guard rejects a cross-currency parent).
+func (f *fakeRepo) RolledUpBalance(_ context.Context, _, accountID string) (domain.Money, error) {
+	a, ok := f.accounts[accountID]
+	if !ok {
+		return domain.Money{}, domain.ErrAccountNotFound
+	}
+	subtree := map[string]bool{accountID: true}
+	// Fixed-point expansion: repeatedly add any account whose parent is
+	// already in the subtree, until a pass adds nothing. Bounded by the
+	// number of accounts, so this always terminates.
+	for {
+		added := false
+		for id, acct := range f.accounts {
+			if subtree[id] {
+				continue
+			}
+			if acct.ParentID != nil && subtree[*acct.ParentID] {
+				subtree[id] = true
+				added = true
+			}
+		}
+		if !added {
+			break
+		}
+	}
+	var sum int64
+	for _, p := range f.postings {
+		if subtree[p.accountID] {
+			sum += p.amount
+		}
+	}
+	return domain.NewMoney(sum, a.Currency)
+}
+
+// AllAccountBalances mirrors the real repository's ADR-023 query: every
+// account with its own (non-rolled-up) derived balance.
+func (f *fakeRepo) AllAccountBalances(_ context.Context, _ string) ([]domain.AccountBalanceRow, error) {
+	out := make([]domain.AccountBalanceRow, 0, len(f.accounts))
+	for _, a := range f.accounts {
+		var sum int64
+		for _, p := range f.postings {
+			if p.accountID == a.ID {
+				sum += p.amount
+			}
+		}
+		out = append(out, domain.AccountBalanceRow{Account: a, Balance: sum})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Account.Name < out[j].Account.Name })
+	return out, nil
+}
+
 func (f *fakeRepo) Balance(_ context.Context, _, accountID string) (domain.Money, error) {
 	a, ok := f.accounts[accountID]
 	if !ok {

@@ -60,6 +60,11 @@ type Querier interface {
 	// TestPostConcurrentStressSingleTenant). AccountBalances is now only ever
 	// called for the subset of accounts that actually have a MinBalance set.
 	AccountStatusFlags(ctx context.Context, arg AccountStatusFlagsParams) ([]AccountStatusFlagsRow, error)
+	// Every account for a tenant with its own derived balance (LEFT JOIN so an
+	// account with no postings returns 0) and its parent_id, so the caller can
+	// build the tree and roll up in memory in one pass. Ordered by name, id for a
+	// stable base order the Go rollup then re-threads parent-before-child.
+	AllAccountBalances(ctx context.Context, tenantID uuid.UUID) ([]AllAccountBalancesRow, error)
 	// The oldest transaction id still in flight, cast the same way audit_outbox.txid
 	// is (xid8 has no direct cast to bigint). A row whose txid is strictly below
 	// this watermark is guaranteed committed and safe to chain (ADR-017,
@@ -505,6 +510,10 @@ type Querier interface {
 	// affected (not zero), so the admin service can tell "no such key" (0 rows)
 	// from "already revoked" (1 row, unchanged) without a separate lookup.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// The balance of an account and everything under it: gather the subtree via
+	// parent_id, then sum those accounts' postings. Same-currency subtree, so this
+	// is one number.
+	RolledUpBalance(ctx context.Context, arg RolledUpBalanceParams) (int64, error)
 	// The chainer's batch read: unprocessed rows whose inserting transaction is
 	// guaranteed settled (txid < the watermark passed in), oldest commit order
 	// first. Ordering by (txid, id) is the total order ADR-017 defines: it is
@@ -522,6 +531,9 @@ type Querier interface {
 	// with no matching row affects zero rows, which is fine: the INSERT that
 	// runs immediately before this in provisioning order creates it first.
 	SetAPIKeyScopesByHash(ctx context.Context, arg SetAPIKeyScopesByHashParams) error
+	// Re-parent (or clear, when parent_id is NULL) one account. Cycle, currency,
+	// and same-tenant are enforced by accounts_hierarchy_guard / the composite FK.
+	SetAccountParent(ctx context.Context, arg SetAccountParentParams) (int64, error)
 	// Task 5.5, audit A1.5: freezes, closes, or reactivates one account. Scoped
 	// to tenant_id like every other write here, so a caller can never flip a
 	// status on another tenant's account by id alone.
