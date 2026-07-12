@@ -920,6 +920,7 @@ const ADMIN_VIEWS = ["tenants", "apikeys", "webhooks", "policy"];
 function keyReady() { return state.demoMode || !!(state.activeKey && state.activeKey.trim()); }
 function adminUnlocked() { return keyReady(); }
 function tenantName() { const t = state.tenants.find(x => x.id === state.adminTenant); return t ? t.name : (state.adminTenant || ""); }
+function acctName(id) { const a = (state.accounts || []).find(x => x.id === id); return a ? a.name : (id ? String(id).slice(0, 8) : "?"); }
 
 /* ---------- shared render bits ---------- */
 function badgeStatus(s) {
@@ -1040,7 +1041,15 @@ function renderOverview() {
     const el = $("#stTxToday"); if (el) el.textContent = txs.filter(t => (t.effective_at || "").slice(0, 10) === today).length;
     const act = $("#activityList");
     if (act) act.innerHTML = txs.length
-      ? txs.slice(0, 6).map(t => `<li><span class="ico">+</span><span>Transaction ${esc(t.id.slice(0, 8))} posted${t.reference ? ", " + esc(t.reference) : ""}</span><span class="when">${esc(new Date(t.effective_at).toLocaleDateString())}</span></li>`).join("")
+      ? txs.slice(0, 6).map(t => {
+          const ps = t.postings || [];
+          const cur = (ps[0] || {}).currency || "";
+          const gross = ps.filter(p => p.amount > 0).reduce((s, p) => s + p.amount, 0);
+          const names = Array.from(new Set(ps.map(p => acctName(p.account_id))));
+          const flow = names.slice(0, 2).map(esc).join(" &rarr; ") + (names.length > 2 ? " &middot; +" + (names.length - 2) : "");
+          const ref = t.reference ? ` &middot; <span class="subtle">${esc(t.reference)}</span>` : "";
+          return `<li><span class="ico">+</span><span><span class="mono">${esc(t.id.slice(0, 8))}</span> <span class="pos">${money(gross)} ${esc(cur)}</span> &middot; ${flow}${ref}</span><span class="when">${esc(new Date(t.effective_at).toLocaleDateString())}</span></li>`;
+        }).join("")
       : `<li><span class="subtle">Nothing yet. Post your first transaction to see activity here.</span></li>`;
   }).catch(e => {
     const el = $("#stTxToday"); if (el) el.textContent = "-";
