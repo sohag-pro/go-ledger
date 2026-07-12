@@ -67,8 +67,13 @@ type Deps struct {
 	Disputes *ledger.DisputeService
 	// FX backs the /v1/admin/fx operations (ADR-020): live rate and markup
 	// config. Optional like the other services; a zero Deps leaves it nil.
-	FX   *fx.AdminService
-	Auth *auth.Resolver
+	FX *fx.AdminService
+	// DemoMode, when true, makes create-tenant prefill the new tenant with the
+	// demo's starter FX rates and 1 percent markup (fx.PrefillDemoRates). It is
+	// demo-only convenience; a zero Deps (production) leaves it false and no
+	// prefill happens.
+	DemoMode bool
+	Auth     *auth.Resolver
 	// RateLimiter, if set, is registered immediately after the auth middleware
 	// (see New). It is optional: a zero Deps (spec generation, and tests that
 	// only exercise unauthenticated routes) leaves it nil and no rate-limit

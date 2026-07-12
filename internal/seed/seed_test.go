@@ -16,6 +16,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/sohag-pro/go-ledger/internal/fx"
 	"github.com/sohag-pro/go-ledger/internal/postgres"
 	"github.com/sohag-pro/go-ledger/internal/seed"
 )
@@ -327,8 +328,11 @@ func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 	}
 
 	var apiRateCount, tenantAPIRateCount, envRateCount, apiMarkupCount, otherTenantMarkupCount, envMarkupCount int
+	// tenant_id IS NULL isolates the tampered GLOBAL USD/EUR row this checks;
+	// the demo prefill legitimately writes a tenant-scoped USD/EUR api row, so
+	// an unscoped count would also pick that up.
 	if err := pool.QueryRow(ctx,
-		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'EUR' AND source = 'api'").Scan(&apiRateCount); err != nil {
+		"SELECT count(*) FROM fx_rates WHERE base = 'USD' AND quote = 'EUR' AND source = 'api' AND tenant_id IS NULL").Scan(&apiRateCount); err != nil {
 		t.Fatalf("count api fx rates: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
@@ -371,5 +375,43 @@ func TestSeedClearsAPISourcedGlobalFXConfig(t *testing.T) {
 	}
 	if envMarkupCount != 1 {
 		t.Errorf("env-sourced global fx markup default did not survive reset: got %d rows, want 1", envMarkupCount)
+	}
+}
+
+// TestSeedPrefillsDemoTenantFX proves the demo seeder prefills the demo tenant
+// with the starter USD-based FX rates and a 1 percent markup, so the console's
+// Exchange rates page is not empty right after a reset.
+func TestSeedPrefillsDemoTenantFX(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tenant := uuid.New()
+	now := time.Now()
+
+	if err := seed.Seed(ctx, pool, tenant.String(), now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+
+	svc := fx.NewAdminService(pool)
+	rates, err := svc.ListRates(ctx, tenant.String())
+	if err != nil {
+		t.Fatalf("ListRates: %v", err)
+	}
+	have := map[string]bool{}
+	for _, r := range rates {
+		have[r.Base+"/"+r.Quote] = true
+	}
+	for _, quote := range []string{"EUR", "MYR", "BDT", "INR"} {
+		if !have["USD/"+quote] {
+			t.Errorf("demo tenant missing prefilled USD/%s rate after seed", quote)
+		}
+	}
+
+	mv, err := svc.GetMarkup(ctx, tenant.String())
+	if err != nil {
+		t.Fatalf("GetMarkup: %v", err)
+	}
+	if mv.Tenant == nil || mv.Tenant.DefaultSpreadBps == nil || *mv.Tenant.DefaultSpreadBps != 100 {
+		t.Fatalf("demo tenant markup = %+v, want a 100 bps default", mv.Tenant)
 	}
 }

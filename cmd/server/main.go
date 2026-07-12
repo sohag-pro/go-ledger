@@ -553,6 +553,7 @@ func run(logger *slog.Logger) error {
 		// FX backs the /v1/admin/fx operations (ADR-020): live rate and markup
 		// config, over the same pool fx.NewDBProvider(pool) above already reads.
 		FX:               fx.NewAdminService(pool),
+		DemoMode:         cfg.demoMode,
 		Auth:             resolver,
 		RateLimiter:      limiter,
 		NegativeThrottle: negativeThrottle,

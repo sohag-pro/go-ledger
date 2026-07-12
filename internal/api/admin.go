@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
+	"github.com/sohag-pro/go-ledger/internal/fx"
 )
 
 // TenantBody is the JSON shape of a tenant in admin responses.
@@ -294,6 +296,15 @@ func registerAdmin(api huma.API, deps Deps) {
 		t, err := deps.Admin.CreateTenant(ctx, in.Body.Name)
 		if err != nil {
 			return nil, toHumaErr(err)
+		}
+		// Demo-only convenience: give a freshly created tenant the demo's
+		// starter FX rates and 1 percent markup so its Exchange rates page is
+		// not empty. Best-effort, never fails the tenant creation.
+		if deps.DemoMode && deps.FX != nil {
+			if perr := fx.PrefillDemoRates(ctx, deps.FX, t.ID); perr != nil {
+				slog.WarnContext(ctx, "demo: prefill fx rates for new tenant failed",
+					slog.String("tenant", t.ID), slog.String("error", perr.Error()))
+			}
 		}
 		return &TenantOutput{Body: toTenantBody(t)}, nil
 	})

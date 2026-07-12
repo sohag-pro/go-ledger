@@ -13,6 +13,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/sohag-pro/go-ledger/internal/fx"
 )
 
 const (
@@ -227,6 +229,14 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM fx_markup_defaults WHERE source = 'api' AND (tenant_id IS NULL OR tenant_id = $1)", tid); err != nil {
 		return fmt.Errorf("seed: clear api-sourced fx markup defaults: %w", err)
+	}
+
+	// Prefill the demo tenant with starter FX rates and a 1 percent markup so
+	// the Exchange rates page is not empty. Runs right after the clears above,
+	// on the same api source they target, so each reset re-prefills a fresh
+	// snapshot (demo only; see fx.PrefillDemoRates).
+	if err := fx.PrefillDemoRates(ctx, fx.NewAdminService(tx), tid.String()); err != nil {
+		return fmt.Errorf("seed: prefill demo fx rates: %w", err)
 	}
 
 	accounts := []struct {
