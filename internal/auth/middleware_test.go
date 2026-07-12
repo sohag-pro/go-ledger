@@ -592,6 +592,18 @@ func TestHumaMiddleware_ActAsTenant(t *testing.T) {
 			header:     "not-a-uuid",
 			wantStatus: http.StatusBadRequest,
 		},
+		{
+			// Fail-safe guard: a non-admin key never reaches the uuid parse
+			// (the scope check short-circuits first), so a malformed header
+			// from it is ignored, not a 400 that would leak the header's
+			// existence. If a future refactor validates the uuid before the
+			// scope check, this case flips to 400 and catches it.
+			name:       "non-admin key with malformed header is still ignored, not a 400",
+			plaintext:  readOnlyPlaintext,
+			header:     "not-a-uuid",
+			wantStatus: http.StatusOK,
+			wantTenant: ownTenant,
+		},
 	}
 
 	for _, tt := range tests {
