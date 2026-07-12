@@ -593,6 +593,16 @@ func TestHumaMiddleware_ActAsTenant(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			// A non-canonical but valid uuid form (braces) must normalize to
+			// the canonical tenant the RLS policy compares against, not pass
+			// through raw and silently resolve to an empty tenant.
+			name:       "admin key with a braced uuid header normalizes to the canonical tenant",
+			plaintext:  adminPlaintext,
+			header:     "{" + otherTenant + "}",
+			wantStatus: http.StatusOK,
+			wantTenant: otherTenant,
+		},
+		{
 			// Fail-safe guard: a non-admin key never reaches the uuid parse
 			// (the scope check short-circuits first), so a malformed header
 			// from it is ignored, not a 400 that would leak the header's

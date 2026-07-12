@@ -134,11 +134,18 @@ func HumaMiddleware(api huma.API, resolver *Resolver, throttle *NegativeThrottle
 		// IS rejected: a typo must not silently resolve to an empty tenant.
 		tenant := key.TenantID
 		if actAs := ctx.Header(actAsTenantHeader); actAs != "" && key.HasScope(domain.ScopeAdmin) {
-			if _, perr := uuid.Parse(actAs); perr != nil {
+			// Parse AND canonicalize. uuid.Parse accepts non-canonical forms
+			// (uppercase hex, braces, urn:uuid: prefix, unhyphenated), which
+			// would pass here but never match the canonical lowercase
+			// tenant_id::text the RLS policy compares against, silently
+			// resolving to an empty tenant. Store the canonical string so a
+			// valid uuid in any accepted form scopes to the right tenant.
+			u, perr := uuid.Parse(actAs)
+			if perr != nil {
 				_ = huma.WriteErr(api, ctx, http.StatusBadRequest, "X-Act-As-Tenant must be a tenant uuid")
 				return
 			}
-			tenant = actAs
+			tenant = u.String()
 		}
 
 		// Best-effort: writes back to the RequestLogInfo box cmd/server's

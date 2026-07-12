@@ -878,7 +878,7 @@ const emptyArt = `<svg class="art" width="72" height="52" viewBox="0 0 72 52" fi
 
 /* ---------- API layer ---------- */
 function api(method, path, body) {
-  if (path.charAt(0) !== "/") throw new Error("refusing to call a non-relative path: " + path);
+  if (path.charAt(0) !== "/" || path.charAt(1) === "/") throw new Error("refusing to call a non-relative path: " + path);
   const opts = { method, headers: { Authorization: "Bearer " + state.activeKey } };
   // Scope every /v1 call to the selected tenant. The server honors this only
   // for an admin-scoped key (ADR-021); a non-admin key stays on its own tenant.
