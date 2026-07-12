@@ -406,7 +406,8 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
               </div>
               <div class="field">
                 <label for="accCurrency">Currency</label>
-                <input id="accCurrency" class="mono" value="USD" maxlength="3" style="text-transform:uppercase">
+                <select id="accCurrency" class="mono"></select>
+                <div class="hint">Only currencies that have an exchange rate are listed, so any account can be converted. Add rates in Settings.</div>
               </div>
             </div>
             <div style="display:flex;gap:10px">
@@ -1088,9 +1089,31 @@ function renderOverview() {
 }
 
 /* ---------- accounts ---------- */
+// The new-account currency dropdown lists only currencies that have an exchange
+// rate for the selected tenant (union of base and quote across its rates), so
+// every account can be converted. Falls back to a default set if none are set
+// or the rates cannot be read (for example a non-admin key).
+function fillAccountCurrencies() {
+  const sel = $("#accCurrency");
+  if (!sel) return;
+  const fallback = ["USD", "EUR", "MYR", "BDT", "INR"];
+  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
+  api("GET", "/v1/admin/fx/rates" + q).then(r => {
+    const set = new Set();
+    (r.rates || []).forEach(x => { set.add(x.base); set.add(x.quote); });
+    const list = set.size ? Array.from(set).sort() : fallback;
+    const keep = sel.value;
+    sel.innerHTML = list.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+    if (keep && list.indexOf(keep) !== -1) sel.value = keep;
+  }).catch(() => {
+    if (!sel.options.length) sel.innerHTML = fallback.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  });
+}
+
 function renderAccounts() {
   const body = $("#accountsBody");
   if (!keyReady()) { body.innerHTML = connectCard(); return; }
+  fillAccountCurrencies();
   body.innerHTML = `<div class="empty"><span class="subtle">Loading&hellip;</span></div>`;
   Promise.all([refreshAccounts(), refreshBalances()]).then(() => {
     const accounts = state.accounts;
@@ -1571,7 +1594,7 @@ $("#gsDismiss").addEventListener("click", () => { state.gsDismissed = true; loca
 
 /* accounts */
 $("#accountsRefresh").addEventListener("click", renderAccounts);
-$("#newAccountBtn").addEventListener("click", () => { $("#accountForm").hidden = false; $("#accName").focus(); });
+$("#newAccountBtn").addEventListener("click", () => { $("#accountForm").hidden = false; fillAccountCurrencies(); $("#accName").focus(); });
 $("#accountFormCancel").addEventListener("click", () => { $("#accountForm").hidden = true; });
 $("#accountFormEl").addEventListener("submit", (e) => {
   e.preventDefault();
