@@ -136,10 +136,10 @@ func setupCryptoTestTenant(t *testing.T, cipher *crypto.Cipher) (pool *pgxpool.P
 	}
 	debit := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	credit := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
-	if err := accounts.Create(ctx, tenant, debit); err != nil {
+	if err := accounts.Create(ctx, tenant, debit, nil); err != nil {
 		t.Fatalf("create debit account: %v", err)
 	}
-	if err := accounts.Create(ctx, tenant, credit); err != nil {
+	if err := accounts.Create(ctx, tenant, credit, nil); err != nil {
 		t.Fatalf("create credit account: %v", err)
 	}
 	return pool, txns, accounts, tenant, debit.ID, credit.ID
@@ -456,13 +456,13 @@ func TestCrypto_PostConvertReverseSucceedAfterShred_FreshVersionMintedOldRedacte
 	usd1 := &domain.Account{Name: "USD Cash", Type: domain.Asset, Currency: "USD"}
 	usd2 := &domain.Account{Name: "USD Revenue", Type: domain.Income, Currency: "USD"}
 	eur := &domain.Account{Name: "EUR Cash", Type: domain.Asset, Currency: "EUR"}
-	if err := accounts.Create(ctx, tenant, usd1); err != nil {
+	if err := accounts.Create(ctx, tenant, usd1, nil); err != nil {
 		t.Fatalf("create usd1 account: %v", err)
 	}
-	if err := accounts.Create(ctx, tenant, usd2); err != nil {
+	if err := accounts.Create(ctx, tenant, usd2, nil); err != nil {
 		t.Fatalf("create usd2 account: %v", err)
 	}
-	if err := accounts.Create(ctx, tenant, eur); err != nil {
+	if err := accounts.Create(ctx, tenant, eur, nil); err != nil {
 		t.Fatalf("create eur account: %v", err)
 	}
 

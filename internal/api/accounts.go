@@ -224,7 +224,7 @@ func registerAccounts(api huma.API, deps Deps) {
 			PartyReference: in.Body.PartyReference,
 			PartyType:      in.Body.PartyType,
 		}
-		if err := deps.Accounts.Create(ctx, tenant, acct); err != nil {
+		if err := deps.Accounts.Create(ctx, tenant, acct, nil); err != nil {
 			return nil, toHumaErr(err)
 		}
 		return &AccountOutput{Body: toAccountBody(*acct)}, nil

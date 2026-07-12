@@ -66,7 +66,7 @@ func TestAccountService_Create_DefaultCurrency(t *testing.T) {
 			}
 
 			acct := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: tt.reqCurrency}
-			err := svc.Create(ctx, tenant, acct)
+			err := svc.Create(ctx, tenant, acct, nil)
 
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {

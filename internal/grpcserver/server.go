@@ -267,7 +267,7 @@ func (s *Server) CreateAccount(ctx context.Context, req *ledgerv1.CreateAccountR
 	if req.PartyType != "" {
 		acct.PartyType = &req.PartyType
 	}
-	if err := s.accounts.Create(ctx, tenantFrom(ctx), acct); err != nil {
+	if err := s.accounts.Create(ctx, tenantFrom(ctx), acct, nil); err != nil {
 		return nil, toStatus(err)
 	}
 	return &ledgerv1.CreateAccountResponse{Account: toProtoAccount(*acct)}, nil

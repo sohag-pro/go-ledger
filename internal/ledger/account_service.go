@@ -51,17 +51,116 @@ func NewAccountService(repo domain.Repository, opts ...AccountOption) *AccountSe
 // and validates the account. If a.Currency is empty and WithDefaultCurrency was
 // set, the configured default is stamped on before validation, so a caller that
 // does not specify a currency gets the deployment's configured default rather
-// than a validation error.
-func (s *AccountService) Create(ctx context.Context, tenantID string, a *domain.Account) error {
+// than a validation error. parentID (ADR-023) sets a's hierarchy parent; nil
+// creates a root account, same as before ParentID existed. A cycle, currency
+// mismatch, or unknown parent is enforced in Postgres and surfaces from the
+// repo as ErrInvalidHierarchy / ErrParentNotFound.
+func (s *AccountService) Create(ctx context.Context, tenantID string, a *domain.Account, parentID *string) error {
 	if a.Currency == "" && s.defaultCurrency != "" {
 		a.Currency = s.defaultCurrency
 	}
+	a.ParentID = parentID
 	return s.repo.CreateAccount(ctx, tenantID, a)
 }
 
 // Get returns an account, or domain.ErrAccountNotFound.
 func (s *AccountService) Get(ctx context.Context, tenantID, id string) (domain.Account, error) {
 	return s.repo.GetAccount(ctx, tenantID, id)
+}
+
+// SetParent sets, changes, or clears (parentID nil) accountID's parent, then
+// returns the updated account. A missing account is ErrAccountNotFound; a
+// cycle, currency mismatch, or unknown parent surfaces from the repo as
+// ErrInvalidHierarchy / ErrParentNotFound.
+func (s *AccountService) SetParent(ctx context.Context, tenantID, accountID string, parentID *string) (domain.Account, error) {
+	n, err := s.repo.SetAccountParent(ctx, tenantID, accountID, parentID)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if n == 0 {
+		return domain.Account{}, domain.ErrAccountNotFound
+	}
+	return s.repo.GetAccount(ctx, tenantID, accountID)
+}
+
+// RolledUpBalance returns accountID's balance including all descendants.
+func (s *AccountService) RolledUpBalance(ctx context.Context, tenantID, accountID string) (domain.Money, error) {
+	return s.repo.RolledUpBalance(ctx, tenantID, accountID)
+}
+
+// Tree returns the tenant's accounts as hierarchy nodes: own balance, rolled-up
+// balance (own plus all descendants), and depth, ordered so each parent comes
+// before its children. Rollups are computed in memory in O(n) from the flat
+// own-balance list, so a deep tree costs one query, not one per node.
+func (s *AccountService) Tree(ctx context.Context, tenantID string) ([]domain.AccountNode, error) {
+	rows, err := s.repo.AllAccountBalances(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return buildTree(rows), nil
+}
+
+// buildTree threads the flat rows into parent-before-child order and rolls up
+// each subtree once. Any row whose parent is missing (should not happen) is
+// treated as a root, so the function never drops an account.
+func buildTree(rows []domain.AccountBalanceRow) []domain.AccountNode {
+	own := make(map[string]int64, len(rows))
+	children := make(map[string][]string, len(rows))
+	acctByID := make(map[string]domain.Account, len(rows))
+	var roots []string
+	for _, r := range rows {
+		own[r.Account.ID] = r.Balance
+		acctByID[r.Account.ID] = r.Account
+		if r.Account.ParentID == nil {
+			roots = append(roots, r.Account.ID)
+		} else {
+			children[*r.Account.ParentID] = append(children[*r.Account.ParentID], r.Account.ID)
+		}
+	}
+	// A parent named by a child but absent from the map cannot happen (FK), but
+	// guard anyway: promote orphans to roots.
+	present := make(map[string]bool, len(rows))
+	for id := range acctByID {
+		present[id] = true
+	}
+	for _, r := range rows {
+		if r.Account.ParentID != nil && !present[*r.Account.ParentID] {
+			roots = append(roots, r.Account.ID)
+		}
+	}
+
+	// rollup(id) = own + sum(rollup(child)); memoized.
+	rolled := make(map[string]int64, len(rows))
+	var rollup func(id string) int64
+	rollup = func(id string) int64 {
+		if v, ok := rolled[id]; ok {
+			return v
+		}
+		total := own[id]
+		for _, c := range children[id] {
+			total += rollup(c)
+		}
+		rolled[id] = total
+		return total
+	}
+
+	var out []domain.AccountNode
+	var walk func(id string, depth int)
+	walk = func(id string, depth int) {
+		out = append(out, domain.AccountNode{
+			Account:         acctByID[id],
+			OwnBalance:      own[id],
+			RolledUpBalance: rollup(id),
+			Depth:           depth,
+		})
+		for _, c := range children[id] {
+			walk(c, depth+1)
+		}
+	}
+	for _, r := range roots {
+		walk(r, 0)
+	}
+	return out
 }
 
 // SetStatus updates an account's lifecycle status (Task 5.5, audit A1.5:

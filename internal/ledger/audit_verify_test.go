@@ -47,10 +47,10 @@ func TestAuditService_Verify_ValidChain(t *testing.T) {
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
-	if err := accounts.Create(ctx, tenant, cash); err != nil {
+	if err := accounts.Create(ctx, tenant, cash, nil); err != nil {
 		t.Fatalf("create cash: %v", err)
 	}
-	if err := accounts.Create(ctx, tenant, revenue); err != nil {
+	if err := accounts.Create(ctx, tenant, revenue, nil); err != nil {
 		t.Fatalf("create revenue: %v", err)
 	}
 
@@ -105,10 +105,10 @@ func TestAuditService_Verify_DetectsTamper(t *testing.T) {
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
-	if err := accounts.Create(ctx, tenant, cash); err != nil {
+	if err := accounts.Create(ctx, tenant, cash, nil); err != nil {
 		t.Fatalf("create cash: %v", err)
 	}
-	if err := accounts.Create(ctx, tenant, revenue); err != nil {
+	if err := accounts.Create(ctx, tenant, revenue, nil); err != nil {
 		t.Fatalf("create revenue: %v", err)
 	}
 

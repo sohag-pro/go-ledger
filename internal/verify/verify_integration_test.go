@@ -139,10 +139,10 @@ func postTxn(t *testing.T, pool *pgxpool.Pool, tenant string) string {
 
 	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
 	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
-	if err := accounts.Create(ctx, tenant, cash); err != nil {
+	if err := accounts.Create(ctx, tenant, cash, nil); err != nil {
 		t.Fatalf("create cash account: %v", err)
 	}
-	if err := accounts.Create(ctx, tenant, revenue); err != nil {
+	if err := accounts.Create(ctx, tenant, revenue, nil); err != nil {
 		t.Fatalf("create revenue account: %v", err)
 	}
 
