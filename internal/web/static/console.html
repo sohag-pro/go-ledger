@@ -1154,6 +1154,8 @@ function renderAccounts() {
   api("GET", "/v1/accounts/tree").then(r => {
     const rows = r.accounts || [];
     state.accounts = rows.map(x => ({ id: x.id, name: x.name, type: x.type, currency: x.currency, parent_id: x.parent_id }));
+    // Keep the create-account dropdowns fresh if the form is open during a refresh.
+    if (!$("#accountForm").hidden) { fillAccountCurrencies(); fillParentOptions(); }
     if (!rows.length) {
       body.innerHTML = `<div class="empty">${emptyArt}
         <p><strong>No accounts yet.</strong><br>Accounts are the buckets money moves between.</p>
@@ -1162,7 +1164,7 @@ function renderAccounts() {
       return;
     }
     body.innerHTML = `<table>
-      <thead><tr><th>Name</th><th>Type</th><th>Currency</th><th class="num">Balance</th><th class="num">Rolled up</th></tr></thead>
+      <thead><tr><th>Name</th><th>Type</th><th>Currency</th><th class="num">Balance</th><th class="num">Rolled up</th><th></th></tr></thead>
       <tbody>${rows.map(x => {
         const pad = 8 + x.depth * 20;
         const roll = x.rolled_up_balance !== x.own_balance ? `<span class="${x.rolled_up_balance < 0 ? "neg" : ""}">${money(x.rolled_up_balance)}</span>` : `<span class="subtle">-</span>`;
@@ -1172,6 +1174,7 @@ function renderAccounts() {
           <td>${esc(x.currency)}</td>
           <td class="num ${x.own_balance < 0 ? "neg" : ""}">${money(x.own_balance)}</td>
           <td class="num">${roll}</td>
+          <td style="text-align:right"><button class="btn ghost sm" data-stmt="${esc(x.id)}">Statement</button></td>
         </tr>`;
       }).join("")}</tbody></table>`;
   }).catch(e => { body.innerHTML = `<div class="empty"><p class="neg">${esc(e.message)}</p></div>`; });
