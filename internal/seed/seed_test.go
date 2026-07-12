@@ -115,13 +115,13 @@ func TestSeed(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Four accounts.
+	// Seven accounts (four USD plus blank EUR, BDT, MYR).
 	accts, err := repo.ListAccounts(ctx, tenant.String(), 100)
 	if err != nil {
 		t.Fatalf("list accounts: %v", err)
 	}
-	if len(accts) != 4 {
-		t.Fatalf("got %d accounts, want 4", len(accts))
+	if len(accts) != 7 {
+		t.Fatalf("got %d accounts, want 7", len(accts))
 	}
 
 	// The ledger nets to zero across every account: the core invariant holds even

@@ -17,6 +17,10 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/fx"
 )
 
+// demoTenantName is the realistic entity name stamped on the demo tenant each
+// reset, so the console shows a real-looking business rather than a placeholder.
+const demoTenantName = "Northwind Payments"
+
 const (
 	spendingTxns = 95 // postings on Spending and Checking
 	incomeTxns   = 95 // postings on Income and Checking
@@ -160,14 +164,14 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 
 	// Ensure the tenant row exists before writing any tenant-owned data:
 	// accounts_tenant_fk and transactions_tenant_fk (migration 0011, Task 2.1)
-	// require it. ON CONFLICT DO NOTHING: a tenant already provisioned via
-	// cmd/server's provisionAPIKeys (which runs before the seeder starts) is
-	// left exactly as it is, including any name or status an operator may
-	// already have set; only a tenant that has never been provisioned gets a
-	// placeholder row here.
+	// require it. This is the demo tenant, reset on a schedule, so its name is
+	// stamped to a realistic entity name on every reset (it is not a real
+	// customer whose name an operator would set); DO UPDATE SET name keeps it
+	// looking like a real business in the console rather than a placeholder.
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
-		tid, "demo-"+tenantID[:8]); err != nil {
+		`INSERT INTO tenants (id, name) VALUES ($1, $2)
+		 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+		tid, demoTenantName); err != nil {
 		return fmt.Errorf("seed: ensure tenant row: %w", err)
 	}
 
@@ -240,17 +244,23 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	}
 
 	accounts := []struct {
-		id, name, typ string
+		id, name, typ, cur string
 	}{
-		{checking, "Checking", "asset"},
-		{savings, "Savings", "asset"},
-		{income, "Income", "income"},
-		{spending, "Spending", "expense"},
+		{checking, "Checking", "asset", currency},
+		{savings, "Savings", "asset", currency},
+		{income, "Income", "income", currency},
+		{spending, "Spending", "expense", currency},
+		// Blank foreign-currency accounts so the demo has somewhere to convert
+		// into out of the box (no postings, so a zero balance). Named like real
+		// multi-currency accounts a business would hold.
+		{newID(), "Euro Account", "asset", "EUR"},
+		{newID(), "Taka Account", "asset", "BDT"},
+		{newID(), "Ringgit Account", "asset", "MYR"},
 	}
 	for _, a := range accounts {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO accounts (id, tenant_id, name, type, currency, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
-			a.id, tid, a.name, a.typ, currency, accountsAt); err != nil {
+			a.id, tid, a.name, a.typ, a.cur, accountsAt); err != nil {
 			return fmt.Errorf("seed: insert account %s: %w", a.name, err)
 		}
 	}

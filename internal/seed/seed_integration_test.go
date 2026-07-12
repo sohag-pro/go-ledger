@@ -41,8 +41,8 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 		`SELECT count(*) FROM accounts WHERE tenant_id = $1`, tenant).Scan(&acctCount); err != nil {
 		t.Fatalf("count accounts: %v", err)
 	}
-	if acctCount != 4 {
-		t.Errorf("account count = %d, want 4", acctCount)
+	if acctCount != 7 {
+		t.Errorf("account count = %d, want 7", acctCount)
 	}
 
 	var txnCount int
@@ -113,8 +113,8 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 		`SELECT count(*) FROM accounts WHERE tenant_id = $1`, tenant).Scan(&acctCount); err != nil {
 		t.Fatalf("count accounts: %v", err)
 	}
-	if acctCount != 4 {
-		t.Errorf("account count after two Seed calls = %d, want 4 (reset, not duplicated)", acctCount)
+	if acctCount != 7 {
+		t.Errorf("account count after two Seed calls = %d, want 7 (reset, not duplicated)", acctCount)
 	}
 
 	var txnCount int
