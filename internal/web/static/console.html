@@ -301,6 +301,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       <button class="nav-btn" data-view="trialbalance"><span class="nav-dot"></span>Trial balance</button>
       <button class="nav-btn" data-view="transactions"><span class="nav-dot"></span>Transactions</button>
       <button class="nav-btn" data-view="disputes"><span class="nav-dot"></span>Disputes</button>
+      <button class="nav-btn" data-view="audit"><span class="nav-dot"></span>Audit log</button>
     </div>
 
     <div class="nav-group">
@@ -683,6 +684,21 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       </section>
 
       <!-- ===== DISPUTES ===== -->
+      <section class="view" id="view-audit" data-screen-label="Audit log">
+        <h1>Audit log</h1>
+        <p class="page-sub">Every change to the ledger, append-only and tamper-evident. Each row is hash-chained to the one before it, so a silent edit is detectable.</p>
+        <div class="card" style="margin-bottom:18px">
+          <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+            <button class="btn" id="auditVerifyBtn">Verify chain</button>
+            <span class="hint" id="auditVerifyOut" style="margin:0">Recompute every row's hash from genesis and confirm nothing was altered.</span>
+          </div>
+        </div>
+        <div class="table-card scroll-x" id="auditBody"></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:12px" id="auditMoreRow" hidden>
+          <button class="btn ghost sm" id="auditMore">Load more</button>
+        </div>
+      </section>
+
       <section class="view" id="view-disputes" data-screen-label="Disputes">
         <h1>Disputes</h1>
         <p class="page-sub">Transactions under review. Funds stay reserved until resolution.</p>
@@ -1491,6 +1507,39 @@ function searchTransactions(cursor) {
 }
 
 /* ---------- reporting: disputes ---------- */
+/* ---------- audit log ---------- */
+let auditLoaded = [];
+function renderAudit() {
+  if (!keyReady()) { $("#auditBody").innerHTML = connectCard(); $("#auditMoreRow").hidden = true; return; }
+  const out = $("#auditVerifyOut");
+  out.className = "hint"; out.style.margin = "0";
+  out.textContent = "Recompute every row's hash from genesis and confirm nothing was altered.";
+  loadAudit(null);
+}
+function loadAudit(cursor) {
+  const q = cursor ? "?cursor=" + encodeURIComponent(cursor) : "";
+  const card = $("#auditBody");
+  if (!cursor) card.innerHTML = `<div class="empty"><span class="subtle">Loading&hellip;</span></div>`;
+  return api("GET", "/v1/audit" + q).then(r => {
+    const rows = r.entries || [];
+    if (!cursor) auditLoaded = rows.slice(); else auditLoaded = auditLoaded.concat(rows);
+    if (!auditLoaded.length) {
+      card.innerHTML = `<div class="empty">${emptyArt}<p><strong>No audit events yet.</strong><br>Every posting, conversion, and admin change appears here.</p></div>`;
+      $("#auditMoreRow").hidden = true; return;
+    }
+    card.innerHTML = `<table>
+      <thead><tr><th>When</th><th>Action</th><th>Transaction</th><th>Actor</th></tr></thead>
+      <tbody>${auditLoaded.map(e => `<tr>
+        <td>${esc(new Date(e.created_at).toLocaleString())}</td>
+        <td><span class="badge cyan">${esc(e.action)}</span></td>
+        <td class="mono" title="${esc(e.transaction_id)}">${esc((e.transaction_id || "").slice(0, 8))}</td>
+        <td class="mono" title="${esc(e.actor)}">${esc((e.actor || "").slice(0, 12))}</td>
+      </tr>`).join("")}</tbody></table>`;
+    state.auditCursor = r.next_cursor;
+    $("#auditMoreRow").hidden = !state.auditCursor;
+  }).catch(e => { card.innerHTML = `<div class="empty"><p class="neg">${esc(e.message)}</p></div>`; $("#auditMoreRow").hidden = true; });
+}
+
 let dispLoaded = [];
 function renderDisputes() {
   if (!keyReady()) { $("#disputesBody").innerHTML = connectCard(); $("#dispMoreRow").hidden = true; return; }
@@ -1627,7 +1676,7 @@ const RENDERERS = {
   convert: renderConvert,
   statement: renderStatement, tenants: renderTenants, apikeys: renderKeys,
   webhooks: renderWebhooks, policy: renderPolicy, trialbalance: renderTrialBalance,
-  transactions: renderTransactions, disputes: renderDisputes, settings: renderSettings
+  transactions: renderTransactions, disputes: renderDisputes, audit: renderAudit, settings: renderSettings
 };
 function go(view) {
   state.view = view;
@@ -1892,6 +1941,20 @@ $("#txExport").addEventListener("click", () => {
 /* disputes */
 $("#dispStatus").addEventListener("change", () => loadDisputes(null));
 $("#dispMore").addEventListener("click", () => loadDisputes(state.dispCursor));
+
+/* audit log */
+$("#auditMore").addEventListener("click", () => loadAudit(state.auditCursor));
+$("#auditVerifyBtn").addEventListener("click", () => {
+  const out = $("#auditVerifyOut");
+  out.className = "hint"; out.textContent = "Verifying...";
+  api("GET", "/v1/audit/verify").then(r => {
+    if (r.valid) {
+      out.innerHTML = `<span class="pos">Chain valid.</span> ${r.checked} row(s) checked${r.pending ? ", " + r.pending + " pending (not yet chained)" : ""}.`;
+    } else {
+      out.innerHTML = `<span class="neg">Chain broken at row ${esc((r.first_break_id || "").slice(0, 8))}.</span> ${r.checked} row(s) verified before the break.`;
+    }
+  }).catch(e => { out.innerHTML = `<span class="neg">${esc(e.message)}</span>`; });
+});
 
 /* settings */
 $("#settingsKeyForm").addEventListener("submit", (e) => {

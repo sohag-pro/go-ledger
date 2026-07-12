@@ -529,6 +529,25 @@ func (f *fakeRepo) ListAuditByAccount(_ context.Context, _, accountID string, af
 	return out, nil
 }
 
+// ListAudit returns all of the fake's audit entries newest-first, keyset-paged
+// by id, mirroring the whole-tenant repo.ListAudit.
+func (f *fakeRepo) ListAudit(_ context.Context, _ string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
+	matched := make([]domain.AuditEntry, 0, len(f.audit))
+	matched = append(matched, f.audit...)
+	sort.Slice(matched, func(i, j int) bool { return matched[i].ID > matched[j].ID })
+	out := make([]domain.AuditEntry, 0, limit)
+	for _, e := range matched {
+		if after != nil && e.ID >= after.ID {
+			continue
+		}
+		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 // SetAccountParent mirrors the real repository's ADR-023 semantics closely
 // enough for handler tests: self-parent and a cycle are rejected with
 // domain.ErrInvalidHierarchy (walking up from the proposed parent), an
@@ -2088,6 +2107,29 @@ func TestAuditEndpoints(t *testing.T) {
 	}
 	if page.NextCursor == nil {
 		t.Fatal("expected next_cursor on a full page")
+	}
+
+	// The tenant-wide audit log lists the same event.
+	all := getJSON(t, router, "/v1/audit")
+	if all.Code != http.StatusOK {
+		t.Fatalf("list audit status = %d", all.Code)
+	}
+	if !strings.Contains(all.Body.String(), "transaction.created") {
+		t.Errorf("tenant audit log missing action: %s", all.Body.String())
+	}
+	pagedAll := getJSON(t, router, "/v1/audit?limit=1")
+	var allPage struct {
+		Entries    []AuditEntryBody `json:"entries"`
+		NextCursor *string          `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(pagedAll.Body.Bytes(), &allPage); err != nil {
+		t.Fatalf("decode paged tenant audit: %v", err)
+	}
+	if len(allPage.Entries) != 1 {
+		t.Fatalf("paged tenant audit has %d entries, want 1", len(allPage.Entries))
+	}
+	if allPage.NextCursor == nil {
+		t.Fatal("expected next_cursor on a full tenant-audit page")
 	}
 }
 

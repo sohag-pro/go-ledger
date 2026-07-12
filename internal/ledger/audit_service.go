@@ -113,6 +113,16 @@ func (s *AuditService) ByAccount(ctx context.Context, tenantID, accountID string
 	return decryptAuditEntries(ctx, s.cipher, tenantID, entries)
 }
 
+// List returns up to limit of the tenant's audit rows, newest first,
+// keyset-paged. Decrypts any encrypted fields the same as ByAccount.
+func (s *AuditService) List(ctx context.Context, tenantID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
+	entries, err := s.repo.ListAudit(ctx, tenantID, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return decryptAuditEntries(ctx, s.cipher, tenantID, entries)
+}
+
 // VerifyResult is the outcome of walking a tenant's audit hash chain
 // (ADR-012, "A per-tenant, tamper-evident audit chain"). Checked is how many
 // rows were confirmed to chain correctly before the walk stopped: the full

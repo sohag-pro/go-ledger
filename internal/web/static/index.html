@@ -553,8 +553,8 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       <article class="feat rv">
         <span class="glyph" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 3h12v14H4z"/><path d="M7 7h6M7 10h6M7 13h4"/></svg></span>
         <p class="feat-no">F-04</p>
-        <h3>Immutable audit log</h3>
-        <p>Append-only, written in the same transaction as the posting, and defended by a Postgres trigger. UPDATE and DELETE are simply impossible.</p>
+        <h3>Tamper-evident audit log</h3>
+        <p>Append-only, written in the same transaction as the posting, and hash-chained row to row. UPDATE and DELETE are refused by a Postgres trigger, and a verify call recomputes the whole chain to prove nothing was altered.</p>
       </article>
       <article class="feat rv">
         <span class="glyph" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 4v12M4 8l6-4 6 4M4 12l6 4 6-4"/></svg></span>
@@ -594,15 +594,15 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
         <div class="week shipped"><span class="wk-no">wk 08</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Observability</span> <span class="wk-d">OpenTelemetry traces, logs, metrics</span></span></div>
         <div class="week shipped"><span class="wk-no">wk 09</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Testing</span> <span class="wk-d">unit, property, chaos, load</span></span></div>
         <div class="week shipped"><span class="wk-no">wk 10</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Docker + deploy</span> <span class="wk-d">distroless images, live to production</span></span></div>
-        <div class="week current"><span class="wk-no">wk 11</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Multi-currency + FX<span class="wk-tag">current</span></span> <span class="wk-d">per-currency invariant, env-configured rates</span></span></div>
-        <div class="week planned"><span class="wk-no">wk 12</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Nested accounts + reporting</span> <span class="wk-d">rolled-up balances, trial balance</span></span></div>
-        <div class="week planned"><span class="wk-no">wk 13</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Approvals + event stream</span> <span class="wk-d">threshold gate, outbox events</span></span></div>
+        <div class="week shipped"><span class="wk-no">wk 11</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Multi-currency + FX</span> <span class="wk-d">per-currency invariant, live admin rates, USD-hub conversion</span></span></div>
+        <div class="week shipped"><span class="wk-no">wk 12</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Nested accounts + reporting</span> <span class="wk-d">rolled-up balances, trial balance</span></span></div>
+        <div class="week current"><span class="wk-no">wk 13</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Approvals + event stream<span class="wk-tag">current</span></span> <span class="wk-d">threshold gate, outbox events</span></span></div>
         <div class="week planned"><span class="wk-no">wk 14</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Webhooks + launch</span> <span class="wk-d">signed delivery, retrospective</span></span></div>
       </div>
     </div>
     <div class="road-note rv" role="group" aria-label="Discipline proof points">
-      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> 10 of 14 weeks shipped</span>
-      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> one ADR per significant decision (11 so far)</span>
+      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> 12 of 14 weeks shipped</span>
+      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> one ADR per significant decision (23 so far)</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> go test -race + lint green in CI</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> live deploy on every push to main</span>
     </div>

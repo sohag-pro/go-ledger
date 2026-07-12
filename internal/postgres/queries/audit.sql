@@ -134,3 +134,17 @@ LIMIT 1;
 SELECT DISTINCT ON (tenant_id) tenant_id, chain_seq, row_hash
 FROM audit_log
 ORDER BY tenant_id, chain_seq DESC;
+
+-- name: ListAudit :many
+-- Keyset page of the tenant's entire audit log, newest first, paged by id
+-- alone (see ListAuditByAccount for why id, assigned in chain-insertion order,
+-- drives ordering rather than created_at). after_id is the keyset position:
+-- pass the max uuid for the first page, then the last id of the prior page.
+SELECT audit_log.id, audit_log.tenant_id, audit_log.action, audit_log.transaction_id,
+       audit_log.actor, audit_log.before, audit_log.after, audit_log.created_at,
+       audit_log.prev_hash, audit_log.row_hash
+FROM audit_log
+WHERE audit_log.tenant_id = sqlc.arg(tenant_id)
+  AND audit_log.id < sqlc.arg(after_id)
+ORDER BY audit_log.id DESC
+LIMIT sqlc.arg(page_limit);

@@ -327,6 +327,11 @@ type Querier interface {
 	// by id only for a stable, deterministic iteration order within one fan-out
 	// pass; it carries no meaning beyond that.
 	ListActiveWebhookSubscriptionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListActiveWebhookSubscriptionsByTenantRow, error)
+	// Keyset page of the tenant's entire audit log, newest first, paged by id
+	// alone (see ListAuditByAccount for why id, assigned in chain-insertion order,
+	// drives ordering rather than created_at). after_id is the keyset position:
+	// pass the max uuid for the first page, then the last id of the prior page.
+	ListAudit(ctx context.Context, arg ListAuditParams) ([]ListAuditRow, error)
 	// Keyset page of audit rows for every transaction with a posting touching the
 	// account, newest first. after_id is the keyset position: pass the max uuid
 	// for the first page. Ordered and paged by id alone, not (created_at, id):

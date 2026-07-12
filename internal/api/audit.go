@@ -45,6 +45,20 @@ type AccountAuditOutput struct {
 	}
 }
 
+// AuditLogInput is the tenant-wide audit log request: keyset paging only.
+type AuditLogInput struct {
+	Limit  int    `query:"limit" default:"50" minimum:"1" maximum:"200" doc:"Max entries per page"`
+	Cursor string `query:"cursor" doc:"Opaque cursor from a previous page's next_cursor"`
+}
+
+// AuditLogOutput is one page of the tenant's whole audit log.
+type AuditLogOutput struct {
+	Body struct {
+		Entries    []AuditEntryBody `json:"entries"`
+		NextCursor *string          `json:"next_cursor" doc:"Cursor for the next page, or null if this is the last page"`
+	}
+}
+
 func toAuditBody(e domain.AuditEntry) AuditEntryBody {
 	b := AuditEntryBody{
 		ID:            e.ID,
@@ -158,6 +172,40 @@ func registerAudit(api huma.API, deps Deps) {
 		}
 		// A full page implies there may be more; hand back a cursor at the last
 		// entry. A short page is the end, so next_cursor stays null.
+		if in.Limit > 0 && len(entries) == in.Limit {
+			last := entries[len(entries)-1]
+			c := encodeCursor(last.CreatedAt, last.ID)
+			out.Body.NextCursor = &c
+		}
+		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-audit-log",
+		Method:      http.MethodGet,
+		Path:        "/v1/audit",
+		Summary:     "List the tenant's audit log",
+		Description: "Returns the tenant's append-only, tamper-evident audit log, newest first, keyset-paged. Each row records an action (for example transaction.created), the transaction it concerns, the actor, and the before/after snapshot. Use GET /v1/audit/verify to confirm the whole chain still hashes correctly.",
+		Tags:        []string{"audit"},
+		Security:    bearerSecurity,
+	}, func(ctx context.Context, in *AuditLogInput) (*AuditLogOutput, error) {
+		after, err := decodeCursor(in.Cursor)
+		if err != nil {
+			return nil, huma.Error422UnprocessableEntity(err.Error())
+		}
+		tenant, err := tenantFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := deps.Audit.List(ctx, tenant, after, in.Limit)
+		if err != nil {
+			return nil, toHumaErr(err)
+		}
+		out := &AuditLogOutput{}
+		out.Body.Entries = make([]AuditEntryBody, 0, len(entries))
+		for _, e := range entries {
+			out.Body.Entries = append(out.Body.Entries, toAuditBody(e))
+		}
 		if in.Limit > 0 && len(entries) == in.Limit {
 			last := entries[len(entries)-1]
 			c := encodeCursor(last.CreatedAt, last.ID)

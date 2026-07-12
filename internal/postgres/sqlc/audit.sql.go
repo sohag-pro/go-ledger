@@ -165,6 +165,71 @@ func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) 
 	return err
 }
 
+const listAudit = `-- name: ListAudit :many
+SELECT audit_log.id, audit_log.tenant_id, audit_log.action, audit_log.transaction_id,
+       audit_log.actor, audit_log.before, audit_log.after, audit_log.created_at,
+       audit_log.prev_hash, audit_log.row_hash
+FROM audit_log
+WHERE audit_log.tenant_id = $1
+  AND audit_log.id < $2
+ORDER BY audit_log.id DESC
+LIMIT $3
+`
+
+type ListAuditParams struct {
+	TenantID  uuid.UUID
+	AfterID   uuid.UUID
+	PageLimit int32
+}
+
+type ListAuditRow struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	Action        string
+	TransactionID uuid.UUID
+	Actor         string
+	Before        []byte
+	After         []byte
+	CreatedAt     time.Time
+	PrevHash      pgtype.Text
+	RowHash       pgtype.Text
+}
+
+// Keyset page of the tenant's entire audit log, newest first, paged by id
+// alone (see ListAuditByAccount for why id, assigned in chain-insertion order,
+// drives ordering rather than created_at). after_id is the keyset position:
+// pass the max uuid for the first page, then the last id of the prior page.
+func (q *Queries) ListAudit(ctx context.Context, arg ListAuditParams) ([]ListAuditRow, error) {
+	rows, err := q.db.Query(ctx, listAudit, arg.TenantID, arg.AfterID, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAuditRow
+	for rows.Next() {
+		var i ListAuditRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Action,
+			&i.TransactionID,
+			&i.Actor,
+			&i.Before,
+			&i.After,
+			&i.CreatedAt,
+			&i.PrevHash,
+			&i.RowHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAuditByAccount = `-- name: ListAuditByAccount :many
 SELECT audit_log.id, audit_log.tenant_id, audit_log.action, audit_log.transaction_id,
        audit_log.actor, audit_log.before, audit_log.after, audit_log.created_at,

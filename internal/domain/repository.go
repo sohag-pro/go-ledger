@@ -258,6 +258,10 @@ type Repository interface {
 	// unknown account yields no rows.
 	ListAuditByAccount(ctx context.Context, tenantID, accountID string, after *StatementCursor, limit int) ([]AuditEntry, error)
 
+	// ListAudit returns up to limit of the tenant's audit rows, newest first,
+	// keyset-paged by id (whole-tenant audit log for GET /v1/audit).
+	ListAudit(ctx context.Context, tenantID string, after *StatementCursor, limit int) ([]AuditEntry, error)
+
 	// ListAuditForVerify returns every audit row for the tenant, oldest first
 	// (created_at, id ascending), including PrevHash and RowHash. It is the
 	// full per-tenant walk used to recompute and check the tamper-evident hash

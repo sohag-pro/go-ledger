@@ -1207,6 +1207,50 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 	return out, nil
 }
 
+// ListAudit returns up to limit of the tenant's audit rows, newest first,
+// keyset-paged by id (see ListAuditByAccount for why id drives ordering). The
+// whole-tenant view backing GET /v1/audit.
+func (r *Repository) ListAudit(ctx context.Context, tenantID string, after *domain.StatementCursor, limit int) ([]domain.AuditEntry, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	afterID := uuid.Max
+	if after != nil {
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+	var rows []sqlc.ListAuditRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListAudit(ctx, sqlc.ListAuditParams{
+			TenantID:  tid,
+			AfterID:   afterID,
+			PageLimit: int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list audit: %w", err)
+	}
+	out := make([]domain.AuditEntry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, domain.AuditEntry{
+			ID:            row.ID.String(),
+			Action:        row.Action,
+			TransactionID: row.TransactionID.String(),
+			Actor:         row.Actor,
+			Before:        row.Before,
+			After:         row.After,
+			CreatedAt:     row.CreatedAt,
+			PrevHash:      row.PrevHash.String,
+			RowHash:       row.RowHash.String,
+		})
+	}
+	return out, nil
+}
+
 // ListAuditForVerify returns every audit row for the tenant, oldest first,
 // including PrevHash and RowHash: the full walk used to recompute and check
 // the tamper-evident hash chain end to end.
