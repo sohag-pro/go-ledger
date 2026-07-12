@@ -313,7 +313,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
   <!-- ============ MAIN ============ -->
   <div class="main">
     <div class="demo-banner" id="demoBanner" style="display:none">
-      <strong>Public demo.</strong> Resets every four hours. Try anything, nothing here is permanent. Admin panels are public here and the demo key is rate limited.
+      <strong>Public demo.</strong> Resets every hour. Try anything, nothing here is permanent. Admin panels are public here and the demo key is rate limited.
     </div>
 
     <header class="topbar">
@@ -700,7 +700,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
             <label>Mode</label>
             <div style="display:flex;align-items:center;gap:10px">
               <span class="pill demo" id="setModePill">Demo</span>
-              <span class="subtle" id="setModeNote">Public demo server, resets every four hours.</span>
+              <span class="subtle" id="setModeNote">Public demo server, resets every hour.</span>
             </div>
           </div>
         </div>
@@ -714,9 +714,10 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
             <p><strong>Spread override</strong> is optional. It is a per-pair markup in basis points (100 bps = 1%). Leave it empty and the pair uses the Markup fee default set below. Fill it to charge a different markup on just this one pair.</p>
             <p class="subtle" style="margin-top:2px"><strong>Demo note.</strong> In the public demo, every tenant is prefilled with USD-based rates for EUR, MYR, BDT, and INR plus a 1% markup. Those are a real snapshot captured once, not updated in real time.</p>
           </div>
+          <div class="subtle" style="margin-bottom:4px">A new rate you save applies to:</div>
           <div class="checks" style="margin-bottom:12px">
-            <label><input type="radio" name="fxRateScope" value="global" checked> Global default</label>
-            <label><input type="radio" name="fxRateScope" value="tenant"> Current tenant</label>
+            <label><input type="radio" name="fxRateScope" value="global" checked> Global default (all tenants)</label>
+            <label><input type="radio" name="fxRateScope" value="tenant"> This tenant only</label>
           </div>
           <div class="scroll-x" id="fxRatesTable"></div>
           <form id="fxRateForm" style="margin-top:14px">
@@ -740,9 +741,10 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
             <p><strong>Where it applies.</strong> This default is used by any pair that has no Spread override of its own (see Exchange rates above). The global default applies to every tenant; a Current tenant override applies to just the selected tenant. Leave the field empty and Save to clear a tenant override so it follows the global default again.</p>
           </div>
           <div id="fxMarkupCurrent" class="hint" style="margin-bottom:12px"></div>
+          <div class="subtle" style="margin-bottom:4px">A markup you save applies to:</div>
           <div class="checks" style="margin-bottom:12px">
-            <label><input type="radio" name="fxMarkupScope" value="global" checked> Global default</label>
-            <label><input type="radio" name="fxMarkupScope" value="tenant"> Current tenant</label>
+            <label><input type="radio" name="fxMarkupScope" value="global" checked> Global default (all tenants)</label>
+            <label><input type="radio" name="fxMarkupScope" value="tenant"> This tenant only</label>
           </div>
           <form id="fxMarkupForm">
             <div class="field" style="max-width:220px">
@@ -843,8 +845,10 @@ function renderFXSettings() {
   loadFXMarkup();
 }
 function loadFXRates() {
-  const scope = fxRateScope();
-  const q = scope ? "?tenant_id=" + encodeURIComponent(scope) : "";
+  // Always list the selected tenant's EFFECTIVE rates (its own overrides plus
+  // the global defaults). The scope radio only decides where a new Save goes,
+  // not what the table shows, so a tenant's prefilled rates are always visible.
+  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
   api("GET", "/v1/admin/fx/rates" + q).then(r => {
     const rows = r.rates || [];
     const host = $("#fxRatesTable");
@@ -862,8 +866,9 @@ function loadFXRates() {
 // to 2 decimal places), never fed back into a request body.
 function fmtMarkupBps(bps) { return bps + " bps (" + (bps / 100).toFixed(2) + "%)"; }
 function loadFXMarkup() {
-  const scope = fxMarkupScope();
-  const q = scope ? "?tenant_id=" + encodeURIComponent(scope) : "";
+  // Always show both the global default and the selected tenant's override.
+  // The scope radio only decides where a new Save goes.
+  const q = state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : "";
   api("GET", "/v1/admin/fx/markup" + q).then(r => {
     // r.global/r.tenant present with default_spread_bps: null means a CLEARED
     // row, not "unset": for the global scope that is no markup at all (0);
@@ -1456,7 +1461,7 @@ function renderSettings() {
   sel.innerHTML = state.tenants.map(t => `<option value="${esc(t.id)}" ${t.id === state.adminTenant ? "selected" : ""}>${esc(t.name)} (${esc(t.status)})</option>`).join("")
     || `<option value="">no tenants</option>`;
   const pill = $("#setModePill"), note = $("#setModeNote");
-  if (state.mode === "demo") { pill.className = "pill demo"; pill.textContent = "Demo"; note.textContent = "Public demo server, resets every four hours."; }
+  if (state.mode === "demo") { pill.className = "pill demo"; pill.textContent = "Demo"; note.textContent = "Public demo server, resets every hour."; }
   else { pill.className = "pill prod"; pill.textContent = "Production"; note.textContent = "Live server. Admin actions need an admin key."; }
   renderFXSettings();
 }
@@ -1630,7 +1635,9 @@ $("#tenantFormEl").addEventListener("submit", (e) => {
   api("POST", "/v1/admin/tenants", { name: $("#tenantName").value.trim() }).then(t => {
     toast("Tenant " + t.name + " created", "ok");
     $("#tenantForm").hidden = true; $("#tenantFormEl").reset();
-    renderTenants();
+    // Switch the whole console to the new tenant so its data (including the
+    // demo-prefilled exchange rates) is what you see next.
+    switchAdminTenant(t.id);
   }).catch(err => toast(err.message, "err"));
 });
 

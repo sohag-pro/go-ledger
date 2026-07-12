@@ -99,7 +99,7 @@ func main() {
 // defaultDemoAPIKey is a known, public value (see ADR-012, "A public demo key
 // keeps the console open"): shipping it in the console and playground is fine
 // on purpose, since the key it names is tenant-scoped to the demo tenant,
-// carries a tight rate limit, and that tenant is wiped every four hours.
+// carries a tight rate limit, and that tenant is wiped every hour.
 const defaultDemoAPIKey = "glk_demo_public_key_reset_every_4h" //nolint:gosec // public by design: a tenant-scoped, rate-limited demo key that the console and playground ship, not a real secret (ADR-012)
 
 // demoAPIKeyRateLimitRPM and loadTestAPIKeyRateLimitRPM are the per-key
@@ -188,7 +188,7 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		serviceName:     getenv("OTEL_SERVICE_NAME", "go-ledger"),
 		demoMode:        getenvBool("DEMO_MODE", false),
 		seedEnabled:     getenvBool("SEED_ENABLED", false),
-		seedInterval:    getenvDuration("SEED_INTERVAL", 4*time.Hour),
+		seedInterval:    getenvDuration("SEED_INTERVAL", time.Hour),
 		demoAPIKey:      getenv("DEMO_API_KEY", defaultDemoAPIKey),
 		loadTestKey:     getenv("LOAD_TEST_API_KEY", ""),
 		loadTestTenants: getenvInt("LOAD_TEST_TENANTS", 8),
