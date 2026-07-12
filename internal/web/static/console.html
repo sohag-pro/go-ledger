@@ -1142,8 +1142,12 @@ function fillAccountCurrencies() {
     const keep = sel.value;
     sel.innerHTML = list.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
     if (keep && list.indexOf(keep) !== -1) sel.value = keep;
+    // The currency select is now populated (this is async), so refresh the
+    // same-currency parent options against the real selected currency.
+    fillParentOptions();
   }).catch(() => {
     if (!sel.options.length) sel.innerHTML = fallback.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+    fillParentOptions();
   });
 }
 
