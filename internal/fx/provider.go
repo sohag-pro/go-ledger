@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -17,6 +19,11 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
 )
+
+// fxHubCurrency is the fixed hub used to triangulate a cross-currency pair that
+// has no direct or inverse rate of its own (ADR-022): a conversion between two
+// non-USD currencies is priced through their USD legs.
+const fxHubCurrency = domain.Currency("USD")
 
 // Provider resolves the current mid rate (quote units per one base unit,
 // scaled by domain.RateScale) and the spread (in basis points) to apply on
@@ -84,10 +91,19 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 	// stores and inverts exactly the pairs the ledger needs (ADR-014).
 	inverse, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: pgTenantID, Base: string(quote), Quote: string(base)})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.FXQuote{}, 0, fmt.Errorf("%w: %s/%s", domain.ErrFXRateNotFound, base, quote)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.FXQuote{}, 0, fmt.Errorf("fx: lookup %s/%s: %w", quote, base, err)
 		}
-		return domain.FXQuote{}, 0, fmt.Errorf("fx: lookup %s/%s: %w", quote, base, err)
+		// Neither the direct pair nor its inverse is stored. Try the USD hub
+		// (ADR-022): a cross pair whose two USD legs are both configured.
+		hq, hs, ok, herr := p.hubQuote(ctx, pgTenantID, base, quote)
+		if herr != nil {
+			return domain.FXQuote{}, 0, herr
+		}
+		if ok {
+			return hq, hs, nil
+		}
+		return domain.FXQuote{}, 0, fmt.Errorf("%w: %s/%s", domain.ErrFXRateNotFound, base, quote)
 	}
 	if inverse.MidRateE8 <= 0 {
 		// fx_rates has a CHECK (mid_rate_e8 > 0), so this should be
@@ -113,6 +129,80 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 		// no separate stored row for this direction (see FXQuote's doc comment).
 		RateID: inverse.ID, Source: inverse.Source, EffectiveAt: inverse.EffectiveAt,
 	}, spread, nil
+}
+
+// leg is one directed rate a hub conversion uses: the mid (quote per base,
+// scaled by RateScale), the spread of the row it came from, and that row's
+// provenance.
+type leg struct {
+	midE8       int64
+	spread      pgtype.Int4
+	rateID      int64
+	source      string
+	effectiveAt time.Time
+}
+
+// legMid resolves base to quote for one hop the same way Rate resolves a direct
+// pair: a stored base to quote row, or the inverse of a stored quote to base
+// row. ok is false (with a nil error) when neither exists, so the caller can
+// decline the hub cleanly.
+func (p *dbRateProvider) legMid(ctx context.Context, tid pgtype.UUID, base, quote domain.Currency) (leg, bool, error) {
+	d, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: tid, Base: string(base), Quote: string(quote)})
+	if err == nil {
+		return leg{midE8: d.MidRateE8, spread: d.SpreadBps, rateID: d.ID, source: d.Source, effectiveAt: d.EffectiveAt}, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return leg{}, false, fmt.Errorf("fx: lookup %s/%s: %w", base, quote, err)
+	}
+	inv, err := p.q.CurrentFXRate(ctx, sqlc.CurrentFXRateParams{TenantID: tid, Base: string(quote), Quote: string(base)})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return leg{}, false, nil
+		}
+		return leg{}, false, fmt.Errorf("fx: lookup %s/%s: %w", quote, base, err)
+	}
+	if inv.MidRateE8 <= 0 {
+		return leg{}, false, fmt.Errorf("%w: %s/%s", domain.ErrNonPositiveRate, quote, base)
+	}
+	inverted := (domain.RateScale * domain.RateScale) / inv.MidRateE8
+	return leg{midE8: inverted, spread: inv.SpreadBps, rateID: inv.ID, source: inv.Source, effectiveAt: inv.EffectiveAt}, true, nil
+}
+
+// hubQuote prices base to quote through the USD hub (ADR-022): compose USD per
+// base with quote per USD. The markup is the base-to-USD leg's spread. Returns
+// ok false (nil error) when either leg is missing, or when base or quote is the
+// hub itself (a USD leg would have resolved directly). Provenance is the base
+// leg's row: there is no single stored row for the cross pair.
+func (p *dbRateProvider) hubQuote(ctx context.Context, tid pgtype.UUID, base, quote domain.Currency) (domain.FXQuote, int32, bool, error) {
+	if base == fxHubCurrency || quote == fxHubCurrency {
+		return domain.FXQuote{}, 0, false, nil
+	}
+	fromLeg, ok, err := p.legMid(ctx, tid, base, fxHubCurrency)
+	if err != nil || !ok {
+		return domain.FXQuote{}, 0, false, err
+	}
+	toLeg, ok, err := p.legMid(ctx, tid, fxHubCurrency, quote)
+	if err != nil || !ok {
+		return domain.FXQuote{}, 0, false, err
+	}
+	// cross mid (quote per base) = fromLeg.midE8 * toLeg.midE8 / RateScale, in
+	// big.Int so the intermediate product cannot overflow int64.
+	cross := new(big.Int).Mul(big.NewInt(fromLeg.midE8), big.NewInt(toLeg.midE8))
+	cross.Quo(cross, big.NewInt(domain.RateScale))
+	if cross.Sign() <= 0 {
+		return domain.FXQuote{}, 0, false, fmt.Errorf("%w: %s/%s via %s", domain.ErrNonPositiveRate, base, quote, fxHubCurrency)
+	}
+	if !cross.IsInt64() {
+		return domain.FXQuote{}, 0, false, fmt.Errorf("fx: composed %s/%s rate via %s overflows int64", base, quote, fxHubCurrency)
+	}
+	spread, err := p.resolveSpread(ctx, tid, fromLeg.spread)
+	if err != nil {
+		return domain.FXQuote{}, 0, false, err
+	}
+	return domain.FXQuote{
+		Base: base, Quote: quote, MidRateE8: cross.Int64(),
+		RateID: fromLeg.rateID, Source: fromLeg.source, EffectiveAt: fromLeg.effectiveAt,
+	}, spread, true, nil
 }
 
 // resolveSpread turns a rate row's nullable spread into the concrete spread a
