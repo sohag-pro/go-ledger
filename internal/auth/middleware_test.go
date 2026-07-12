@@ -532,6 +532,156 @@ func TestHumaMiddleware_AdminPathRequiresAdminScope(t *testing.T) {
 	}
 }
 
+// --- Admin act-as-tenant override (ADR-021): a single gated exception to
+// "the tenant comes only from the resolved key". ---
+
+// TestHumaMiddleware_ActAsTenant proves the four rules ADR-021 requires: an
+// admin-scoped key acting as another tenant sees that tenant; an admin key
+// sending no header stays on its own tenant; a non-admin key sending the
+// header has it silently ignored (fail-safe to less access, never more, and
+// the request still succeeds rather than being rejected for merely sending
+// the header); and a malformed header from an admin key is a loud 400
+// instead of silently resolving to an empty tenant.
+func TestHumaMiddleware_ActAsTenant(t *testing.T) {
+	t.Parallel()
+
+	const (
+		adminPlaintext    = "glk_act-as-admin-key"
+		readOnlyPlaintext = "glk_act-as-read-only-key"
+		ownTenant         = "tenant-act-as-own"
+		otherTenant       = "22222222-2222-4222-8222-222222222222"
+	)
+	adminKey := domain.APIKey{ID: "key-act-as-admin", TenantID: ownTenant, Name: "admin", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeAdmin}}
+	readOnlyKey := domain.APIKey{ID: "key-act-as-read", TenantID: ownTenant, Name: "read-only", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeRead}}
+	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{
+		domain.HashAPIKey(adminPlaintext):    adminKey,
+		domain.HashAPIKey(readOnlyPlaintext): readOnlyKey,
+	}), time.Minute)
+
+	tests := []struct {
+		name       string
+		plaintext  string
+		header     string
+		wantStatus int
+		wantTenant string
+	}{
+		{
+			name:       "admin key with valid act-as header sees the other tenant",
+			plaintext:  adminPlaintext,
+			header:     otherTenant,
+			wantStatus: http.StatusOK,
+			wantTenant: otherTenant,
+		},
+		{
+			name:       "admin key with no header stays on its own tenant",
+			plaintext:  adminPlaintext,
+			header:     "",
+			wantStatus: http.StatusOK,
+			wantTenant: ownTenant,
+		},
+		{
+			name:       "non-admin key with act-as header is ignored, own tenant, request still succeeds",
+			plaintext:  readOnlyPlaintext,
+			header:     otherTenant,
+			wantStatus: http.StatusOK,
+			wantTenant: ownTenant,
+		},
+		{
+			name:       "admin key with malformed header is a loud 400",
+			plaintext:  adminPlaintext,
+			header:     "not-a-uuid",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// A non-canonical but valid uuid form (braces) must normalize to
+			// the canonical tenant the RLS policy compares against, not pass
+			// through raw and silently resolve to an empty tenant.
+			name:       "admin key with a braced uuid header normalizes to the canonical tenant",
+			plaintext:  adminPlaintext,
+			header:     "{" + otherTenant + "}",
+			wantStatus: http.StatusOK,
+			wantTenant: otherTenant,
+		},
+		{
+			// Fail-safe guard: a non-admin key never reaches the uuid parse
+			// (the scope check short-circuits first), so a malformed header
+			// from it is ignored, not a 400 that would leak the header's
+			// existence. If a future refactor validates the uuid before the
+			// scope check, this case flips to 400 and catches it.
+			name:       "non-admin key with malformed header is still ignored, not a 400",
+			plaintext:  readOnlyPlaintext,
+			header:     "not-a-uuid",
+			wantStatus: http.StatusOK,
+			wantTenant: ownTenant,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mux, _ := newTestAPI(t, resolver)
+			req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+			req.Header.Set(authHeader, "Bearer "+tt.plaintext)
+			if tt.header != "" {
+				req.Header.Set(actAsTenantHeader, tt.header)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+			var out struct {
+				Tenant string `json:"tenant"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if out.Tenant != tt.wantTenant {
+				t.Errorf("tenant seen by handler = %q, want %q", out.Tenant, tt.wantTenant)
+			}
+		})
+	}
+}
+
+// TestHumaMiddleware_ActAsTenant_LogsEffectiveTenant proves SetRequestLogInfo
+// records the EFFECTIVE (acted-as) tenant, not always the key's own tenant,
+// so the access log shows who acted on which tenant (ADR-021's audit point).
+func TestHumaMiddleware_ActAsTenant_LogsEffectiveTenant(t *testing.T) {
+	t.Parallel()
+
+	const (
+		plaintext   = "glk_act-as-log-admin-key"
+		ownTenant   = "tenant-act-as-log-own"
+		otherTenant = "33333333-3333-4333-8333-333333333333"
+	)
+	key := domain.APIKey{ID: "key-act-as-log", TenantID: ownTenant, Name: "admin", TenantStatus: domain.TenantActive, Scopes: []domain.Scope{domain.ScopeAdmin}}
+	resolver := NewResolver(newFakeLookup(map[string]domain.APIKey{domain.HashAPIKey(plaintext): key}), time.Minute)
+	mux, _ := newTestAPI(t, resolver)
+
+	info := &RequestLogInfo{}
+	req := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+	req = req.WithContext(WithRequestLogInfo(req.Context(), info))
+	req.Header.Set(authHeader, "Bearer "+plaintext)
+	req.Header.Set(actAsTenantHeader, otherTenant)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if info.TenantID != otherTenant {
+		t.Errorf("RequestLogInfo.TenantID = %q, want the effective (acted-as) tenant %q", info.TenantID, otherTenant)
+	}
+	if info.KeyID != key.ID {
+		t.Errorf("RequestLogInfo.KeyID = %q, want %q", info.KeyID, key.ID)
+	}
+}
+
 // --- Negative-lookup throttle wiring (Task 5.2, audit A2.5/A6.4): a flood of
 // bad keys from one IP must stop reaching the resolver/lookup once it is over
 // its failure budget, closing the vector where auth.Resolver's deliberate
