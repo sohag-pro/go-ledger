@@ -165,12 +165,19 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, err
 	}
 
+	// The applied rate (spread-adjusted, destination units per source unit,
+	// scaled by RateScale) rendered as a plain decimal, plus the currency
+	// pair, so every leg's description records what conversion produced it:
+	// "convert USD to EUR at 0.91540000".
+	rate := fmt.Sprintf("%d.%08d", appliedE8/domain.RateScale, appliedE8%domain.RateScale)
+	pair := fmt.Sprintf("%s to %s at %s", from.Currency, to.Currency, rate)
+
 	t := &domain.Transaction{
 		Postings: []domain.Posting{
-			{AccountID: from.ID, Amount: negSource, Description: "convert: debit source account"},
-			{AccountID: clearingFrom.ID, Amount: source, Description: "convert: source currency clearing"},
-			{AccountID: clearingTo.ID, Amount: negConverted, Description: "convert: destination currency clearing"},
-			{AccountID: to.ID, Amount: converted, Description: "convert: credit destination account"},
+			{AccountID: from.ID, Amount: negSource, Description: fmt.Sprintf("convert %s: debit %s source account", pair, from.Currency)},
+			{AccountID: clearingFrom.ID, Amount: source, Description: fmt.Sprintf("convert %s: %s source clearing", pair, from.Currency)},
+			{AccountID: clearingTo.ID, Amount: negConverted, Description: fmt.Sprintf("convert %s: %s destination clearing", pair, to.Currency)},
+			{AccountID: to.ID, Amount: converted, Description: fmt.Sprintf("convert %s: credit %s destination account", pair, to.Currency)},
 		},
 		FX: &domain.FXDetail{
 			SourceAmount:    req.SourceAmount,
