@@ -284,6 +284,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       <div class="nav-label">Ledger</div>
       <button class="nav-btn" data-view="accounts"><span class="nav-dot"></span>Accounts</button>
       <button class="nav-btn" data-view="post"><span class="nav-dot"></span>Post a transaction</button>
+      <button class="nav-btn" data-view="convert"><span class="nav-dot"></span>Convert currency</button>
       <button class="nav-btn" data-view="statement"><span class="nav-dot"></span>Statement</button>
     </div>
 
@@ -422,7 +423,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       <!-- ===== POST ===== -->
       <section class="view" id="view-post" data-screen-label="Post a transaction">
         <h1>Post a transaction</h1>
-        <p class="page-sub">Move money as a set of postings. Positive amounts debit an account, negative amounts credit it. The set must sum to zero.</p>
+        <p class="page-sub">Move money as a set of postings. Positive amounts debit an account, negative amounts credit it. The set must sum to zero, so every posting here is in one currency. To move between currencies, use <a href="#" data-goto="convert">Convert currency</a>.</p>
         <div class="card" style="max-width:760px" id="postCard">
           <form id="postForm">
             <div class="field" style="max-width:320px">
@@ -460,6 +461,35 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       </section>
 
       <!-- ===== STATEMENT ===== -->
+      <!-- ===== CONVERT ===== -->
+      <section class="view" id="view-convert" data-screen-label="Convert currency">
+        <h1>Convert currency</h1>
+        <p class="page-sub">Move money between two accounts in different currencies. The server applies the exchange rate and markup and posts the balanced legs for you.</p>
+        <div class="card" style="max-width:640px" id="convertCard">
+          <div class="help">
+            <p><strong>How it works.</strong> Pick the account to take money from and the account to move it into. They must be in different currencies, and a rate for that pair must exist (set them in Settings). Enter the amount in the from account's currency, and the amount the other account receives is calculated for you.</p>
+            <p><strong>Plain transactions stay single-currency.</strong> Post a transaction requires every posting in one currency (they must sum to zero). Crossing currencies is this page, because it needs a rate.</p>
+          </div>
+          <form id="convertForm">
+            <div class="form-row">
+              <div class="field"><label for="cvFrom">From account (debit)</label><select id="cvFrom"></select></div>
+              <div class="field"><label for="cvTo">To account (credit)</label><select id="cvTo"></select></div>
+            </div>
+            <div class="field" style="max-width:260px">
+              <label for="cvAmount">Amount <span class="subtle" id="cvFromCur"></span></label>
+              <input id="cvAmount" placeholder="100.00">
+            </div>
+            <div class="balance-bar" id="cvPreview" role="status" aria-live="polite">
+              <span>Recipient gets:</span>
+              <span class="bal" id="cvConverted">-</span>
+              <span class="note" id="cvNote">Pick two accounts and an amount</span>
+            </div>
+            <button class="btn primary lg" type="submit" id="cvSubmit" disabled>Convert</button>
+          </form>
+          <div class="hint" id="cvOut" style="margin-top:12px"></div>
+        </div>
+      </section>
+
       <section class="view" id="view-statement" data-screen-label="Statement">
         <h1>Statement</h1>
         <p class="page-sub">A running-balance view of a single account.</p>
@@ -1489,9 +1519,69 @@ function renderSettings() {
   renderFXSettings();
 }
 
+/* ---------- convert currency ---------- */
+// fxQuoteFor finds a mid rate (e8) and effective spread for converting fromCur
+// into toCur from the tenant's loaded rates: a direct pair (base=from,
+// quote=to), or the inverse of a stored (to,from) pair. Returns null when no
+// rate covers the pair, matching the server (it derives only the inverse, not
+// cross pairs). Client-side estimate only; the server does the authoritative math.
+function fxQuoteFor(fromCur, toCur) {
+  const rates = state.fxRates || [];
+  const direct = rates.find(r => r.base === fromCur && r.quote === toCur);
+  if (direct) return { midE8: direct.mid_rate_e8, spread: direct.effective_spread_bps };
+  const inv = rates.find(r => r.base === toCur && r.quote === fromCur);
+  if (inv && inv.mid_rate_e8 > 0) {
+    // 1e8 * 1e8 / mid, as BigInt so large rates stay exact.
+    const invE8 = Number((100000000n * 100000000n) / BigInt(inv.mid_rate_e8));
+    return { midE8: invE8, spread: inv.effective_spread_bps };
+  }
+  return null;
+}
+function cvAccount(id) { return (state.accounts || []).find(a => a.id === id); }
+function renderConvert() {
+  const card = $("#convertCard");
+  if (!keyReady()) { card.innerHTML = connectCard(); return; }
+  Promise.all([
+    state.accounts.length ? Promise.resolve() : refreshAccounts(),
+    api("GET", "/v1/admin/fx/rates" + (state.adminTenant ? "?tenant_id=" + encodeURIComponent(state.adminTenant) : ""))
+      .then(r => { state.fxRates = r.rates || []; }).catch(() => { state.fxRates = state.fxRates || []; })
+  ]).then(() => {
+    const opts = state.accounts.map(a => `<option value="${esc(a.id)}">${esc(a.name)} (${esc(a.currency)})</option>`).join("");
+    const from = $("#cvFrom"), to = $("#cvTo");
+    const kf = from.value, kt = to.value;
+    from.innerHTML = opts; to.innerHTML = opts;
+    if (kf) from.value = kf;
+    if (kt) to.value = kt; else if (state.accounts.length > 1) to.selectedIndex = 1;
+    updateConvertPreview();
+  });
+}
+function updateConvertPreview() {
+  const fromA = cvAccount($("#cvFrom").value), toA = cvAccount($("#cvTo").value);
+  const bar = $("#cvPreview"), note = $("#cvNote"), out = $("#cvConverted"), submit = $("#cvSubmit");
+  $("#cvFromCur").textContent = fromA ? "(" + fromA.currency + ")" : "";
+  const src = toMinor($("#cvAmount").value);
+  const setBad = (msg) => { bar.className = "balance-bar bad"; out.textContent = "-"; note.textContent = msg; submit.disabled = true; };
+  if (!fromA || !toA) { return setBad("Pick two accounts"); }
+  if (fromA.id === toA.id || fromA.currency === toA.currency) { return setBad("From and To must be different currencies"); }
+  const q = fxQuoteFor(fromA.currency, toA.currency);
+  if (!q) { return setBad("No exchange rate for " + fromA.currency + " to " + toA.currency + ". Add one in Settings."); }
+  if (src == null) { bar.className = "balance-bar"; out.textContent = "-"; note.textContent = "Enter an amount in " + fromA.currency; submit.disabled = true; return; }
+  if (isNaN(src) || src <= 0) { return setBad("Enter a positive amount"); }
+  // converted_minor = round( src * midE8 * (10000 - spread) / (1e8 * 10000) ),
+  // BigInt so the product cannot overflow; half-up (a preview estimate).
+  const num = BigInt(src) * BigInt(q.midE8) * BigInt(10000 - q.spread);
+  const den = 100000000n * 10000n;
+  const conv = Number((num + den / 2n) / den);
+  bar.className = "balance-bar ok";
+  out.textContent = money(conv) + " " + toA.currency;
+  note.textContent = "estimated at " + fromRateE8(q.midE8) + " minus " + fmtMarkupBps(q.spread) + " markup";
+  submit.disabled = conv <= 0;
+}
+
 /* ---------- router ---------- */
 const RENDERERS = {
   overview: renderOverview, accounts: renderAccounts, post: renderPost,
+  convert: renderConvert,
   statement: renderStatement, tenants: renderTenants, apikeys: renderKeys,
   webhooks: renderWebhooks, policy: renderPolicy, trialbalance: renderTrialBalance,
   transactions: renderTransactions, disputes: renderDisputes, settings: renderSettings
@@ -1645,6 +1735,28 @@ $("#postForm").addEventListener("submit", (e) => {
     $("#txRef").value = "";
     renderPostingRows();
   }).catch(err => { toast(err.message, "err"); $("#postOut").innerHTML = `<span class="neg">${esc(err.message)}</span>`; });
+});
+
+/* convert currency */
+$("#cvFrom").addEventListener("change", updateConvertPreview);
+$("#cvTo").addEventListener("change", updateConvertPreview);
+$("#cvAmount").addEventListener("input", updateConvertPreview);
+$("#convertForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const fromA = cvAccount($("#cvFrom").value), toA = cvAccount($("#cvTo").value);
+  if (!fromA || !toA) { toast("Pick two accounts.", "err"); return; }
+  if (fromA.id === toA.id || fromA.currency === toA.currency) { toast("From and To must be different currencies.", "err"); return; }
+  const src = toMinor($("#cvAmount").value);
+  if (src == null || isNaN(src) || src <= 0) { toast("Enter a positive amount.", "err"); return; }
+  api("POST", "/v1/transactions/convert", { from_account: fromA.id, to_account: toA.id, source_amount: src }).then(res => {
+    const f = res.fx || {};
+    const line = money(f.source_amount) + " " + fromA.currency + " to " + money(f.converted_amount) + " " + toA.currency;
+    toast("Converted " + line, "ok");
+    $("#cvOut").textContent = "Posted: " + line + " at rate " + fromRateE8(f.applied_e8) + ".";
+    $("#cvAmount").value = "";
+    refreshBalances();
+    updateConvertPreview();
+  }).catch(err => { toast(err.message, "err"); $("#cvOut").innerHTML = `<span class="neg">${esc(err.message)}</span>`; });
 });
 
 /* statement */
