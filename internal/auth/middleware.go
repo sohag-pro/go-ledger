@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/uuid"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 )
@@ -15,6 +16,12 @@ import (
 // authHeader is the header a bearer token is read from. Handlers and this
 // middleware never log its value, only the outcome of resolving it.
 const authHeader = "Authorization"
+
+// actAsTenantHeader lets an admin-scoped key operate against a tenant other
+// than its own (ADR-021). HumaMiddleware is the only place this header is
+// read: it is the single gated exception to "the tenant comes only from the
+// resolved key", so the security-relevant decision stays in one place.
+const actAsTenantHeader = "X-Act-As-Tenant"
 
 // v1PathPrefix is the only path prefix that requires a bearer API key. Health,
 // the OpenAPI/schema documents, the playground, the console, and static assets
@@ -116,15 +123,35 @@ func HumaMiddleware(api huma.API, resolver *Resolver, throttle *NegativeThrottle
 			return
 		}
 
+		// Admin act-as-tenant override (ADR-021): the effective tenant is the
+		// X-Act-As-Tenant header ONLY when the resolved key carries
+		// ScopeAdmin; otherwise (no header, or a non-admin key sending one
+		// anyway) it stays the key's own tenant. A non-admin key sending the
+		// header is silently ignored rather than rejected: failing loud here
+		// would leak that the header exists and behave inconsistently for a
+		// caller that can never use it, and the fail-safe direction is always
+		// toward LESS access, never more. A malformed value from an admin key
+		// IS rejected: a typo must not silently resolve to an empty tenant.
+		tenant := key.TenantID
+		if actAs := ctx.Header(actAsTenantHeader); actAs != "" && key.HasScope(domain.ScopeAdmin) {
+			if _, perr := uuid.Parse(actAs); perr != nil {
+				_ = huma.WriteErr(api, ctx, http.StatusBadRequest, "X-Act-As-Tenant must be a tenant uuid")
+				return
+			}
+			tenant = actAs
+		}
+
 		// Best-effort: writes back to the RequestLogInfo box cmd/server's
 		// access-log middleware installed before this request ever reached
 		// huma, if one is present (see SetRequestLogInfo's doc comment). A
 		// caller that bypasses that middleware, for example a test invoking
 		// HumaMiddleware directly, simply has no box installed and this is a
-		// silent no-op, never a nil dereference or an error.
-		SetRequestLogInfo(ctx.Context(), key.ID, key.TenantID)
+		// silent no-op, never a nil dereference or an error. tenant here is
+		// the EFFECTIVE tenant (the acted-as one, if any), so the access log
+		// shows who acted on which tenant.
+		SetRequestLogInfo(ctx.Context(), key.ID, tenant)
 
-		newCtx := WithKey(WithTenant(ctx.Context(), key.TenantID), key)
+		newCtx := WithKey(WithTenant(ctx.Context(), tenant), key)
 		next(huma.WithContext(ctx, newCtx))
 	}
 }

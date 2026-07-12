@@ -299,6 +299,97 @@ func TestV1CrossTenantIsolation_Postgres(t *testing.T) {
 	}
 }
 
+// TestV1ActAsTenant_Postgres proves ADR-021's admin act-as-tenant override
+// end to end against real Postgres, so it exercises actual row-level
+// security, not a test double: an admin key for tenant A, sending
+// X-Act-As-Tenant for tenant B, sees tenant B's account and not tenant A's;
+// the same key with no header sees only its own tenant A, exactly as before.
+func TestV1ActAsTenant_Postgres(t *testing.T) {
+	if authPoolErr != nil {
+		t.Skipf("skipping integration test: %v", authPoolErr)
+	}
+
+	repo := postgres.NewRepository(sharedAuthPool)
+	ctx := context.Background()
+
+	tenantA := newUUID(t)
+	tenantB := newUUID(t)
+	const adminPlaintextA = "glk_act-as-test-admin-key-a"
+
+	if err := repo.CreateTenant(ctx, tenantA, "act-as tenant A"); err != nil {
+		t.Fatalf("create tenant A: %v", err)
+	}
+	if err := repo.CreateTenant(ctx, tenantB, "act-as tenant B"); err != nil {
+		t.Fatalf("create tenant B: %v", err)
+	}
+	if err := repo.InsertAPIKey(ctx,
+		domain.APIKey{TenantID: tenantA, Name: "tenant A admin", Scopes: []domain.Scope{domain.ScopeAdmin}},
+		domain.HashAPIKey(adminPlaintextA),
+	); err != nil {
+		t.Fatalf("insert tenant A admin key: %v", err)
+	}
+
+	acctA := &domain.Account{Name: "Tenant A Cash", Type: domain.Asset, Currency: "USD"}
+	if err := repo.CreateAccount(ctx, tenantA, acctA); err != nil {
+		t.Fatalf("create tenant A account: %v", err)
+	}
+	acctB := &domain.Account{Name: "Tenant B Cash", Type: domain.Asset, Currency: "USD"}
+	if err := repo.CreateAccount(ctx, tenantB, acctB); err != nil {
+		t.Fatalf("create tenant B account: %v", err)
+	}
+
+	r := chi.NewRouter()
+	New(r, Deps{
+		Accounts:     ledger.NewAccountService(repo),
+		Transactions: ledger.NewTransactionService(repo, slog.New(slog.NewTextHandler(io.Discard, nil)), nil),
+		Audit:        ledger.NewAuditService(repo),
+		Auth:         auth.NewResolver(repo, time.Minute),
+	})
+
+	// Without the header, tenant A's admin key sees only tenant A's account.
+	ownReq := httptest.NewRequest(http.MethodGet, "/v1/accounts", nil)
+	ownReq.Header.Set("Authorization", "Bearer "+adminPlaintextA)
+	ownRec := httptest.NewRecorder()
+	r.ServeHTTP(ownRec, ownReq)
+	if ownRec.Code != http.StatusOK {
+		t.Fatalf("own-tenant list status = %d, want 200 (%s)", ownRec.Code, ownRec.Body.String())
+	}
+	var outOwn struct {
+		Accounts []AccountBody `json:"accounts"`
+	}
+	if err := json.Unmarshal(ownRec.Body.Bytes(), &outOwn); err != nil {
+		t.Fatalf("decode own-tenant list: %v", err)
+	}
+	if len(outOwn.Accounts) != 1 || outOwn.Accounts[0].ID != acctA.ID {
+		t.Fatalf("own-tenant accounts = %+v, want exactly tenant A's account %+v", outOwn.Accounts, acctA)
+	}
+
+	// With X-Act-As-Tenant: tenantB, the SAME admin key sees tenant B's
+	// account, and NOT tenant A's: this is the RLS-backed proof, not a mock.
+	actAsReq := httptest.NewRequest(http.MethodGet, "/v1/accounts", nil)
+	actAsReq.Header.Set("Authorization", "Bearer "+adminPlaintextA)
+	actAsReq.Header.Set("X-Act-As-Tenant", tenantB)
+	actAsRec := httptest.NewRecorder()
+	r.ServeHTTP(actAsRec, actAsReq)
+	if actAsRec.Code != http.StatusOK {
+		t.Fatalf("act-as list status = %d, want 200 (%s)", actAsRec.Code, actAsRec.Body.String())
+	}
+	var outActAs struct {
+		Accounts []AccountBody `json:"accounts"`
+	}
+	if err := json.Unmarshal(actAsRec.Body.Bytes(), &outActAs); err != nil {
+		t.Fatalf("decode act-as list: %v", err)
+	}
+	if len(outActAs.Accounts) != 1 || outActAs.Accounts[0].ID != acctB.ID {
+		t.Fatalf("act-as accounts = %+v, want exactly tenant B's account %+v", outActAs.Accounts, acctB)
+	}
+	for _, acc := range outActAs.Accounts {
+		if acc.ID == acctA.ID {
+			t.Errorf("act-as list leaked tenant A's account: %+v", acc)
+		}
+	}
+}
+
 // TestConvertCrossTenantIsolation_Postgres checks that POST
 // /v1/transactions/convert rejects a to_account belonging to a different
 // tenant with 404, exactly like any other account lookup (ADR-012's tenant
