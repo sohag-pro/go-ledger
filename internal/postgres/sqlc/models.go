@@ -23,6 +23,7 @@ type Account struct {
 	MinBalance     pgtype.Int8
 	PartyReference pgtype.Text
 	PartyType      pgtype.Text
+	ParentID       pgtype.UUID
 }
 
 type ApiKey struct {

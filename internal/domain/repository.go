@@ -50,6 +50,21 @@ type TransactionFilter struct {
 	Reference     *string
 }
 
+// AccountBalanceRow is an account plus its own derived balance (no rollup).
+type AccountBalanceRow struct {
+	Account Account
+	Balance int64
+}
+
+// AccountNode is one row of the account tree: the account, its own balance, the
+// balance rolled up over its whole subtree, and its depth from a root.
+type AccountNode struct {
+	Account         Account
+	OwnBalance      int64
+	RolledUpBalance int64
+	Depth           int
+}
+
 // TransactionListItem is one row of a keyset-paged transaction list (Task
 // 4.4, audit A7.2): the transaction itself plus CreatedAt, the row's actual
 // insert time. CreatedAt is not a Transaction field (EffectiveAt is a
@@ -173,6 +188,16 @@ type Repository interface {
 	// Accounts are a small bounded set, so this is a simple capped list rather
 	// than a paginated cursor.
 	ListAccounts(ctx context.Context, tenantID string, limit int) ([]Account, error)
+
+	// SetAccountParent sets, changes, or clears (parentID nil) an account's
+	// parent. Returns the number of rows updated (0 if no such account).
+	// Cycle, currency, and same-tenant are enforced in Postgres (ADR-023).
+	SetAccountParent(ctx context.Context, tenantID, accountID string, parentID *string) (int64, error)
+	// RolledUpBalance returns the balance of accountID and all its descendants.
+	RolledUpBalance(ctx context.Context, tenantID, accountID string) (Money, error)
+	// AllAccountBalances returns every account for the tenant with its own
+	// derived balance, for building the account tree.
+	AllAccountBalances(ctx context.Context, tenantID string) ([]AccountBalanceRow, error)
 
 	// CreateTransaction validates t (the double-entry invariant) and persists the
 	// transaction together with all its postings in a single atomic database

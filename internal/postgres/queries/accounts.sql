@@ -6,16 +6,16 @@
 -- status is NOT inserted explicitly: the column default ('active', migration
 -- 0022) applies, the same way CreateTenant leaves status to the column
 -- default.
-INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance, party_reference, party_type)
-VALUES ($1, $2, $3, $4, $5, sqlc.narg(min_balance), sqlc.narg(party_reference), sqlc.narg(party_type));
+INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance, party_reference, party_type, parent_id)
+VALUES ($1, $2, $3, $4, $5, sqlc.narg(min_balance), sqlc.narg(party_reference), sqlc.narg(party_type), sqlc.narg(parent_id));
 
 -- name: GetAccount :one
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type, parent_id
 FROM accounts
 WHERE tenant_id = $1 AND id = $2;
 
 -- name: ListAccounts :many
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type, parent_id
 FROM accounts
 WHERE tenant_id = $1
 ORDER BY name, id
@@ -98,3 +98,38 @@ VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (tenant_id, name) WHERE is_system
     DO UPDATE SET id = accounts.id
 RETURNING id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type;
+
+-- name: SetAccountParent :execrows
+-- Re-parent (or clear, when parent_id is NULL) one account. Cycle, currency,
+-- and same-tenant are enforced by accounts_hierarchy_guard / the composite FK.
+UPDATE accounts SET parent_id = sqlc.narg(parent_id)
+WHERE tenant_id = $1 AND id = $2;
+
+-- name: RolledUpBalance :one
+-- The balance of an account and everything under it: gather the subtree via
+-- parent_id, then sum those accounts' postings. Same-currency subtree, so this
+-- is one number.
+WITH RECURSIVE subtree AS (
+  SELECT a.id FROM accounts a WHERE a.tenant_id = $1 AND a.id = $2
+  UNION ALL
+  SELECT a.id FROM accounts a
+    JOIN subtree s ON a.parent_id = s.id AND a.tenant_id = $1
+)
+SELECT COALESCE(SUM(p.amount), 0)::bigint AS balance
+FROM postings p
+WHERE p.tenant_id = $1 AND p.account_id IN (SELECT id FROM subtree);
+
+-- name: AllAccountBalances :many
+-- Every account for a tenant with its own derived balance (LEFT JOIN so an
+-- account with no postings returns 0) and its parent_id, so the caller can
+-- build the tree and roll up in memory in one pass. Ordered by name, id for a
+-- stable base order the Go rollup then re-threads parent-before-child.
+SELECT a.id, a.tenant_id, a.name, a.type, a.currency, a.status, a.min_balance,
+       a.is_system, a.created_at, a.party_reference, a.party_type, a.parent_id,
+       COALESCE(SUM(p.amount), 0)::bigint AS balance
+FROM accounts a
+LEFT JOIN postings p ON p.tenant_id = a.tenant_id AND p.account_id = a.id
+WHERE a.tenant_id = $1
+GROUP BY a.id, a.tenant_id, a.name, a.type, a.currency, a.status, a.min_balance,
+         a.is_system, a.created_at, a.party_reference, a.party_type, a.parent_id
+ORDER BY a.name, a.id;

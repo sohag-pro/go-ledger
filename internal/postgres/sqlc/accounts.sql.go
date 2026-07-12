@@ -122,9 +122,75 @@ func (q *Queries) AccountStatusFlags(ctx context.Context, arg AccountStatusFlags
 	return items, nil
 }
 
+const allAccountBalances = `-- name: AllAccountBalances :many
+SELECT a.id, a.tenant_id, a.name, a.type, a.currency, a.status, a.min_balance,
+       a.is_system, a.created_at, a.party_reference, a.party_type, a.parent_id,
+       COALESCE(SUM(p.amount), 0)::bigint AS balance
+FROM accounts a
+LEFT JOIN postings p ON p.tenant_id = a.tenant_id AND p.account_id = a.id
+WHERE a.tenant_id = $1
+GROUP BY a.id, a.tenant_id, a.name, a.type, a.currency, a.status, a.min_balance,
+         a.is_system, a.created_at, a.party_reference, a.party_type, a.parent_id
+ORDER BY a.name, a.id
+`
+
+type AllAccountBalancesRow struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Name           string
+	Type           string
+	Currency       string
+	Status         string
+	MinBalance     pgtype.Int8
+	IsSystem       bool
+	CreatedAt      time.Time
+	PartyReference pgtype.Text
+	PartyType      pgtype.Text
+	ParentID       pgtype.UUID
+	Balance        int64
+}
+
+// Every account for a tenant with its own derived balance (LEFT JOIN so an
+// account with no postings returns 0) and its parent_id, so the caller can
+// build the tree and roll up in memory in one pass. Ordered by name, id for a
+// stable base order the Go rollup then re-threads parent-before-child.
+func (q *Queries) AllAccountBalances(ctx context.Context, tenantID uuid.UUID) ([]AllAccountBalancesRow, error) {
+	rows, err := q.db.Query(ctx, allAccountBalances, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AllAccountBalancesRow
+	for rows.Next() {
+		var i AllAccountBalancesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Name,
+			&i.Type,
+			&i.Currency,
+			&i.Status,
+			&i.MinBalance,
+			&i.IsSystem,
+			&i.CreatedAt,
+			&i.PartyReference,
+			&i.PartyType,
+			&i.ParentID,
+			&i.Balance,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createAccount = `-- name: CreateAccount :exec
-INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance, party_reference, party_type)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO accounts (id, tenant_id, name, type, currency, min_balance, party_reference, party_type, parent_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 `
 
 type CreateAccountParams struct {
@@ -136,6 +202,7 @@ type CreateAccountParams struct {
 	MinBalance     pgtype.Int8
 	PartyReference pgtype.Text
 	PartyType      pgtype.Text
+	ParentID       pgtype.UUID
 }
 
 // min_balance (Task 5.5, audit A1.5), party_reference, and party_type (Task
@@ -155,12 +222,13 @@ func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) er
 		arg.MinBalance,
 		arg.PartyReference,
 		arg.PartyType,
+		arg.ParentID,
 	)
 	return err
 }
 
 const getAccount = `-- name: GetAccount :one
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type, parent_id
 FROM accounts
 WHERE tenant_id = $1 AND id = $2
 `
@@ -182,6 +250,7 @@ type GetAccountRow struct {
 	CreatedAt      time.Time
 	PartyReference pgtype.Text
 	PartyType      pgtype.Text
+	ParentID       pgtype.UUID
 }
 
 func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (GetAccountRow, error) {
@@ -199,6 +268,7 @@ func (q *Queries) GetAccount(ctx context.Context, arg GetAccountParams) (GetAcco
 		&i.CreatedAt,
 		&i.PartyReference,
 		&i.PartyType,
+		&i.ParentID,
 	)
 	return i, err
 }
@@ -283,7 +353,7 @@ func (q *Queries) GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreat
 }
 
 const listAccounts = `-- name: ListAccounts :many
-SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type
+SELECT id, tenant_id, name, type, currency, status, min_balance, is_system, created_at, party_reference, party_type, parent_id
 FROM accounts
 WHERE tenant_id = $1
 ORDER BY name, id
@@ -307,6 +377,7 @@ type ListAccountsRow struct {
 	CreatedAt      time.Time
 	PartyReference pgtype.Text
 	PartyType      pgtype.Text
+	ParentID       pgtype.UUID
 }
 
 func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]ListAccountsRow, error) {
@@ -330,6 +401,7 @@ func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]L
 			&i.CreatedAt,
 			&i.PartyReference,
 			&i.PartyType,
+			&i.ParentID,
 		); err != nil {
 			return nil, err
 		}
@@ -339,6 +411,54 @@ func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]L
 		return nil, err
 	}
 	return items, nil
+}
+
+const rolledUpBalance = `-- name: RolledUpBalance :one
+WITH RECURSIVE subtree AS (
+  SELECT a.id FROM accounts a WHERE a.tenant_id = $1 AND a.id = $2
+  UNION ALL
+  SELECT a.id FROM accounts a
+    JOIN subtree s ON a.parent_id = s.id AND a.tenant_id = $1
+)
+SELECT COALESCE(SUM(p.amount), 0)::bigint AS balance
+FROM postings p
+WHERE p.tenant_id = $1 AND p.account_id IN (SELECT id FROM subtree)
+`
+
+type RolledUpBalanceParams struct {
+	TenantID uuid.UUID
+	ID       uuid.UUID
+}
+
+// The balance of an account and everything under it: gather the subtree via
+// parent_id, then sum those accounts' postings. Same-currency subtree, so this
+// is one number.
+func (q *Queries) RolledUpBalance(ctx context.Context, arg RolledUpBalanceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, rolledUpBalance, arg.TenantID, arg.ID)
+	var balance int64
+	err := row.Scan(&balance)
+	return balance, err
+}
+
+const setAccountParent = `-- name: SetAccountParent :execrows
+UPDATE accounts SET parent_id = $3
+WHERE tenant_id = $1 AND id = $2
+`
+
+type SetAccountParentParams struct {
+	TenantID uuid.UUID
+	ID       uuid.UUID
+	ParentID pgtype.UUID
+}
+
+// Re-parent (or clear, when parent_id is NULL) one account. Cycle, currency,
+// and same-tenant are enforced by accounts_hierarchy_guard / the composite FK.
+func (q *Queries) SetAccountParent(ctx context.Context, arg SetAccountParentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAccountParent, arg.TenantID, arg.ID, arg.ParentID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setAccountStatus = `-- name: SetAccountStatus :execrows

@@ -198,4 +198,9 @@ var (
 	// other caller (for example a future gRPC surface) that does not share
 	// that validation.
 	ErrInvalidDisputeAction = errors.New("domain: dispute action must be reverse or reject")
+	// ErrInvalidHierarchy is a rejected parent change: a self-parent, a cycle, or a
+	// child whose currency differs from its parent's. Mapped to 422.
+	ErrInvalidHierarchy = errors.New("domain: invalid account hierarchy")
+	// ErrParentNotFound is a parent_id that names no account in the tenant. Mapped to 422.
+	ErrParentNotFound = errors.New("domain: parent account not found")
 )

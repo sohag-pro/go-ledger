@@ -411,6 +411,10 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
                 <select id="accCurrency" class="mono"></select>
                 <div class="hint">Only currencies that have an exchange rate are listed, so any account can be converted. Add rates in Settings.</div>
               </div>
+              <div class="field">
+                <label for="accParent">Parent account (optional)</label>
+                <select id="accParent"></select>
+              </div>
             </div>
             <div style="display:flex;gap:10px">
               <button class="btn primary" type="submit">Create account</button>
@@ -1146,31 +1150,42 @@ function fillAccountCurrencies() {
 function renderAccounts() {
   const body = $("#accountsBody");
   if (!keyReady()) { body.innerHTML = connectCard(); return; }
-  fillAccountCurrencies();
   body.innerHTML = `<div class="empty"><span class="subtle">Loading&hellip;</span></div>`;
-  Promise.all([refreshAccounts(), refreshBalances()]).then(() => {
-    const accounts = state.accounts;
-    if (!accounts.length) {
+  api("GET", "/v1/accounts/tree").then(r => {
+    const rows = r.accounts || [];
+    state.accounts = rows.map(x => ({ id: x.id, name: x.name, type: x.type, currency: x.currency, parent_id: x.parent_id }));
+    // Keep the create-account dropdowns fresh if the form is open during a refresh.
+    if (!$("#accountForm").hidden) { fillAccountCurrencies(); fillParentOptions(); }
+    if (!rows.length) {
       body.innerHTML = `<div class="empty">${emptyArt}
-        <p><strong>No accounts yet.</strong><br>Accounts are the buckets money moves between. Create your first one to start posting.</p>
+        <p><strong>No accounts yet.</strong><br>Accounts are the buckets money moves between.</p>
         <button class="btn primary" id="emptyNewAccount">New account</button></div>`;
-      $("#emptyNewAccount").addEventListener("click", () => { $("#accountForm").hidden = false; $("#accName").focus(); });
+      $("#emptyNewAccount").addEventListener("click", () => { $("#accountForm").hidden = false; fillAccountCurrencies(); fillParentOptions(); $("#accName").focus(); });
       return;
     }
     body.innerHTML = `<table>
-      <thead><tr><th>Name</th><th>Type</th><th>Currency</th><th class="num">Balance</th><th></th></tr></thead>
-      <tbody>${accounts.map(a => {
-        const bal = state.balances[a.id];
-        const balCell = bal ? `<span class="${bal.balance >= 0 ? "" : "neg"}">${money(bal.balance)}</span>` : `<span class="subtle">-</span>`;
+      <thead><tr><th>Name</th><th>Type</th><th>Currency</th><th class="num">Balance</th><th class="num">Rolled up</th><th></th></tr></thead>
+      <tbody>${rows.map(x => {
+        const pad = 8 + x.depth * 20;
+        const roll = x.rolled_up_balance !== x.own_balance ? `<span class="${x.rolled_up_balance < 0 ? "neg" : ""}">${money(x.rolled_up_balance)}</span>` : `<span class="subtle">-</span>`;
         return `<tr>
-          <td class="mono">${esc(a.name)}</td>
-          <td><span class="badge grey">${esc(a.type)}</span></td>
-          <td>${esc(a.currency)}</td>
-          <td class="num">${balCell}</td>
-          <td style="text-align:right"><button class="btn ghost sm" data-stmt="${esc(a.id)}">Statement</button></td>
+          <td class="mono" style="padding-left:${pad}px">${x.depth ? '<span class="subtle">&#8226; </span>' : ''}${esc(x.name)}</td>
+          <td><span class="badge grey">${esc(x.type)}</span></td>
+          <td>${esc(x.currency)}</td>
+          <td class="num ${x.own_balance < 0 ? "neg" : ""}">${money(x.own_balance)}</td>
+          <td class="num">${roll}</td>
+          <td style="text-align:right"><button class="btn ghost sm" data-stmt="${esc(x.id)}">Statement</button></td>
         </tr>`;
       }).join("")}</tbody></table>`;
   }).catch(e => { body.innerHTML = `<div class="empty"><p class="neg">${esc(e.message)}</p></div>`; });
+}
+
+function fillParentOptions() {
+  const sel = $("#accParent"); if (!sel) return;
+  const cur = $("#accCurrency").value;
+  const opts = ['<option value="">None (top level)</option>'].concat(
+    (state.accounts || []).filter(a => a.currency === cur).map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`));
+  sel.innerHTML = opts.join("");
 }
 
 /* ---------- post transaction ---------- */
@@ -1708,11 +1723,13 @@ $("#gsDismiss").addEventListener("click", () => { state.gsDismissed = true; loca
 
 /* accounts */
 $("#accountsRefresh").addEventListener("click", renderAccounts);
-$("#newAccountBtn").addEventListener("click", () => { $("#accountForm").hidden = false; fillAccountCurrencies(); $("#accName").focus(); });
+$("#newAccountBtn").addEventListener("click", () => { $("#accountForm").hidden = false; fillAccountCurrencies(); fillParentOptions(); $("#accName").focus(); });
 $("#accountFormCancel").addEventListener("click", () => { $("#accountForm").hidden = true; });
+$("#accCurrency").addEventListener("change", fillParentOptions);
 $("#accountFormEl").addEventListener("submit", (e) => {
   e.preventDefault();
   const body = { name: $("#accName").value.trim(), type: $("#accType").value, currency: $("#accCurrency").value.trim().toUpperCase() };
+  if ($("#accParent").value) body.parent_id = $("#accParent").value;
   api("POST", "/v1/accounts", body).then(() => {
     toast("Account created", "ok");
     $("#accountForm").hidden = true; $("#accountFormEl").reset(); $("#accCurrency").value = "USD";

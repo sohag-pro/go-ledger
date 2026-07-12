@@ -395,7 +395,7 @@ func TestAccountService_SetStatus(t *testing.T) {
 	tenant := newAccountStatusTenant(t, repo)
 
 	acct := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
-	if err := accounts.Create(ctx, tenant, acct); err != nil {
+	if err := accounts.Create(ctx, tenant, acct, nil); err != nil {
 		t.Fatalf("create account: %v", err)
 	}
 

@@ -137,8 +137,12 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 	if err != nil {
 		return fmt.Errorf("postgres: parse account id: %w", err)
 	}
+	pid, err := optUUID(a.ParentID)
+	if err != nil {
+		return err
+	}
 	return r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
-		return q.CreateAccount(ctx, sqlc.CreateAccountParams{
+		return mapHierarchyErr(q.CreateAccount(ctx, sqlc.CreateAccountParams{
 			ID:             aid,
 			TenantID:       tid,
 			Name:           a.Name,
@@ -147,7 +151,8 @@ func (r *Repository) CreateAccount(ctx context.Context, tenantID string, a *doma
 			MinBalance:     ptrToInt8(a.MinBalance),
 			PartyReference: ptrToText(a.PartyReference),
 			PartyType:      ptrToText(a.PartyType),
-		})
+			ParentID:       pid,
+		}))
 	})
 }
 
@@ -173,7 +178,7 @@ func (r *Repository) GetAccount(ctx context.Context, tenantID, id string) (domai
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get account: %w", err)
 	}
-	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType, row.ParentID)
 }
 
 // ListAccounts returns up to limit of the tenant's accounts, ordered by name.
@@ -196,7 +201,7 @@ func (r *Repository) ListAccounts(ctx context.Context, tenantID string, limit in
 	}
 	out := make([]domain.Account, 0, len(rows))
 	for _, row := range rows {
-		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
+		acct, err := accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType, row.ParentID)
 		if err != nil {
 			return nil, err
 		}
@@ -234,6 +239,104 @@ func (r *Repository) SetAccountStatus(ctx context.Context, tenantID, id string, 
 		return domain.ErrAccountNotFound
 	}
 	return nil
+}
+
+// SetAccountParent sets, changes, or clears (parentID nil) accountID's parent
+// (ADR-023). It returns the number of rows updated (0 if no such account).
+// Cycle, currency, and same-tenant are enforced by accounts_hierarchy_guard
+// and the accounts_parent_fk composite foreign key, mapped here via
+// mapHierarchyErr into domain.ErrInvalidHierarchy / domain.ErrParentNotFound.
+func (r *Repository) SetAccountParent(ctx context.Context, tenantID, accountID string, parentID *string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	pid, err := optUUID(parentID)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var e error
+		n, e = q.SetAccountParent(ctx, sqlc.SetAccountParentParams{
+			TenantID: tid,
+			ID:       aid,
+			ParentID: pid,
+		})
+		return mapHierarchyErr(e)
+	})
+	return n, err
+}
+
+// RolledUpBalance returns the balance of accountID and all its descendants
+// (ADR-023). It returns domain.ErrAccountNotFound if accountID does not
+// exist: GetAccount is used first, both to produce that clear error (rather
+// than a silent zero from an empty recursive base row) and to get the
+// account's own currency for the returned Money.
+func (r *Repository) RolledUpBalance(ctx context.Context, tenantID, accountID string) (domain.Money, error) {
+	acct, err := r.GetAccount(ctx, tenantID, accountID)
+	if err != nil {
+		return domain.Money{}, err
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return domain.Money{}, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	aid, err := uuid.Parse(accountID)
+	if err != nil {
+		return domain.Money{}, fmt.Errorf("postgres: parse account id: %w", err)
+	}
+	var amount int64
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var e error
+		amount, e = q.RolledUpBalance(ctx, sqlc.RolledUpBalanceParams{TenantID: tid, ID: aid})
+		return e
+	})
+	if err != nil {
+		return domain.Money{}, fmt.Errorf("postgres: rolled up balance: %w", err)
+	}
+	return domain.NewMoney(amount, acct.Currency)
+}
+
+// AllAccountBalances returns every account for the tenant with its own
+// derived balance and parent_id (ADR-023), for the caller to build the
+// account tree and roll up balances in memory in one pass.
+func (r *Repository) AllAccountBalances(ctx context.Context, tenantID string) ([]domain.AccountBalanceRow, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var rows []sqlc.AllAccountBalancesRow
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var e error
+		rows, e = q.AllAccountBalances(ctx, tid)
+		return e
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: all account balances: %w", err)
+	}
+	out := make([]domain.AccountBalanceRow, 0, len(rows))
+	for _, row := range rows {
+		acct, err := toDomainAccountFromBalanceRow(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, domain.AccountBalanceRow{Account: acct, Balance: row.Balance})
+	}
+	return out, nil
+}
+
+// toDomainAccountFromBalanceRow builds a domain.Account from an
+// AllAccountBalancesRow, mirroring accountFromRow for the balance-carrying
+// row type sqlc generated for the AllAccountBalances query (its column list,
+// including the trailing Balance, does not match GetAccountRow/ListAccountsRow,
+// so it is its own sqlc struct).
+func toDomainAccountFromBalanceRow(row sqlc.AllAccountBalancesRow) (domain.Account, error) {
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType, row.ParentID)
 }
 
 // clearingAccountName is the reserved, deterministic name of a tenant's FX
@@ -277,7 +380,10 @@ func (r *Repository) GetOrCreateClearingAccount(ctx context.Context, tenantID st
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: get or create clearing account: %w", err)
 	}
-	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType)
+	// GetOrCreateClearingAccountRow does not select parent_id (a system
+	// account is never given a parent): pass the zero pgtype.UUID, which maps
+	// to nil the same as a real NULL would.
+	return accountFromRow(row.ID, row.Name, row.Type, row.Currency, row.Status, row.MinBalance, row.IsSystem, row.PartyReference, row.PartyType, pgtype.UUID{})
 }
 
 // CreateTransaction validates t and writes the transaction and all its postings
@@ -1896,6 +2002,53 @@ func textToPtr(t pgtype.Text) *string {
 	return &v
 }
 
+// optUUID maps an optional string id to a pgtype.UUID (Valid false when nil
+// or empty). Used for accounts.parent_id (ADR-023): nil means "no parent
+// (a root account)", the same meaning NULL carries in the column.
+func optUUID(id *string) (pgtype.UUID, error) {
+	if id == nil || *id == "" {
+		return pgtype.UUID{}, nil
+	}
+	u, err := uuid.Parse(*id)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("postgres: parse uuid %q: %w", *id, err)
+	}
+	return pgtype.UUID{Bytes: u, Valid: true}, nil
+}
+
+// uuidToPtr is the inverse of optUUID: nil when u is not Valid (NULL in the
+// column), otherwise a pointer to its string form. Used for accounts.parent_id
+// (ADR-023), the same convention textToPtr follows for a nullable text column.
+func uuidToPtr(u pgtype.UUID) *string {
+	if !u.Valid {
+		return nil
+	}
+	s := uuid.UUID(u.Bytes).String()
+	return &s
+}
+
+// mapHierarchyErr turns the hierarchy guard's check_violation (23514) into
+// domain.ErrInvalidHierarchy and the parent FK's foreign_key_violation
+// (23503) into domain.ErrParentNotFound (ADR-023), so the API returns 422
+// rather than 500.
+func mapHierarchyErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23514":
+			return fmt.Errorf("%w: %s", domain.ErrInvalidHierarchy, pgErr.Message)
+		case "23503":
+			if pgErr.ConstraintName == "accounts_parent_fk" {
+				return domain.ErrParentNotFound
+			}
+		}
+	}
+	return err
+}
+
 // accountFromRow builds a domain.Account from the scalar fields common to every
 // account-shaped row sqlc generates (GetAccountRow, ListAccountsRow, ...). Taking
 // individual fields rather than one sqlc row type is deliberate: sqlc gives each
@@ -1905,10 +2058,13 @@ func textToPtr(t pgtype.Text) *string {
 // struct type would not compile across call sites.
 //
 // status, minBalance, and isSystem are Task 5.5 (audit A1.5) additions;
-// partyReference and partyType are Task 6.1 (audit A9.1) additions: every
-// query that selects them (GetAccount, ListAccounts, GetOrCreateClearingAccount)
-// passes its own row's values through unchanged.
-func accountFromRow(id uuid.UUID, name, accountType, currency, status string, minBalance pgtype.Int8, isSystem bool, partyReference, partyType pgtype.Text) (domain.Account, error) {
+// partyReference and partyType are Task 6.1 (audit A9.1) additions;
+// parentID is an ADR-023 addition: every query that selects them (GetAccount,
+// ListAccounts, GetOrCreateClearingAccount) passes its own row's values
+// through unchanged. GetOrCreateClearingAccount's row never selects
+// parent_id (a system account is never given a parent), so it passes the
+// zero pgtype.UUID, which maps to nil the same as a real NULL would.
+func accountFromRow(id uuid.UUID, name, accountType, currency, status string, minBalance pgtype.Int8, isSystem bool, partyReference, partyType pgtype.Text, parentID pgtype.UUID) (domain.Account, error) {
 	at, err := domain.ParseAccountType(accountType)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("postgres: parse account type: %w", err)
@@ -1922,6 +2078,7 @@ func accountFromRow(id uuid.UUID, name, accountType, currency, status string, mi
 		System:         isSystem,
 		PartyReference: textToPtr(partyReference),
 		PartyType:      textToPtr(partyType),
+		ParentID:       uuidToPtr(parentID),
 	}
 	if minBalance.Valid {
 		v := minBalance.Int64

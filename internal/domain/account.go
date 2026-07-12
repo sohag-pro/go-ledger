@@ -138,6 +138,10 @@ type Account struct {
 	// may not match a fixed set this package would have to keep in sync
 	// with), beyond the length cap (MaxPartyTypeLen).
 	PartyType *string
+	// ParentID, when set, is this account's parent in the hierarchy (ADR-023).
+	// A subtree is single-currency and acyclic (enforced in Postgres). nil for
+	// a root account.
+	ParentID *string
 }
 
 // IsSystem reports whether the account is a system account (for example an
@@ -152,7 +156,11 @@ func (a Account) IsSystem() bool {
 // as "invalid" for this field. PartyReference and PartyType (Task 6.1, audit
 // A9.1) are checked only against their length caps: they are opaque linkage
 // metadata for an external KYC/party system, so there is no format or
-// taxonomy for this package to enforce beyond that.
+// taxonomy for this package to enforce beyond that. ParentID (ADR-023) is
+// rejected only for the trivially detectable self-parent case; a cycle
+// through other accounts or a cross-currency parent cannot be checked
+// in-memory and is enforced by the Postgres trigger instead (see
+// ErrInvalidHierarchy).
 func (a Account) Validate() error {
 	if a.ID == "" || a.Name == "" {
 		return ErrInvalidAccount
@@ -168,6 +176,9 @@ func (a Account) Validate() error {
 	}
 	if a.PartyType != nil && len(*a.PartyType) > MaxPartyTypeLen {
 		return ErrPartyTypeTooLong
+	}
+	if a.ParentID != nil && *a.ParentID == a.ID {
+		return fmt.Errorf("%w: an account cannot be its own parent", ErrInvalidAccount)
 	}
 	return a.Currency.Validate()
 }

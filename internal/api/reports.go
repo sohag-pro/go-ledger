@@ -28,6 +28,12 @@ type AccountBalanceBody struct {
 	Currency  string `json:"currency"`
 	IsSystem  bool   `json:"is_system" doc:"true for a system account (e.g. an FX clearing account), which carries a permanent open position rather than a normal user-owned balance"`
 	Balance   int64  `json:"balance" doc:"Signed derived balance in minor units"`
+	// RolledUpBalance is Balance summed over this account and every
+	// descendant in its hierarchy (ADR-023). It is additive display only:
+	// the balance proof (the currency net/imbalance fields above) is
+	// computed from own balances alone, since a rollup double-counts a
+	// parent and its descendants by design.
+	RolledUpBalance int64 `json:"rolled_up_balance" doc:"Balance including all descendants, in minor units"`
 }
 
 // TrialBalanceOutput is the GET /v1/reports/trial-balance response.
@@ -68,12 +74,13 @@ func registerReports(api huma.API, deps Deps) {
 		out.Body.Accounts = make([]AccountBalanceBody, 0, len(tb.Accounts))
 		for _, a := range tb.Accounts {
 			out.Body.Accounts = append(out.Body.Accounts, AccountBalanceBody{
-				AccountID: a.AccountID,
-				Name:      a.Name,
-				Type:      a.Type.String(),
-				Currency:  string(a.Currency),
-				IsSystem:  a.IsSystem,
-				Balance:   a.Balance,
+				AccountID:       a.AccountID,
+				Name:            a.Name,
+				Type:            a.Type.String(),
+				Currency:        string(a.Currency),
+				IsSystem:        a.IsSystem,
+				Balance:         a.Balance,
+				RolledUpBalance: a.RolledUpBalance,
 			})
 		}
 		return out, nil

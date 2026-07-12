@@ -162,6 +162,13 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("account is missing a required field")
 	case errors.Is(err, domain.ErrInvalidAccountType):
 		return huma.Error422UnprocessableEntity("invalid account type")
+	// domain.ErrInvalidHierarchy and domain.ErrParentNotFound (ADR-023) are a
+	// rejected parent change or create: a self-parent, a cycle, a
+	// cross-currency parent, or a parent_id naming no account in the tenant.
+	// All are well-formed requests that just fail a hierarchy check, so they
+	// map to 422 like the rest of this group.
+	case errors.Is(err, domain.ErrInvalidHierarchy), errors.Is(err, domain.ErrParentNotFound):
+		return huma.Error422UnprocessableEntity(err.Error())
 	case errors.Is(err, domain.ErrInvalidCurrency):
 		return huma.Error422UnprocessableEntity("invalid currency code (expected three uppercase letters)")
 	case errors.Is(err, domain.ErrDescriptionTooLong):
