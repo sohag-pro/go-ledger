@@ -27,6 +27,13 @@ func RequiredHTTPScope(method, path string) domain.Scope {
 	if strings.HasPrefix(path, adminPathPrefix) {
 		return domain.ScopeAdmin
 	}
+	// Deciding a pending (approve/reject) needs ScopeApprove; POST would
+	// otherwise map to ScopePost. Cancel stays ScopePost (the creator's own
+	// key). The list/get GETs fall through to ScopeRead.
+	if strings.HasPrefix(path, "/v1/pending/") &&
+		(strings.HasSuffix(path, "/approve") || strings.HasSuffix(path, "/reject")) {
+		return domain.ScopeApprove
+	}
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return domain.ScopeRead

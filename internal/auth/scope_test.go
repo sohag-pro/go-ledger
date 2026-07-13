@@ -28,6 +28,10 @@ func TestRequiredHTTPScope(t *testing.T) {
 		{"admin path with POST is admin", http.MethodPost, "/v1/admin/keys", domain.ScopeAdmin},
 		{"admin path with DELETE is admin", http.MethodDelete, "/v1/admin/keys/1", domain.ScopeAdmin},
 		{"unrecognized method fails closed to post", "TRACE", "/v1/accounts", domain.ScopePost},
+		{"approve path is approve", http.MethodPost, "/v1/pending/2f.../approve", domain.ScopeApprove},
+		{"reject path is approve", http.MethodPost, "/v1/pending/2f.../reject", domain.ScopeApprove},
+		{"cancel path is post", http.MethodPost, "/v1/pending/2f.../cancel", domain.ScopePost},
+		{"pending list is read", http.MethodGet, "/v1/pending", domain.ScopeRead},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
