@@ -43,6 +43,7 @@ func TestParseApprovalThresholds(t *testing.T) {
 func TestApprovalGate(t *testing.T) {
 	cfg := ApprovalConfig{Enabled: true, Thresholds: map[string]int64{"USD": 100000}}
 	usd := func(a int64) domain.Posting { return newUSDPosting(t, a) }
+	eur := func(a int64) domain.Posting { return newEURPosting(t, a) }
 	// under threshold: not gated
 	if _, _, g := cfg.Gate([]domain.Posting{usd(600), usd(-600)}); g {
 		t.Fatal("600 under 100000 must not gate")
@@ -62,5 +63,16 @@ func TestApprovalGate(t *testing.T) {
 	eurCfg := ApprovalConfig{Enabled: true, Thresholds: map[string]int64{"USD": 100000}}
 	if _, _, g := eurCfg.Gate([]domain.Posting{newEURPosting(t, 500000), newEURPosting(t, -500000)}); g {
 		t.Fatal("EUR has no threshold, must not gate")
+	}
+	// boundary (strict >): posting exactly equal to threshold must not gate
+	boundaryConfig := ApprovalConfig{Enabled: true, Thresholds: map[string]int64{"USD": 100000}}
+	if _, _, g := boundaryConfig.Gate([]domain.Posting{usd(100000), usd(-100000)}); g {
+		t.Fatal("posting exactly equal to threshold (100000) must not gate")
+	}
+	// max-overage selection across currencies: largest overage wins
+	multiCfg := ApprovalConfig{Enabled: true, Thresholds: map[string]int64{"USD": 100000, "EUR": 100000}}
+	ccy, amt, g = multiCfg.Gate([]domain.Posting{usd(100500), eur(120000), usd(-100500), eur(-120000)})
+	if !g || ccy != "EUR" || amt != 100000 {
+		t.Fatalf("expected gate EUR/100000 (larger overage), got %s/%d/%v", ccy, amt, g)
 	}
 }
