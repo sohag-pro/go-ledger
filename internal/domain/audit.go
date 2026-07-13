@@ -25,6 +25,16 @@ const ActionTransactionReversed = "transaction.reversed"
 // fixed magic value that could be mistaken for a real hash.
 const AuditGenesisHash = ""
 
+// Audit row-hash scheme versions (ADR-025). v1 is the original
+// transaction-only preimage; v2 adds subject_type/subject_id and tolerates a
+// null transaction id, so the chain can carry non-transaction lifecycle
+// events. A row records its version so verification recomputes with the
+// matching preimage and every existing (v1) row stays reproducible.
+const (
+	AuditHashV1 = 1
+	AuditHashV2 = 2
+)
+
 // AuditEntry is one immutable row of the audit log. Before is nil for a create.
 // After is a JSON snapshot of the entity as of the action. Actor is the tenant
 // id until an auth layer resolves a real principal.
@@ -54,6 +64,16 @@ type AuditEntry struct {
 	PrevHash      string
 	RowHash       string
 	ChainSeq      int64
+
+	// SubjectType, SubjectID, and HashVersion carry the v2 row-hash scheme
+	// (ADR-025). SubjectType/SubjectID identify the entity a non-transaction
+	// lifecycle event (e.g. an approval decision) is about, since
+	// TransactionID may be empty for those. HashVersion selects which
+	// preimage ComputeAuditRowHash uses: 0 (unset, legacy) or 1 means the
+	// original transaction-only preimage; 2 means the subject-aware preimage.
+	SubjectType string
+	SubjectID   string
+	HashVersion int
 }
 
 // AuditAnchor is one recorded off-box checkpoint of a tenant's chain head
@@ -81,6 +101,14 @@ type AuditEvent struct {
 	Actor         string
 	Before        json.RawMessage
 	After         json.RawMessage
+
+	// SubjectType, SubjectID, and HashVersion mirror the same fields on
+	// AuditEntry (see its doc comment); they let a non-transaction lifecycle
+	// event flow through the outbox to the chainer, which copies them onto
+	// the AuditEntry it builds and hashes.
+	SubjectType string
+	SubjectID   string
+	HashVersion int
 }
 
 // ComputeAuditRowHash returns the hex SHA-256 digest chaining tenantID and e's
@@ -90,16 +118,21 @@ type AuditEvent struct {
 // RowHash must reproduce the row's stored RowHash exactly; any mismatch means
 // the row (or one before it) was altered after the fact.
 //
-// The hashed fields, in this exact order, are:
+// e.HashVersion selects which preimage is hashed (ADR-025).
 //
-//  1. tenantID
-//  2. Action
-//  3. TransactionID
-//  4. Actor
-//  5. Before (raw bytes, nil for a create)
-//  6. After (raw bytes)
-//  7. CreatedAt, encoded as its UnixNano decimal string
-//  8. prevHash
+// When e.HashVersion is 0 (unset, every row written before ADR-025) or
+// AuditHashV1, the hashed fields are, in this exact order: tenantID, Action,
+// TransactionID, Actor, Before (raw bytes, nil for a create), After (raw
+// bytes), CreatedAt (its UnixNano decimal string), prevHash. This branch does
+// not read SubjectType or SubjectID at all, so it is unaffected by those
+// fields being set; every row stored before ADR-025 recomputes to its stored
+// hash unchanged.
+//
+// When e.HashVersion is AuditHashV2, the same preimage carries SubjectType and
+// SubjectID right after Action and ahead of TransactionID, which is tolerated
+// empty for a non-transaction lifecycle event (e.g. an approval decision):
+// tenantID, Action, SubjectType, SubjectID, TransactionID (empty string when
+// the event has none), Actor, Before, After, CreatedAt, prevHash.
 //
 // Each field is length-prefixed before hashing (the same self-delimiting
 // framing Transaction.Fingerprint uses via writeField), so no field's bytes
@@ -118,9 +151,25 @@ type AuditEvent struct {
 // tenant structurally, extended and verified by reading only that tenant's rows
 // in created_at, id order, with prevHash required to match that tenant's actual
 // previous row_hash for the chain to extend. See ADR-012 ("A per-tenant,
-// tamper-evident audit chain").
+// tamper-evident audit chain") and ADR-025 ("Versioned audit-row hashing").
 func ComputeAuditRowHash(tenantID string, e AuditEntry, prevHash string) string {
 	h := sha256.New()
+	if e.HashVersion == AuditHashV2 {
+		// v2: fold in the subject and tolerate an empty transaction id.
+		writeField(h, []byte(tenantID))
+		writeField(h, []byte(e.Action))
+		writeField(h, []byte(e.SubjectType))
+		writeField(h, []byte(e.SubjectID))
+		writeField(h, []byte(e.TransactionID))
+		writeField(h, []byte(e.Actor))
+		writeField(h, e.Before)
+		writeField(h, e.After)
+		writeField(h, []byte(strconv.FormatInt(e.CreatedAt.UnixNano(), 10)))
+		writeField(h, []byte(prevHash))
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	// v1 (HashVersion 0 or 1): the exact original preimage. Unchanged, so
+	// every already-stored transaction row recomputes to its stored hash.
 	writeField(h, []byte(tenantID))
 	writeField(h, []byte(e.Action))
 	writeField(h, []byte(e.TransactionID))

@@ -168,3 +168,42 @@ func TestComputeAuditRowHashNoBoundaryCollision(t *testing.T) {
 		}
 	}
 }
+
+func TestComputeAuditRowHash_V1Unchanged(t *testing.T) {
+	// A v1 (transaction) entry must hash identically whether HashVersion is 0
+	// (unset, legacy) or explicitly 1, and must not depend on subject fields.
+	base := AuditEntry{
+		Action: ActionTransactionCreated, TransactionID: "tx-1", Actor: "ten-1",
+		After: []byte(`{"id":"tx-1"}`), CreatedAt: time.Unix(0, 0).UTC(),
+	}
+	h0 := ComputeAuditRowHash("ten-1", base, AuditGenesisHash)
+	withV1 := base
+	withV1.HashVersion = AuditHashV1
+	if got := ComputeAuditRowHash("ten-1", withV1, AuditGenesisHash); got != h0 {
+		t.Fatalf("v1 explicit hash %s != legacy %s", got, h0)
+	}
+	withSubject := base
+	withSubject.SubjectType = "pending_transaction"
+	withSubject.SubjectID = "p-1"
+	if got := ComputeAuditRowHash("ten-1", withSubject, AuditGenesisHash); got != h0 {
+		t.Fatalf("v1 hash must ignore subject fields, got %s", got)
+	}
+}
+
+func TestComputeAuditRowHash_V2UsesSubject(t *testing.T) {
+	e := AuditEntry{
+		Action: "approval.rejected", Actor: "ten-1", HashVersion: AuditHashV2,
+		SubjectType: "pending_transaction", SubjectID: "p-1",
+		After: []byte(`{"status":"rejected"}`), CreatedAt: time.Unix(0, 0).UTC(),
+	}
+	h := ComputeAuditRowHash("ten-1", e, AuditGenesisHash)
+	tampered := e
+	tampered.SubjectID = "p-2"
+	if ComputeAuditRowHash("ten-1", tampered, AuditGenesisHash) == h {
+		t.Fatal("changing subject_id must change the v2 hash")
+	}
+	// v2 tolerates an empty TransactionID (rejections have none).
+	if e.TransactionID != "" {
+		t.Fatal("precondition: v2 rejection has no transaction id")
+	}
+}
