@@ -60,6 +60,11 @@ UPDATE webhook_fanout_cursor SET last_chain_seq = sqlc.arg(last_chain_seq);
 -- failover-safe, skew-proof linearization key), not id or created_at, for
 -- the same reason GetLastAuditHash does: it is the one order the chainer
 -- itself guarantees is monotonic across any failover.
+--
+-- transaction_id is nullable (ADR-025, migration 0034): a chained
+-- non-transaction lifecycle event (for example approval.rejected) has none.
+-- The fan-out worker maps a null transaction_id to an empty string in the
+-- webhook payload, the same convention the rest of the audit read path uses.
 SELECT chain_seq, tenant_id, action, transaction_id, after, created_at
 FROM audit_log
 WHERE chain_seq > sqlc.arg(after_seq)

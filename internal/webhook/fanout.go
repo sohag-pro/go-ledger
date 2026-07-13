@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
@@ -83,7 +84,7 @@ func (w *Worker) fanOutBatch(ctx context.Context, db dbtx) (int, error) {
 				ID:            deliveryID.String(),
 				Event:         ev.Action,
 				TenantID:      ev.TenantID.String(),
-				TransactionID: ev.TransactionID.String(),
+				TransactionID: pgUUIDToString(ev.TransactionID),
 				OccurredAt:    ev.CreatedAt,
 				Data:          json.RawMessage(ev.After),
 			}
@@ -113,4 +114,17 @@ func (w *Worker) fanOutBatch(ctx context.Context, db dbtx) (int, error) {
 		return 0, fmt.Errorf("webhook fan-out: commit: %w", err)
 	}
 	return created, nil
+}
+
+// pgUUIDToString maps a nullable pgtype.UUID column back onto a plain,
+// possibly-empty string (ADR-025, migration 0034): "" when the column is
+// NULL (a chained non-transaction lifecycle event has no transaction_id),
+// otherwise its string form. pgtype.UUID.String() does NOT check Valid
+// itself (it happily formats the zero value), so this must be used instead
+// of calling it directly on a nullable column.
+func pgUUIDToString(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	return uuid.UUID(u.Bytes).String()
 }

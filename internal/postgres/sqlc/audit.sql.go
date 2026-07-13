@@ -124,15 +124,15 @@ func (q *Queries) InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorPa
 }
 
 const insertAuditLog = `-- name: InsertAuditLog :exec
-INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id, subject_type, subject_id, hash_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 `
 
 type InsertAuditLogParams struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -140,6 +140,9 @@ type InsertAuditLogParams struct {
 	PrevHash      pgtype.Text
 	RowHash       pgtype.Text
 	OutboxID      pgtype.Int8
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 // outbox_id is the source audit_outbox row this audit_log row was chained
@@ -148,6 +151,12 @@ type InsertAuditLogParams struct {
 // unique violation instead of silently forking the chain. chain_seq is left
 // to its column DEFAULT (nextval), never supplied by the caller: it is what
 // makes chain order immune to any host's clock (see GetLastAuditHash below).
+//
+// transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+// migration 0034): a chained non-transaction lifecycle event carries
+// subject_type/subject_id instead of a transaction_id. hash_version is
+// copied straight from the source outbox row, so recomputing this row's
+// hash later (Verify) always uses the same preimage it was chained with.
 func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error {
 	_, err := q.db.Exec(ctx, insertAuditLog,
 		arg.ID,
@@ -161,6 +170,9 @@ func (q *Queries) InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) 
 		arg.PrevHash,
 		arg.RowHash,
 		arg.OutboxID,
+		arg.SubjectType,
+		arg.SubjectID,
+		arg.HashVersion,
 	)
 	return err
 }
@@ -186,7 +198,7 @@ type ListAuditRow struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -257,7 +269,7 @@ type ListAuditByAccountRow struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -318,14 +330,14 @@ ORDER BY id
 
 type ListAuditByTransactionParams struct {
 	TenantID      uuid.UUID
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 }
 
 type ListAuditByTransactionRow struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -368,7 +380,7 @@ func (q *Queries) ListAuditByTransaction(ctx context.Context, arg ListAuditByTra
 }
 
 const listAuditForVerify = `-- name: ListAuditForVerify :many
-SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, subject_type, subject_id, hash_version
 FROM audit_log
 WHERE tenant_id = $1
 ORDER BY chain_seq
@@ -378,13 +390,16 @@ type ListAuditForVerifyRow struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
 	CreatedAt     time.Time
 	PrevHash      pgtype.Text
 	RowHash       pgtype.Text
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 // Every audit row for the tenant, in true chain order: the full walk used to
@@ -392,6 +407,10 @@ type ListAuditForVerifyRow struct {
 // chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
 // migration 0016) for why chain_seq, not id, is the failover-safe chain
 // order.
+//
+// Includes subject_type, subject_id, and hash_version (ADR-025, migration
+// 0034) so recomputing a row's hash uses the same preimage it was chained
+// with.
 func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error) {
 	rows, err := q.db.Query(ctx, listAuditForVerify, tenantID)
 	if err != nil {
@@ -412,6 +431,9 @@ func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([
 			&i.CreatedAt,
 			&i.PrevHash,
 			&i.RowHash,
+			&i.SubjectType,
+			&i.SubjectID,
+			&i.HashVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -424,7 +446,7 @@ func (q *Queries) ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([
 }
 
 const listAuditForVerifyPage = `-- name: ListAuditForVerifyPage :many
-SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq, subject_type, subject_id, hash_version
 FROM audit_log
 WHERE tenant_id = $1 AND chain_seq > $2
 ORDER BY chain_seq
@@ -441,7 +463,7 @@ type ListAuditForVerifyPageRow struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -449,6 +471,9 @@ type ListAuditForVerifyPageRow struct {
 	PrevHash      pgtype.Text
 	RowHash       pgtype.Text
 	ChainSeq      int64
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 // A bounded page of the tenant's audit rows in true chain order, strictly
@@ -462,6 +487,11 @@ type ListAuditForVerifyPageRow struct {
 // the cursor without a second round trip. after_chain_seq is 0 to start
 // from genesis, or an anchor's chain_seq to start from a trusted checkpoint
 // (VerifyFromLatestAnchor).
+//
+// Also includes subject_type, subject_id, and hash_version (ADR-025,
+// migration 0034): this is the query AuditService.Verify actually pages
+// through, so it must return everything ComputeAuditRowHash needs to
+// recompute each row (both v1 and v2) exactly as it was chained.
 func (q *Queries) ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error) {
 	rows, err := q.db.Query(ctx, listAuditForVerifyPage, arg.TenantID, arg.AfterChainSeq, arg.PageLimit)
 	if err != nil {
@@ -483,6 +513,9 @@ func (q *Queries) ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVe
 			&i.PrevHash,
 			&i.RowHash,
 			&i.ChainSeq,
+			&i.SubjectType,
+			&i.SubjectID,
+			&i.HashVersion,
 		); err != nil {
 			return nil, err
 		}

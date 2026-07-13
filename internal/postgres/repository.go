@@ -719,6 +719,13 @@ func (tr txRepo) InsertIdempotencyKey(ctx context.Context, tenantID, key, finger
 // their column defaults (migration 0015); the database server's clock and
 // current transaction id stamp them, not this process's.
 //
+// e.TransactionID is nullable (ADR-025, migration 0034): empty means a
+// non-transaction lifecycle event, mapped to a NULL column via
+// optUUIDFromString, the same as e.SubjectID. e.HashVersion defaults to
+// domain.AuditHashV1 when the caller left it zero, so every existing caller
+// that predates ADR-025 (every transaction post) keeps writing v1 rows
+// unchanged.
+//
 // The single background chainer (internal/audit.Chainer) is what later reads
 // this row back and extends the tenant's tamper-evident hash chain.
 func (tr txRepo) AppendAuditOutbox(ctx context.Context, tenantID string, e domain.AuditEvent) error {
@@ -726,9 +733,17 @@ func (tr txRepo) AppendAuditOutbox(ctx context.Context, tenantID string, e domai
 	if err != nil {
 		return fmt.Errorf("postgres: parse tenant id: %w", err)
 	}
-	txID, err := uuid.Parse(e.TransactionID)
+	txID, err := optUUIDFromString(e.TransactionID)
 	if err != nil {
 		return fmt.Errorf("postgres: parse audit transaction id: %w", err)
+	}
+	subjectID, err := optUUIDFromString(e.SubjectID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse audit subject id: %w", err)
+	}
+	hv := e.HashVersion
+	if hv == 0 {
+		hv = domain.AuditHashV1
 	}
 	if err := tr.q.InsertAuditOutbox(ctx, sqlc.InsertAuditOutboxParams{
 		TenantID:      tid,
@@ -737,6 +752,9 @@ func (tr txRepo) AppendAuditOutbox(ctx context.Context, tenantID string, e domai
 		Actor:         e.Actor,
 		Before:        e.Before,
 		After:         e.After,
+		SubjectType:   optTextFromString(e.SubjectType),
+		SubjectID:     subjectID,
+		HashVersion:   int16(hv), //nolint:gosec // hv is one of the two small domain.AuditHashV* constants
 	}); err != nil {
 		return fmt.Errorf("postgres: insert audit outbox: %w", err)
 	}
@@ -1123,7 +1141,10 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 	var rows []sqlc.ListAuditByTransactionRow
 	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
 		var err error
-		rows, err = q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{TenantID: tid, TransactionID: txID})
+		rows, err = q.ListAuditByTransaction(ctx, sqlc.ListAuditByTransactionParams{
+			TenantID:      tid,
+			TransactionID: pgtype.UUID{Bytes: txID, Valid: true},
+		})
 		return err
 	})
 	if err != nil {
@@ -1134,7 +1155,7 @@ func (r *Repository) ListAuditByTransaction(ctx context.Context, tenantID, trans
 		out = append(out, domain.AuditEntry{
 			ID:            row.ID.String(),
 			Action:        row.Action,
-			TransactionID: row.TransactionID.String(),
+			TransactionID: stringFromUUID(row.TransactionID),
 			Actor:         row.Actor,
 			Before:        row.Before,
 			After:         row.After,
@@ -1195,7 +1216,7 @@ func (r *Repository) ListAuditByAccount(ctx context.Context, tenantID, accountID
 		out = append(out, domain.AuditEntry{
 			ID:            row.ID.String(),
 			Action:        row.Action,
-			TransactionID: row.TransactionID.String(),
+			TransactionID: stringFromUUID(row.TransactionID),
 			Actor:         row.Actor,
 			Before:        row.Before,
 			After:         row.After,
@@ -1239,7 +1260,7 @@ func (r *Repository) ListAudit(ctx context.Context, tenantID string, after *doma
 		out = append(out, domain.AuditEntry{
 			ID:            row.ID.String(),
 			Action:        row.Action,
-			TransactionID: row.TransactionID.String(),
+			TransactionID: stringFromUUID(row.TransactionID),
 			Actor:         row.Actor,
 			Before:        row.Before,
 			After:         row.After,
@@ -1273,13 +1294,16 @@ func (r *Repository) ListAuditForVerify(ctx context.Context, tenantID string) ([
 		out = append(out, domain.AuditEntry{
 			ID:            row.ID.String(),
 			Action:        row.Action,
-			TransactionID: row.TransactionID.String(),
+			TransactionID: stringFromUUID(row.TransactionID),
 			Actor:         row.Actor,
 			Before:        row.Before,
 			After:         row.After,
 			CreatedAt:     row.CreatedAt,
 			PrevHash:      row.PrevHash.String,
 			RowHash:       row.RowHash.String,
+			SubjectType:   row.SubjectType.String,
+			SubjectID:     stringFromUUID(row.SubjectID),
+			HashVersion:   int(row.HashVersion),
 		})
 	}
 	return out, nil
@@ -1315,7 +1339,7 @@ func (r *Repository) ListAuditForVerifyPage(ctx context.Context, tenantID string
 		out = append(out, domain.AuditEntry{
 			ID:            row.ID.String(),
 			Action:        row.Action,
-			TransactionID: row.TransactionID.String(),
+			TransactionID: stringFromUUID(row.TransactionID),
 			Actor:         row.Actor,
 			Before:        row.Before,
 			After:         row.After,
@@ -1323,6 +1347,9 @@ func (r *Repository) ListAuditForVerifyPage(ctx context.Context, tenantID string
 			PrevHash:      row.PrevHash.String,
 			RowHash:       row.RowHash.String,
 			ChainSeq:      row.ChainSeq,
+			SubjectType:   row.SubjectType.String,
+			SubjectID:     stringFromUUID(row.SubjectID),
+			HashVersion:   int(row.HashVersion),
 		})
 	}
 	return out, nil
@@ -2069,6 +2096,46 @@ func uuidToPtr(u pgtype.UUID) *string {
 	}
 	s := uuid.UUID(u.Bytes).String()
 	return &s
+}
+
+// optTextFromString maps a possibly-empty string to a pgtype.Text (Valid
+// false when empty), the same empty-string-means-NULL convention
+// optUUIDFromString follows for a nullable uuid column. Used for
+// domain.AuditEvent/AuditEntry's SubjectType (ADR-025, migration 0034).
+func optTextFromString(s string) pgtype.Text {
+	if s == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: s, Valid: true}
+}
+
+// optUUIDFromString maps a possibly-empty string id to a pgtype.UUID (Valid
+// false when the string is empty), the same nullable convention optUUID
+// follows for a *string. Used for domain.AuditEvent/AuditEntry's
+// TransactionID and SubjectID (ADR-025, migration 0034): both are plain
+// strings where "" means "none" (a NULL column), never a pointer, since
+// AuditEvent/AuditEntry predate this nullable case and every other caller
+// still always supplies a real transaction id.
+func optUUIDFromString(id string) (pgtype.UUID, error) {
+	if id == "" {
+		return pgtype.UUID{}, nil
+	}
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("postgres: parse uuid %q: %w", id, err)
+	}
+	return pgtype.UUID{Bytes: u, Valid: true}, nil
+}
+
+// stringFromUUID is the inverse of optUUIDFromString: "" when u is not Valid
+// (NULL in the column), otherwise its string form. Used to map a nullable
+// transaction_id/subject_id column back onto AuditEvent/AuditEntry's plain
+// string fields.
+func stringFromUUID(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	return uuid.UUID(u.Bytes).String()
 }
 
 // mapHierarchyErr turns the hierarchy guard's check_violation (23514) into

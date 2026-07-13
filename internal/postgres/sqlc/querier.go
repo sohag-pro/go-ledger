@@ -243,12 +243,24 @@ type Querier interface {
 	// unique violation instead of silently forking the chain. chain_seq is left
 	// to its column DEFAULT (nextval), never supplied by the caller: it is what
 	// makes chain order immune to any host's clock (see GetLastAuditHash below).
+	//
+	// transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+	// migration 0034): a chained non-transaction lifecycle event carries
+	// subject_type/subject_id instead of a transaction_id. hash_version is
+	// copied straight from the source outbox row, so recomputing this row's
+	// hash later (Verify) always uses the same preimage it was chained with.
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
 	// Writes one outbox row inside the caller's own transaction (ADR-017): the
 	// event is durable if and only if the surrounding post/convert transaction
 	// commits. occurred_at, txid, and created_at are all left to their column
 	// defaults (the database server's now() and pg_current_xact_id(), see
 	// migration 0015): no chain read, no hash computed, here.
+	//
+	// transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+	// migration 0034): a non-transaction lifecycle event (for example
+	// approval.rejected) carries subject_type/subject_id instead of a
+	// transaction_id. hash_version records which row-hash preimage the caller
+	// computed against, so the chainer and Verify recompute with the same one.
 	InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxParams) error
 	// fx_markup_defaults is append-only (ADR-020): a new default is a new row.
 	// tenant_id NULL is the global default, a non-NULL tenant_id is that tenant's
@@ -348,6 +360,10 @@ type Querier interface {
 	// chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
 	// migration 0016) for why chain_seq, not id, is the failover-safe chain
 	// order.
+	//
+	// Includes subject_type, subject_id, and hash_version (ADR-025, migration
+	// 0034) so recomputing a row's hash uses the same preimage it was chained
+	// with.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
 	// A bounded page of the tenant's audit rows in true chain order, strictly
 	// after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
@@ -360,6 +376,11 @@ type Querier interface {
 	// the cursor without a second round trip. after_chain_seq is 0 to start
 	// from genesis, or an anchor's chain_seq to start from a trusted checkpoint
 	// (VerifyFromLatestAnchor).
+	//
+	// Also includes subject_type, subject_id, and hash_version (ADR-025,
+	// migration 0034): this is the query AuditService.Verify actually pages
+	// through, so it must return everything ComputeAuditRowHash needs to
+	// recompute each row (both v1 and v2) exactly as it was chained.
 	ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error)
 	// One row per tenant with at least one audit_log entry: that tenant's
 	// current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
@@ -373,6 +394,11 @@ type Querier interface {
 	// failover-safe, skew-proof linearization key), not id or created_at, for
 	// the same reason GetLastAuditHash does: it is the one order the chainer
 	// itself guarantees is monotonic across any failover.
+	//
+	// transaction_id is nullable (ADR-025, migration 0034): a chained
+	// non-transaction lifecycle event (for example approval.rejected) has none.
+	// The fan-out worker maps a null transaction_id to an empty string in the
+	// webhook payload, the same convention the rest of the audit read path uses.
 	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
 	// The current effective row per (base, quote) for a tenant plus the global
 	// defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts
@@ -524,6 +550,10 @@ type Querier interface {
 	// first. Ordering by (txid, id) is the total order ADR-017 defines: it is
 	// stable because txid is not reused and id is a bigserial tiebreaker for the
 	// (rare) case of equal txid.
+	//
+	// Includes subject_type, subject_id, and hash_version (ADR-025, migration
+	// 0034) so the chainer can copy them onto the audit_log row it builds and
+	// hash with the row's own recorded version.
 	ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error)
 	// Reconciles an already-existing key's scopes to exactly the given set, keyed
 	// by hash rather than id (ADR-019 follow-up, review fix): InsertAPIKey is

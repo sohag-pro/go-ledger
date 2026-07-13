@@ -112,6 +112,15 @@ type Tx interface {
 	// instances. The single background chainer (internal/audit.Chainer) is
 	// what later reads this row and extends the tenant's tamper-evident hash
 	// chain (see ComputeAuditRowHash and the chainer's doc comment).
+	//
+	// e.TransactionID and e.SubjectID are both nullable columns underneath
+	// (ADR-025): an empty string on either maps to NULL, the convention
+	// every nullable-uuid field on AuditEvent/AuditEntry follows. e.
+	// HashVersion defaults to AuditHashV1 when the caller leaves it zero, so
+	// every existing caller (every transaction post, which predates
+	// ADR-025) keeps writing v1 rows unchanged; only a caller that sets
+	// HashVersion to AuditHashV2 (a non-transaction lifecycle event) needs
+	// to also set SubjectType/SubjectID.
 	AppendAuditOutbox(ctx context.Context, tenantID string, e AuditEvent) error
 
 	// TenantDailyDebits returns the tenant's already-posted per-currency

@@ -51,7 +51,7 @@ type AuditLog struct {
 	ID            uuid.UUID
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -60,13 +60,16 @@ type AuditLog struct {
 	RowHash       pgtype.Text
 	ChainSeq      int64
 	OutboxID      pgtype.Int8
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 type AuditOutbox struct {
 	ID            int64
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
@@ -74,6 +77,9 @@ type AuditOutbox struct {
 	Txid          int64
 	CreatedAt     time.Time
 	ProcessedAt   pgtype.Timestamptz
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 type CryptoKey struct {

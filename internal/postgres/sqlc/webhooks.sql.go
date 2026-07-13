@@ -186,7 +186,7 @@ type ListAuditLogSinceChainSeqRow struct {
 	ChainSeq      int64
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	After         []byte
 	CreatedAt     time.Time
 }
@@ -196,6 +196,11 @@ type ListAuditLogSinceChainSeqRow struct {
 // failover-safe, skew-proof linearization key), not id or created_at, for
 // the same reason GetLastAuditHash does: it is the one order the chainer
 // itself guarantees is monotonic across any failover.
+//
+// transaction_id is nullable (ADR-025, migration 0034): a chained
+// non-transaction lifecycle event (for example approval.rejected) has none.
+// The fan-out worker maps a null transaction_id to an empty string in the
+// webhook payload, the same convention the rest of the audit read path uses.
 func (q *Queries) ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error) {
 	rows, err := q.db.Query(ctx, listAuditLogSinceChainSeq, arg.AfterSeq, arg.BatchLimit)
 	if err != nil {
