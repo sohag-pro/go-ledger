@@ -85,8 +85,12 @@ func (w *Worker) fanOutBatch(ctx context.Context, db dbtx) (int, error) {
 				Event:         ev.Action,
 				TenantID:      ev.TenantID.String(),
 				TransactionID: pgUUIDToString(ev.TransactionID),
+				SubjectID:     pgUUIDToString(ev.SubjectID),
 				OccurredAt:    ev.CreatedAt,
 				Data:          json.RawMessage(ev.After),
+			}
+			if ev.SubjectType.Valid {
+				payload.SubjectType = ev.SubjectType.String
 			}
 			body, err := json.Marshal(payload)
 			if err != nil {
@@ -118,10 +122,14 @@ func (w *Worker) fanOutBatch(ctx context.Context, db dbtx) (int, error) {
 
 // pgUUIDToString maps a nullable pgtype.UUID column back onto a plain,
 // possibly-empty string (ADR-025, migration 0034): "" when the column is
-// NULL (a chained non-transaction lifecycle event has no transaction_id),
-// otherwise its string form. pgtype.UUID.String() does NOT check Valid
-// itself (it happily formats the zero value), so this must be used instead
-// of calling it directly on a nullable column.
+// NULL (a chained non-transaction lifecycle event has no transaction_id, or
+// an ordinary transaction event has no subject_id), otherwise its string
+// form. pgtype.UUID.String() does NOT check Valid itself (it happily
+// formats the zero value), so this must be used instead of calling it
+// directly on a nullable column. Both callers rely on WebhookPayload's
+// TransactionID and SubjectID being omitempty (Task 10, ADR-025), so this
+// empty-string mapping also means the field is omitted from the delivered
+// JSON, not sent as a misleading present-but-empty key.
 func pgUUIDToString(u pgtype.UUID) string {
 	if !u.Valid {
 		return ""

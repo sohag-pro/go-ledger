@@ -408,8 +408,11 @@ type Querier interface {
 	//
 	// transaction_id is nullable (ADR-025, migration 0034): a chained
 	// non-transaction lifecycle event (for example approval.rejected) has none.
-	// The fan-out worker maps a null transaction_id to an empty string in the
-	// webhook payload, the same convention the rest of the audit read path uses.
+	// The fan-out worker maps a null transaction_id to an empty, omitted field
+	// in the webhook payload, the same convention the rest of the audit read
+	// path uses. subject_type/subject_id (also ADR-025) are what that kind of
+	// event carries instead: the fan-out worker copies them onto the payload
+	// (Task 10) so a consumer can tell which subject the event concerns.
 	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
 	// The current effective row per (base, quote) for a tenant plus the global
 	// defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts
