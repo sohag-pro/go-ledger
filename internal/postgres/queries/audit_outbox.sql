@@ -4,8 +4,14 @@
 -- commits. occurred_at, txid, and created_at are all left to their column
 -- defaults (the database server's now() and pg_current_xact_id(), see
 -- migration 0015): no chain read, no hash computed, here.
-INSERT INTO audit_outbox (tenant_id, action, transaction_id, actor, before, after)
-VALUES ($1, $2, $3, $4, $5, $6);
+--
+-- transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+-- migration 0034): a non-transaction lifecycle event (for example
+-- approval.rejected) carries subject_type/subject_id instead of a
+-- transaction_id. hash_version records which row-hash preimage the caller
+-- computed against, so the chainer and Verify recompute with the same one.
+INSERT INTO audit_outbox (tenant_id, action, transaction_id, actor, before, after, subject_type, subject_id, hash_version)
+VALUES (sqlc.arg(tenant_id), sqlc.arg(action), sqlc.narg(transaction_id), sqlc.arg(actor), sqlc.arg(before), sqlc.arg(after), sqlc.narg(subject_type), sqlc.narg(subject_id), sqlc.arg(hash_version));
 
 -- name: AuditOutboxWatermark :one
 -- The oldest transaction id still in flight, cast the same way audit_outbox.txid
@@ -20,7 +26,11 @@ SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint;
 -- first. Ordering by (txid, id) is the total order ADR-017 defines: it is
 -- stable because txid is not reused and id is a bigserial tiebreaker for the
 -- (rare) case of equal txid.
-SELECT id, tenant_id, action, transaction_id, actor, before, after, occurred_at, txid
+--
+-- Includes subject_type, subject_id, and hash_version (ADR-025, migration
+-- 0034) so the chainer can copy them onto the audit_log row it builds and
+-- hash with the row's own recorded version.
+SELECT id, tenant_id, action, transaction_id, actor, before, after, occurred_at, txid, subject_type, subject_id, hash_version
 FROM audit_outbox
 WHERE processed_at IS NULL AND txid < sqlc.arg(xmin)
 ORDER BY txid, id

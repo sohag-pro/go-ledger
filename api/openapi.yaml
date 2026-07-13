@@ -291,6 +291,9 @@ components:
       properties:
         fx:
           $ref: "#/components/schemas/FXDetailBody"
+        pending:
+          $ref: "#/components/schemas/PendingBody"
+          description: Set instead of transaction/fx when the conversion exceeded the approval threshold (ADR-025) and the request was held for approval rather than posted.
         transaction:
           $ref: "#/components/schemas/TransactionBody"
       required:
@@ -406,6 +409,35 @@ components:
       required:
         - currency
         - postings
+      type: object
+    CreateTransactionOutputBody:
+      additionalProperties: false
+      properties:
+        effective_at:
+          description: Value date; defaults to when the transaction was posted if not supplied
+          format: date-time
+          type: string
+        id:
+          type: string
+        pending:
+          $ref: "#/components/schemas/PendingBody"
+          description: Set instead of the transaction fields when postings exceeded the approval threshold (ADR-025) and the request was held for approval rather than posted. Poll GET /v1/pending/{id} for its decision.
+        postings:
+          items:
+            $ref: "#/components/schemas/PostingBody"
+          type:
+            - array
+            - "null"
+        reference:
+          description: Optional client-supplied external reference, unique per tenant
+          type: string
+        reverses_transaction_id:
+          description: "Set only when this transaction is a reversal: the id of the transaction it reverses"
+          type: string
+      required:
+        - id
+        - postings
+        - effective_at
       type: object
     CreateWebhookSubscriptionInputBody:
       additionalProperties: false
@@ -871,6 +903,68 @@ components:
         - transaction_id
         - reason
       type: object
+    PendingBody:
+      additionalProperties: false
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        created_by:
+          type: string
+        decided_at:
+          format: date-time
+          type: string
+        decided_by:
+          description: Set once a decision (approve, reject, cancel, or the TTL sweep) has been made
+          type: string
+        id:
+          type: string
+        kind:
+          description: "Which write path this pending will replay on approval: post, convert, or reverse"
+          type: string
+        reason:
+          description: Set when status is rejected
+          type: string
+        status:
+          description: "One of: pending, approved, rejected, cancelled, expired"
+          type: string
+        threshold_amount:
+          description: The configured threshold amount, in minor units, this transaction exceeded
+          format: int64
+          type: integer
+        threshold_currency:
+          description: The currency whose configured threshold this transaction exceeded
+          type: string
+        transaction_id:
+          description: "Set when status is approved: the transaction the approval posted"
+          type: string
+      required:
+        - id
+        - kind
+        - status
+        - threshold_currency
+        - threshold_amount
+        - created_by
+        - created_at
+      type: object
+    PendingListOutputBody:
+      additionalProperties: false
+      properties:
+        next_cursor:
+          description: Cursor for the next page, or null if this is the last page
+          type:
+            - string
+            - "null"
+        pending:
+          items:
+            $ref: "#/components/schemas/PendingBody"
+          type:
+            - array
+            - "null"
+      required:
+        - pending
+        - next_cursor
+      type: object
     PostingBody:
       additionalProperties: false
       properties:
@@ -908,6 +1002,14 @@ components:
         - account_id
         - amount
       type: object
+    RejectPendingInputBody:
+      additionalProperties: false
+      properties:
+        reason:
+          description: Optional free-text reason recorded on the pending
+          maxLength: 256
+          type: string
+      type: object
     ResolveDisputeInputBody:
       additionalProperties: false
       properties:
@@ -919,6 +1021,35 @@ components:
           type: string
       required:
         - action
+      type: object
+    ReverseTransactionOutputBody:
+      additionalProperties: false
+      properties:
+        effective_at:
+          description: Value date; defaults to when the transaction was posted if not supplied
+          format: date-time
+          type: string
+        id:
+          type: string
+        pending:
+          $ref: "#/components/schemas/PendingBody"
+          description: Set instead of the transaction fields when the reversal exceeded the approval threshold (ADR-025) and the request was held for approval rather than posted.
+        postings:
+          items:
+            $ref: "#/components/schemas/PostingBody"
+          type:
+            - array
+            - "null"
+        reference:
+          description: Optional client-supplied external reference, unique per tenant
+          type: string
+        reverses_transaction_id:
+          description: "Set only when this transaction is a reversal: the id of the transaction it reverses"
+          type: string
+      required:
+        - id
+        - postings
+        - effective_at
       type: object
     SetAccountParentInputBody:
       additionalProperties: false
@@ -2306,6 +2437,183 @@ paths:
       summary: Resolve a dispute
       tags:
         - disputes
+  /v1/pending:
+    get:
+      description: "Lists the tenant's held transactions awaiting an approval decision (ADR-025), newest first, optionally filtered by status. Keyset paged: pass the response's next_cursor back as cursor to fetch the next page; next_cursor is null on the last page."
+      operationId: list-pending
+      parameters:
+        - description: "Optional filter: one of pending, approved, rejected, cancelled, expired. Omitted returns every status."
+          explode: false
+          in: query
+          name: status
+          schema:
+            description: "Optional filter: one of pending, approved, rejected, cancelled, expired. Omitted returns every status."
+            type: string
+        - description: Max pending transactions per page
+          explode: false
+          in: query
+          name: limit
+          schema:
+            default: 50
+            description: Max pending transactions per page
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+        - description: Opaque cursor from a previous page's next_cursor
+          explode: false
+          in: query
+          name: cursor
+          schema:
+            description: Opaque cursor from a previous page's next_cursor
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingListOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: List pending (over-threshold) transactions
+      tags:
+        - approvals
+  /v1/pending/{id}:
+    get:
+      operationId: get-pending
+      parameters:
+        - description: Pending transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Pending transaction id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Get a pending transaction
+      tags:
+        - approvals
+  /v1/pending/{id}/approve:
+    post:
+      description: "Approves the pending transaction named by id and replays it through the normal posting path against CURRENT balances (ADR-025): a plain post, an FX conversion, or a reversal, whichever it originally was. Requires approve scope (or admin). Approving an already-approved pending is idempotent and returns the SAME transaction rather than posting a second one; approving one already rejected, cancelled, or expired returns 409 Conflict."
+      operationId: approve-pending
+      parameters:
+        - description: Pending transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Pending transaction id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Approve a pending transaction
+      tags:
+        - approvals
+  /v1/pending/{id}/cancel:
+    post:
+      description: "Cancels the pending transaction named by id (ADR-025): only the tenant that created it may cancel, and only while it is still pending (returns 403 Forbidden otherwise for a non-creator, or 409 Conflict for one already decided). No money ever moves for it. Cancel requires only post scope, the creator's own key, unlike approve/reject which require approve scope."
+      operationId: cancel-pending
+      parameters:
+        - description: Pending transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Pending transaction id
+            format: uuid
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Cancel a pending transaction
+      tags:
+        - approvals
+  /v1/pending/{id}/reject:
+    post:
+      description: "Rejects the pending transaction named by id (ADR-025): no money ever moves for it. Requires approve scope (or admin). Rejecting an already-decided pending (approved, rejected, cancelled, or expired) returns 409 Conflict."
+      operationId: reject-pending
+      parameters:
+        - description: Pending transaction id
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Pending transaction id
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectPendingInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      security:
+        - bearerAuth: []
+      summary: Reject a pending transaction
+      tags:
+        - approvals
   /v1/reports/trial-balance:
     get:
       description: Returns, for the caller's tenant, each currency's net posted total (which must be zero in a correct double-entry ledger, the balance proof) and every account's derived balance, including system (FX clearing) accounts, which hold the FX position and are part of the proof.
@@ -2426,7 +2734,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TransactionBody"
+                $ref: "#/components/schemas/CreateTransactionOutputBody"
           description: Created
           headers:
             Idempotent-Replayed:
@@ -2643,7 +2951,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TransactionBody"
+                $ref: "#/components/schemas/ReverseTransactionOutputBody"
           description: Created
           headers:
             Already-Reversed:
@@ -2680,6 +2988,8 @@ tags:
     name: reports
   - description: Open and resolve disputes (chargebacks) against posted transactions.
     name: disputes
+  - description: List and decide (approve, reject, cancel) transactions held for exceeding the tenant's approval threshold.
+    name: approvals
   - description: Read the tamper-evident audit trail.
     name: audit
   - description: Service health and metadata.

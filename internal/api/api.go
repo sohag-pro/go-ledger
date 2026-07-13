@@ -65,6 +65,14 @@ type Deps struct {
 	// Disputes backs the /v1/disputes operations (Task 6.3, audit A9.2): a
 	// dispute/chargeback data model built on the reversal primitive.
 	Disputes *ledger.DisputeService
+	// Approvals backs the /v1/pending operations (Task 9, ADR-025): listing,
+	// reading, approving, rejecting, and cancelling a held (over-threshold)
+	// transaction. Optional like the other services; a zero Deps leaves it
+	// nil, and the approve/reject/cancel/list/get operations are still
+	// registered (they are always part of the spec), but call a nil
+	// *ledger.ApprovalService if ever invoked without one configured, the same
+	// tradeoff every other optional Deps field already makes.
+	Approvals *ledger.ApprovalService
 	// FX backs the /v1/admin/fx operations (ADR-020): live rate and markup
 	// config. Optional like the other services; a zero Deps leaves it nil.
 	FX *fx.AdminService
@@ -169,6 +177,7 @@ func New(router chi.Router, deps Deps) huma.API {
 		{Name: "transactions", Description: "Post and reverse double-entry transactions."},
 		{Name: "reports", Description: "Read-only reporting and analytics over a tenant's ledger."},
 		{Name: "disputes", Description: "Open and resolve disputes (chargebacks) against posted transactions."},
+		{Name: "approvals", Description: "List and decide (approve, reject, cancel) transactions held for exceeding the tenant's approval threshold."},
 		{Name: "audit", Description: "Read the tamper-evident audit trail."},
 		{Name: "meta", Description: "Service health and metadata."},
 	}
@@ -226,6 +235,7 @@ func registerOperations(api huma.API, deps Deps) {
 	registerAdmin(api, deps)
 	registerReports(api, deps)
 	registerDisputes(api, deps)
+	registerApprovals(api, deps)
 }
 
 // SpecYAML builds the API on a throwaway router and serializes its OpenAPI spec

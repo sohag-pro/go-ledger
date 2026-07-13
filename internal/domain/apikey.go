@@ -27,14 +27,19 @@ const (
 	// carrying it satisfies any required scope without also needing "read" and
 	// "post" listed explicitly. See APIKey.HasScope.
 	ScopeAdmin Scope = "admin"
+	// ScopeApprove lets a key approve or reject a pending (over-threshold)
+	// transaction (ADR-025). It is distinct from ScopePost so "authorize a
+	// large movement" is separable from "operate the tenant". ScopeAdmin is a
+	// superset (see HasScope), so an admin key satisfies it without listing it.
+	ScopeApprove Scope = "approve"
 )
 
-// Valid reports whether s is one of the three defined scopes. The api_keys
+// Valid reports whether s is one of the defined scopes. The api_keys
 // table's api_keys_scopes_valid CHECK constraint (migration 0012) enforces
 // the same set at the schema level.
 func (s Scope) Valid() bool {
 	switch s {
-	case ScopeRead, ScopePost, ScopeAdmin:
+	case ScopeRead, ScopePost, ScopeApprove, ScopeAdmin:
 		return true
 	default:
 		return false

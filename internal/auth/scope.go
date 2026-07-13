@@ -19,6 +19,8 @@ const adminPathPrefix = "/v1/admin/"
 //
 //   - any path under adminPathPrefix requires domain.ScopeAdmin, regardless
 //     of method;
+//   - a path /v1/pending/{id}/approve or /v1/pending/{id}/reject requires
+//     domain.ScopeApprove, regardless of method;
 //   - a safe method (GET, HEAD, OPTIONS) requires domain.ScopeRead;
 //   - every other method (POST, PUT, PATCH, DELETE, and anything else)
 //     requires domain.ScopePost, the fail-closed default: an unrecognized
@@ -26,6 +28,13 @@ const adminPathPrefix = "/v1/admin/"
 func RequiredHTTPScope(method, path string) domain.Scope {
 	if strings.HasPrefix(path, adminPathPrefix) {
 		return domain.ScopeAdmin
+	}
+	// Deciding a pending (approve/reject) needs ScopeApprove; POST would
+	// otherwise map to ScopePost. Cancel stays ScopePost (the creator's own
+	// key). The list/get GETs fall through to ScopeRead.
+	if strings.HasPrefix(path, "/v1/pending/") &&
+		(strings.HasSuffix(path, "/approve") || strings.HasSuffix(path, "/reject")) {
+		return domain.ScopeApprove
 	}
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:

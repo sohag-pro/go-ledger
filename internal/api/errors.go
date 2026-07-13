@@ -114,6 +114,10 @@ func toHumaErr(err error) error {
 		return huma.Error404NotFound("transaction not found")
 	case errors.Is(err, domain.ErrDisputeNotFound):
 		return huma.Error404NotFound("dispute not found")
+	// domain.ErrPendingTransactionNotFound (ADR-025) is a 404, the same class
+	// as the other "no such resource" cases above.
+	case errors.Is(err, domain.ErrPendingTransactionNotFound):
+		return huma.Error404NotFound("pending transaction not found")
 	case errors.Is(err, domain.ErrInvalidDispute):
 		return huma.Error422UnprocessableEntity("dispute is missing a required field")
 	case errors.Is(err, domain.ErrDisputeReasonTooLong):

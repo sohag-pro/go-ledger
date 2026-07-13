@@ -204,6 +204,20 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
+	// ADR-025 section 6 (Lifecycle): the replay-dedup read. holdForApproval
+	// calls this before inserting a new pending, and again if the insert itself
+	// loses a race against a concurrent identical retry
+	// (pending_transactions_idempotency_idx unique violation), so a retry of the
+	// same gated create with the same idempotency key always returns the one
+	// pending that key produced, never a second one.
+	GetPendingByIdempotencyKey(ctx context.Context, arg GetPendingByIdempotencyKeyParams) (PendingTransaction, error)
+	// Task 4 (ADR-025): the row-locking read a decision (approve/reject/cancel)
+	// takes before transitioning a pending, so two racing decisions cannot both
+	// win; the loser's transaction blocks on this lock until the winner commits
+	// or rolls back, then re-reads the now-terminal row. Called only from
+	// inside RunInTx (via the Tx port), never as a standalone read.
+	GetPendingForUpdate(ctx context.Context, arg GetPendingForUpdateParams) (PendingTransaction, error)
+	GetPendingTransaction(ctx context.Context, arg GetPendingTransactionParams) (PendingTransaction, error)
 	// The reversal of a given original, if one exists (Task 4.2, audit A1.2):
 	// transactions_one_reversal_idx (migration 0017) guarantees at most one row
 	// can ever match, so this is a plain :one lookup, not a list.
@@ -243,12 +257,24 @@ type Querier interface {
 	// unique violation instead of silently forking the chain. chain_seq is left
 	// to its column DEFAULT (nextval), never supplied by the caller: it is what
 	// makes chain order immune to any host's clock (see GetLastAuditHash below).
+	//
+	// transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+	// migration 0034): a chained non-transaction lifecycle event carries
+	// subject_type/subject_id instead of a transaction_id. hash_version is
+	// copied straight from the source outbox row, so recomputing this row's
+	// hash later (Verify) always uses the same preimage it was chained with.
 	InsertAuditLog(ctx context.Context, arg InsertAuditLogParams) error
 	// Writes one outbox row inside the caller's own transaction (ADR-017): the
 	// event is durable if and only if the surrounding post/convert transaction
 	// commits. occurred_at, txid, and created_at are all left to their column
 	// defaults (the database server's now() and pg_current_xact_id(), see
 	// migration 0015): no chain read, no hash computed, here.
+	//
+	// transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+	// migration 0034): a non-transaction lifecycle event (for example
+	// approval.rejected) carries subject_type/subject_id instead of a
+	// transaction_id. hash_version records which row-hash preimage the caller
+	// computed against, so the chainer and Verify recompute with the same one.
 	InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxParams) error
 	// fx_markup_defaults is append-only (ADR-020): a new default is a new row.
 	// tenant_id NULL is the global default, a non-NULL tenant_id is that tenant's
@@ -294,6 +320,13 @@ type Querier interface {
 	// domain.ErrDuplicateIdempotencyKey exactly as a plain unique-violation used
 	// to, preserving replay-on-duplicate for the still-live case.
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (uuid.UUID, error)
+	// Task 4 (ADR-025): status is NOT inserted explicitly (the column default
+	// 'pending' applies), the same convention CreateDispute leaves status to its
+	// own column default for. idempotency_key (migration 0036, ADR-025 section
+	// 6) is nullable via sqlc.narg: a held create with no caller-supplied key
+	// inserts NULL, which never collides under pending_transactions_idempotency_idx
+	// (a partial unique index that only applies where the key is present).
+	InsertPendingTransaction(ctx context.Context, arg InsertPendingTransactionParams) error
 	// Creates one fan-out row for a (subscription, audit event) pairing. The
 	// ON CONFLICT DO NOTHING against the UNIQUE (subscription_id,
 	// audit_chain_seq) index (migration 0021) is what makes fan-out
@@ -348,6 +381,10 @@ type Querier interface {
 	// chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
 	// migration 0016) for why chain_seq, not id, is the failover-safe chain
 	// order.
+	//
+	// Includes subject_type, subject_id, and hash_version (ADR-025, migration
+	// 0034) so recomputing a row's hash uses the same preimage it was chained
+	// with.
 	ListAuditForVerify(ctx context.Context, tenantID uuid.UUID) ([]ListAuditForVerifyRow, error)
 	// A bounded page of the tenant's audit rows in true chain order, strictly
 	// after after_chain_seq (Task 5.3, audit A2.4): the streaming counterpart to
@@ -360,6 +397,11 @@ type Querier interface {
 	// the cursor without a second round trip. after_chain_seq is 0 to start
 	// from genesis, or an anchor's chain_seq to start from a trusted checkpoint
 	// (VerifyFromLatestAnchor).
+	//
+	// Also includes subject_type, subject_id, and hash_version (ADR-025,
+	// migration 0034): this is the query AuditService.Verify actually pages
+	// through, so it must return everything ComputeAuditRowHash needs to
+	// recompute each row (both v1 and v2) exactly as it was chained.
 	ListAuditForVerifyPage(ctx context.Context, arg ListAuditForVerifyPageParams) ([]ListAuditForVerifyPageRow, error)
 	// One row per tenant with at least one audit_log entry: that tenant's
 	// current chain head (chain_seq, row_hash). The anchor job (Task 5.3) reads
@@ -373,6 +415,14 @@ type Querier interface {
 	// failover-safe, skew-proof linearization key), not id or created_at, for
 	// the same reason GetLastAuditHash does: it is the one order the chainer
 	// itself guarantees is monotonic across any failover.
+	//
+	// transaction_id is nullable (ADR-025, migration 0034): a chained
+	// non-transaction lifecycle event (for example approval.rejected) has none.
+	// The fan-out worker maps a null transaction_id to an empty, omitted field
+	// in the webhook payload, the same convention the rest of the audit read
+	// path uses. subject_type/subject_id (also ADR-025) are what that kind of
+	// event carries instead: the fan-out worker copies them onto the payload
+	// (Task 10) so a consumer can tell which subject the event concerns.
 	ListAuditLogSinceChainSeq(ctx context.Context, arg ListAuditLogSinceChainSeqParams) ([]ListAuditLogSinceChainSeqRow, error)
 	// The current effective row per (base, quote) for a tenant plus the global
 	// defaults: DISTINCT ON collapses each pair to one row, and the ORDER BY puts
@@ -403,6 +453,11 @@ type Querier interface {
 	// row lock is released the moment this statement completes; correctness
 	// does not depend on holding it any longer than that.
 	ListDueWebhookDeliveries(ctx context.Context, batchLimit int32) ([]ListDueWebhookDeliveriesRow, error)
+	// Filtered, keyset-paged list of a tenant's pendings, newest first (Task 4,
+	// ADR-025). status is an optional filter via sqlc.narg: NULL disables it
+	// (every status is returned). Keyset paged by (created_at, id) descending,
+	// the identical cursor shape ListDisputes already uses.
+	ListPendingTransactions(ctx context.Context, arg ListPendingTransactionsParams) ([]PendingTransaction, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	// Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
 	// ListTransactions returns up to a page's worth of transaction rows, and
@@ -503,6 +558,14 @@ type Querier interface {
 	// tenant_id is of type uuid but expression is of type text"). Casting to
 	// uuid explicitly at each use pins its type regardless of statement order.
 	MintCryptoKeyVersion(ctx context.Context, arg MintCryptoKeyVersionParams) (MintCryptoKeyVersionRow, error)
+	// Task 6 (ADR-025): the reverse-of-approved exemption's read. True only when
+	// some pending transaction's decision produced transaction_id AND that
+	// decision was an approval (a rejected or cancelled pending never sets
+	// transaction_id at all, per the transaction_id IS NULL OR status =
+	// 'approved' check in migration 0035, so the status filter here is mostly
+	// belt-and-suspenders). TransactionService.ReverseTransaction calls this
+	// before gating a reversal, never from inside RunInTx.
+	PendingApprovedForTransaction(ctx context.Context, arg PendingApprovedForTransactionParams) (bool, error)
 	// Task 6.3, audit A9.2: the guarded transition out of 'open'. The WHERE
 	// status = 'open' clause is what makes resolving an already-resolved (or
 	// concurrently-being-resolved) dispute return zero rows rather than
@@ -524,6 +587,10 @@ type Querier interface {
 	// first. Ordering by (txid, id) is the total order ADR-017 defines: it is
 	// stable because txid is not reused and id is a bigserial tiebreaker for the
 	// (rare) case of equal txid.
+	//
+	// Includes subject_type, subject_id, and hash_version (ADR-025, migration
+	// 0034) so the chainer can copy them onto the audit_log row it builds and
+	// hash with the row's own recorded version.
 	ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error)
 	// Reconciles an already-existing key's scopes to exactly the given set, keyed
 	// by hash rather than id (ADR-019 follow-up, review fix): InsertAPIKey is
@@ -602,6 +669,18 @@ type Querier interface {
 	// loops this query in batches until a call deletes 0 rows (or a max
 	// iteration guard trips), summing the deleted count for the sweep log line.
 	SweepExpiredIdempotencyKeysBatch(ctx context.Context, batchSize int32) (int64, error)
+	// Task 4 (ADR-025): the TTL sweep, mirroring
+	// SweepExpiredIdempotencyKeysBatch's role for idempotency keys. Runs
+	// outside any tenant's RunInTx (a background goroutine with no tenant GUC
+	// set, so the RLS policy's allow-when-unset branch lets it see every
+	// tenant), on an interval, moving every still-pending row older than
+	// older_than_seconds to 'expired' and decided_by 'system'. RETURNING the
+	// full rows lets the caller emit one approval.expired lifecycle event per
+	// row expired, without a second read. older_than_seconds is a float8 of
+	// seconds, not a Postgres interval literal, the same
+	// server-clock-independent-duration convention InsertIdempotencyKey's
+	// ttl_seconds already uses.
+	SweepExpiredPending(ctx context.Context, olderThanSeconds float64) ([]PendingTransaction, error)
 	// Task 2.4b (audit A3.4): each currency's already-posted debit total for
 	// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
 	// up with the same clock that stamped created_at on every posting). Read
@@ -630,6 +709,13 @@ type Querier interface {
 	// posted total across every account in the tenant; in a correct ledger every
 	// total is zero (ADR-001).
 	TrialBalanceByCurrency(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceByCurrencyRow, error)
+	// Task 4 (ADR-025): the decision write. Always called after
+	// GetPendingForUpdate has already locked and validated the row within the
+	// same surrounding transaction, so this is a plain unconditional update, not
+	// a guarded one the way ResolveDispute's UPDATE ... WHERE status = 'open'
+	// is: the row lock is what prevents a second concurrent decision here, not
+	// a WHERE clause on this statement.
+	UpdatePendingStatus(ctx context.Context, arg UpdatePendingStatusParams) error
 }
 
 var _ Querier = (*Queries)(nil)

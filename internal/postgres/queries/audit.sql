@@ -5,8 +5,14 @@
 -- unique violation instead of silently forking the chain. chain_seq is left
 -- to its column DEFAULT (nextval), never supplied by the caller: it is what
 -- makes chain order immune to any host's clock (see GetLastAuditHash below).
-INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
+--
+-- transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+-- migration 0034): a chained non-transaction lifecycle event carries
+-- subject_type/subject_id instead of a transaction_id. hash_version is
+-- copied straight from the source outbox row, so recomputing this row's
+-- hash later (Verify) always uses the same preimage it was chained with.
+INSERT INTO audit_log (id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, outbox_id, subject_type, subject_id, hash_version)
+VALUES (sqlc.arg(id), sqlc.arg(tenant_id), sqlc.arg(action), sqlc.narg(transaction_id), sqlc.arg(actor), sqlc.arg(before), sqlc.arg(after), sqlc.arg(created_at), sqlc.arg(prev_hash), sqlc.arg(row_hash), sqlc.arg(outbox_id), sqlc.narg(subject_type), sqlc.narg(subject_id), sqlc.arg(hash_version));
 
 -- name: GetLastAuditHash :one
 -- The tenant's most recent row_hash, used to extend the per-tenant hash chain.
@@ -66,7 +72,11 @@ LIMIT sqlc.arg(page_limit);
 -- chain_seq, not id or created_at: see GetLastAuditHash's comment (ADR-017,
 -- migration 0016) for why chain_seq, not id, is the failover-safe chain
 -- order.
-SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash
+--
+-- Includes subject_type, subject_id, and hash_version (ADR-025, migration
+-- 0034) so recomputing a row's hash uses the same preimage it was chained
+-- with.
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, subject_type, subject_id, hash_version
 FROM audit_log
 WHERE tenant_id = sqlc.arg(tenant_id)
 ORDER BY chain_seq;
@@ -83,7 +93,12 @@ ORDER BY chain_seq;
 -- the cursor without a second round trip. after_chain_seq is 0 to start
 -- from genesis, or an anchor's chain_seq to start from a trusted checkpoint
 -- (VerifyFromLatestAnchor).
-SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq
+--
+-- Also includes subject_type, subject_id, and hash_version (ADR-025,
+-- migration 0034): this is the query AuditService.Verify actually pages
+-- through, so it must return everything ComputeAuditRowHash needs to
+-- recompute each row (both v1 and v2) exactly as it was chained.
+SELECT id, tenant_id, action, transaction_id, actor, before, after, created_at, prev_hash, row_hash, chain_seq, subject_type, subject_id, hash_version
 FROM audit_log
 WHERE tenant_id = sqlc.arg(tenant_id) AND chain_seq > sqlc.arg(after_chain_seq)
 ORDER BY chain_seq

@@ -1042,3 +1042,134 @@ func TestChainer_LeaderLockLoss_ReleasesLeadershipAndReContends(t *testing.T) {
 	}
 	assertNoFork(t, repo, tenant, 1+more)
 }
+
+// TestChainer_MixedV1V2RowsChainAndVerify proves ADR-025 end to end: a
+// tenant's chain can carry both an ordinary v1 transaction event and a v2
+// non-transaction lifecycle event (for example approval.rejected, which
+// never becomes a transaction) side by side, both chain correctly, and
+// AuditService.Verify recomputes each with its own recorded hash_version. It
+// then corrupts the v2 row's subject_id directly (standing in for a
+// database-privileged tamper) and confirms Verify catches it at that row.
+func TestChainer_MixedV1V2RowsChainAndVerify(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil)
+	auditSvc := ledger.NewAuditService(repo)
+	ctx := context.Background()
+
+	tenant, debit, credit := seedTenant(t, repo)
+
+	// A normal v1 transaction event: the existing path, untouched by
+	// ADR-025. AppendAuditOutbox defaults HashVersion to domain.AuditHashV1
+	// when the caller (TransactionService) leaves it zero.
+	txID := post(t, svc, tenant, debit, credit, 500)
+
+	// A v2 lifecycle event with no transaction (a rejected pending never
+	// becomes one): subject_type/subject_id name what it is about instead.
+	subjectID := uuid.NewString()
+	after, err := json.Marshal(map[string]any{"pending_id": subjectID, "reason": "policy violation"})
+	if err != nil {
+		t.Fatalf("marshal after: %v", err)
+	}
+	err = repo.RunInTx(ctx, tenant, func(ctx context.Context, tx domain.Tx) error {
+		return tx.AppendAuditOutbox(ctx, tenant, domain.AuditEvent{
+			Action:      "approval.rejected",
+			Actor:       tenant,
+			After:       after,
+			SubjectType: "pending_transaction",
+			SubjectID:   subjectID,
+			HashVersion: domain.AuditHashV2,
+		})
+	})
+	if err != nil {
+		t.Fatalf("append v2 audit outbox: %v", err)
+	}
+
+	chainer := audit.NewChainer(pool, discardLogger(), time.Millisecond, 500)
+	drainUntilEmpty(t, chainer, repo, tenant)
+
+	rows, err := repo.ListAuditForVerify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("list audit for verify: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("audit rows = %d, want 2", len(rows))
+	}
+
+	var v1Row, v2Row domain.AuditEntry
+	var sawV1, sawV2 bool
+	for _, row := range rows {
+		switch row.HashVersion {
+		case domain.AuditHashV1:
+			v1Row, sawV1 = row, true
+		case domain.AuditHashV2:
+			v2Row, sawV2 = row, true
+		default:
+			t.Fatalf("unexpected hash_version %d on row %s", row.HashVersion, row.ID)
+		}
+	}
+	if !sawV1 || !sawV2 {
+		t.Fatalf("sawV1=%v sawV2=%v, want both", sawV1, sawV2)
+	}
+	if v1Row.TransactionID != txID {
+		t.Errorf("v1 row transaction_id = %q, want %q", v1Row.TransactionID, txID)
+	}
+	if v1Row.SubjectType != "" || v1Row.SubjectID != "" {
+		t.Errorf("v1 row subject = (%q, %q), want empty", v1Row.SubjectType, v1Row.SubjectID)
+	}
+	if v2Row.TransactionID != "" {
+		t.Errorf("v2 row transaction_id = %q, want empty (a rejected pending never becomes one)", v2Row.TransactionID)
+	}
+	if v2Row.SubjectType != "pending_transaction" || v2Row.SubjectID != subjectID {
+		t.Errorf("v2 row subject = (%q, %q), want (%q, %q)", v2Row.SubjectType, v2Row.SubjectID, "pending_transaction", subjectID)
+	}
+
+	result, err := auditSvc.Verify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("chain invalid before corruption: checked=%d first_break=%s", result.Checked, result.FirstBreakID)
+	}
+	if result.Checked != 2 {
+		t.Fatalf("checked = %d, want 2", result.Checked)
+	}
+
+	// Corrupt the v2 row's subject_id directly (a database-privileged
+	// rewrite, not something the application path can do: audit_log rejects
+	// UPDATE/DELETE outside the demo seeder's purge GUC, flipped here the
+	// same way audit_hash_chain_test.go's tamper tests do). Verify must
+	// catch it: subject_id is part of the v2 preimage, so recomputing the
+	// row's hash from the tampered content no longer matches its stored
+	// row_hash.
+	tamperedSubjectID := uuid.MustParse(uuid.NewString())
+	rowID := uuid.MustParse(v2Row.ID)
+	tamperTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tamper tx: %v", err)
+	}
+	defer tamperTx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
+	if _, err := tamperTx.Exec(ctx, `SET LOCAL audit.allow_purge = 'on'`); err != nil {
+		t.Fatalf("set local: %v", err)
+	}
+	if _, err := tamperTx.Exec(ctx,
+		`UPDATE audit_log SET subject_id = $1 WHERE id = $2`,
+		tamperedSubjectID, rowID,
+	); err != nil {
+		t.Fatalf("corrupt v2 row subject_id: %v", err)
+	}
+	if err := tamperTx.Commit(ctx); err != nil {
+		t.Fatalf("commit tamper: %v", err)
+	}
+
+	result, err = auditSvc.Verify(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify after corruption: %v", err)
+	}
+	if result.Valid {
+		t.Fatalf("chain reported valid after corrupting v2 row %s's subject_id, want invalid", v2Row.ID)
+	}
+	if result.FirstBreakID != v2Row.ID {
+		t.Errorf("first_break_id = %q, want %q (the corrupted v2 row)", result.FirstBreakID, v2Row.ID)
+	}
+}

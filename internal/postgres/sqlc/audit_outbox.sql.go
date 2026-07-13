@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const auditOutboxWatermark = `-- name: AuditOutboxWatermark :one
@@ -43,17 +44,20 @@ func (q *Queries) CountPendingOutbox(ctx context.Context, tenantID uuid.UUID) (i
 }
 
 const insertAuditOutbox = `-- name: InsertAuditOutbox :exec
-INSERT INTO audit_outbox (tenant_id, action, transaction_id, actor, before, after)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO audit_outbox (tenant_id, action, transaction_id, actor, before, after, subject_type, subject_id, hash_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 `
 
 type InsertAuditOutboxParams struct {
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 // Writes one outbox row inside the caller's own transaction (ADR-017): the
@@ -61,6 +65,12 @@ type InsertAuditOutboxParams struct {
 // commits. occurred_at, txid, and created_at are all left to their column
 // defaults (the database server's now() and pg_current_xact_id(), see
 // migration 0015): no chain read, no hash computed, here.
+//
+// transaction_id, subject_type, and subject_id are all nullable (ADR-025,
+// migration 0034): a non-transaction lifecycle event (for example
+// approval.rejected) carries subject_type/subject_id instead of a
+// transaction_id. hash_version records which row-hash preimage the caller
+// computed against, so the chainer and Verify recompute with the same one.
 func (q *Queries) InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxParams) error {
 	_, err := q.db.Exec(ctx, insertAuditOutbox,
 		arg.TenantID,
@@ -69,6 +79,9 @@ func (q *Queries) InsertAuditOutbox(ctx context.Context, arg InsertAuditOutboxPa
 		arg.Actor,
 		arg.Before,
 		arg.After,
+		arg.SubjectType,
+		arg.SubjectID,
+		arg.HashVersion,
 	)
 	return err
 }
@@ -86,7 +99,7 @@ func (q *Queries) MarkAuditOutboxProcessed(ctx context.Context, id int64) error 
 }
 
 const scanUnprocessedAuditOutbox = `-- name: ScanUnprocessedAuditOutbox :many
-SELECT id, tenant_id, action, transaction_id, actor, before, after, occurred_at, txid
+SELECT id, tenant_id, action, transaction_id, actor, before, after, occurred_at, txid, subject_type, subject_id, hash_version
 FROM audit_outbox
 WHERE processed_at IS NULL AND txid < $1
 ORDER BY txid, id
@@ -102,12 +115,15 @@ type ScanUnprocessedAuditOutboxRow struct {
 	ID            int64
 	TenantID      uuid.UUID
 	Action        string
-	TransactionID uuid.UUID
+	TransactionID pgtype.UUID
 	Actor         string
 	Before        []byte
 	After         []byte
 	OccurredAt    time.Time
 	Txid          int64
+	SubjectType   pgtype.Text
+	SubjectID     pgtype.UUID
+	HashVersion   int16
 }
 
 // The chainer's batch read: unprocessed rows whose inserting transaction is
@@ -115,6 +131,10 @@ type ScanUnprocessedAuditOutboxRow struct {
 // first. Ordering by (txid, id) is the total order ADR-017 defines: it is
 // stable because txid is not reused and id is a bigserial tiebreaker for the
 // (rare) case of equal txid.
+//
+// Includes subject_type, subject_id, and hash_version (ADR-025, migration
+// 0034) so the chainer can copy them onto the audit_log row it builds and
+// hash with the row's own recorded version.
 func (q *Queries) ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnprocessedAuditOutboxParams) ([]ScanUnprocessedAuditOutboxRow, error) {
 	rows, err := q.db.Query(ctx, scanUnprocessedAuditOutbox, arg.Xmin, arg.BatchLimit)
 	if err != nil {
@@ -134,6 +154,9 @@ func (q *Queries) ScanUnprocessedAuditOutbox(ctx context.Context, arg ScanUnproc
 			&i.After,
 			&i.OccurredAt,
 			&i.Txid,
+			&i.SubjectType,
+			&i.SubjectID,
+			&i.HashVersion,
 		); err != nil {
 			return nil, err
 		}

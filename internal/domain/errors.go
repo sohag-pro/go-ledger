@@ -203,4 +203,38 @@ var (
 	ErrInvalidHierarchy = errors.New("domain: invalid account hierarchy")
 	// ErrParentNotFound is a parent_id that names no account in the tenant. Mapped to 422.
 	ErrParentNotFound = errors.New("domain: parent account not found")
+	// ErrPendingTransactionNotFound is returned when no pending_transactions
+	// row matches the given id within the tenant (ADR-025, Week 13).
+	ErrPendingTransactionNotFound = errors.New("domain: pending transaction not found")
+	// ErrInvalidPendingTransaction is returned when a PendingTransaction
+	// carries an unrecognized Kind, an empty Payload, or an empty
+	// ThresholdCcy/CreatedBy (ADR-025, Week 13).
+	ErrInvalidPendingTransaction = errors.New("domain: invalid pending transaction")
+	// ErrDuplicatePendingIdempotencyKey is returned by InsertPendingTransaction
+	// when a concurrent hold already consumed p.IdempotencyKey for this
+	// tenant (pending_transactions_idempotency_idx, migration 0036): the
+	// insert lost a race against another request holding the identical
+	// retry. holdForApproval catches this and reads back the pending the
+	// winner inserted instead of surfacing it as an error, so a racing
+	// replay still gets the same-pending guarantee ADR-025 section 6 promises.
+	ErrDuplicatePendingIdempotencyKey = errors.New("domain: pending transaction idempotency key already consumed")
+	// ErrCannotApproveOwn is returned when ApprovalConfig.RequireDifferentActor
+	// is set and the actor approving a pending transaction is the same actor
+	// who created it (ADR-025, Week 13): a four-eyes policy requires a
+	// second, different person to approve, so an approver approving their
+	// own request is refused rather than silently let through.
+	ErrCannotApproveOwn = errors.New("domain: cannot approve your own pending transaction")
+	// ErrPendingAlreadyDecided is returned when a decision (approve, reject,
+	// or cancel) targets a pending transaction that has already left the
+	// pending status (ADR-025, Week 13): a pending is decided at most once,
+	// and a second, different decision on an already-terminal row is
+	// rejected rather than silently overwriting the first one. Approving an
+	// already-approved pending is the one exception: that is idempotent and
+	// returns the already-posted transaction instead of this error (see
+	// ApprovalService.Approve).
+	ErrPendingAlreadyDecided = errors.New("domain: pending transaction already decided")
+	// ErrNotPendingCreator is returned when Cancel is called by an actor who
+	// did not create the pending transaction (ADR-025, Week 13): only the
+	// creator may withdraw their own held request before a decision is made.
+	ErrNotPendingCreator = errors.New("domain: only the creator can cancel a pending transaction")
 )

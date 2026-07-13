@@ -112,6 +112,15 @@ type Tx interface {
 	// instances. The single background chainer (internal/audit.Chainer) is
 	// what later reads this row and extends the tenant's tamper-evident hash
 	// chain (see ComputeAuditRowHash and the chainer's doc comment).
+	//
+	// e.TransactionID and e.SubjectID are both nullable columns underneath
+	// (ADR-025): an empty string on either maps to NULL, the convention
+	// every nullable-uuid field on AuditEvent/AuditEntry follows. e.
+	// HashVersion defaults to AuditHashV1 when the caller leaves it zero, so
+	// every existing caller (every transaction post, which predates
+	// ADR-025) keeps writing v1 rows unchanged; only a caller that sets
+	// HashVersion to AuditHashV2 (a non-transaction lifecycle event) needs
+	// to also set SubjectType/SubjectID.
 	AppendAuditOutbox(ctx context.Context, tenantID string, e AuditEvent) error
 
 	// TenantDailyDebits returns the tenant's already-posted per-currency
@@ -156,6 +165,34 @@ type Tx interface {
 	// concurrency onto a handful of accounts, the same class of retry storm
 	// ADR-017 removed the audit chain read to get rid of.
 	AccountPostingStates(ctx context.Context, tenantID string, accountIDs []string) (map[string]AccountPostingState, error)
+
+	// GetPendingForUpdate returns the pending transaction identified by id
+	// within tenantID, row-locked (SELECT ... FOR UPDATE) for the rest of
+	// the surrounding transaction (Task 4, ADR-025): the read a decision
+	// (approve/reject/cancel) takes before transitioning a pending, so two
+	// racing decisions on the same row cannot both proceed; the loser
+	// blocks on the lock until the winner commits or rolls back, then sees
+	// the now-terminal row. Returns ErrPendingTransactionNotFound if no
+	// pending transaction matches id within tenantID.
+	GetPendingForUpdate(ctx context.Context, tenantID, id string) (*PendingTransaction, error)
+
+	// UpdatePendingStatus transitions the pending transaction identified by
+	// id to status, stamping decidedBy and decided_at (server clock), and
+	// reason/txID if given (Task 4, ADR-025). It is always called after
+	// GetPendingForUpdate has already locked the row within the same
+	// transaction: unlike Repository.ResolveDispute's guarded UPDATE, this
+	// is a plain unconditional update, the lock is what prevents a second
+	// concurrent decision, not a WHERE clause here.
+	UpdatePendingStatus(ctx context.Context, tenantID string, id string, status PendingStatus, decidedBy string, reason *string, txID *string) error
+
+	// InsertPendingTransaction assigns an identity if p.ID is empty and
+	// inserts p (Task 6, ADR-025), the same insert Repository.
+	// InsertPendingTransaction performs, exposed on Tx as well so
+	// TransactionService.holdForApproval can write the pending and its
+	// approval.requested lifecycle event together, inside one RunInTx: a
+	// crash between the two would otherwise leave a pending with no audit
+	// trail, or an audit row for a pending that never actually persisted.
+	InsertPendingTransaction(ctx context.Context, tenantID string, p *PendingTransaction) error
 }
 
 // Repository is the persistence port for the ledger. The domain owns this
@@ -564,4 +601,51 @@ type Repository interface {
 	// already-shredded tenant is a no-op success, not an error, and never
 	// moves the original shredded_at timestamp.
 	ShredTenantCryptoKey(ctx context.Context, tenantID string) error
+
+	// InsertPendingTransaction assigns an identity if p.ID is empty and
+	// inserts p (Task 4, ADR-025): a gated over-threshold transaction, held
+	// as intent with status defaulting to PendingStatusPending. Nothing in
+	// postings/transactions is touched by this call.
+	InsertPendingTransaction(ctx context.Context, tenantID string, p *PendingTransaction) error
+
+	// GetPendingTransaction returns the pending transaction with the given
+	// id within the tenant, or ErrPendingTransactionNotFound if none exists
+	// (Task 4, ADR-025).
+	GetPendingTransaction(ctx context.Context, tenantID, id string) (*PendingTransaction, error)
+
+	// GetPendingByIdempotencyKey returns the pending transaction whose
+	// IdempotencyKey equals key within the tenant, or
+	// ErrPendingTransactionNotFound if none exists (ADR-025 section 6,
+	// Lifecycle, the fix for the replay-creates-a-second-pending gap):
+	// holdForApproval calls this before inserting a new pending so a retry
+	// of the same gated create, with the same caller-supplied idempotency
+	// key, returns the original pending instead of holding a second one.
+	GetPendingByIdempotencyKey(ctx context.Context, tenantID, key string) (*PendingTransaction, error)
+
+	// ListPendingTransactions returns up to limit of the tenant's pending
+	// transactions, newest first, keyset paged the same way ListDisputes
+	// pages (Task 4, ADR-025). status, if non-nil, filters to only that
+	// status; nil returns every status. after is the keyset position to
+	// page from; nil starts at the newest row.
+	ListPendingTransactions(ctx context.Context, tenantID string, status *PendingStatus, after *StatementCursor, limit int) ([]PendingTransaction, error)
+
+	// SweepExpiredPending moves every still-pending row older than
+	// olderThan to PendingStatusExpired (decided_by "system"), across every
+	// tenant, and returns the rows it expired (Task 4, ADR-025): the TTL
+	// sweep, mirroring SweepExpiredIdempotencyKeys's role. It is not scoped
+	// to one tenant and is never called from inside RunInTx: a background
+	// goroutine calls it on an interval (PENDING_TTL), independent of any
+	// request's unit of work. The returned rows let the caller emit one
+	// approval.expired lifecycle event per row, without a second read.
+	SweepExpiredPending(ctx context.Context, olderThan time.Duration) ([]PendingTransaction, error)
+
+	// PendingApprovedForTransaction reports whether an approved pending
+	// transaction produced txID (Task 6, ADR-025): the reverse-of-approved
+	// exemption. TransactionService.ReverseTransaction calls this before
+	// gating a reversal so money that already cleared the approval gate
+	// once, when it was originally posted, is not held a second time just
+	// because its reversal happens to touch the same over-threshold amount.
+	// false (with a nil error) is the ordinary case: most transactions were
+	// never gated at all.
+	PendingApprovedForTransaction(ctx context.Context, tenantID, txID string) (bool, error)
 }

@@ -153,6 +153,17 @@ type config struct {
 	webhookDeliveryInterval  time.Duration
 	metricsCollectInterval   time.Duration
 	adminBootstrap           bool
+	// Approval workflow config (Task 9, ADR-025): approvalEnabled off (the
+	// default) means the gate never fires and posting behaves exactly as
+	// before this feature existed. approvalThresholdsRaw is parsed by
+	// ledger.ParseApprovalThresholds below, into the map ledger.ApprovalConfig
+	// actually carries; it stays a raw string on config itself, matching how
+	// fxRates is carried unparsed until fx.Seed consumes it.
+	approvalEnabled               bool
+	approvalThresholdsRaw         string
+	approvalRequireDifferentActor bool
+	pendingTTL                    time.Duration
+	pendingSweepInterval          time.Duration
 }
 
 // loadConfig loads the server's configuration from the environment, running
@@ -279,6 +290,19 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		// (for example when an operator would rather mint their own admin
 		// key via ledgerctl and never have one printed to the logs).
 		adminBootstrap: getenvBool("ADMIN_BOOTSTRAP", true),
+		// Approval workflow config (Task 9, ADR-025): off by default, like
+		// every other opt-in feature flag in this config (chainerEnabled,
+		// webhooksEnabled, and so on), so an existing deployment that never
+		// sets APPROVAL_ENABLED keeps posting exactly as it did before this
+		// feature existed. PENDING_TTL and PENDING_SWEEP_INTERVAL still get
+		// sane defaults even when the gate itself is off, since a disabled
+		// gate never creates a pending in the first place: there is nothing
+		// for the sweep to expire, so an unused default here is harmless.
+		approvalEnabled:               getenvBool("APPROVAL_ENABLED", false),
+		approvalThresholdsRaw:         getenv("APPROVAL_THRESHOLDS", ""),
+		approvalRequireDifferentActor: getenvBool("APPROVAL_REQUIRE_DIFFERENT_ACTOR", false),
+		pendingTTL:                    getenvDuration("PENDING_TTL", 72*time.Hour),
+		pendingSweepInterval:          getenvDuration("PENDING_SWEEP_INTERVAL", time.Hour),
 	}
 	if cfg.databaseURL == "" {
 		if !interactive {
@@ -312,6 +336,15 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 	// (seed.Seed also stamps this currency on every seeded account).
 	if err := domain.Currency(cfg.defaultCurrency).Validate(); err != nil {
 		return config{}, fmt.Errorf("DEFAULT_CURRENCY %q is invalid: %w", cfg.defaultCurrency, err)
+	}
+	// Fail fast on a malformed APPROVAL_THRESHOLDS (Task 9, ADR-025), the same
+	// way as DEFAULT_CURRENCY above: a bad "CCY:amount" entry should stop the
+	// server at boot, not surface later as a silently-ungated (or
+	// silently-misconfigured) approval workflow. The parsed map itself is
+	// rebuilt in run() from this same raw string when the ApprovalConfig is
+	// actually constructed; this call exists only to validate it eagerly.
+	if _, err := ledger.ParseApprovalThresholds(cfg.approvalThresholdsRaw); err != nil {
+		return config{}, fmt.Errorf("APPROVAL_THRESHOLDS is invalid: %w", err)
 	}
 	// A SET-but-malformed LEDGER_MASTER_KEY (Task 6.2, audit A9.3) fails the
 	// server's boot immediately, before anything else is constructed, rather
@@ -525,6 +558,25 @@ func run(logger *slog.Logger) error {
 	// lookup runs at all. See its own doc comment (internal/auth/negativethrottle.go)
 	// for the full reasoning and the bounded-map design.
 	negativeThrottle := auth.NewNegativeThrottle(cfg.authNegativeMaxFailures, cfg.authNegativeWindow)
+
+	// Approval workflow config (Task 9, ADR-025): the thresholds map is
+	// rebuilt here from cfg.approvalThresholdsRaw, already validated once in
+	// loadConfigWithTTY, so this parse cannot fail. approvalCfg is shared by
+	// the TransactionService (which gates Post/Convert/ReverseTransaction)
+	// and the ApprovalService (which decides a held pending), the same way a
+	// single ApprovalConfig value is meant to govern both halves of the
+	// workflow (see ledger.NewApprovalService's own doc comment).
+	approvalThresholds, err := ledger.ParseApprovalThresholds(cfg.approvalThresholdsRaw)
+	if err != nil {
+		return fmt.Errorf("parse APPROVAL_THRESHOLDS: %w", err)
+	}
+	approvalCfg := ledger.ApprovalConfig{
+		Enabled:               cfg.approvalEnabled,
+		Thresholds:            approvalThresholds,
+		RequireDifferentActor: cfg.approvalRequireDifferentActor,
+		TTL:                   cfg.pendingTTL,
+	}
+
 	transactions := ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
 		ledger.WithFXProvider(fx.NewDBProvider(pool)),
 		ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
@@ -536,7 +588,16 @@ func run(logger *slog.Logger) error {
 		// integration replaces this one line with its own PrePostHook
 		// implementation; nothing else in the posting path needs to change.
 		ledger.WithPrePostHook(ledger.NoopPrePostHook{}),
-		ledger.WithCipher(cipher))
+		ledger.WithCipher(cipher),
+		// The approval gate (Task 9, ADR-025): approvalCfg.Enabled false (the
+		// default) makes this a no-op, so Post/Convert/ReverseTransaction
+		// behave exactly as they did before this feature existed.
+		ledger.WithApproval(approvalCfg))
+	// approvalSvc decides a pending Post/Convert/ReverseTransaction gated
+	// above: approve (replay through the SAME transactions instance, against
+	// current balances), reject, or cancel. See internal/api.Deps.Approvals
+	// and registerApprovals for the /v1/pending surface this backs.
+	approvalSvc := ledger.NewApprovalService(repo, transactions, approvalCfg, logger)
 	deps := api.Deps{
 		Accounts: ledger.NewAccountService(repo,
 			ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency)),
@@ -554,6 +615,7 @@ func run(logger *slog.Logger) error {
 		// FX backs the /v1/admin/fx operations (ADR-020): live rate and markup
 		// config, over the same pool fx.NewDBProvider(pool) above already reads.
 		FX:               fx.NewAdminService(pool),
+		Approvals:        approvalSvc,
 		DemoMode:         cfg.demoMode,
 		Auth:             resolver,
 		RateLimiter:      limiter,
@@ -643,6 +705,16 @@ func run(logger *slog.Logger) error {
 	defer cancelSweep()
 	go runIdempotencySweep(sweepCtx, logger, repo, cfg.idempotencySweepInterval)
 
+	// The pending-approval TTL sweep (Task 9, ADR-025): mirrors the
+	// idempotency-key sweep immediately above, running unconditionally on
+	// every instance regardless of whether APPROVAL_ENABLED is set. A
+	// disabled gate never creates a pending in the first place, so this is
+	// harmless, pure housekeeping either way, never a correctness concern
+	// (see runPendingSweep's own doc comment, Task 8).
+	pendingSweepCtx, cancelPendingSweep := context.WithCancel(context.Background())
+	defer cancelPendingSweep()
+	go runPendingSweep(pendingSweepCtx, logger, approvalSvc, cfg.pendingSweepInterval)
+
 	router := chi.NewRouter()
 	// No RealIP middleware: it trusts client-set forwarding headers and is
 	// spoofable. Revisit with a trusted-proxy allowlist when one is in front.
@@ -656,6 +728,14 @@ func run(logger *slog.Logger) error {
 	router.Get("/console/config", web.ConsoleConfig(web.ConsoleConfigData{
 		DemoMode:        cfg.demoMode,
 		DefaultTenantID: cfg.defaultTenant,
+		// Approval policy (Task 12, ADR-025), read only: the same
+		// approvalCfg built above for the transaction and approval
+		// services, so the console's Policy panel always describes the
+		// gate that is actually running, never a separately maintained copy.
+		ApprovalEnabled:               approvalCfg.Enabled,
+		ApprovalThresholds:            approvalCfg.Thresholds,
+		ApprovalRequireDifferentActor: approvalCfg.RequireDifferentActor,
+		ApprovalTTLSeconds:            int64(approvalCfg.TTL.Seconds()),
 	}))
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
 	router.Get("/the-ledger-book.pdf", web.BookPDF(goledger.LedgerBookPDF))
@@ -1115,6 +1195,51 @@ func runIdempotencySweep(ctx context.Context, logger *slog.Logger, sweeper idemp
 			logger.Info("idempotency keys swept", "deleted", n)
 		} else {
 			logger.Debug("idempotency key sweep found nothing to delete")
+		}
+	}
+
+	doSweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			doSweep()
+		}
+	}
+}
+
+// pendingSweeper is the slice of the ApprovalService the background TTL
+// sweep needs (Task 8, ADR-025): a plain, best-effort maintenance sweep that
+// expires stale pendings, not a per-request business call. A fake in
+// main_test.go exercises runPendingSweep without a real database.
+type pendingSweeper interface {
+	SweepExpiredPending(ctx context.Context) (int64, error)
+}
+
+// runPendingSweep expires pending transactions left undecided past
+// PENDING_TTL once immediately, then every interval, until ctx is cancelled
+// (Task 8, ADR-025). It mirrors runIdempotencySweep's shape exactly: a
+// failed sweep is logged and the loop continues rather than exiting, since
+// this is pure housekeeping, never something a request is waiting on.
+//
+// The goroutine start call (go runPendingSweep(...)) is wired in Task 9,
+// alongside the ApprovalService's own construction in main.go: this task
+// only adds the runner and its narrow interface so Task 9 can wire it
+// without also having to design the sweep loop.
+func runPendingSweep(ctx context.Context, logger *slog.Logger, sweeper pendingSweeper, interval time.Duration) {
+	doSweep := func() {
+		n, err := sweeper.SweepExpiredPending(ctx)
+		if err != nil {
+			logger.Error("pending approval sweep failed", "error", err)
+			return
+		}
+		if n > 0 {
+			logger.Info("pending approvals swept", "expired", n)
+		} else {
+			logger.Debug("pending approval sweep found nothing to expire")
 		}
 	}
 

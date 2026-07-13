@@ -147,10 +147,25 @@ type WebhookPayload struct {
 	// X-Ledger-Delivery-Id header: a receiver dedups repeat deliveries of the
 	// same event by this value, which is stable across every retry of the
 	// same row.
-	ID            string          `json:"id"`
-	Event         string          `json:"event"`
-	TenantID      string          `json:"tenant_id"`
-	TransactionID string          `json:"transaction_id"`
-	OccurredAt    time.Time       `json:"occurred_at"`
-	Data          json.RawMessage `json:"data"`
+	ID       string `json:"id"`
+	Event    string `json:"event"`
+	TenantID string `json:"tenant_id"`
+
+	// TransactionID is omitempty (ADR-025): a chained non-transaction
+	// lifecycle event (for example approval.requested) has no transaction,
+	// only a subject (see SubjectType/SubjectID below), and a consumer
+	// should not see a misleading present-but-empty transaction_id key on
+	// that kind of delivery.
+	TransactionID string `json:"transaction_id,omitempty"`
+
+	// SubjectType and SubjectID (ADR-025) name the entity a non-transaction
+	// lifecycle event is about (for example subject_type
+	// "pending_transaction", subject_id the pending's own id), so a
+	// consumer of that event can tell which pending it concerns. Both are
+	// omitempty: an ordinary transaction event carries neither.
+	SubjectType string `json:"subject_type,omitempty"`
+	SubjectID   string `json:"subject_id,omitempty"`
+
+	OccurredAt time.Time       `json:"occurred_at"`
+	Data       json.RawMessage `json:"data"`
 }

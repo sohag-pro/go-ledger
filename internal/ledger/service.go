@@ -38,6 +38,7 @@ type TransactionService struct {
 	idempotencyTTL time.Duration
 	prePostHook    PrePostHook
 	cipher         DescriptionCipher
+	approval       ApprovalConfig
 }
 
 // ServiceOption configures optional TransactionService dependencies that most
@@ -86,6 +87,15 @@ func WithPrePostHook(h PrePostHook) ServiceOption {
 // in: only when LEDGER_MASTER_KEY is set).
 func WithCipher(c DescriptionCipher) ServiceOption {
 	return func(s *TransactionService) { s.cipher = c }
+}
+
+// WithApproval sets the ApprovalConfig Post, Convert, and ReverseTransaction
+// gate against (ADR-025, Task 6). A TransactionService constructed without
+// this option has a zero-value ApprovalConfig, whose Enabled is false: Gate
+// always reports gated=false, so every existing caller and test keeps
+// posting exactly as before this option existed.
+func WithApproval(cfg ApprovalConfig) ServiceOption {
+	return func(s *TransactionService) { s.approval = cfg }
 }
 
 // NewTransactionService returns a TransactionService backed by repo. If log is
@@ -220,6 +230,22 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		span.SetStatus(codes.Error, "screening rejected post")
 		metrics.PostDuration.WithLabelValues("rejected").Observe(0)
 		return false, err
+	}
+
+	// Approval gate (ADR-025, Task 6): an over-threshold transaction is held
+	// as a pending instead of posted, unless this is the approval replay of
+	// an already-cleared pending (isApprovalReplay). Runs after screening (an
+	// unscreened post never reaches here) and before any posting write: the
+	// pending is committed by holdForApproval itself, in its own
+	// transaction, so nothing below this point ever runs for a held post.
+	if !isApprovalReplay(ctx) {
+		if ccy, amt, gated := s.approval.Gate(t.Postings); gated {
+			var idemKey string
+			if idem != nil {
+				idemKey = idem.Key
+			}
+			return false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindPost, postPayload(t), ccy, amt, idemKey)
+		}
 	}
 
 	// Encrypt-once (Task 6.2, audit A9.3): each posting's Description is

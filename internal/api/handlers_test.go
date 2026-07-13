@@ -61,6 +61,12 @@ type fakeRepo struct {
 	// disputes is a minimal in-memory stand-in for the disputes table (Task
 	// 6.3, audit A9.2), keyed by dispute id.
 	disputes map[string]domain.Dispute
+	// pending is a minimal in-memory stand-in for the pending_transactions
+	// table (Task 4, ADR-025), keyed by pending transaction id. No handler
+	// test in this package exercises the approval gate itself (that is
+	// Task 5+); this exists only so fakeRepo satisfies domain.Repository/
+	// domain.Tx.
+	pending map[string]domain.PendingTransaction
 }
 
 type postingRec struct {
@@ -89,6 +95,7 @@ func newFakeRepo() *fakeRepo {
 		tenants:      map[string]domain.Tenant{},
 		webhookSubs:  map[string]domain.WebhookSubscription{},
 		disputes:     map[string]domain.Dispute{},
+		pending:      map[string]domain.PendingTransaction{},
 	}
 }
 
@@ -1108,6 +1115,125 @@ func (f *fakeRepo) ResolveDispute(_ context.Context, tenantID, id string, status
 	d.ResolvedAt = &resolvedAt
 	f.disputes[id] = d
 	return d, nil
+}
+
+// InsertPendingTransaction mirrors postgres.Repository.InsertPendingTransaction
+// (Task 4, ADR-025): assigns an id if empty and defaults Status to pending.
+func (f *fakeRepo) InsertPendingTransaction(_ context.Context, tenantID string, p *domain.PendingTransaction) error {
+	if p.ID == "" {
+		p.ID = uuid.NewString()
+	}
+	p.TenantID = tenantID
+	p.Status = domain.PendingStatusPending
+	f.clock++
+	p.CreatedAt = time.Unix(f.clock, 0).UTC()
+	f.pending[p.ID] = *p
+	return nil
+}
+
+// GetPendingTransaction mirrors postgres.Repository.GetPendingTransaction
+// (Task 4, ADR-025).
+func (f *fakeRepo) GetPendingTransaction(_ context.Context, tenantID, id string) (*domain.PendingTransaction, error) {
+	p, ok := f.pending[id]
+	if !ok || p.TenantID != tenantID {
+		return nil, domain.ErrPendingTransactionNotFound
+	}
+	return &p, nil
+}
+
+// GetPendingByIdempotencyKey mirrors
+// postgres.Repository.GetPendingByIdempotencyKey (ADR-025 section 6): a
+// linear scan is fine here, the same tradeoff every other fakeRepo lookup
+// in this file already makes for an in-memory test double with no
+// meaningful row count.
+func (f *fakeRepo) GetPendingByIdempotencyKey(_ context.Context, tenantID, key string) (*domain.PendingTransaction, error) {
+	for _, p := range f.pending {
+		if p.TenantID == tenantID && p.IdempotencyKey != nil && *p.IdempotencyKey == key {
+			pending := p
+			return &pending, nil
+		}
+	}
+	return nil, domain.ErrPendingTransactionNotFound
+}
+
+// ListPendingTransactions mirrors ListDisputes' "collect, sort ascending,
+// then walk from the newest applying the cursor" style (Task 4, ADR-025).
+func (f *fakeRepo) ListPendingTransactions(_ context.Context, tenantID string, status *domain.PendingStatus, after *domain.StatementCursor, limit int) ([]domain.PendingTransaction, error) {
+	asc := make([]domain.PendingTransaction, 0, len(f.pending))
+	for _, p := range f.pending {
+		if p.TenantID != tenantID {
+			continue
+		}
+		if status != nil && p.Status != *status {
+			continue
+		}
+		asc = append(asc, p)
+	}
+	sort.Slice(asc, func(i, j int) bool {
+		if !asc[i].CreatedAt.Equal(asc[j].CreatedAt) {
+			return asc[i].CreatedAt.Before(asc[j].CreatedAt)
+		}
+		return asc[i].ID < asc[j].ID
+	})
+	out := make([]domain.PendingTransaction, 0, len(asc))
+	for i := len(asc) - 1; i >= 0; i-- {
+		p := asc[i]
+		if after != nil {
+			if p.CreatedAt.After(after.CreatedAt) || (p.CreatedAt.Equal(after.CreatedAt) && p.ID >= after.ID) {
+				continue
+			}
+		}
+		out = append(out, p)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// SweepExpiredPending mirrors postgres.Repository.SweepExpiredPending (Task
+// 4, ADR-025): no handler test exercises the TTL sweep (it has its own
+// Postgres-backed integration test), so this is a plain, always-empty
+// no-op that exists only to satisfy domain.Repository.
+func (f *fakeRepo) SweepExpiredPending(_ context.Context, _ time.Duration) ([]domain.PendingTransaction, error) {
+	return nil, nil
+}
+
+// GetPendingForUpdate mirrors postgres.txRepo.GetPendingForUpdate (Task 4,
+// ADR-025). fakeRepo has no real transaction isolation, so this is simply
+// GetPendingTransaction's lookup without any locking semantics.
+func (f *fakeRepo) GetPendingForUpdate(ctx context.Context, tenantID, id string) (*domain.PendingTransaction, error) {
+	return f.GetPendingTransaction(ctx, tenantID, id)
+}
+
+// UpdatePendingStatus mirrors postgres.txRepo.UpdatePendingStatus (Task 4,
+// ADR-025).
+func (f *fakeRepo) UpdatePendingStatus(_ context.Context, tenantID, id string, status domain.PendingStatus, decidedBy string, reason, txID *string) error {
+	p, ok := f.pending[id]
+	if !ok || p.TenantID != tenantID {
+		return domain.ErrPendingTransactionNotFound
+	}
+	p.Status = status
+	p.DecidedBy = &decidedBy
+	f.clock++
+	decidedAt := time.Unix(f.clock, 0).UTC()
+	p.DecidedAt = &decidedAt
+	p.Reason = reason
+	p.TransactionID = txID
+	f.pending[id] = p
+	return nil
+}
+
+// PendingApprovedForTransaction mirrors postgres.Repository.
+// PendingApprovedForTransaction (Task 6, ADR-025): true only when some
+// pending in f.pending both names txID as its TransactionID and is approved.
+func (f *fakeRepo) PendingApprovedForTransaction(_ context.Context, tenantID, txID string) (bool, error) {
+	for _, p := range f.pending {
+		if p.TenantID == tenantID && p.Status == domain.PendingStatusApproved && p.TransactionID != nil && *p.TransactionID == txID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 var _ domain.Repository = (*fakeRepo)(nil)

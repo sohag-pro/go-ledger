@@ -86,9 +86,21 @@ type TransactionOutput struct {
 // CreateTransactionOutput is the post-transaction response. Replayed is surfaced
 // as the Idempotent-Replayed header: true when an Idempotency-Key matched an
 // earlier request and the original transaction was returned unchanged.
+//
+// Status overrides the operation's DefaultStatus (201) at runtime: huma reads
+// a field literally named Status on an output struct and uses it as the
+// actual response code instead (see huma's processOutputType), so every
+// return path through create-transaction sets it explicitly, either 201 (the
+// transaction posted) or 202 (ADR-025: postings exceeded the tenant's
+// approval threshold and were held as a pending instead; Body.Pending is set
+// in that case and the TransactionBody fields are left zero).
 type CreateTransactionOutput struct {
+	Status   int
 	Replayed bool `header:"Idempotent-Replayed"`
-	Body     TransactionBody
+	Body     struct {
+		TransactionBody
+		Pending *PendingBody `json:"pending,omitempty" doc:"Set instead of the transaction fields when postings exceeded the approval threshold (ADR-025) and the request was held for approval rather than posted. Poll GET /v1/pending/{id} for its decision."`
+	}
 }
 
 type transactionIDInput struct {
@@ -98,12 +110,17 @@ type transactionIDInput struct {
 // ReverseTransactionOutput is the reverse-transaction response. AlreadyReversed
 // mirrors CreateTransactionOutput's Replayed / ConvertOutput's Replayed: true
 // when the original already had a reversal and the existing one was returned
-// unchanged instead of a new one being posted. The response status is always
-// 201, even when AlreadyReversed is true, the same convention Post and
-// Convert use for their own idempotent replay.
+// unchanged instead of a new one being posted. The response status is 201
+// whenever a reversal exists (new or already-reversed), or 202 (ADR-025) when
+// the reversal itself exceeded the approval threshold and was held instead;
+// see CreateTransactionOutput's Status doc comment for the mechanism.
 type ReverseTransactionOutput struct {
+	Status          int
 	AlreadyReversed bool `header:"Already-Reversed"`
-	Body            TransactionBody
+	Body            struct {
+		TransactionBody
+		Pending *PendingBody `json:"pending,omitempty" doc:"Set instead of the transaction fields when the reversal exceeded the approval threshold (ADR-025) and the request was held for approval rather than posted."`
+	}
 }
 
 // TransactionListInput is the list-transactions request: optional date-range
@@ -313,16 +330,23 @@ type ConvertInput struct {
 
 // ConvertResponseBody is the JSON shape of a successful convert: the posted
 // transaction (source account, source clearing, destination clearing,
-// destination account) plus the FX rate detail actually applied.
+// destination account) plus the FX rate detail actually applied. Pending is
+// set instead (ADR-025) when the conversion exceeded the approval threshold
+// and was held rather than posted; Transaction and FX are left zero in that
+// case.
 type ConvertResponseBody struct {
 	Transaction TransactionBody `json:"transaction"`
 	FX          FXDetailBody    `json:"fx"`
+	Pending     *PendingBody    `json:"pending,omitempty" doc:"Set instead of transaction/fx when the conversion exceeded the approval threshold (ADR-025) and the request was held for approval rather than posted."`
 }
 
 // ConvertOutput is the convert response. Replayed mirrors
 // CreateTransactionOutput: true when an Idempotency-Key matched an earlier
-// convert request and the original conversion was returned unchanged.
+// convert request and the original conversion was returned unchanged. Status
+// is 201 (converted) or 202 (ADR-025: held for approval); see
+// CreateTransactionOutput's Status doc comment for the mechanism.
 type ConvertOutput struct {
+	Status   int
 	Replayed bool `header:"Idempotent-Replayed"`
 	Body     ConvertResponseBody
 }
@@ -363,9 +387,22 @@ func registerTransactions(api huma.API, deps Deps) {
 		}
 		replayed, err := deps.Transactions.Post(ctx, tenant, txn, idem)
 		if err != nil {
+			// ADR-025: an over-threshold post is held as a pending instead of
+			// posted. holdForApproval already committed the pending row and its
+			// approval.requested lifecycle event by the time this error
+			// reaches here, so there is nothing left to write, only to report:
+			// 202 Accepted with the pending resource instead of the usual 201.
+			if pending, held := ledger.AsHeldForApproval(err); held {
+				out := &CreateTransactionOutput{Status: http.StatusAccepted}
+				body := toPendingBody(pending)
+				out.Body.Pending = &body
+				return out, nil
+			}
 			return nil, toHumaErr(err)
 		}
-		return &CreateTransactionOutput{Replayed: replayed, Body: toTransactionBody(*txn)}, nil
+		out := &CreateTransactionOutput{Status: http.StatusCreated, Replayed: replayed}
+		out.Body.TransactionBody = toTransactionBody(*txn)
+		return out, nil
 	})
 
 	huma.Register(api, huma.Operation{
@@ -413,9 +450,15 @@ func registerTransactions(api huma.API, deps Deps) {
 		idem := &domain.Idempotency{Key: in.IdempotencyKey}
 		txn, replayed, err := deps.Transactions.Convert(ctx, tenant, req, idem)
 		if err != nil {
+			// ADR-025: see create-transaction's identical check above.
+			if pending, held := ledger.AsHeldForApproval(err); held {
+				body := toPendingBody(pending)
+				return &ConvertOutput{Status: http.StatusAccepted, Body: ConvertResponseBody{Pending: &body}}, nil
+			}
 			return nil, toHumaErr(err)
 		}
 		return &ConvertOutput{
+			Status:   http.StatusCreated,
 			Replayed: replayed,
 			Body: ConvertResponseBody{
 				Transaction: toTransactionBody(*txn),
@@ -440,9 +483,18 @@ func registerTransactions(api huma.API, deps Deps) {
 		}
 		reversal, alreadyReversed, err := deps.Transactions.ReverseTransaction(ctx, tenant, in.ID)
 		if err != nil {
+			// ADR-025: see create-transaction's identical check above.
+			if pending, held := ledger.AsHeldForApproval(err); held {
+				out := &ReverseTransactionOutput{Status: http.StatusAccepted}
+				body := toPendingBody(pending)
+				out.Body.Pending = &body
+				return out, nil
+			}
 			return nil, toHumaErr(err)
 		}
-		return &ReverseTransactionOutput{AlreadyReversed: alreadyReversed, Body: toTransactionBody(*reversal)}, nil
+		out := &ReverseTransactionOutput{Status: http.StatusCreated, AlreadyReversed: alreadyReversed}
+		out.Body.TransactionBody = toTransactionBody(*reversal)
+		return out, nil
 	})
 
 	huma.Register(api, huma.Operation{

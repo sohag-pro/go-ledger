@@ -329,12 +329,15 @@ func (c *Chainer) chainOne(ctx context.Context, db dbtx, row sqlc.ScanUnprocesse
 	entry := domain.AuditEntry{
 		ID:            id.String(),
 		Action:        row.Action,
-		TransactionID: row.TransactionID.String(),
+		TransactionID: pgUUIDToString(row.TransactionID),
 		Actor:         row.Actor,
 		Before:        row.Before,
 		After:         row.After,
 		CreatedAt:     row.OccurredAt.UTC().Truncate(time.Microsecond),
 		PrevHash:      prev,
+		SubjectType:   row.SubjectType.String,
+		SubjectID:     pgUUIDToString(row.SubjectID),
+		HashVersion:   int(row.HashVersion),
 	}
 	entry.RowHash = domain.ComputeAuditRowHash(tenantID, entry, prev)
 
@@ -355,6 +358,9 @@ func (c *Chainer) chainOne(ctx context.Context, db dbtx, row sqlc.ScanUnprocesse
 		PrevHash:      pgtype.Text{String: entry.PrevHash, Valid: true},
 		RowHash:       pgtype.Text{String: entry.RowHash, Valid: true},
 		OutboxID:      pgtype.Int8{Int64: row.ID, Valid: true},
+		SubjectType:   row.SubjectType,
+		SubjectID:     row.SubjectID,
+		HashVersion:   row.HashVersion,
 	})
 	if insertErr != nil {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
@@ -377,6 +383,22 @@ func (c *Chainer) chainOne(ctx context.Context, db dbtx, row sqlc.ScanUnprocesse
 
 	lastHash[tenantID] = entry.RowHash
 	return nil
+}
+
+// pgUUIDToString maps a nullable pgtype.UUID column back onto the plain,
+// possibly-empty string domain.AuditEntry uses (ADR-025, migration 0034):
+// "" when the column is NULL (a non-transaction lifecycle event's
+// transaction_id, or any row's subject_id before ADR-025), otherwise its
+// string form. pgtype.UUID.String() does NOT check Valid itself (it happily
+// formats the zero value), so calling it directly on a possibly-null column
+// would silently turn NULL into the nil UUID string instead of "": every
+// read of a nullable audit uuid column in this package must go through this
+// helper, never row.Field.String() directly.
+func pgUUIDToString(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	return uuid.UUID(u.Bytes).String()
 }
 
 // isDuplicateOutboxChain reports whether err is audit_log's outbox_id unique
