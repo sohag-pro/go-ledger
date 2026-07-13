@@ -114,6 +114,33 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 	if withPostings != txnCount {
 		t.Errorf("audit_outbox rows with a 2-leg postings snapshot = %d, want %d", withPostings, txnCount)
 	}
+
+	// Task 12 (ADR-025): the demo Approvals panel must never be empty. Seed a
+	// few pending_transactions rows, all still pending, each carrying the
+	// threshold it was held against, so a visitor sees something to approve
+	// or reject on first load.
+	var pendingCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pending_transactions WHERE tenant_id = $1 AND status = 'pending'`,
+		tenant).Scan(&pendingCount); err != nil {
+		t.Fatalf("count pending_transactions: %v", err)
+	}
+	if pendingCount < 2 {
+		t.Errorf("pending_transactions (status=pending) = %d, want at least 2", pendingCount)
+	}
+
+	var populatedThreshold int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pending_transactions
+		 WHERE tenant_id = $1 AND status = 'pending'
+		 AND threshold_ccy <> '' AND threshold_amt > 0`,
+		tenant).Scan(&populatedThreshold); err != nil {
+		t.Fatalf("count pending_transactions with a populated threshold: %v", err)
+	}
+	if populatedThreshold != pendingCount {
+		t.Errorf("pending_transactions with populated threshold_ccy/threshold_amt = %d, want %d (all of them)",
+			populatedThreshold, pendingCount)
+	}
 }
 
 // TestSeed_ResetsRatherThanDuplicates calls Seed twice for the same tenant,
@@ -151,6 +178,18 @@ func TestSeed_ResetsRatherThanDuplicates(t *testing.T) {
 	}
 	if txnCount < 80 || txnCount > 200 {
 		t.Errorf("transaction count after two Seed calls = %d, want roughly 124 (80 to 200), not doubled", txnCount)
+	}
+
+	// The reset must clear the first round's pending_transactions before
+	// re-seeding, not pile a second batch on top: 2 to 3 pendings, same as a
+	// single Seed call, never 4 to 6.
+	var pendingCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pending_transactions WHERE tenant_id = $1`, tenant).Scan(&pendingCount); err != nil {
+		t.Fatalf("count pending_transactions: %v", err)
+	}
+	if pendingCount < 2 || pendingCount > 3 {
+		t.Errorf("pending_transactions after two Seed calls = %d, want 2 to 3 (reset, not duplicated)", pendingCount)
 	}
 }
 
@@ -212,8 +251,12 @@ func TestPurgeNonDemoTenants(t *testing.T) {
 		t.Errorf("purged %d tenants, want 1", purged)
 	}
 
-	// The victim must be gone from tenants and every tenant-scoped table.
-	for _, table := range []string{"tenants", "accounts", "transactions", "postings", "audit_outbox", "api_keys"} {
+	// The victim must be gone from tenants and every tenant-scoped table,
+	// including pending_transactions (Task 12): Seed above already left the
+	// victim holding 2 to 3 pendings, exactly the FK hazard purgeOrder must
+	// clear before the final DELETE FROM tenants, since
+	// pending_transactions.tenant_id references tenants(id).
+	for _, table := range []string{"tenants", "accounts", "transactions", "postings", "audit_outbox", "api_keys", "pending_transactions"} {
 		col := "tenant_id"
 		if table == "tenants" {
 			col = "id"

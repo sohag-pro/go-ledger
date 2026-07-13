@@ -728,6 +728,14 @@ func run(logger *slog.Logger) error {
 	router.Get("/console/config", web.ConsoleConfig(web.ConsoleConfigData{
 		DemoMode:        cfg.demoMode,
 		DefaultTenantID: cfg.defaultTenant,
+		// Approval policy (Task 12, ADR-025), read only: the same
+		// approvalCfg built above for the transaction and approval
+		// services, so the console's Policy panel always describes the
+		// gate that is actually running, never a separately maintained copy.
+		ApprovalEnabled:               approvalCfg.Enabled,
+		ApprovalThresholds:            approvalCfg.Thresholds,
+		ApprovalRequireDifferentActor: approvalCfg.RequireDifferentActor,
+		ApprovalTTLSeconds:            int64(approvalCfg.TTL.Seconds()),
 	}))
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
 	router.Get("/the-ledger-book.pdf", web.BookPDF(goledger.LedgerBookPDF))

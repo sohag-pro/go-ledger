@@ -220,13 +220,19 @@ func DemoTenantIDs(defaultTenantID string) []string {
 // they go first; webhook_deliveries references webhook_subscriptions; the tenant
 // row in tenants is deleted last, by PurgeNonDemoTenants itself. fx_rates and
 // fx_markup_defaults are handled separately because their tenant_id is nullable
-// (global rows must survive), so they are not in this list.
+// (global rows must survive), so they are not in this list. pending_transactions
+// (migration 0035, ADR-025) only references tenants, not transactions or
+// accounts, so its place among the tenant-scoped tables is not FK-forced; it
+// goes early anyway, alongside the other tables ahead of transactions, so a
+// visitor tenant seeded with a pending (Task 12) never trips the final DELETE
+// FROM tenants on a stray foreign key.
 var purgeOrder = []string{
 	"postings",
 	"disputes",
 	"audit_log",
 	"audit_outbox",
 	"idempotency_keys",
+	"pending_transactions",
 	"transactions",
 	"accounts",
 	"webhook_deliveries",
@@ -405,7 +411,10 @@ func seedTenant(ctx context.Context, pool *pgxpool.Pool, th theme, now time.Time
 	// transactions before accounts. audit_outbox is not append-only guarded
 	// (no immutability trigger; it holds no chain data, just pending
 	// events), so it needs no purge GUC, unlike audit_log above.
-	for _, table := range []string{"idempotency_keys", "audit_log", "audit_outbox", "postings", "transactions", "accounts"} {
+	// pending_transactions (Task 12, ADR-025) holds this tenant's old seeded
+	// pendings; clear it here too, before re-seeding a fresh batch below, so
+	// a reset never leaves stale or duplicated pendings behind.
+	for _, table := range []string{"idempotency_keys", "audit_log", "audit_outbox", "pending_transactions", "postings", "transactions", "accounts"} {
 		if _, err := tx.Exec(ctx, "DELETE FROM "+table+" WHERE tenant_id = $1", tid); err != nil {
 			return fmt.Errorf("seed: clear %s: %w", table, err)
 		}
@@ -486,6 +495,60 @@ func seedTenant(ctx context.Context, pool *pgxpool.Pool, th theme, now time.Time
 			 VALUES ($1,$2,$3,$4,$5,$6)`,
 			tid, domain.ActionTransactionCreated, txID, tid.String(), after, t.at); err != nil {
 			return fmt.Errorf("seed: insert audit outbox: %w", err)
+		}
+	}
+
+	// Seed a few pending approvals (Task 12, ADR-025) so the demo Approvals
+	// panel is never empty: a plausible large transfer between two of the
+	// tenant's own accounts, held because it exceeds threshold_amt. This is
+	// demo data only, written the same way the transactions above are:
+	// nothing here calls ledger.ApprovalConfig.Gate, so these rows exist
+	// regardless of whether APPROVAL_ENABLED is set on this deployment.
+	// decided_by, decided_at, reason, and transaction_id are left NULL,
+	// satisfying both pending_transactions CHECK constraints for a row still
+	// in the 'pending' status.
+	if len(th.accounts) >= 2 {
+		debitID := idByName[th.accounts[0].name]
+		creditID := idByName[th.accounts[1].name]
+
+		// Scale the threshold to the tenant's own largest ordinary flow
+		// amount, so "over threshold" reads as plausible across themes of
+		// very different size: a bank's ledger runs two orders of magnitude
+		// bigger than a personal budget's.
+		var maxCat int64
+		for _, f := range th.flows {
+			for _, c := range f.cats {
+				if c.max > maxCat {
+					maxCat = c.max
+				}
+			}
+		}
+		if maxCat <= 0 {
+			maxCat = 100000
+		}
+
+		pendingCount := 2 + rng.Intn(2) // 2 or 3
+		for i := 0; i < pendingCount; i++ {
+			// 25 to 75 percent over the threshold: clearly over, not a
+			// borderline value.
+			amt := maxCat + maxCat/4 + rng.Int63n(maxCat/2+1)
+			desc := "Large transfer pending approval"
+			payload, err := json.Marshal(map[string]any{
+				"postings": []map[string]any{
+					{"account_id": debitID, "amount": amt, "currency": th.currency, "description": desc},
+					{"account_id": creditID, "amount": -amt, "currency": th.currency, "description": desc},
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("seed: marshal pending payload: %w", err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO pending_transactions
+				 (id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at)
+				 VALUES ($1,$2,'post',$3,'pending',$4,$5,$6,$7)`,
+				newID(), tid, payload, th.currency, maxCat, tid.String(), randTime(rng, now)); err != nil {
+				return fmt.Errorf("seed: insert pending transaction: %w", err)
+			}
 		}
 	}
 

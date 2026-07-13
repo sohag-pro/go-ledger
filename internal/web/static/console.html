@@ -620,6 +620,11 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       <!-- ===== POLICY ===== -->
       <section class="view" id="view-policy" data-screen-label="Policy">
         <h1>Policy</h1>
+        <div class="card" style="max-width:520px;margin-bottom:18px">
+          <h2 style="font-size:14.5px;margin:0 0 12px">Approval workflow (ADR-025)</h2>
+          <p class="hint" style="margin:0 0 12px">Server-wide and read only here. A transaction that crosses a threshold is held; see it under Approvals.</p>
+          <div class="hint" id="approvalPolicyOut">Loading&hellip;</div>
+        </div>
         <p class="page-sub">Guardrails for <span class="mono" id="policyTenant"></span>. Everything here is optional. Saving writes the full policy: an empty field clears that guardrail.</p>
         <div class="admin-gate" data-gate>
           <div class="card" style="max-width:520px">
@@ -1020,7 +1025,8 @@ const state = {
   txFilter: { from: "", to: "", ref: "" },
   txCursor: null,
   dispCursor: null,
-  apprCursor: null
+  apprCursor: null,
+  approvalPolicy: null // server-wide approval config from /console/config (ADR-025), read only
 };
 
 const ADMIN_VIEWS = ["tenants", "apikeys", "webhooks", "policy"];
@@ -1462,7 +1468,29 @@ function showWebhookReveal(secret, url) {
 }
 
 /* ---------- admin: policy ---------- */
+// renderApprovalPolicy shows the server-wide approval workflow config
+// (ADR-025) from /console/config: not tenant scoped and not gated behind
+// adminUnlocked(), since it is public, read-only, unauthenticated data (the
+// same trust level as demo_mode / default_tenant_id already served there).
+function renderApprovalPolicy() {
+  const out = $("#approvalPolicyOut");
+  if (!out) return;
+  const p = state.approvalPolicy;
+  if (!p || !p.enabled) {
+    out.innerHTML = '<span class="badge grey">disabled</span> No transaction is held for approval on this deployment.';
+    return;
+  }
+  const entries = Object.entries(p.thresholds || {});
+  const thresholds = entries.length
+    ? entries.map(([ccy, amt]) => `${esc(ccy)} ${money(amt)}`).join(", ")
+    : "none configured";
+  const ttlHours = p.ttlSeconds ? Math.round(p.ttlSeconds / 3600) : 0;
+  out.innerHTML = `<span class="badge teal">enabled</span> Thresholds: ${thresholds}. `
+    + `Undecided pendings expire after ${ttlHours}h. `
+    + (p.requireDifferentActor ? "Approver must differ from the requester." : "The requester may also approve their own pending.");
+}
 function renderPolicy() {
+  renderApprovalPolicy();
   $("#policyTenant").textContent = tenantName();
   const gate = $("#view-policy [data-gate]");
   if (!adminUnlocked()) { lockCard(gate); return; }
@@ -2142,6 +2170,12 @@ function boot() {
     state.demoMode = !!cfg.demo_mode;
     state.mode = state.demoMode ? "demo" : "production";
     state.defaultTenantId = cfg.default_tenant_id || "";
+    state.approvalPolicy = {
+      enabled: !!cfg.approval_enabled,
+      thresholds: cfg.approval_thresholds || {},
+      requireDifferentActor: !!cfg.approval_require_different_actor,
+      ttlSeconds: cfg.approval_ttl_seconds || 0
+    };
     state.adminTenant = localStorage.getItem("gl_tenant") || state.defaultTenantId;
     if (state.demoMode) { state.activeKey = DEMO_API_KEY; }
     else { state.activeKey = localStorage.getItem(STORAGE_KEY) || ""; }
