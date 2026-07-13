@@ -236,8 +236,25 @@ func TestSeedResetsAuditAndIdempotency(t *testing.T) {
 	if auditCount != 0 {
 		t.Errorf("audit_log not cleared on reset: %d rows remain", auditCount)
 	}
-	if outboxCount != 0 {
-		t.Errorf("audit_outbox not cleared on reset: %d rows remain", outboxCount)
+	// The reset clears every pre-existing audit_outbox row (the fabricated one
+	// above plus the first seed's) and then writes a fresh one per seeded
+	// transaction (ADR-017), so the tamper-evident chain covers seeded data too.
+	// The count therefore equals the reseeded transaction count, not zero; what
+	// must be gone is the fabricated row, whose transaction no longer exists.
+	var txnCount, staleOutbox int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM transactions WHERE tenant_id = $1", tenant).Scan(&txnCount); err != nil {
+		t.Fatalf("count transactions: %v", err)
+	}
+	if outboxCount != txnCount {
+		t.Errorf("audit_outbox after reset = %d, want %d (one per seeded transaction, old rows cleared)", outboxCount, txnCount)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM audit_outbox WHERE transaction_id = $1", txnID).Scan(&staleOutbox); err != nil {
+		t.Fatalf("count stale audit_outbox: %v", err)
+	}
+	if staleOutbox != 0 {
+		t.Errorf("pre-existing audit_outbox row not cleared on reset: %d remain", staleOutbox)
 	}
 }
 

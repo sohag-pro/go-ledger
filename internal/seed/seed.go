@@ -7,6 +7,7 @@ package seed
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/fx"
 )
 
@@ -203,6 +205,100 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, tenantID string, now time.Tim
 	return seedTenant(ctx, pool, personalTheme(tenantID, currency), now, demoKeyHash)
 }
 
+// DemoTenantIDs returns the fixed ids of the three demo tenants (the personal
+// budget on defaultTenantID, plus the bank and company on their own fixed ids).
+// It is the "keep" set for PurgeNonDemoTenants: everything else is a
+// visitor-created tenant the demo reset should wipe.
+func DemoTenantIDs(defaultTenantID string) []string {
+	return []string{defaultTenantID, bankTenantID, companyTenantID}
+}
+
+// purgeOrder lists the tenant-scoped tables to clear when deleting a tenant
+// wholesale, in an order that never violates a foreign key: rows that reference
+// another table come before the table they reference. postings, disputes,
+// audit_log, audit_outbox, and idempotency_keys all reference transactions, so
+// they go first; webhook_deliveries references webhook_subscriptions; the tenant
+// row in tenants is deleted last, by PurgeNonDemoTenants itself. fx_rates and
+// fx_markup_defaults are handled separately because their tenant_id is nullable
+// (global rows must survive), so they are not in this list.
+var purgeOrder = []string{
+	"postings",
+	"disputes",
+	"audit_log",
+	"audit_outbox",
+	"idempotency_keys",
+	"transactions",
+	"accounts",
+	"webhook_deliveries",
+	"webhook_subscriptions",
+	"api_keys",
+	"crypto_keys",
+	"audit_anchors",
+}
+
+// PurgeNonDemoTenants deletes every tenant whose id is not in keep, along with
+// all of that tenant's data across every tenant-scoped table, and returns how
+// many tenant rows it removed. It keeps the public demo clean: visitors can
+// create tenants through the (demo-mode) admin panel, and without this they
+// accumulate forever, since the seeder only ever resets the fixed demo ids.
+//
+// This is a DEMO-ONLY, deliberately destructive operation. Unlike seedTenant it
+// does NOT honor the ADR-015 api-key guard: visitor tenants hold their own api
+// keys, and the whole point here is to remove them. The only thing standing
+// between this and a real deployment's data is the call site: it runs solely
+// from runSeeder, which starts only when DEMO_MODE and SEED_ENABLED are both on
+// (ADR-015 "Safe-by-default deployment"). Never call it from a non-demo path.
+//
+// Everything happens in one transaction, so the reset never exposes a
+// half-purged database. keep must be non-empty (it always holds the three demo
+// ids); an empty keep would match every tenant and is refused, as a guard
+// against a caller wiping the entire tenants table by mistake.
+func PurgeNonDemoTenants(ctx context.Context, pool *pgxpool.Pool, keep []string) (int64, error) {
+	if len(keep) == 0 {
+		return 0, fmt.Errorf("seed: PurgeNonDemoTenants: refusing to run with an empty keep set")
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("seed: purge: begin: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
+
+	// audit_log is append-only, guarded by a trigger that rejects DELETE. The
+	// demo reset is the sanctioned exception; this transaction-local GUC lets the
+	// purge clear it, exactly as seedTenant does for a single tenant.
+	if _, err := tx.Exec(ctx, "SET LOCAL audit.allow_purge = 'on'"); err != nil {
+		return 0, fmt.Errorf("seed: purge: enable audit purge: %w", err)
+	}
+
+	for _, table := range purgeOrder {
+		if _, err := tx.Exec(ctx,
+			"DELETE FROM "+table+" WHERE tenant_id <> ALL($1::uuid[])", keep); err != nil {
+			return 0, fmt.Errorf("seed: purge: clear %s: %w", table, err)
+		}
+	}
+
+	// fx_rates and fx_markup_defaults carry a nullable tenant_id: NULL rows are
+	// global (env- or api-seeded) and must survive. Only delete rows owned by a
+	// non-demo tenant.
+	for _, table := range []string{"fx_rates", "fx_markup_defaults"} {
+		if _, err := tx.Exec(ctx,
+			"DELETE FROM "+table+" WHERE tenant_id IS NOT NULL AND tenant_id <> ALL($1::uuid[])", keep); err != nil {
+			return 0, fmt.Errorf("seed: purge: clear %s: %w", table, err)
+		}
+	}
+
+	tag, err := tx.Exec(ctx, "DELETE FROM tenants WHERE id <> ALL($1::uuid[])", keep)
+	if err != nil {
+		return 0, fmt.Errorf("seed: purge: clear tenants: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("seed: purge: commit: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // Demo resets all three demo tenants: the personal budget on
 // defaultTenantID, plus a bank and a company on their own fixed ids. Each is
 // reset and repopulated in its own transaction, so a failure on one is reported
@@ -371,12 +467,54 @@ func seedTenant(ctx context.Context, pool *pgxpool.Pool, th theme, now time.Time
 				return fmt.Errorf("seed: insert posting: %w", err)
 			}
 		}
+
+		// Emit the same audit event a real post writes (ADR-017): a transaction.created
+		// row in the outbox, which the background chainer later drains into the
+		// tamper-evident audit_log. Without this, seeded transactions have no audit
+		// trail and the audit view / chain is blank, an inconsistency with any
+		// transaction posted through the API. occurred_at is the backdated posting
+		// time, which the chainer copies into audit_log.created_at, so the audit
+		// row lines up with the transaction it records. The after snapshot mirrors
+		// the shape auditSnapshot produces in the service, so the console renders
+		// the amount and account for seeded rows exactly as it does for live ones.
+		after, err := auditAfter(txID, th.currency, t)
+		if err != nil {
+			return fmt.Errorf("seed: marshal audit snapshot: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_outbox (tenant_id, action, transaction_id, actor, after, occurred_at)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			tid, domain.ActionTransactionCreated, txID, tid.String(), after, t.at); err != nil {
+			return fmt.Errorf("seed: insert audit outbox: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("seed: commit: %w", err)
 	}
 	return nil
+}
+
+// auditAfter builds the JSON after-snapshot for a seeded transaction, matching
+// the shape internal/ledger.auditSnapshot writes for a live post: the id, a
+// postings array of {account_id, amount, currency, description}, and the
+// effective time. Amounts are minor units. Map keys marshal in sorted order, so
+// the bytes are deterministic (the chainer hashes them verbatim).
+func auditAfter(txID, currency string, t txn) ([]byte, error) {
+	postings := make([]map[string]any, 0, len(t.legs))
+	for _, leg := range t.legs {
+		postings = append(postings, map[string]any{
+			"account_id":  leg.accountID,
+			"amount":      leg.amount,
+			"currency":    currency,
+			"description": leg.desc,
+		})
+	}
+	return json.Marshal(map[string]any{
+		"id":           txID,
+		"postings":     postings,
+		"effective_at": t.at,
+	})
 }
 
 // newID returns a fresh UUIDv7 string. The id encodes generation time, but

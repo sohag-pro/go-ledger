@@ -87,6 +87,33 @@ func TestSeed_PopulatesTenant(t *testing.T) {
 	if seenTxns != txnCount {
 		t.Errorf("grouped %d transactions from postings, want %d (matching the transactions table)", seenTxns, txnCount)
 	}
+
+	// Every seeded transaction must emit exactly one transaction.created audit
+	// outbox row (ADR-017), so the background chainer builds a tamper-evident
+	// audit trail for seeded data just like it does for a live post. Without
+	// this the audit view and chain are blank for prefilled data.
+	var outboxCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_outbox WHERE tenant_id = $1 AND action = 'transaction.created'`,
+		tenant).Scan(&outboxCount); err != nil {
+		t.Fatalf("count audit_outbox: %v", err)
+	}
+	if outboxCount != txnCount {
+		t.Errorf("audit_outbox rows = %d, want %d (one per seeded transaction)", outboxCount, txnCount)
+	}
+
+	// The after snapshot must carry the postings (account_id + amount), the
+	// fields the console renders, so seeded audit rows show amount and account.
+	var withPostings int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_outbox
+		 WHERE tenant_id = $1 AND json_array_length(after->'postings') = 2`,
+		tenant).Scan(&withPostings); err != nil {
+		t.Fatalf("check audit_outbox after snapshot: %v", err)
+	}
+	if withPostings != txnCount {
+		t.Errorf("audit_outbox rows with a 2-leg postings snapshot = %d, want %d", withPostings, txnCount)
+	}
 }
 
 // TestSeed_ResetsRatherThanDuplicates calls Seed twice for the same tenant,
@@ -145,6 +172,75 @@ func insertAPIKey(t *testing.T, pool *pgxpool.Pool, tenant, keyHash string) {
 		`INSERT INTO api_keys (id, tenant_id, name, key_hash) VALUES ($1, $2, $3, $4)`,
 		uuid.NewString(), tenant, "test-key", keyHash); err != nil {
 		t.Fatalf("insert api key: %v", err)
+	}
+}
+
+// TestPurgeNonDemoTenants proves the demo reset wipes visitor-created tenants
+// wholesale: given a kept (demo) tenant and a victim tenant, both fully seeded,
+// and the victim additionally holding its own api key, PurgeNonDemoTenants
+// removes the victim and all its data across every tenant-scoped table while
+// leaving the kept tenant untouched. Unlike Seed, the purge ignores the ADR-015
+// api-key guard: a visitor tenant holding its own key is exactly what must be
+// removed.
+// Deliberately NOT parallel: PurgeNonDemoTenants deletes every tenant not in
+// its keep set, so on this package's shared test database it would wipe the
+// tenants other parallel tests create. Running it in the sequential phase (when
+// every t.Parallel() test is paused before it has seeded anything) keeps it from
+// racing them.
+func TestPurgeNonDemoTenants(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	keep := uuid.NewString()
+	victim := uuid.NewString()
+	if err := seed.Seed(ctx, pool, keep, now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("seed kept tenant: %v", err)
+	}
+	if err := seed.Seed(ctx, pool, victim, now, "USD", testDemoKeyHash); err != nil {
+		t.Fatalf("seed victim tenant: %v", err)
+	}
+	// The victim holds its own (non-demo) api key: the exact case Seed refuses to
+	// touch but the purge must remove.
+	insertAPIKey(t, pool, victim, "victim-key-hash")
+
+	purged, err := seed.PurgeNonDemoTenants(ctx, pool, []string{keep})
+	if err != nil {
+		t.Fatalf("PurgeNonDemoTenants: %v", err)
+	}
+	if purged != 1 {
+		t.Errorf("purged %d tenants, want 1", purged)
+	}
+
+	// The victim must be gone from tenants and every tenant-scoped table.
+	for _, table := range []string{"tenants", "accounts", "transactions", "postings", "audit_outbox", "api_keys"} {
+		col := "tenant_id"
+		if table == "tenants" {
+			col = "id"
+		}
+		var n int
+		if err := pool.QueryRow(ctx,
+			"SELECT count(*) FROM "+table+" WHERE "+col+" = $1", victim).Scan(&n); err != nil {
+			t.Fatalf("count %s for victim: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("victim rows left in %s = %d, want 0", table, n)
+		}
+	}
+
+	// The kept tenant must be fully intact.
+	var keptAccts int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM accounts WHERE tenant_id = $1`, keep).Scan(&keptAccts); err != nil {
+		t.Fatalf("count kept accounts: %v", err)
+	}
+	if keptAccts != 11 {
+		t.Errorf("kept tenant accounts = %d, want 11 (untouched)", keptAccts)
+	}
+
+	// An empty keep set is refused, so a caller can never wipe every tenant.
+	if _, err := seed.PurgeNonDemoTenants(ctx, pool, nil); err == nil {
+		t.Error("PurgeNonDemoTenants with empty keep set: want error, got nil")
 	}
 }
 

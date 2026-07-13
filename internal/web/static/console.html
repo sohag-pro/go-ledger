@@ -1514,7 +1514,21 @@ function renderAudit() {
   const out = $("#auditVerifyOut");
   out.className = "hint"; out.style.margin = "0";
   out.textContent = "Recompute every row's hash from genesis and confirm nothing was altered.";
-  loadAudit(null);
+  // Load accounts first so postings can show account names, not bare ids.
+  (state.accounts && state.accounts.length ? Promise.resolve() : refreshAccounts().catch(() => {}))
+    .then(() => loadAudit(null));
+}
+
+// auditDetail renders the amount/account legs from an audit row's after
+// snapshot (postings: [{account_id, amount, currency}]). Amounts are minor
+// units; positive debits, negative credits. Non-transaction rows carry no
+// postings, so it falls back to a dash.
+function auditDetail(e) {
+  const ps = (e.after && e.after.postings) || [];
+  if (!ps.length) return '<span class="subtle">-</span>';
+  return ps.map(p =>
+    `<div style="white-space:nowrap"><span class="mono ${p.amount < 0 ? "neg" : "pos"}">${money(p.amount)} ${esc(p.currency || "")}</span> <span class="subtle">${esc(acctName(p.account_id))}</span></div>`
+  ).join("");
 }
 function loadAudit(cursor) {
   const q = cursor ? "?cursor=" + encodeURIComponent(cursor) : "";
@@ -1528,10 +1542,11 @@ function loadAudit(cursor) {
       $("#auditMoreRow").hidden = true; return;
     }
     card.innerHTML = `<table>
-      <thead><tr><th>When</th><th>Action</th><th>Transaction</th><th>Actor</th></tr></thead>
+      <thead><tr><th>When</th><th>Action</th><th>Amount &amp; account</th><th>Transaction</th><th>Actor</th></tr></thead>
       <tbody>${auditLoaded.map(e => `<tr>
         <td>${esc(new Date(e.created_at).toLocaleString())}</td>
         <td><span class="badge cyan">${esc(e.action)}</span></td>
+        <td>${auditDetail(e)}</td>
         <td class="mono" title="${esc(e.transaction_id)}">${esc((e.transaction_id || "").slice(0, 8))}</td>
         <td class="mono" title="${esc(e.actor)}">${esc((e.actor || "").slice(0, 12))}</td>
       </tr>`).join("")}</tbody></table>`;

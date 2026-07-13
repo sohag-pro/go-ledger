@@ -1060,6 +1060,16 @@ func provisionAdminKey(ctx context.Context, store apiKeyStore, adminSvc adminKey
 func runSeeder(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, tenant, currency string, interval time.Duration, demoKeyHash string) {
 	doSeed := func() {
 		start := time.Now()
+		// Wipe any visitor-created tenants first, so the public demo does not
+		// accumulate them across resets (the seeder below only touches the fixed
+		// demo ids). Demo-only and destructive; guarded by DEMO_MODE + SEED_ENABLED
+		// at this call site (see PurgeNonDemoTenants). A purge failure is logged
+		// but does not block the reseed.
+		if purged, err := seed.PurgeNonDemoTenants(ctx, pool, seed.DemoTenantIDs(tenant)); err != nil {
+			logger.Error("demo purge of non-demo tenants failed", "error", err)
+		} else if purged > 0 {
+			logger.Info("demo purged visitor-created tenants", "count", purged)
+		}
 		if err := seed.Demo(ctx, pool, tenant, time.Now(), currency, demoKeyHash); err != nil {
 			logger.Error("demo seed failed", "error", err)
 			return
