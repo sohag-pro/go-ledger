@@ -61,6 +61,7 @@ func TestScopeValid(t *testing.T) {
 		{ScopeRead, true},
 		{ScopePost, true},
 		{ScopeAdmin, true},
+		{ScopeApprove, true},
 		{Scope(""), false},
 		{Scope("write"), false},
 		{Scope("READ"), false},
@@ -86,7 +87,10 @@ func TestAPIKeyHasScope(t *testing.T) {
 		{"read+post key does not satisfy admin", []Scope{ScopeRead, ScopePost}, ScopeAdmin, false},
 		{"admin key satisfies read (superset)", []Scope{ScopeAdmin}, ScopeRead, true},
 		{"admin key satisfies post (superset)", []Scope{ScopeAdmin}, ScopePost, true},
+		{"admin key satisfies approve (superset)", []Scope{ScopeAdmin}, ScopeApprove, true},
 		{"admin key satisfies admin", []Scope{ScopeAdmin}, ScopeAdmin, true},
+		{"approve key satisfies approve", []Scope{ScopeApprove}, ScopeApprove, true},
+		{"approve key does not satisfy post", []Scope{ScopeApprove}, ScopePost, false},
 		{"no scopes satisfies nothing", nil, ScopeRead, false},
 	}
 	for _, tt := range tests {

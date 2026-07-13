@@ -19,6 +19,8 @@ const adminPathPrefix = "/v1/admin/"
 //
 //   - any path under adminPathPrefix requires domain.ScopeAdmin, regardless
 //     of method;
+//   - a path /v1/pending/{id}/approve or /v1/pending/{id}/reject requires
+//     domain.ScopeApprove, regardless of method;
 //   - a safe method (GET, HEAD, OPTIONS) requires domain.ScopeRead;
 //   - every other method (POST, PUT, PATCH, DELETE, and anything else)
 //     requires domain.ScopePost, the fail-closed default: an unrecognized
