@@ -71,6 +71,28 @@ func Favicon(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
+// BookPDF serves the compiled book with Content-Disposition: inline so browsers
+// open it in their native PDF viewer instead of downloading it. The bytes are
+// embedded at the module root (the goledger package); passing them in keeps this
+// package free of that import. The content-hash ETag gives revalidation, since
+// embedded bytes carry no modtime.
+func BookPDF(pdf []byte) http.HandlerFunc {
+	sum := sha256.Sum256(pdf)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	return func(w http.ResponseWriter, r *http.Request) {
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Disposition", `inline; filename="the-ledger-book.pdf"`)
+		w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
+		w.Header().Set("ETag", etag)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		_, _ = w.Write(pdf)
+	}
+}
+
 func servePage(w http.ResponseWriter, r *http.Request, body []byte, etag string) {
 	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)

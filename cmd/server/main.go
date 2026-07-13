@@ -25,6 +25,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	goledger "github.com/sohag-pro/go-ledger"
 	"github.com/sohag-pro/go-ledger/internal/admin"
 	"github.com/sohag-pro/go-ledger/internal/api"
 	"github.com/sohag-pro/go-ledger/internal/audit"
@@ -657,6 +658,7 @@ func run(logger *slog.Logger) error {
 		DefaultTenantID: cfg.defaultTenant,
 	}))
 	router.Handle("/static/*", http.StripPrefix("/static/", web.Assets()))
+	router.Get("/the-ledger-book.pdf", web.BookPDF(goledger.LedgerBookPDF))
 	api.RegisterPlayground(router)
 	api.New(router, deps) // mounts /v1/*, /healthz, /openapi.*, /schemas/
 
