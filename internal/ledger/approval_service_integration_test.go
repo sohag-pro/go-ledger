@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -569,5 +570,113 @@ func TestApprovalService_GetAndList(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("List(pending) = %+v, want to contain %q", list, pending.ID)
+	}
+}
+
+// TestApprovalService_SweepExpiredPendingExpiresOnlyStale covers the TTL
+// sweep (Task 8, ADR-025): a pending left undecided past cfg.TTL is moved to
+// expired with an approval.expired lifecycle event, while a fresh pending
+// (well within the TTL) is left untouched.
+func TestApprovalService_SweepExpiredPendingExpiresOnlyStale(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil,
+		ledger.WithApproval(ledger.ApprovalConfig{
+			Enabled:    true,
+			Thresholds: map[string]int64{"USD": 100000},
+		}),
+	)
+	cfg := ledger.ApprovalConfig{
+		Enabled:    true,
+		Thresholds: map[string]int64{"USD": 100000},
+		TTL:        time.Hour,
+	}
+	approvals := ledger.NewApprovalService(repo, svc, cfg, discardLogger())
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newApprovalGateAccounts(t, repo, tenant)
+
+	stale := holdGatedPost(t, svc, tenant, debit.ID, credit.ID)
+	fresh := holdGatedPost(t, svc, tenant, debit.ID, credit.ID)
+
+	// Backdate the stale pending's created_at well past the TTL. Only a raw
+	// SQL statement can do this: InsertPendingTransaction leaves created_at
+	// to its column default (now()), the same reason the demo seeder writes
+	// created_at directly for its own backdated rows.
+	tid, err := uuid.Parse(tenant)
+	if err != nil {
+		t.Fatalf("parse tenant id: %v", err)
+	}
+	pid, err := uuid.Parse(stale.ID)
+	if err != nil {
+		t.Fatalf("parse stale pending id: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE pending_transactions SET created_at = now() - interval '2 hours' WHERE tenant_id = $1 AND id = $2`,
+		tid, pid); err != nil {
+		t.Fatalf("backdate stale pending: %v", err)
+	}
+
+	n, err := approvals.SweepExpiredPending(ctx)
+	if err != nil {
+		t.Fatalf("SweepExpiredPending() error = %v, want nil", err)
+	}
+	if n != 1 {
+		t.Fatalf("SweepExpiredPending() = %d, want 1", n)
+	}
+
+	storedStale, err := repo.GetPendingTransaction(ctx, tenant, stale.ID)
+	if err != nil {
+		t.Fatalf("GetPendingTransaction(stale): %v", err)
+	}
+	if storedStale.Status != domain.PendingStatusExpired {
+		t.Errorf("stale pending.Status = %q, want expired", storedStale.Status)
+	}
+
+	storedFresh, err := repo.GetPendingTransaction(ctx, tenant, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetPendingTransaction(fresh): %v", err)
+	}
+	if storedFresh.Status != domain.PendingStatusPending {
+		t.Errorf("fresh pending.Status = %q, want still pending", storedFresh.Status)
+	}
+
+	// An approval.expired lifecycle event landed in the outbox for the
+	// stale pending, and only the stale one.
+	var staleCount int
+	row := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_outbox WHERE tenant_id = $1 AND action = 'approval.expired' AND subject_id = $2 AND subject_type = 'pending_transaction'`,
+		tid, pid)
+	if err := row.Scan(&staleCount); err != nil {
+		t.Fatalf("query audit_outbox (stale): %v", err)
+	}
+	if staleCount != 1 {
+		t.Fatalf("approval.expired outbox rows for stale pending %s = %d, want 1", stale.ID, staleCount)
+	}
+
+	freshPid, err := uuid.Parse(fresh.ID)
+	if err != nil {
+		t.Fatalf("parse fresh pending id: %v", err)
+	}
+	var freshCount int
+	row = pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_outbox WHERE tenant_id = $1 AND action = 'approval.expired' AND subject_id = $2 AND subject_type = 'pending_transaction'`,
+		tid, freshPid)
+	if err := row.Scan(&freshCount); err != nil {
+		t.Fatalf("query audit_outbox (fresh): %v", err)
+	}
+	if freshCount != 0 {
+		t.Fatalf("approval.expired outbox rows for fresh pending %s = %d, want 0", fresh.ID, freshCount)
+	}
+
+	// A second sweep is a no-op: the stale pending is already terminal, and
+	// there is nothing left older than the TTL to expire.
+	n2, err := approvals.SweepExpiredPending(ctx)
+	if err != nil {
+		t.Fatalf("second SweepExpiredPending() error = %v, want nil", err)
+	}
+	if n2 != 0 {
+		t.Fatalf("second SweepExpiredPending() = %d, want 0", n2)
 	}
 }

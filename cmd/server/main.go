@@ -1131,6 +1131,51 @@ func runIdempotencySweep(ctx context.Context, logger *slog.Logger, sweeper idemp
 	}
 }
 
+// pendingSweeper is the slice of the ApprovalService the background TTL
+// sweep needs (Task 8, ADR-025): a plain, best-effort maintenance sweep that
+// expires stale pendings, not a per-request business call. A fake in
+// main_test.go exercises runPendingSweep without a real database.
+type pendingSweeper interface {
+	SweepExpiredPending(ctx context.Context) (int64, error)
+}
+
+// runPendingSweep expires pending transactions left undecided past
+// PENDING_TTL once immediately, then every interval, until ctx is cancelled
+// (Task 8, ADR-025). It mirrors runIdempotencySweep's shape exactly: a
+// failed sweep is logged and the loop continues rather than exiting, since
+// this is pure housekeeping, never something a request is waiting on.
+//
+// The goroutine start call (go runPendingSweep(...)) is wired in Task 9,
+// alongside the ApprovalService's own construction in main.go: this task
+// only adds the runner and its narrow interface so Task 9 can wire it
+// without also having to design the sweep loop.
+func runPendingSweep(ctx context.Context, logger *slog.Logger, sweeper pendingSweeper, interval time.Duration) {
+	doSweep := func() {
+		n, err := sweeper.SweepExpiredPending(ctx)
+		if err != nil {
+			logger.Error("pending approval sweep failed", "error", err)
+			return
+		}
+		if n > 0 {
+			logger.Info("pending approvals swept", "expired", n)
+		} else {
+			logger.Debug("pending approval sweep found nothing to expire")
+		}
+	}
+
+	doSweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			doSweep()
+		}
+	}
+}
+
 // otelRouteName upgrades the otelhttp server span name from the raw path to the
 // matched chi route pattern once routing has resolved, so high-cardinality URLs
 // (account and transaction ids) cannot explode the trace backend.

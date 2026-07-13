@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -337,6 +338,41 @@ func (s *ApprovalService) Cancel(ctx context.Context, tenantID, id, actor string
 			return appendPendingEvent(ctx, tx, tenantID, "approval.cancelled", pending, nil)
 		},
 	)
+}
+
+// SweepExpiredPending moves every pending left undecided past cfg.TTL to
+// expired (Task 8, ADR-025), mirroring the existing idempotency-key sweep's
+// shape: a background goroutine (runPendingSweep in cmd/server) calls this
+// on an interval, not a per-request path. The repository's own
+// SweepExpiredPending does the actual UPDATE (across every tenant, outside
+// any RunInTx: see its doc comment), so this method's only job is to turn
+// each returned row into an approval.expired lifecycle event. Each event is
+// appended in its own RunInTx, scoped to that row's own tenant: the swept
+// rows can span tenants, and appendPendingEvent needs a domain.Tx opened
+// under the right tenant GUC for its RLS-scoped write to land. A failure
+// appending one row's event does not stop the sweep from emitting the rest;
+// it is returned as a combined error after every row has been tried, the
+// same "keep going, report at the end" shape SweepExpiredIdempotencyKeys'
+// caller already tolerates for pure housekeeping.
+func (s *ApprovalService) SweepExpiredPending(ctx context.Context) (int64, error) {
+	expired, err := s.repo.SweepExpiredPending(ctx, s.cfg.TTL)
+	if err != nil {
+		return 0, err
+	}
+	var errs []error
+	for i := range expired {
+		p := expired[i]
+		err := s.repo.RunInTx(ctx, p.TenantID, func(ctx context.Context, tx domain.Tx) error {
+			return appendPendingEvent(ctx, tx, p.TenantID, "approval.expired", &p, nil)
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("ledger: emit approval.expired for pending %s: %w", p.ID, err))
+		}
+	}
+	if len(errs) > 0 {
+		return int64(len(expired)), errors.Join(errs...)
+	}
+	return int64(len(expired)), nil
 }
 
 // Get returns the pending transaction with the given id within the tenant,

@@ -772,6 +772,81 @@ func TestRunIdempotencySweep(t *testing.T) {
 	}
 }
 
+// fakePendingSweeper is an in-memory pendingSweeper: each call to
+// SweepExpiredPending pops the next queued result (or reports an error) and
+// signals a buffered channel so a test can wait for a specific number of
+// calls without a real database or a sleep-based race. It mirrors
+// fakeSweeper above (Task 4.5's idempotency-key sweep fake) for the pending
+// approval TTL sweep (Task 8, ADR-025).
+type fakePendingSweeper struct {
+	mu      sync.Mutex
+	results []int64 // -1 means "return an error instead"
+	calls   chan int64
+}
+
+func newFakePendingSweeper(results ...int64) *fakePendingSweeper {
+	return &fakePendingSweeper{results: results, calls: make(chan int64, len(results)+8)}
+}
+
+func (s *fakePendingSweeper) SweepExpiredPending(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	if len(s.results) > 0 {
+		n = s.results[0]
+		s.results = s.results[1:]
+	}
+	if n == -1 {
+		s.calls <- -1
+		return 0, errors.New("fake pending sweep failure")
+	}
+	s.calls <- n
+	return n, nil
+}
+
+// TestRunPendingSweep proves the background TTL sweep (Task 8, ADR-025) runs
+// once immediately (not waiting a full interval first), keeps running on the
+// ticker until its context is cancelled, and survives a failed sweep
+// (logged, not fatal) rather than exiting the loop. It mirrors
+// TestRunIdempotencySweep above.
+func TestRunPendingSweep(t *testing.T) {
+	sweeper := newFakePendingSweeper(3, -1, 0, 5)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runPendingSweep(ctx, logger, sweeper, time.Millisecond)
+		close(done)
+	}()
+
+	// Wait for all four queued results to have been consumed: the immediate
+	// call plus three ticks.
+	for i := 0; i < 4; i++ {
+		select {
+		case <-sweeper.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for sweep call %d", i+1)
+		}
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runPendingSweep did not return after its context was cancelled")
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "pending approval sweep failed") {
+		t.Errorf("log missing the failed-sweep error line: %q", logs)
+	}
+	if !strings.Contains(logs, "pending approvals swept") {
+		t.Errorf("log missing a successful non-zero sweep line: %q", logs)
+	}
+}
+
 // TestProvisionAdminKey_DemoModeIsANoOp proves provisionAdminKey does nothing
 // in demo mode (ADR-019): the demo key itself already carries admin scope
 // there (demoKeyScopes), so a separate bootstrap-admin key would be
