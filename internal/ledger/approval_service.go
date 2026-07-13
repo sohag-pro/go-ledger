@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/sohag-pro/go-ledger/internal/domain"
 )
@@ -13,64 +14,36 @@ import (
 // post path (Post, Convert, or ReverseTransaction) against CURRENT balances,
 // links the resulting transaction, and emits an approval.approved lifecycle
 // event; Reject and Cancel close a pending out without ever posting money.
-// Every transition row-locks the pending (GetPendingForUpdate) so two
-// racing decisions on the same pending cannot both proceed.
+// Every transition row-locks the pending (GetPendingForUpdate) and holds
+// that lock across its own status write, so two racing decisions on the same
+// pending are serialized: the loser blocks on the lock until the winner
+// commits, then re-reads a now-terminal row instead of racing an unguarded
+// write against it. See lockedTransition (Reject, Cancel) and Approve's own
+// doc comment (which cannot use lockedTransition directly: its write has to
+// happen on the far side of a replay that must NOT run with the row locked).
 type ApprovalService struct {
 	repo domain.Repository
 	txns *TransactionService
 	cfg  ApprovalConfig
+	log  *slog.Logger
 }
 
 // NewApprovalService returns an ApprovalService backed by repo (for the
 // pending's own storage) and txns (the normal post path a replay runs
 // through), governed by cfg (the same ApprovalConfig txns itself was built
-// with, for RequireDifferentActor).
-func NewApprovalService(repo domain.Repository, txns *TransactionService, cfg ApprovalConfig) *ApprovalService {
-	return &ApprovalService{repo: repo, txns: txns, cfg: cfg}
-}
-
-// lockAndCheck opens its own transaction, row-locks the pending
-// (GetPendingForUpdate), and returns it. A pending already in a rejected,
-// cancelled, or expired state is terminal and decided at most once, so this
-// returns domain.ErrPendingAlreadyDecided for any of those. An
-// already-approved pending is deliberately NOT rejected here: Approve's
-// whole point is that a second Approve is a no-op returning the same
-// transaction, while Reject and Cancel treat "already approved" as any
-// other terminal state and check for it themselves after calling this.
-//
-// The row lock this takes is only held for the duration of this one short
-// transaction, not across whatever the caller does next (a replay, in
-// Approve's case, runs its own separate RunInTx inside Post/Convert/
-// ReverseTransaction). That is intentional, not a gap: see replay's and
-// Approve's own doc comments for how the pending's own idempotency key
-// (derived from its id) is what actually keeps two racing or crash-retried
-// decisions on the same pending from ever posting twice, not this lock by
-// itself.
-func (s *ApprovalService) lockAndCheck(ctx context.Context, tenantID, id string) (*domain.PendingTransaction, error) {
-	var pending *domain.PendingTransaction
-	err := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
-		p, err := tx.GetPendingForUpdate(ctx, tenantID, id)
-		if err != nil {
-			return err
-		}
-		pending = p
-		return nil
-	})
-	if err != nil {
-		return nil, err
+// with, for RequireDifferentActor). If log is nil the default slog logger is
+// used (matching NewTransactionService).
+func NewApprovalService(repo domain.Repository, txns *TransactionService, cfg ApprovalConfig, log *slog.Logger) *ApprovalService {
+	if log == nil {
+		log = slog.Default()
 	}
-	switch pending.Status {
-	case domain.PendingStatusPending, domain.PendingStatusApproved:
-		return pending, nil
-	default:
-		return nil, domain.ErrPendingAlreadyDecided
-	}
+	return &ApprovalService{repo: repo, txns: txns, cfg: cfg, log: log}
 }
 
 // approvalIdempotencyKey derives a deterministic idempotency key from the
 // pending's own id: every replay of the same pending, whether from a second
 // Approve call racing the first, or a retry after a crash between the
-// replay's own post and the second transaction that marks the pending
+// replay's own post and the later transaction that marks the pending
 // approved, reuses this exact key. Post and Convert's own idempotency
 // machinery (GetIdempotencyKey's precheck, and the unique index backing it
 // for the genuine race window) is what actually guarantees the pending is
@@ -154,25 +127,64 @@ func (s *ApprovalService) replay(ctx context.Context, tenantID string, p *domain
 // against CURRENT state. The replay runs with withApprovalReplay so it is
 // not re-gated.
 //
-// CRASH-SAFETY: the replay posts the transaction in its own RunInTx (inside
-// Post/Convert/ReverseTransaction); marking the pending approved and linking
-// the transaction id is a SECOND, separate transaction below. A crash
-// between the two leaves a posted transaction with a still-pending row. The
-// next Approve call is safe regardless of which side of that gap it lands
-// on: if the second transaction already committed, lockAndCheck's re-read
-// sees Status == approved and this returns the linked transaction without
-// replaying; if only the first committed, replay calls Post/Convert again
-// with the SAME derived idempotency key (approvalIdempotencyKey), so it
-// replays the already-posted transaction instead of creating a second one,
-// and the second transaction then runs (for the first time) to mark the
-// pending approved. Either way a second Approve is a no-op that returns the
-// same transaction id.
+// This runs in three phases instead of one lockedTransition, because unlike
+// Reject and Cancel, the write in the middle (the replay) must NOT run with
+// the pending row locked: it opens its own RunInTx inside Post/Convert/
+// ReverseTransaction, and holding the pending's row lock across that would
+// serialize every concurrent Approve/Reject/Cancel on the SAME pending
+// behind the replay's full posting latency for no reason (worse, it would
+// invite a lock-ordering deadlock against whatever the replay itself locks).
+// Instead, each phase that touches the row takes and releases its own lock,
+// and Phase C is what makes the sequence race-safe overall:
+//
+//   - Phase A (locked): read the pending. Already approved -> return its
+//     linked transaction (idempotent no-op, no replay). Any other terminal
+//     status -> ErrPendingAlreadyDecided. Four-eyes violation -> ErrCannotApproveOwn.
+//     Otherwise (pending) -> fall through to the replay, lock released.
+//   - Phase B (unlocked): replay. On error, nothing posted, pending
+//     untouched, return the error.
+//   - Phase C (re-locked): re-read the pending. A concurrent decision may
+//     have run to completion in the window between Phase A's lock release
+//     and this lock's acquisition:
+//     -- already approved: a concurrent Approve's replay landed first (its
+//     replay resolves the SAME idempotency key, so it posted the SAME
+//     transaction ours did); leave the row alone and do not emit a
+//     second approval.approved event.
+//     -- still pending: the common case; write approved + link + event now,
+//     under this lock.
+//     -- rejected/cancelled/expired: a concurrent decision terminalized the
+//     pending WHILE this replay was posting. The transaction above is
+//     already posted and cannot be un-posted, so POST WINS: force the
+//     pending back to approved and linked, so a posted transaction is
+//     never left orphaned under a terminal non-approved pending. This is
+//     an exceptional path; it is logged as a warning.
+//
+// CRASH-SAFETY: a crash between Phase B and Phase C leaves a posted
+// transaction with a still-pending row. The next Approve call is safe
+// regardless of which side of that gap it lands on: if Phase C already
+// committed, Phase A's re-read sees Status == approved and returns the
+// linked transaction without replaying; if only Phase B committed, the
+// retry's own Phase B calls Post/Convert again with the SAME derived
+// idempotency key (approvalIdempotencyKey), so it replays the
+// already-posted transaction instead of creating a second one, and its
+// Phase C then runs (for the first time) to mark the pending approved.
 func (s *ApprovalService) Approve(ctx context.Context, tenantID, id, actor string) (*domain.Transaction, error) {
-	pending, err := s.lockAndCheck(ctx, tenantID, id)
+	// Phase A: lock, read, validate the transition.
+	var pending *domain.PendingTransaction
+	err := s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
+		p, err := tx.GetPendingForUpdate(ctx, tenantID, id)
+		if err != nil {
+			return err
+		}
+		pending = p
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if pending.Status == domain.PendingStatusApproved {
+
+	switch pending.Status {
+	case domain.PendingStatusApproved:
 		if pending.TransactionID == nil {
 			return nil, fmt.Errorf("ledger: pending %s is approved but has no linked transaction", id)
 		}
@@ -181,11 +193,17 @@ func (s *ApprovalService) Approve(ctx context.Context, tenantID, id, actor strin
 			return nil, err
 		}
 		return &tx, nil
+	case domain.PendingStatusPending:
+		// Proceed to the four-eyes check and replay below.
+	default:
+		return nil, domain.ErrPendingAlreadyDecided
 	}
+
 	if s.cfg.RequireDifferentActor && actor == pending.CreatedBy {
 		return nil, domain.ErrCannotApproveOwn
 	}
 
+	// Phase B: replay, unlocked (see the doc comment above for why).
 	tx, err := s.replay(withApprovalReplay(ctx), tenantID, pending)
 	if err != nil {
 		// Validation failed against current state (for example a
@@ -195,14 +213,49 @@ func (s *ApprovalService) Approve(ctx context.Context, tenantID, id, actor strin
 		// the underlying condition clears.
 		return nil, err
 	}
+	txID := tx.ID
 
+	// Phase C: re-lock and resolve against whatever the row looks like now.
 	err = s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, dtx domain.Tx) error {
-		txID := tx.ID
-		if err := dtx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusApproved, actor, nil, &txID); err != nil {
+		current, err := dtx.GetPendingForUpdate(ctx, tenantID, id)
+		if err != nil {
 			return err
 		}
-		pending.Status = domain.PendingStatusApproved
-		return appendPendingEvent(ctx, dtx, tenantID, "approval.approved", pending, &txID)
+		switch current.Status {
+		case domain.PendingStatusApproved:
+			// A concurrent Approve already committed Phase C first. Its
+			// replay resolved the same idempotency key ours did, so it
+			// posted the exact same transaction: leave the row alone and
+			// do not emit a second approval.approved event.
+			return nil
+		case domain.PendingStatusPending:
+			if err := dtx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusApproved, actor, nil, &txID); err != nil {
+				return err
+			}
+			current.Status = domain.PendingStatusApproved
+			return appendPendingEvent(ctx, dtx, tenantID, "approval.approved", current, &txID)
+		default:
+			// rejected, cancelled, or expired: a concurrent decision
+			// terminalized this pending while our replay above was
+			// posting the transaction. That transaction is real money
+			// already moved and cannot be un-posted, so POST WINS: force
+			// the pending back to approved and linked to it rather than
+			// leave a terminal, non-approved pending pointing at nothing
+			// while a live posted transaction has no pending to show for
+			// it. This is an exceptional race, not routine behavior.
+			s.log.Warn("ledger: approval post-wins race: a concurrent decision terminalized a pending while its replay was posting; forcing it back to approved so the posted transaction is not orphaned",
+				"tenant_id", tenantID,
+				"pending_id", id,
+				"transaction_id", txID,
+				"overridden_status", string(current.Status),
+				"actor", actor,
+			)
+			if err := dtx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusApproved, actor, nil, &txID); err != nil {
+				return err
+			}
+			current.Status = domain.PendingStatusApproved
+			return appendPendingEvent(ctx, dtx, tenantID, "approval.approved", current, &txID)
+		}
 	})
 	if err != nil {
 		return nil, err
@@ -210,53 +263,80 @@ func (s *ApprovalService) Approve(ctx context.Context, tenantID, id, actor strin
 	return tx, nil
 }
 
+// lockedTransition runs a Reject- or Cancel-shaped decision as a single
+// RunInTx: lock the pending (GetPendingForUpdate), let check validate the
+// transition against the locked row (returning any error, most commonly
+// domain.ErrPendingAlreadyDecided or domain.ErrNotPendingCreator, to abort
+// before anything is written), then write. The lock is held from the read
+// through the write, so a concurrent decision on the same pending is
+// serialized out: the loser blocks on the lock until the winner's
+// transaction commits, then check sees the now-terminal row and refuses.
+func (s *ApprovalService) lockedTransition(
+	ctx context.Context,
+	tenantID, id string,
+	check func(p *domain.PendingTransaction) error,
+	write func(ctx context.Context, tx domain.Tx, p *domain.PendingTransaction) error,
+) error {
+	return s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
+		pending, err := tx.GetPendingForUpdate(ctx, tenantID, id)
+		if err != nil {
+			return err
+		}
+		if err := check(pending); err != nil {
+			return err
+		}
+		return write(ctx, tx, pending)
+	})
+}
+
 // Reject locks the pending, refuses an already-decided one (including an
 // already-approved one) with domain.ErrPendingAlreadyDecided, and otherwise
 // moves it to rejected with reason, atomically with an approval.rejected
-// lifecycle event. Nothing is ever posted for a rejected pending.
+// lifecycle event, all under the SAME row lock. Nothing is ever posted for a
+// rejected pending.
 func (s *ApprovalService) Reject(ctx context.Context, tenantID, id, actor string, reason *string) error {
-	pending, err := s.lockAndCheck(ctx, tenantID, id)
-	if err != nil {
-		return err
-	}
-	if pending.Status != domain.PendingStatusPending {
-		return domain.ErrPendingAlreadyDecided
-	}
-
-	return s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, dtx domain.Tx) error {
-		if err := dtx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusRejected, actor, reason, nil); err != nil {
-			return err
-		}
-		pending.Status = domain.PendingStatusRejected
-		pending.Reason = reason
-		return appendPendingEvent(ctx, dtx, tenantID, "approval.rejected", pending, nil)
-	})
+	return s.lockedTransition(ctx, tenantID, id,
+		func(p *domain.PendingTransaction) error {
+			if p.Status != domain.PendingStatusPending {
+				return domain.ErrPendingAlreadyDecided
+			}
+			return nil
+		},
+		func(ctx context.Context, tx domain.Tx, pending *domain.PendingTransaction) error {
+			if err := tx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusRejected, actor, reason, nil); err != nil {
+				return err
+			}
+			pending.Status = domain.PendingStatusRejected
+			pending.Reason = reason
+			return appendPendingEvent(ctx, tx, tenantID, "approval.rejected", pending, nil)
+		},
+	)
 }
 
 // Cancel locks the pending, requires actor to be the pending's own creator
 // (domain.ErrNotPendingCreator otherwise), refuses an already-decided one
 // with domain.ErrPendingAlreadyDecided, and otherwise moves it to cancelled,
-// atomically with an approval.cancelled lifecycle event. Nothing is ever
-// posted for a cancelled pending.
+// atomically with an approval.cancelled lifecycle event, all under the SAME
+// row lock. Nothing is ever posted for a cancelled pending.
 func (s *ApprovalService) Cancel(ctx context.Context, tenantID, id, actor string) error {
-	pending, err := s.lockAndCheck(ctx, tenantID, id)
-	if err != nil {
-		return err
-	}
-	if pending.Status != domain.PendingStatusPending {
-		return domain.ErrPendingAlreadyDecided
-	}
-	if actor != pending.CreatedBy {
-		return domain.ErrNotPendingCreator
-	}
-
-	return s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, dtx domain.Tx) error {
-		if err := dtx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusCancelled, actor, nil, nil); err != nil {
-			return err
-		}
-		pending.Status = domain.PendingStatusCancelled
-		return appendPendingEvent(ctx, dtx, tenantID, "approval.cancelled", pending, nil)
-	})
+	return s.lockedTransition(ctx, tenantID, id,
+		func(p *domain.PendingTransaction) error {
+			if p.Status != domain.PendingStatusPending {
+				return domain.ErrPendingAlreadyDecided
+			}
+			if actor != p.CreatedBy {
+				return domain.ErrNotPendingCreator
+			}
+			return nil
+		},
+		func(ctx context.Context, tx domain.Tx, pending *domain.PendingTransaction) error {
+			if err := tx.UpdatePendingStatus(ctx, tenantID, id, domain.PendingStatusCancelled, actor, nil, nil); err != nil {
+				return err
+			}
+			pending.Status = domain.PendingStatusCancelled
+			return appendPendingEvent(ctx, tx, tenantID, "approval.cancelled", pending, nil)
+		},
+	)
 }
 
 // Get returns the pending transaction with the given id within the tenant,

@@ -55,7 +55,7 @@ func TestApprovalService_ApprovePostsLinksAndEmitsEvent(t *testing.T) {
 	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
 		Enabled:    true,
 		Thresholds: map[string]int64{"USD": 100000},
-	})
+	}, discardLogger())
 	ctx := context.Background()
 	tenant := uuid.NewString()
 	debit, credit := newApprovalGateAccounts(t, repo, tenant)
@@ -143,7 +143,7 @@ func TestApprovalService_FourEyesBlocksSelfApproval(t *testing.T) {
 		Enabled:               true,
 		Thresholds:            map[string]int64{"USD": 100000},
 		RequireDifferentActor: true,
-	})
+	}, discardLogger())
 	ctx := context.Background()
 	tenant := uuid.NewString()
 	debit, credit := newApprovalGateAccounts(t, repo, tenant)
@@ -200,7 +200,7 @@ func TestApprovalService_RejectThenApproveConflicts(t *testing.T) {
 	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
 		Enabled:    true,
 		Thresholds: map[string]int64{"USD": 100000},
-	})
+	}, discardLogger())
 	ctx := context.Background()
 	tenant := uuid.NewString()
 	debit, credit := newApprovalGateAccounts(t, repo, tenant)
@@ -259,6 +259,123 @@ func TestApprovalService_RejectThenApproveConflicts(t *testing.T) {
 	}
 }
 
+// TestApprovalService_RejectCannotOrphanApprovedPending is a deterministic,
+// sequential simulation of the ordering a concurrent Approve-vs-Reject race
+// would produce: Approve wins and links a transaction first, then a Reject
+// against the SAME pending arrives. It must be refused with
+// ErrPendingAlreadyDecided rather than flipping the pending back to
+// rejected and clearing its transaction_id, which would orphan the posted
+// transaction (money already moved with nothing pending left to show for
+// it). This exercises exactly the write-side guard the fix adds: Reject now
+// locks the row and re-checks status atomically with its write
+// (lockedTransition), so it can never race a concurrent decision's write.
+func TestApprovalService_RejectCannotOrphanApprovedPending(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil,
+		ledger.WithApproval(ledger.ApprovalConfig{
+			Enabled:    true,
+			Thresholds: map[string]int64{"USD": 100000},
+		}),
+	)
+	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
+		Enabled:    true,
+		Thresholds: map[string]int64{"USD": 100000},
+	}, discardLogger())
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newApprovalGateAccounts(t, repo, tenant)
+
+	pending := holdGatedPost(t, svc, tenant, debit.ID, credit.ID)
+
+	tx, err := approvals.Approve(ctx, tenant, pending.ID, "approver-1")
+	if err != nil {
+		t.Fatalf("Approve() error = %v, want nil", err)
+	}
+
+	// A Reject that arrives after the pending is already approved must be
+	// refused, not silently flip a linked, posted pending back to rejected.
+	reason := "too late, already approved"
+	err = approvals.Reject(ctx, tenant, pending.ID, "reviewer-1", &reason)
+	if !errors.Is(err, domain.ErrPendingAlreadyDecided) {
+		t.Fatalf("Reject() on an already-approved pending error = %v, want ErrPendingAlreadyDecided", err)
+	}
+
+	// The pending is still approved and still linked to the posted
+	// transaction: the Reject must not have cleared transaction_id or
+	// flipped the status.
+	storedPending, err := repo.GetPendingTransaction(ctx, tenant, pending.ID)
+	if err != nil {
+		t.Fatalf("GetPendingTransaction(%q): %v", pending.ID, err)
+	}
+	if storedPending.Status != domain.PendingStatusApproved {
+		t.Errorf("pending.Status after refused Reject = %q, want approved", storedPending.Status)
+	}
+	if storedPending.TransactionID == nil || *storedPending.TransactionID != tx.ID {
+		t.Errorf("pending.TransactionID after refused Reject = %v, want %q (must not be orphaned)", storedPending.TransactionID, tx.ID)
+	}
+
+	// The posted transaction really is still there, untouched.
+	stored, err := repo.GetTransaction(ctx, tenant, tx.ID)
+	if err != nil {
+		t.Fatalf("GetTransaction(%q): %v", tx.ID, err)
+	}
+	if stored.ID != tx.ID {
+		t.Fatalf("GetTransaction().ID = %q, want %q", stored.ID, tx.ID)
+	}
+}
+
+// TestApprovalService_CancelCannotOrphanApprovedPending mirrors the Reject
+// case above for Cancel: once a pending is approved and linked, a Cancel
+// against it (even by its own creator) must be refused rather than orphan
+// the posted transaction.
+func TestApprovalService_CancelCannotOrphanApprovedPending(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	svc := ledger.NewTransactionService(repo, discardLogger(), nil,
+		ledger.WithApproval(ledger.ApprovalConfig{
+			Enabled:    true,
+			Thresholds: map[string]int64{"USD": 100000},
+		}),
+	)
+	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
+		Enabled:    true,
+		Thresholds: map[string]int64{"USD": 100000},
+	}, discardLogger())
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newApprovalGateAccounts(t, repo, tenant)
+
+	pending := holdGatedPost(t, svc, tenant, debit.ID, credit.ID)
+
+	tx, err := approvals.Approve(ctx, tenant, pending.ID, "approver-1")
+	if err != nil {
+		t.Fatalf("Approve() error = %v, want nil", err)
+	}
+
+	// pending.CreatedBy is stamped as the tenant id (see the four-eyes test
+	// above), so this Cancel call is made BY the creator: even the creator
+	// cannot cancel out from under an already-approved, already-posted
+	// pending.
+	err = approvals.Cancel(ctx, tenant, pending.ID, pending.CreatedBy)
+	if !errors.Is(err, domain.ErrPendingAlreadyDecided) {
+		t.Fatalf("Cancel() on an already-approved pending error = %v, want ErrPendingAlreadyDecided", err)
+	}
+
+	storedPending, err := repo.GetPendingTransaction(ctx, tenant, pending.ID)
+	if err != nil {
+		t.Fatalf("GetPendingTransaction(%q): %v", pending.ID, err)
+	}
+	if storedPending.Status != domain.PendingStatusApproved {
+		t.Errorf("pending.Status after refused Cancel = %q, want approved", storedPending.Status)
+	}
+	if storedPending.TransactionID == nil || *storedPending.TransactionID != tx.ID {
+		t.Errorf("pending.TransactionID after refused Cancel = %v, want %q (must not be orphaned)", storedPending.TransactionID, tx.ID)
+	}
+}
+
 func TestApprovalService_CancelByCreatorOKByOthersRefused(t *testing.T) {
 	t.Parallel()
 	pool := newTestPool(t)
@@ -272,7 +389,7 @@ func TestApprovalService_CancelByCreatorOKByOthersRefused(t *testing.T) {
 	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
 		Enabled:    true,
 		Thresholds: map[string]int64{"USD": 100000},
-	})
+	}, discardLogger())
 	ctx := context.Background()
 	tenant := uuid.NewString()
 	debit, credit := newApprovalGateAccounts(t, repo, tenant)
@@ -337,7 +454,7 @@ func TestApprovalService_ApproveRevalidatesAgainstCurrentBalances(t *testing.T) 
 	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
 		Enabled:    true,
 		Thresholds: map[string]int64{"USD": 100000},
-	})
+	}, discardLogger())
 	ctx := context.Background()
 	tenant := uuid.NewString()
 	if err := repo.CreateTenant(ctx, tenant, "revalidation test tenant"); err != nil {
@@ -424,7 +541,7 @@ func TestApprovalService_GetAndList(t *testing.T) {
 	approvals := ledger.NewApprovalService(repo, svc, ledger.ApprovalConfig{
 		Enabled:    true,
 		Thresholds: map[string]int64{"USD": 100000},
-	})
+	}, discardLogger())
 	ctx := context.Background()
 	tenant := uuid.NewString()
 	debit, credit := newApprovalGateAccounts(t, repo, tenant)
