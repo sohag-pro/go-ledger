@@ -135,22 +135,41 @@ h1 .go{color:var(--cyan)}
 .btn-primary:hover{background:#22bde2;color:#07131B;box-shadow:0 6px 24px rgba(0,173,216,.35)}
 .btn-ghost{border-color:var(--hair-strong);color:var(--text)}
 .btn-ghost:hover{color:var(--text);border-color:var(--muted);background:rgba(159,176,195,.06)}
-/* hero book teaser */
-.hero-book{
-  display:inline-flex;align-items:center;gap:13px;margin-top:22px;
-  padding:11px 15px 11px 13px;border:1px solid var(--hair-strong);border-radius:11px;
-  background:linear-gradient(100deg,rgba(232,163,61,.07),rgba(0,173,216,.05));
-  text-decoration:none;max-width:520px;
-  transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease;
+/* book announcement banner (top of page, first thing seen) */
+.book-banner{display:block;text-decoration:none;position:relative;overflow:hidden;border-bottom:1px solid var(--hair);
+  background:
+    radial-gradient(130% 200% at 12% 0%, rgba(0,173,216,.18), transparent 52%),
+    radial-gradient(130% 200% at 92% 120%, rgba(232,163,61,.16), transparent 52%),
+    var(--bg-deep);}
+.book-banner::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(105deg,transparent 30%,rgba(255,255,255,.06) 46%,transparent 62%);
+  transform:translateX(-120%);animation:bbsheen 6.5s ease-in-out 1.2s infinite}
+@keyframes bbsheen{0%{transform:translateX(-120%)}22%,100%{transform:translateX(120%)}}
+.book-banner .bb-in{position:relative;max-width:var(--wrap);margin:0 auto;
+  padding:15px 40px;display:flex;align-items:center;gap:20px}
+.book-banner .bb-cover{flex:none;filter:drop-shadow(0 6px 16px rgba(0,0,0,.45))}
+.book-banner .bb-cover svg{display:block;border-radius:3px}
+.book-banner .bb-body{flex:1;min-width:0}
+.book-banner .bb-kick{font:600 10.5px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--cyan);display:inline-flex;align-items:center;gap:9px}
+.book-banner .bb-kick .bb-dot{width:6px;height:6px;border-radius:99px;background:var(--amber);box-shadow:0 0 0 4px rgba(232,163,61,.18)}
+.book-banner .bb-title{font:600 20px/1.2 var(--sans);letter-spacing:-.01em;color:var(--text);margin:6px 0 3px}
+.book-banner .bb-title .g{background:linear-gradient(92deg,var(--cyan),var(--teal));-webkit-background-clip:text;background-clip:text;color:transparent}
+.book-banner .bb-sub{font:400 14px/1.4 var(--sans);color:var(--muted);margin:0}
+.book-banner .bb-sub strong{color:#D9E4EF;font-weight:600}
+.book-banner .bb-cta{flex:none;display:inline-flex;align-items:center;gap:8px;
+  font:600 14px/1 var(--sans);color:#07131B;background:var(--amber);
+  padding:13px 20px;border-radius:9px;text-decoration:none;white-space:nowrap;
+  transition:transform .15s ease,box-shadow .15s ease,background .15s ease}
+.book-banner .bb-cta:hover{transform:translateY(-1px);background:#efb457;box-shadow:0 8px 26px rgba(232,163,61,.34);text-decoration:none}
+.book-banner .bb-cta .a{transition:transform .15s ease}
+.book-banner .bb-cta:hover .a{transform:translateX(3px)}
+@media (max-width:720px){
+  .book-banner .bb-in{padding:14px 22px;gap:15px;flex-wrap:wrap}
+  .book-banner .bb-cover{display:none}
+  .book-banner .bb-body{flex:1 1 100%}
+  .book-banner .bb-cta{margin-top:2px}
 }
-.hero-book:hover{transform:translateY(-1px);border-color:rgba(232,163,61,.5);box-shadow:0 8px 26px rgba(0,0,0,.28);text-decoration:none}
-.hero-book .hb-ico{flex:none;color:var(--amber);display:flex}
-.hero-book .hb-txt{font:400 13.5px/1.45 var(--sans);color:var(--muted)}
-.hero-book .hb-txt strong{color:var(--text);font-weight:600}
-.hero-book .hb-tag{font:600 9.5px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border:1px solid rgba(232,163,61,.45);border-radius:99px;padding:3px 7px;margin-left:4px;white-space:nowrap;vertical-align:1px}
-.hero-book .hb-arrow{flex:none;margin-left:auto;color:var(--cyan);font-size:17px;transition:transform .15s ease}
-.hero-book:hover .hb-arrow{transform:translateX(3px)}
-@media (max-width:560px){.hero-book .hb-arrow{display:none}}
+@media (prefers-reduced-motion:reduce){.book-banner::after{animation:none;display:none}}
 
 /* balance motif */
 .motif{margin:64px 0 0;padding:0 0 8px}
@@ -433,6 +452,32 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
 
 <main id="main">
 
+<!-- ============ BOOK ANNOUNCEMENT BANNER ============ -->
+<a class="book-banner" href="#book" aria-label="The Ledger Book: the whole build plus interview Q and A found only in the book">
+  <span class="bb-in">
+    <span class="bb-cover" aria-hidden="true">
+      <svg width="58" height="82" viewBox="0 0 58 82" role="img">
+        <rect x="0" y="0" width="58" height="82" rx="3" fill="#0E1B2A"/>
+        <rect x="0" y="0" width="4" height="82" rx="0" fill="#081019"/>
+        <text x="13" y="22" font-family="ui-monospace,Menlo,monospace" font-size="8.5" font-weight="700" fill="#E8EDF2">THE</text>
+        <text x="13" y="33" font-family="ui-monospace,Menlo,monospace" font-size="8.5" font-weight="700" fill="#E8EDF2">LEDGER</text>
+        <text x="13" y="44" font-family="ui-monospace,Menlo,monospace" font-size="8.5" font-weight="700" fill="#00ADD8">BOOK</text>
+        <rect x="13" y="49" width="20" height="2" rx="1" fill="#00ADD8"/>
+        <text x="13" y="66" font-family="ui-monospace,Menlo,monospace" font-size="6" fill="#E17A6B">-600</text>
+        <text x="30" y="66" font-family="ui-monospace,Menlo,monospace" font-size="6" fill="#8FA3B6">0</text>
+        <text x="36" y="66" font-family="ui-monospace,Menlo,monospace" font-size="6" fill="#2DD4BF">+600</text>
+        <text x="13" y="75" font-family="ui-monospace,Menlo,monospace" font-size="5" fill="#6B7C90">S. Hasan</text>
+      </svg>
+    </span>
+    <span class="bb-body">
+      <span class="bb-kick"><span class="bb-dot" aria-hidden="true"></span>new &middot; book-only</span>
+      <div class="bb-title">Read <span class="g">The Ledger Book</span></div>
+      <p class="bb-sub">The whole 14-week build in one volume, <strong>plus the senior-engineer interview Q&amp;A that lives only here.</strong></p>
+    </span>
+    <span class="bb-cta">Get the book <span class="a" aria-hidden="true">&rarr;</span></span>
+  </span>
+</a>
+
 <!-- ================= HERO ================= -->
 <section class="hero rule-bg" id="top" aria-labelledby="hero-h">
   <div class="wrap">
@@ -447,11 +492,6 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
             View on GitHub</a>
           <a class="btn btn-ghost" href="https://notes.sohag.pro/series/go-ledger">Read the build series</a>
         </div>
-        <a class="hero-book" href="#book" aria-label="The Ledger Book: the full build plus interview Q&amp;A found only in the book">
-          <span class="hb-ico" aria-hidden="true"><svg width="19" height="19" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 4.5v12M10 4.5C8.5 3.4 6.6 3 4.5 3H3v11.5h1.5c2.1 0 4 .4 5.5 1.5M10 4.5c1.5-1.1 3.4-1.5 5.5-1.5H17v11.5h-1.5c-2.1 0-4 .4-5.5 1.5"/></svg></span>
-          <span class="hb-txt"><strong>The Ledger Book.</strong> Every week's build, plus the senior-engineer interview Q&amp;A that lives only here. <span class="hb-tag">book-only</span></span>
-          <span class="hb-arrow" aria-hidden="true">&rarr;</span>
-        </a>
       </div>
 
       <figure class="code-card" aria-label="The Validate method from internal/domain/transaction.go">
