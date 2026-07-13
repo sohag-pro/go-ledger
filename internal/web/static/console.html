@@ -302,6 +302,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
       <button class="nav-btn" data-view="transactions"><span class="nav-dot"></span>Transactions</button>
       <button class="nav-btn" data-view="disputes"><span class="nav-dot"></span>Disputes</button>
       <button class="nav-btn" data-view="audit"><span class="nav-dot"></span>Audit log</button>
+      <button class="nav-btn" data-view="approvals"><span class="nav-dot"></span>Approvals</button>
     </div>
 
     <div class="nav-group">
@@ -717,6 +718,27 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
         </div>
       </section>
 
+      <!-- ===== APPROVALS ===== -->
+      <section class="view" id="view-approvals" data-screen-label="Approvals">
+        <h1>Approvals</h1>
+        <p class="page-sub">Transactions held because they crossed the tenant's approval threshold (ADR-025). Nothing posts until a decision is made.</p>
+        <div class="field" style="max-width:280px">
+          <label for="apprStatus">Status</label>
+          <select id="apprStatus">
+            <option value="pending" selected>pending</option>
+            <option value="">All</option>
+            <option value="approved">approved</option>
+            <option value="rejected">rejected</option>
+            <option value="cancelled">cancelled</option>
+            <option value="expired">expired</option>
+          </select>
+        </div>
+        <div class="table-card scroll-x" id="approvalsBody"></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:12px" id="apprMoreRow" hidden>
+          <button class="btn ghost sm" id="apprMore">Load more</button>
+        </div>
+      </section>
+
       <!-- ===== SETTINGS ===== -->
       <section class="view" id="view-settings" data-screen-label="Settings">
         <h1>Settings</h1>
@@ -997,7 +1019,8 @@ const state = {
   stmt: { account: "", cursor: null, count: 0 },
   txFilter: { from: "", to: "", ref: "" },
   txCursor: null,
-  dispCursor: null
+  dispCursor: null,
+  apprCursor: null
 };
 
 const ADMIN_VIEWS = ["tenants", "apikeys", "webhooks", "policy"];
@@ -1008,10 +1031,11 @@ function acctName(id) { const a = (state.accounts || []).find(x => x.id === id);
 
 /* ---------- shared render bits ---------- */
 function badgeStatus(s) {
-  if (s === "active") return `<span class="badge teal">${esc(s)}</span>`;
-  if (s === "suspended" || s === "open" || s === "frozen") return `<span class="badge amber">${esc(s)}</span>`;
-  if (s === "closed" || s === "revoked" || s === "resolved_rejected") return `<span class="badge red">${esc(s)}</span>`;
+  if (s === "active" || s === "approved") return `<span class="badge teal">${esc(s)}</span>`;
+  if (s === "suspended" || s === "open" || s === "frozen" || s === "pending") return `<span class="badge amber">${esc(s)}</span>`;
+  if (s === "closed" || s === "revoked" || s === "resolved_rejected" || s === "rejected") return `<span class="badge red">${esc(s)}</span>`;
   if (s === "resolved_reversed") return `<span class="badge cyan">${esc(s)}</span>`;
+  if (s === "cancelled" || s === "expired") return `<span class="badge grey">${esc(s)}</span>`;
   return `<span class="badge grey">${esc(s)}</span>`;
 }
 function connectCard() {
@@ -1586,6 +1610,45 @@ function loadDisputes(cursor) {
   }).catch(e => { card.innerHTML = `<div class="empty"><p class="neg">${esc(e.message)}</p></div>`; $("#dispMoreRow").hidden = true; });
 }
 
+/* ---------- reporting: approvals ---------- */
+let apprLoaded = [];
+function renderApprovals() {
+  if (!keyReady()) { $("#approvalsBody").innerHTML = connectCard(); $("#apprMoreRow").hidden = true; return; }
+  loadApprovals(null);
+}
+function loadApprovals(cursor) {
+  const q = new URLSearchParams();
+  const status = $("#apprStatus").value;
+  if (status) q.set("status", status);
+  if (cursor) q.set("cursor", cursor);
+  const card = $("#approvalsBody");
+  if (!cursor) card.innerHTML = `<div class="empty"><span class="subtle">Loading&hellip;</span></div>`;
+  return api("GET", "/v1/pending?" + q.toString()).then(r => {
+    const rows = r.pending || [];
+    if (!cursor) { apprLoaded = rows.slice(); } else { apprLoaded = apprLoaded.concat(rows); }
+    if (!apprLoaded.length) {
+      card.innerHTML = `<div class="empty">${emptyArt}<p><strong>No pending approvals.</strong><br>A transaction that crosses the tenant's threshold shows up here awaiting a decision.</p></div>`;
+      $("#apprMoreRow").hidden = true; return;
+    }
+    card.innerHTML = `<table>
+      <thead><tr><th>When</th><th>Kind</th><th>Threshold</th><th>Created by</th><th>Status</th><th></th></tr></thead>
+      <tbody>${apprLoaded.map(p => `<tr>
+        <td>${esc(new Date(p.created_at).toLocaleString())}</td>
+        <td><span class="badge cyan">${esc(p.kind)}</span></td>
+        <td class="mono">${money(p.threshold_amount)} ${esc(p.threshold_currency)}</td>
+        <td class="mono" title="${esc(p.created_by)}">${esc((p.created_by || "").slice(0, 12))}</td>
+        <td>${badgeStatus(p.status)}</td>
+        <td style="text-align:right;white-space:nowrap">${p.status === "pending" ? `
+          <button class="btn ghost sm" data-approve="${esc(p.id)}">Approve</button>
+          <button class="btn danger sm" data-reject="${esc(p.id)}">Reject</button>
+          <button class="btn ghost sm" data-cancel="${esc(p.id)}">Cancel</button>
+        ` : ""}</td>
+      </tr>`).join("")}</tbody></table>`;
+    state.apprCursor = r.next_cursor;
+    $("#apprMoreRow").hidden = !state.apprCursor;
+  }).catch(e => { card.innerHTML = `<div class="empty"><p class="neg">${esc(e.message)}</p></div>`; $("#apprMoreRow").hidden = true; });
+}
+
 /* ---------- settings ---------- */
 function renderSettings() {
   if (state.demoMode) {
@@ -1691,7 +1754,7 @@ const RENDERERS = {
   convert: renderConvert,
   statement: renderStatement, tenants: renderTenants, apikeys: renderKeys,
   webhooks: renderWebhooks, policy: renderPolicy, trialbalance: renderTrialBalance,
-  transactions: renderTransactions, disputes: renderDisputes, audit: renderAudit, settings: renderSettings
+  transactions: renderTransactions, disputes: renderDisputes, audit: renderAudit, approvals: renderApprovals, settings: renderSettings
 };
 function go(view) {
   state.view = view;
@@ -1752,6 +1815,31 @@ document.addEventListener("click", (e) => {
   if (rev) { api("POST", "/v1/admin/keys/" + rev.dataset.revoke + "/revoke").then(() => { toast("Key revoked", "ok"); loadKeys(); }).catch(err => toast(err.message, "err")); return; }
   const delwh = e.target.closest("[data-delwh]");
   if (delwh) { api("DELETE", "/v1/admin/webhooks/" + delwh.dataset.delwh).then(() => { toast("Webhook deleted", "ok"); loadWebhooks(); }).catch(err => toast(err.message, "err")); return; }
+
+  const appr = e.target.closest("[data-approve]");
+  if (appr) {
+    api("POST", "/v1/pending/" + appr.dataset.approve + "/approve").then(t => {
+      toast(t && t.id ? "Approved. Posted transaction " + t.id.slice(0, 8) : "Approved", "ok");
+      loadApprovals(null);
+    }).catch(err => toast(err.message, "err"));
+    return;
+  }
+  const rej = e.target.closest("[data-reject]");
+  if (rej) {
+    api("POST", "/v1/pending/" + rej.dataset.reject + "/reject", {}).then(() => {
+      toast("Rejected", "ok");
+      loadApprovals(null);
+    }).catch(err => toast(err.message, "err"));
+    return;
+  }
+  const cxl = e.target.closest("[data-cancel]");
+  if (cxl) {
+    api("POST", "/v1/pending/" + cxl.dataset.cancel + "/cancel").then(() => {
+      toast("Cancelled", "ok");
+      loadApprovals(null);
+    }).catch(err => toast(err.message, "err"));
+    return;
+  }
 });
 
 document.addEventListener("change", (e) => {
@@ -1838,8 +1926,13 @@ $("#postForm").addEventListener("submit", (e) => {
   const body = { currency, postings };
   if ($("#txRef").value.trim()) body.reference = $("#txRef").value.trim();
   api("POST", "/v1/transactions", body).then(t => {
-    toast("Posted " + t.id.slice(0, 8) + ". The books still sum to zero.", "ok");
-    $("#postOut").textContent = "Posted transaction " + t.id;
+    if (t.pending) {
+      toast("Held for approval: exceeds the tenant's threshold. Find it under Approvals.");
+      $("#postOut").innerHTML = `<span class="badge amber">held for approval</span> Pending id ${esc(t.pending.id)}. It will post once approved.`;
+    } else {
+      toast("Posted " + t.id.slice(0, 8) + ". The books still sum to zero.", "ok");
+      $("#postOut").textContent = "Posted transaction " + t.id;
+    }
     state.postings = [{ accountId: "", amount: "", desc: "" }, { accountId: "", amount: "", desc: "" }];
     $("#txRef").value = "";
     renderPostingRows();
@@ -1956,6 +2049,10 @@ $("#txExport").addEventListener("click", () => {
 /* disputes */
 $("#dispStatus").addEventListener("change", () => loadDisputes(null));
 $("#dispMore").addEventListener("click", () => loadDisputes(state.dispCursor));
+
+/* approvals */
+$("#apprStatus").addEventListener("change", () => loadApprovals(null));
+$("#apprMore").addEventListener("click", () => loadApprovals(state.apprCursor));
 
 /* audit log */
 $("#auditMore").addEventListener("click", () => loadAudit(state.auditCursor));
