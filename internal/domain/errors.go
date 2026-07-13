@@ -210,4 +210,23 @@ var (
 	// carries an unrecognized Kind, an empty Payload, or an empty
 	// ThresholdCcy/CreatedBy (ADR-025, Week 13).
 	ErrInvalidPendingTransaction = errors.New("domain: invalid pending transaction")
+	// ErrCannotApproveOwn is returned when ApprovalConfig.RequireDifferentActor
+	// is set and the actor approving a pending transaction is the same actor
+	// who created it (ADR-025, Week 13): a four-eyes policy requires a
+	// second, different person to approve, so an approver approving their
+	// own request is refused rather than silently let through.
+	ErrCannotApproveOwn = errors.New("domain: cannot approve your own pending transaction")
+	// ErrPendingAlreadyDecided is returned when a decision (approve, reject,
+	// or cancel) targets a pending transaction that has already left the
+	// pending status (ADR-025, Week 13): a pending is decided at most once,
+	// and a second, different decision on an already-terminal row is
+	// rejected rather than silently overwriting the first one. Approving an
+	// already-approved pending is the one exception: that is idempotent and
+	// returns the already-posted transaction instead of this error (see
+	// ApprovalService.Approve).
+	ErrPendingAlreadyDecided = errors.New("domain: pending transaction already decided")
+	// ErrNotPendingCreator is returned when Cancel is called by an actor who
+	// did not create the pending transaction (ADR-025, Week 13): only the
+	// creator may withdraw their own held request before a decision is made.
+	ErrNotPendingCreator = errors.New("domain: only the creator can cancel a pending transaction")
 )
