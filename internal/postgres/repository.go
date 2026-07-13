@@ -2306,18 +2306,19 @@ func (r *Repository) SetWebhookSubscriptionActive(ctx context.Context, id string
 // one of those selects the identical column set.
 func pendingFromRow(row sqlc.PendingTransaction) domain.PendingTransaction {
 	p := domain.PendingTransaction{
-		ID:            row.ID.String(),
-		TenantID:      row.TenantID.String(),
-		Kind:          domain.PendingKind(row.Kind),
-		Payload:       json.RawMessage(row.Payload),
-		Status:        domain.PendingStatus(row.Status),
-		ThresholdCcy:  row.ThresholdCcy,
-		ThresholdAmt:  row.ThresholdAmt,
-		CreatedBy:     row.CreatedBy,
-		CreatedAt:     row.CreatedAt,
-		DecidedBy:     textToPtr(row.DecidedBy),
-		Reason:        textToPtr(row.Reason),
-		TransactionID: uuidToPtr(row.TransactionID),
+		ID:             row.ID.String(),
+		TenantID:       row.TenantID.String(),
+		Kind:           domain.PendingKind(row.Kind),
+		Payload:        json.RawMessage(row.Payload),
+		Status:         domain.PendingStatus(row.Status),
+		ThresholdCcy:   row.ThresholdCcy,
+		ThresholdAmt:   row.ThresholdAmt,
+		CreatedBy:      row.CreatedBy,
+		CreatedAt:      row.CreatedAt,
+		DecidedBy:      textToPtr(row.DecidedBy),
+		Reason:         textToPtr(row.Reason),
+		TransactionID:  uuidToPtr(row.TransactionID),
+		IdempotencyKey: textToPtr(row.IdempotencyKey),
 	}
 	if row.DecidedAt.Valid {
 		t := row.DecidedAt.Time
@@ -2352,17 +2353,53 @@ func (r *Repository) InsertPendingTransaction(ctx context.Context, tenantID stri
 	if err != nil {
 		return fmt.Errorf("postgres: parse pending transaction id: %w", err)
 	}
-	return r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
 		return q.InsertPendingTransaction(ctx, sqlc.InsertPendingTransactionParams{
-			ID:           pid,
-			TenantID:     tid,
-			Kind:         string(p.Kind),
-			Payload:      p.Payload,
-			ThresholdCcy: p.ThresholdCcy,
-			ThresholdAmt: p.ThresholdAmt,
-			CreatedBy:    p.CreatedBy,
+			ID:             pid,
+			TenantID:       tid,
+			Kind:           string(p.Kind),
+			Payload:        p.Payload,
+			ThresholdCcy:   p.ThresholdCcy,
+			ThresholdAmt:   p.ThresholdAmt,
+			CreatedBy:      p.CreatedBy,
+			IdempotencyKey: ptrToText(p.IdempotencyKey),
 		})
 	})
+	if err != nil {
+		if isUniqueViolation(err) && pgConstraint(err) == "pending_transactions_idempotency_idx" {
+			return domain.ErrDuplicatePendingIdempotencyKey
+		}
+		return fmt.Errorf("postgres: insert pending transaction: %w", err)
+	}
+	return nil
+}
+
+// GetPendingByIdempotencyKey returns the pending transaction whose
+// idempotency_key equals key within the tenant, or
+// domain.ErrPendingTransactionNotFound if none exists (ADR-025 section 6,
+// Lifecycle).
+func (r *Repository) GetPendingByIdempotencyKey(ctx context.Context, tenantID, key string) (*domain.PendingTransaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	var row sqlc.PendingTransaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetPendingByIdempotencyKey(ctx, sqlc.GetPendingByIdempotencyKeyParams{
+			TenantID:       tid,
+			IdempotencyKey: pgtype.Text{String: key, Valid: true},
+		})
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPendingTransactionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get pending transaction by idempotency key: %w", err)
+	}
+	p := pendingFromRow(row)
+	return &p, nil
 }
 
 // GetPendingTransaction returns the pending transaction, or
@@ -2509,15 +2546,31 @@ func (tr txRepo) InsertPendingTransaction(ctx context.Context, tenantID string, 
 	if err != nil {
 		return fmt.Errorf("postgres: parse pending transaction id: %w", err)
 	}
-	return tr.q.InsertPendingTransaction(ctx, sqlc.InsertPendingTransactionParams{
-		ID:           pid,
-		TenantID:     tid,
-		Kind:         string(p.Kind),
-		Payload:      p.Payload,
-		ThresholdCcy: p.ThresholdCcy,
-		ThresholdAmt: p.ThresholdAmt,
-		CreatedBy:    p.CreatedBy,
-	})
+	if err := tr.q.InsertPendingTransaction(ctx, sqlc.InsertPendingTransactionParams{
+		ID:             pid,
+		TenantID:       tid,
+		Kind:           string(p.Kind),
+		Payload:        p.Payload,
+		ThresholdCcy:   p.ThresholdCcy,
+		ThresholdAmt:   p.ThresholdAmt,
+		CreatedBy:      p.CreatedBy,
+		IdempotencyKey: ptrToText(p.IdempotencyKey),
+	}); err != nil {
+		// A concurrent hold consumed p.IdempotencyKey first
+		// (pending_transactions_idempotency_idx, migration 0036): this
+		// aborts the surrounding transaction, the same way any other
+		// unique violation would. holdForApproval catches
+		// ErrDuplicatePendingIdempotencyKey after RunInTx returns and reads
+		// back the winner's pending with a fresh, non-transactional
+		// GetPendingByIdempotencyKey call, so a racing replay still gets
+		// the same-pending guarantee ADR-025 section 6 promises instead of
+		// a bare error.
+		if isUniqueViolation(err) && pgConstraint(err) == "pending_transactions_idempotency_idx" {
+			return domain.ErrDuplicatePendingIdempotencyKey
+		}
+		return fmt.Errorf("postgres: insert pending transaction: %w", err)
+	}
+	return nil
 }
 
 // GetPendingForUpdate returns the pending transaction, row-locked (SELECT

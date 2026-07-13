@@ -613,6 +613,15 @@ type Repository interface {
 	// (Task 4, ADR-025).
 	GetPendingTransaction(ctx context.Context, tenantID, id string) (*PendingTransaction, error)
 
+	// GetPendingByIdempotencyKey returns the pending transaction whose
+	// IdempotencyKey equals key within the tenant, or
+	// ErrPendingTransactionNotFound if none exists (ADR-025 section 6,
+	// Lifecycle, the fix for the replay-creates-a-second-pending gap):
+	// holdForApproval calls this before inserting a new pending so a retry
+	// of the same gated create, with the same caller-supplied idempotency
+	// key, returns the original pending instead of holding a second one.
+	GetPendingByIdempotencyKey(ctx context.Context, tenantID, key string) (*PendingTransaction, error)
+
 	// ListPendingTransactions returns up to limit of the tenant's pending
 	// transactions, newest first, keyset paged the same way ListDisputes
 	// pages (Task 4, ADR-025). status, if non-nil, filters to only that

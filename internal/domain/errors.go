@@ -210,6 +210,14 @@ var (
 	// carries an unrecognized Kind, an empty Payload, or an empty
 	// ThresholdCcy/CreatedBy (ADR-025, Week 13).
 	ErrInvalidPendingTransaction = errors.New("domain: invalid pending transaction")
+	// ErrDuplicatePendingIdempotencyKey is returned by InsertPendingTransaction
+	// when a concurrent hold already consumed p.IdempotencyKey for this
+	// tenant (pending_transactions_idempotency_idx, migration 0036): the
+	// insert lost a race against another request holding the identical
+	// retry. holdForApproval catches this and reads back the pending the
+	// winner inserted instead of surfacing it as an error, so a racing
+	// replay still gets the same-pending guarantee ADR-025 section 6 promises.
+	ErrDuplicatePendingIdempotencyKey = errors.New("domain: pending transaction idempotency key already consumed")
 	// ErrCannotApproveOwn is returned when ApprovalConfig.RequireDifferentActor
 	// is set and the actor approving a pending transaction is the same actor
 	// who created it (ADR-025, Week 13): a four-eyes policy requires a

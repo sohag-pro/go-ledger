@@ -235,7 +235,11 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 	// so a hold reports nil, false, and the *HeldForApprovalError.
 	if !isApprovalReplay(ctx) {
 		if ccy, amt, gated := s.approval.Gate(t.Postings); gated {
-			return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindConvert, convertPayload(req), ccy, amt)
+			var idemKey string
+			if idem != nil {
+				idemKey = idem.Key
+			}
+			return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindConvert, convertPayload(req), ccy, amt, idemKey)
 		}
 	}
 

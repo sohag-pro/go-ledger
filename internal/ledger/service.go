@@ -240,7 +240,11 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 	// transaction, so nothing below this point ever runs for a held post.
 	if !isApprovalReplay(ctx) {
 		if ccy, amt, gated := s.approval.Gate(t.Postings); gated {
-			return false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindPost, postPayload(t), ccy, amt)
+			var idemKey string
+			if idem != nil {
+				idemKey = idem.Key
+			}
+			return false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindPost, postPayload(t), ccy, amt, idemKey)
 		}
 	}
 

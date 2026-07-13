@@ -128,7 +128,12 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 				return nil, false, err
 			}
 			if !approved {
-				return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindReverse, reversePayload(originalID), ccy, amt)
+				// ReverseTransaction takes no caller-supplied idempotency
+				// key (its own idempotency comes from the
+				// transactions_one_reversal_idx unique constraint on
+				// reverses_transaction_id, not a request header), so there
+				// is nothing to dedup a held reversal's pending on here.
+				return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindReverse, reversePayload(originalID), ccy, amt, "")
 			}
 		}
 	}

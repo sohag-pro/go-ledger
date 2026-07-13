@@ -13,8 +13,47 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getPendingByIdempotencyKey = `-- name: GetPendingByIdempotencyKey :one
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
+FROM pending_transactions
+WHERE tenant_id = $1 AND idempotency_key = $2
+`
+
+type GetPendingByIdempotencyKeyParams struct {
+	TenantID       uuid.UUID
+	IdempotencyKey pgtype.Text
+}
+
+// ADR-025 section 6 (Lifecycle): the replay-dedup read. holdForApproval
+// calls this before inserting a new pending, and again if the insert itself
+// loses a race against a concurrent identical retry
+// (pending_transactions_idempotency_idx unique violation), so a retry of the
+// same gated create with the same idempotency key always returns the one
+// pending that key produced, never a second one.
+func (q *Queries) GetPendingByIdempotencyKey(ctx context.Context, arg GetPendingByIdempotencyKeyParams) (PendingTransaction, error) {
+	row := q.db.QueryRow(ctx, getPendingByIdempotencyKey, arg.TenantID, arg.IdempotencyKey)
+	var i PendingTransaction
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Kind,
+		&i.Payload,
+		&i.Status,
+		&i.ThresholdCcy,
+		&i.ThresholdAmt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DecidedBy,
+		&i.DecidedAt,
+		&i.Reason,
+		&i.TransactionID,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
 const getPendingForUpdate = `-- name: GetPendingForUpdate :one
-SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 FROM pending_transactions
 WHERE tenant_id = $1 AND id = $2
 FOR UPDATE
@@ -47,12 +86,13 @@ func (q *Queries) GetPendingForUpdate(ctx context.Context, arg GetPendingForUpda
 		&i.DecidedAt,
 		&i.Reason,
 		&i.TransactionID,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
 
 const getPendingTransaction = `-- name: GetPendingTransaction :one
-SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 FROM pending_transactions
 WHERE tenant_id = $1 AND id = $2
 `
@@ -79,28 +119,33 @@ func (q *Queries) GetPendingTransaction(ctx context.Context, arg GetPendingTrans
 		&i.DecidedAt,
 		&i.Reason,
 		&i.TransactionID,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
 
 const insertPendingTransaction = `-- name: InsertPendingTransaction :exec
-INSERT INTO pending_transactions (id, tenant_id, kind, payload, threshold_ccy, threshold_amt, created_by)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO pending_transactions (id, tenant_id, kind, payload, threshold_ccy, threshold_amt, created_by, idempotency_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 `
 
 type InsertPendingTransactionParams struct {
-	ID           uuid.UUID
-	TenantID     uuid.UUID
-	Kind         string
-	Payload      []byte
-	ThresholdCcy string
-	ThresholdAmt int64
-	CreatedBy    string
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Kind           string
+	Payload        []byte
+	ThresholdCcy   string
+	ThresholdAmt   int64
+	CreatedBy      string
+	IdempotencyKey pgtype.Text
 }
 
 // Task 4 (ADR-025): status is NOT inserted explicitly (the column default
 // 'pending' applies), the same convention CreateDispute leaves status to its
-// own column default for.
+// own column default for. idempotency_key (migration 0036, ADR-025 section
+// 6) is nullable via sqlc.narg: a held create with no caller-supplied key
+// inserts NULL, which never collides under pending_transactions_idempotency_idx
+// (a partial unique index that only applies where the key is present).
 func (q *Queries) InsertPendingTransaction(ctx context.Context, arg InsertPendingTransactionParams) error {
 	_, err := q.db.Exec(ctx, insertPendingTransaction,
 		arg.ID,
@@ -110,12 +155,13 @@ func (q *Queries) InsertPendingTransaction(ctx context.Context, arg InsertPendin
 		arg.ThresholdCcy,
 		arg.ThresholdAmt,
 		arg.CreatedBy,
+		arg.IdempotencyKey,
 	)
 	return err
 }
 
 const listPendingTransactions = `-- name: ListPendingTransactions :many
-SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 FROM pending_transactions
 WHERE tenant_id = $1
   AND ($2::text IS NULL OR status = $2)
@@ -166,6 +212,7 @@ func (q *Queries) ListPendingTransactions(ctx context.Context, arg ListPendingTr
 			&i.DecidedAt,
 			&i.Reason,
 			&i.TransactionID,
+			&i.IdempotencyKey,
 		); err != nil {
 			return nil, err
 		}
@@ -210,7 +257,7 @@ UPDATE pending_transactions
 SET status = 'expired', decided_at = now(), decided_by = 'system'
 WHERE status = 'pending'
   AND created_at < now() - ($1::float8 * interval '1 second')
-RETURNING id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+RETURNING id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 `
 
 // Task 4 (ADR-025): the TTL sweep, mirroring
@@ -247,6 +294,7 @@ func (q *Queries) SweepExpiredPending(ctx context.Context, olderThanSeconds floa
 			&i.DecidedAt,
 			&i.Reason,
 			&i.TransactionID,
+			&i.IdempotencyKey,
 		); err != nil {
 			return nil, err
 		}

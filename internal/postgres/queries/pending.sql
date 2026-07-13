@@ -1,14 +1,28 @@
 -- name: InsertPendingTransaction :exec
 -- Task 4 (ADR-025): status is NOT inserted explicitly (the column default
 -- 'pending' applies), the same convention CreateDispute leaves status to its
--- own column default for.
-INSERT INTO pending_transactions (id, tenant_id, kind, payload, threshold_ccy, threshold_amt, created_by)
-VALUES (sqlc.arg(id), sqlc.arg(tenant_id), sqlc.arg(kind), sqlc.arg(payload), sqlc.arg(threshold_ccy), sqlc.arg(threshold_amt), sqlc.arg(created_by));
+-- own column default for. idempotency_key (migration 0036, ADR-025 section
+-- 6) is nullable via sqlc.narg: a held create with no caller-supplied key
+-- inserts NULL, which never collides under pending_transactions_idempotency_idx
+-- (a partial unique index that only applies where the key is present).
+INSERT INTO pending_transactions (id, tenant_id, kind, payload, threshold_ccy, threshold_amt, created_by, idempotency_key)
+VALUES (sqlc.arg(id), sqlc.arg(tenant_id), sqlc.arg(kind), sqlc.arg(payload), sqlc.arg(threshold_ccy), sqlc.arg(threshold_amt), sqlc.arg(created_by), sqlc.narg(idempotency_key));
 
 -- name: GetPendingTransaction :one
-SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 FROM pending_transactions
 WHERE tenant_id = sqlc.arg(tenant_id) AND id = sqlc.arg(id);
+
+-- name: GetPendingByIdempotencyKey :one
+-- ADR-025 section 6 (Lifecycle): the replay-dedup read. holdForApproval
+-- calls this before inserting a new pending, and again if the insert itself
+-- loses a race against a concurrent identical retry
+-- (pending_transactions_idempotency_idx unique violation), so a retry of the
+-- same gated create with the same idempotency key always returns the one
+-- pending that key produced, never a second one.
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
+FROM pending_transactions
+WHERE tenant_id = sqlc.arg(tenant_id) AND idempotency_key = sqlc.arg(idempotency_key);
 
 -- name: GetPendingForUpdate :one
 -- Task 4 (ADR-025): the row-locking read a decision (approve/reject/cancel)
@@ -16,7 +30,7 @@ WHERE tenant_id = sqlc.arg(tenant_id) AND id = sqlc.arg(id);
 -- win; the loser's transaction blocks on this lock until the winner commits
 -- or rolls back, then re-reads the now-terminal row. Called only from
 -- inside RunInTx (via the Tx port), never as a standalone read.
-SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 FROM pending_transactions
 WHERE tenant_id = sqlc.arg(tenant_id) AND id = sqlc.arg(id)
 FOR UPDATE;
@@ -26,7 +40,7 @@ FOR UPDATE;
 -- ADR-025). status is an optional filter via sqlc.narg: NULL disables it
 -- (every status is returned). Keyset paged by (created_at, id) descending,
 -- the identical cursor shape ListDisputes already uses.
-SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id
+SELECT id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key
 FROM pending_transactions
 WHERE tenant_id = sqlc.arg(tenant_id)
   AND (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status'))
@@ -78,4 +92,4 @@ UPDATE pending_transactions
 SET status = 'expired', decided_at = now(), decided_by = 'system'
 WHERE status = 'pending'
   AND created_at < now() - (sqlc.arg(older_than_seconds)::float8 * interval '1 second')
-RETURNING id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id;
+RETURNING id, tenant_id, kind, payload, status, threshold_ccy, threshold_amt, created_by, created_at, decided_by, decided_at, reason, transaction_id, idempotency_key;

@@ -204,6 +204,13 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
+	// ADR-025 section 6 (Lifecycle): the replay-dedup read. holdForApproval
+	// calls this before inserting a new pending, and again if the insert itself
+	// loses a race against a concurrent identical retry
+	// (pending_transactions_idempotency_idx unique violation), so a retry of the
+	// same gated create with the same idempotency key always returns the one
+	// pending that key produced, never a second one.
+	GetPendingByIdempotencyKey(ctx context.Context, arg GetPendingByIdempotencyKeyParams) (PendingTransaction, error)
 	// Task 4 (ADR-025): the row-locking read a decision (approve/reject/cancel)
 	// takes before transitioning a pending, so two racing decisions cannot both
 	// win; the loser's transaction blocks on this lock until the winner commits
@@ -315,7 +322,10 @@ type Querier interface {
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (uuid.UUID, error)
 	// Task 4 (ADR-025): status is NOT inserted explicitly (the column default
 	// 'pending' applies), the same convention CreateDispute leaves status to its
-	// own column default for.
+	// own column default for. idempotency_key (migration 0036, ADR-025 section
+	// 6) is nullable via sqlc.narg: a held create with no caller-supplied key
+	// inserts NULL, which never collides under pending_transactions_idempotency_idx
+	// (a partial unique index that only applies where the key is present).
 	InsertPendingTransaction(ctx context.Context, arg InsertPendingTransactionParams) error
 	// Creates one fan-out row for a (subscription, audit event) pairing. The
 	// ON CONFLICT DO NOTHING against the UNIQUE (subscription_id,

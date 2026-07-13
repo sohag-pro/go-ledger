@@ -82,8 +82,15 @@ type PendingTransaction struct {
 	// current balances, not against the threshold that originally gated it.
 	ThresholdCcy string
 	ThresholdAmt int64
-	CreatedBy    string
-	CreatedAt    time.Time
+	// IdempotencyKey is the caller's Idempotency-Key at the time the gate
+	// held this pending, or nil if the caller supplied none (ADR-025
+	// section 6, Lifecycle). Non-nil, it is unique per tenant
+	// (pending_transactions_idempotency_idx): holdForApproval consumes it
+	// against this pending, so a replay of the same key returns this same
+	// pending instead of creating a second one for an identical retry.
+	IdempotencyKey *string
+	CreatedBy      string
+	CreatedAt      time.Time
 	// DecidedBy, DecidedAt, and Reason are nil until a decision (approve,
 	// reject, cancel, or the expiry sweep) is made; a decision sets all
 	// three at once, exactly one time, whichever attempt wins the row lock

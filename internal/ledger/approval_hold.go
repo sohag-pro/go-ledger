@@ -54,12 +54,42 @@ func isApprovalReplay(ctx context.Context) bool {
 // lifecycle event in one transaction, then returns a HeldForApprovalError. It
 // is called by Post, Convert, and ReverseTransaction after ApprovalConfig.Gate
 // reports a transaction as over threshold: nothing about the original write
-// (postings, the transaction row, its idempotency key) is ever touched, only
-// the pending is created.
+// (postings, the transaction row) is ever touched, only the pending is
+// created.
+//
+// idempotencyKey is the caller's Idempotency-Key, or "" if the request
+// carried none. ADR-025 section 6 (Lifecycle) promises that a gated create
+// consumes its idempotency key against the pending it holds, so a replay of
+// the same key returns the same pending rather than creating a second one:
+// a client that retries an identical over-threshold create (for example
+// after a dropped 202 response) must not end up with two pendings for the
+// same request, since approving both would double-post the same money under
+// two different derived approval keys. When idempotencyKey is "" (the
+// caller supplied none), this dedup does not apply: every hold creates a
+// fresh pending, exactly as before.
+//
+// This dedups on the key alone, not on the payload: a retry that reuses the
+// same idempotency key but changes the payload gets back the ORIGINAL
+// pending, not a 422 conflict the way idempotency_keys' fingerprint check
+// would produce for an ordinary post. That is a deliberate, narrower
+// guarantee than the ordinary idempotency path: building fingerprint
+// comparison for pendings is out of scope here.
 func (s *TransactionService) holdForApproval(
 	ctx context.Context, tenantID, actor string, kind domain.PendingKind,
-	payload any, ccy string, amt int64,
+	payload any, ccy string, amt int64, idempotencyKey string,
 ) error {
+	if idempotencyKey != "" {
+		existing, err := s.repo.GetPendingByIdempotencyKey(ctx, tenantID, idempotencyKey)
+		switch {
+		case err == nil:
+			return &HeldForApprovalError{Pending: existing}
+		case errors.Is(err, domain.ErrPendingTransactionNotFound):
+			// No existing pending for this key: proceed to hold a new one.
+		default:
+			return err
+		}
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -74,6 +104,9 @@ func (s *TransactionService) holdForApproval(
 		ThresholdAmt: amt,
 		CreatedBy:    actor,
 	}
+	if idempotencyKey != "" {
+		p.IdempotencyKey = &idempotencyKey
+	}
 	err = s.repo.RunInTx(ctx, tenantID, func(ctx context.Context, tx domain.Tx) error {
 		if err := tx.InsertPendingTransaction(ctx, tenantID, p); err != nil {
 			return err
@@ -81,6 +114,16 @@ func (s *TransactionService) holdForApproval(
 		return appendPendingEvent(ctx, tx, tenantID, "approval.requested", p, nil)
 	})
 	if err != nil {
+		// A concurrent hold raced in between the check above and this
+		// insert and won: read back ITS pending rather than surfacing a
+		// duplicate-key error, so this retry still gets the same-pending
+		// guarantee (see the doc comment above).
+		if idempotencyKey != "" && errors.Is(err, domain.ErrDuplicatePendingIdempotencyKey) {
+			existing, ferr := s.repo.GetPendingByIdempotencyKey(ctx, tenantID, idempotencyKey)
+			if ferr == nil {
+				return &HeldForApprovalError{Pending: existing}
+			}
+		}
 		return err
 	}
 	return &HeldForApprovalError{Pending: p}

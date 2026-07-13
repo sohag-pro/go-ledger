@@ -133,19 +133,20 @@ type IdempotencyKey struct {
 }
 
 type PendingTransaction struct {
-	ID            uuid.UUID
-	TenantID      uuid.UUID
-	Kind          string
-	Payload       []byte
-	Status        string
-	ThresholdCcy  string
-	ThresholdAmt  int64
-	CreatedBy     string
-	CreatedAt     time.Time
-	DecidedBy     pgtype.Text
-	DecidedAt     pgtype.Timestamptz
-	Reason        pgtype.Text
-	TransactionID pgtype.UUID
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	Kind           string
+	Payload        []byte
+	Status         string
+	ThresholdCcy   string
+	ThresholdAmt   int64
+	CreatedBy      string
+	CreatedAt      time.Time
+	DecidedBy      pgtype.Text
+	DecidedAt      pgtype.Timestamptz
+	Reason         pgtype.Text
+	TransactionID  pgtype.UUID
+	IdempotencyKey pgtype.Text
 }
 
 type Posting struct {

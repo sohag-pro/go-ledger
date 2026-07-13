@@ -1141,6 +1141,21 @@ func (f *fakeRepo) GetPendingTransaction(_ context.Context, tenantID, id string)
 	return &p, nil
 }
 
+// GetPendingByIdempotencyKey mirrors
+// postgres.Repository.GetPendingByIdempotencyKey (ADR-025 section 6): a
+// linear scan is fine here, the same tradeoff every other fakeRepo lookup
+// in this file already makes for an in-memory test double with no
+// meaningful row count.
+func (f *fakeRepo) GetPendingByIdempotencyKey(_ context.Context, tenantID, key string) (*domain.PendingTransaction, error) {
+	for _, p := range f.pending {
+		if p.TenantID == tenantID && p.IdempotencyKey != nil && *p.IdempotencyKey == key {
+			pending := p
+			return &pending, nil
+		}
+	}
+	return nil, domain.ErrPendingTransactionNotFound
+}
+
 // ListPendingTransactions mirrors ListDisputes' "collect, sort ascending,
 // then walk from the newest applying the cursor" style (Task 4, ADR-025).
 func (f *fakeRepo) ListPendingTransactions(_ context.Context, tenantID string, status *domain.PendingStatus, after *domain.StatementCursor, limit int) ([]domain.PendingTransaction, error) {
