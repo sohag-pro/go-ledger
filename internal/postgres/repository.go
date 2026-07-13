@@ -2299,3 +2299,212 @@ func (r *Repository) SetWebhookSubscriptionActive(ctx context.Context, id string
 	}
 	return nil
 }
+
+// pendingFromRow builds a domain.PendingTransaction from a sqlc.PendingTransaction
+// row, shared by GetPendingTransaction, GetPendingForUpdate,
+// ListPendingTransactions, and SweepExpiredPending (Task 4, ADR-025): every
+// one of those selects the identical column set.
+func pendingFromRow(row sqlc.PendingTransaction) domain.PendingTransaction {
+	p := domain.PendingTransaction{
+		ID:            row.ID.String(),
+		TenantID:      row.TenantID.String(),
+		Kind:          domain.PendingKind(row.Kind),
+		Payload:       json.RawMessage(row.Payload),
+		Status:        domain.PendingStatus(row.Status),
+		ThresholdCcy:  row.ThresholdCcy,
+		ThresholdAmt:  row.ThresholdAmt,
+		CreatedBy:     row.CreatedBy,
+		CreatedAt:     row.CreatedAt,
+		DecidedBy:     textToPtr(row.DecidedBy),
+		Reason:        textToPtr(row.Reason),
+		TransactionID: uuidToPtr(row.TransactionID),
+	}
+	if row.DecidedAt.Valid {
+		t := row.DecidedAt.Time
+		p.DecidedAt = &t
+	}
+	return p
+}
+
+// InsertPendingTransaction assigns an identity if p.ID is empty, defaults
+// Status to pending, and inserts p (Task 4, ADR-025): an over-threshold
+// transaction held as intent. Nothing in postings/transactions is touched by
+// this call. It returns domain.ErrInvalidPendingTransaction if p carries an
+// unrecognized Kind, an empty Payload, or an empty ThresholdCcy/CreatedBy.
+func (r *Repository) InsertPendingTransaction(ctx context.Context, tenantID string, p *domain.PendingTransaction) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if p.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate pending transaction id: %w", err)
+		}
+		p.ID = id.String()
+	}
+	if !p.Kind.Valid() || len(p.Payload) == 0 || p.ThresholdCcy == "" || p.CreatedBy == "" {
+		return domain.ErrInvalidPendingTransaction
+	}
+	p.TenantID = tenantID
+	p.Status = domain.PendingStatusPending
+	pid, err := uuid.Parse(p.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse pending transaction id: %w", err)
+	}
+	return r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		return q.InsertPendingTransaction(ctx, sqlc.InsertPendingTransactionParams{
+			ID:           pid,
+			TenantID:     tid,
+			Kind:         string(p.Kind),
+			Payload:      p.Payload,
+			ThresholdCcy: p.ThresholdCcy,
+			ThresholdAmt: p.ThresholdAmt,
+			CreatedBy:    p.CreatedBy,
+		})
+	})
+}
+
+// GetPendingTransaction returns the pending transaction, or
+// domain.ErrPendingTransactionNotFound if absent (Task 4, ADR-025).
+func (r *Repository) GetPendingTransaction(ctx context.Context, tenantID, id string) (*domain.PendingTransaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	pid, err := uuid.Parse(id)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse pending transaction id: %w", err)
+	}
+	var row sqlc.PendingTransaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		row, err = q.GetPendingTransaction(ctx, sqlc.GetPendingTransactionParams{TenantID: tid, ID: pid})
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPendingTransactionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get pending transaction: %w", err)
+	}
+	p := pendingFromRow(row)
+	return &p, nil
+}
+
+// ListPendingTransactions returns up to limit of the tenant's pending
+// transactions, newest first, keyset paged, optionally filtered by status
+// (Task 4, ADR-025).
+func (r *Repository) ListPendingTransactions(ctx context.Context, tenantID string, status *domain.PendingStatus, after *domain.StatementCursor, limit int) ([]domain.PendingTransaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+
+	afterTime, afterID := statementFirstPageTime, uuid.Max
+	if after != nil {
+		afterTime = after.CreatedAt
+		if afterID, err = uuid.Parse(after.ID); err != nil {
+			return nil, fmt.Errorf("postgres: parse cursor id: %w", err)
+		}
+	}
+
+	var statusFilter pgtype.Text
+	if status != nil {
+		statusFilter = pgtype.Text{String: string(*status), Valid: true}
+	}
+
+	var rows []sqlc.PendingTransaction
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		rows, err = q.ListPendingTransactions(ctx, sqlc.ListPendingTransactionsParams{
+			TenantID:       tid,
+			Status:         statusFilter,
+			AfterCreatedAt: afterTime,
+			AfterID:        afterID,
+			PageLimit:      int32(limit), //nolint:gosec // limit is bounded by the API layer
+		})
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list pending transactions: %w", err)
+	}
+	out := make([]domain.PendingTransaction, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, pendingFromRow(row))
+	}
+	return out, nil
+}
+
+// SweepExpiredPending moves every still-pending row older than olderThan to
+// domain.PendingStatusExpired (decided_by "system"), across every tenant,
+// and returns the rows it expired (Task 4, ADR-025). Not tenant-scoped and
+// not run inside RunInTx, the same convention SweepExpiredIdempotencyKeys
+// follows: it runs directly against r.q (the pool), with no app.tenant_id
+// GUC ever set on that connection, so the RLS policy's allow-when-unset
+// branch is what lets it see and update every tenant's rows.
+func (r *Repository) SweepExpiredPending(ctx context.Context, olderThan time.Duration) ([]domain.PendingTransaction, error) {
+	rows, err := r.q.SweepExpiredPending(ctx, olderThan.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: sweep expired pending: %w", err)
+	}
+	out := make([]domain.PendingTransaction, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, pendingFromRow(row))
+	}
+	return out, nil
+}
+
+// GetPendingForUpdate returns the pending transaction, row-locked (SELECT
+// ... FOR UPDATE) for the rest of the surrounding transaction, or
+// domain.ErrPendingTransactionNotFound if absent (Task 4, ADR-025).
+func (tr txRepo) GetPendingForUpdate(ctx context.Context, tenantID, id string) (*domain.PendingTransaction, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	pid, err := uuid.Parse(id)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse pending transaction id: %w", err)
+	}
+	row, err := tr.q.GetPendingForUpdate(ctx, sqlc.GetPendingForUpdateParams{TenantID: tid, ID: pid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPendingTransactionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get pending transaction for update: %w", err)
+	}
+	p := pendingFromRow(row)
+	return &p, nil
+}
+
+// UpdatePendingStatus transitions the pending transaction to status,
+// stamping decidedBy and the server clock's decided_at, and reason/txID if
+// given (Task 4, ADR-025). Always called after GetPendingForUpdate has
+// already locked the row within the same surrounding transaction: this is a
+// plain unconditional update, not a guarded one the way
+// Repository.ResolveDispute's UPDATE ... WHERE status = 'open' is, since
+// the row lock, not a WHERE clause here, is what prevents a second
+// concurrent decision.
+func (tr txRepo) UpdatePendingStatus(ctx context.Context, tenantID string, id string, status domain.PendingStatus, decidedBy string, reason *string, txID *string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	pid, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("postgres: parse pending transaction id: %w", err)
+	}
+	txnID, err := optUUID(txID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse pending decision transaction id: %w", err)
+	}
+	return tr.q.UpdatePendingStatus(ctx, sqlc.UpdatePendingStatusParams{
+		Status:        string(status),
+		DecidedBy:     pgtype.Text{String: decidedBy, Valid: true},
+		Reason:        ptrToText(reason),
+		TransactionID: txnID,
+		TenantID:      tid,
+		ID:            pid,
+	})
+}

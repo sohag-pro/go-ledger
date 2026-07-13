@@ -204,6 +204,13 @@ type Querier interface {
 	// exactly one row, new or existing, in a single round trip with no second
 	// snapshot to race against.
 	GetOrCreateClearingAccount(ctx context.Context, arg GetOrCreateClearingAccountParams) (GetOrCreateClearingAccountRow, error)
+	// Task 4 (ADR-025): the row-locking read a decision (approve/reject/cancel)
+	// takes before transitioning a pending, so two racing decisions cannot both
+	// win; the loser's transaction blocks on this lock until the winner commits
+	// or rolls back, then re-reads the now-terminal row. Called only from
+	// inside RunInTx (via the Tx port), never as a standalone read.
+	GetPendingForUpdate(ctx context.Context, arg GetPendingForUpdateParams) (PendingTransaction, error)
+	GetPendingTransaction(ctx context.Context, arg GetPendingTransactionParams) (PendingTransaction, error)
 	// The reversal of a given original, if one exists (Task 4.2, audit A1.2):
 	// transactions_one_reversal_idx (migration 0017) guarantees at most one row
 	// can ever match, so this is a plain :one lookup, not a list.
@@ -306,6 +313,10 @@ type Querier interface {
 	// domain.ErrDuplicateIdempotencyKey exactly as a plain unique-violation used
 	// to, preserving replay-on-duplicate for the still-live case.
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (uuid.UUID, error)
+	// Task 4 (ADR-025): status is NOT inserted explicitly (the column default
+	// 'pending' applies), the same convention CreateDispute leaves status to its
+	// own column default for.
+	InsertPendingTransaction(ctx context.Context, arg InsertPendingTransactionParams) error
 	// Creates one fan-out row for a (subscription, audit event) pairing. The
 	// ON CONFLICT DO NOTHING against the UNIQUE (subscription_id,
 	// audit_chain_seq) index (migration 0021) is what makes fan-out
@@ -429,6 +440,11 @@ type Querier interface {
 	// row lock is released the moment this statement completes; correctness
 	// does not depend on holding it any longer than that.
 	ListDueWebhookDeliveries(ctx context.Context, batchLimit int32) ([]ListDueWebhookDeliveriesRow, error)
+	// Filtered, keyset-paged list of a tenant's pendings, newest first (Task 4,
+	// ADR-025). status is an optional filter via sqlc.narg: NULL disables it
+	// (every status is returned). Keyset paged by (created_at, id) descending,
+	// the identical cursor shape ListDisputes already uses.
+	ListPendingTransactions(ctx context.Context, arg ListPendingTransactionsParams) ([]PendingTransaction, error)
 	ListPostingsByTransaction(ctx context.Context, arg ListPostingsByTransactionParams) ([]ListPostingsByTransactionRow, error)
 	// Batch posting fetch for a page of transactions (Task 4.4, audit A7.2):
 	// ListTransactions returns up to a page's worth of transaction rows, and
@@ -632,6 +648,18 @@ type Querier interface {
 	// loops this query in batches until a call deletes 0 rows (or a max
 	// iteration guard trips), summing the deleted count for the sweep log line.
 	SweepExpiredIdempotencyKeysBatch(ctx context.Context, batchSize int32) (int64, error)
+	// Task 4 (ADR-025): the TTL sweep, mirroring
+	// SweepExpiredIdempotencyKeysBatch's role for idempotency keys. Runs
+	// outside any tenant's RunInTx (a background goroutine with no tenant GUC
+	// set, so the RLS policy's allow-when-unset branch lets it see every
+	// tenant), on an interval, moving every still-pending row older than
+	// older_than_seconds to 'expired' and decided_by 'system'. RETURNING the
+	// full rows lets the caller emit one approval.expired lifecycle event per
+	// row expired, without a second read. older_than_seconds is a float8 of
+	// seconds, not a Postgres interval literal, the same
+	// server-clock-independent-duration convention InsertIdempotencyKey's
+	// ttl_seconds already uses.
+	SweepExpiredPending(ctx context.Context, olderThanSeconds float64) ([]PendingTransaction, error)
 	// Task 2.4b (audit A3.4): each currency's already-posted debit total for
 	// today (date_trunc('day', now()), the DATABASE SERVER's clock, so it lines
 	// up with the same clock that stamped created_at on every posting). Read
@@ -660,6 +688,13 @@ type Querier interface {
 	// posted total across every account in the tenant; in a correct ledger every
 	// total is zero (ADR-001).
 	TrialBalanceByCurrency(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceByCurrencyRow, error)
+	// Task 4 (ADR-025): the decision write. Always called after
+	// GetPendingForUpdate has already locked and validated the row within the
+	// same surrounding transaction, so this is a plain unconditional update, not
+	// a guarded one the way ResolveDispute's UPDATE ... WHERE status = 'open'
+	// is: the row lock is what prevents a second concurrent decision here, not
+	// a WHERE clause on this statement.
+	UpdatePendingStatus(ctx context.Context, arg UpdatePendingStatusParams) error
 }
 
 var _ Querier = (*Queries)(nil)

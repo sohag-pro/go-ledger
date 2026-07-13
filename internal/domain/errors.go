@@ -203,4 +203,11 @@ var (
 	ErrInvalidHierarchy = errors.New("domain: invalid account hierarchy")
 	// ErrParentNotFound is a parent_id that names no account in the tenant. Mapped to 422.
 	ErrParentNotFound = errors.New("domain: parent account not found")
+	// ErrPendingTransactionNotFound is returned when no pending_transactions
+	// row matches the given id within the tenant (ADR-025, Week 13).
+	ErrPendingTransactionNotFound = errors.New("domain: pending transaction not found")
+	// ErrInvalidPendingTransaction is returned when a PendingTransaction
+	// carries an unrecognized Kind, an empty Payload, or an empty
+	// ThresholdCcy/CreatedBy (ADR-025, Week 13).
+	ErrInvalidPendingTransaction = errors.New("domain: invalid pending transaction")
 )
