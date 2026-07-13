@@ -47,6 +47,21 @@ SET status = sqlc.arg(status), decided_by = sqlc.arg(decided_by), decided_at = n
     reason = sqlc.narg(reason), transaction_id = sqlc.narg(transaction_id)
 WHERE tenant_id = sqlc.arg(tenant_id) AND id = sqlc.arg(id);
 
+-- name: PendingApprovedForTransaction :one
+-- Task 6 (ADR-025): the reverse-of-approved exemption's read. True only when
+-- some pending transaction's decision produced transaction_id AND that
+-- decision was an approval (a rejected or cancelled pending never sets
+-- transaction_id at all, per the transaction_id IS NULL OR status =
+-- 'approved' check in migration 0035, so the status filter here is mostly
+-- belt-and-suspenders). TransactionService.ReverseTransaction calls this
+-- before gating a reversal, never from inside RunInTx.
+SELECT EXISTS(
+    SELECT 1 FROM pending_transactions
+    WHERE tenant_id = sqlc.arg(tenant_id)
+      AND transaction_id = sqlc.arg(transaction_id)
+      AND status = 'approved'
+) AS exists;
+
 -- name: SweepExpiredPending :many
 -- Task 4 (ADR-025): the TTL sweep, mirroring
 -- SweepExpiredIdempotencyKeysBatch's role for idempotency keys. Runs

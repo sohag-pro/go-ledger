@@ -2455,6 +2455,71 @@ func (r *Repository) SweepExpiredPending(ctx context.Context, olderThan time.Dur
 	return out, nil
 }
 
+// PendingApprovedForTransaction reports whether an approved pending
+// transaction produced txID (Task 6, ADR-025): the reverse-of-approved
+// exemption's read, called by TransactionService.ReverseTransaction before
+// gating a reversal, never from inside RunInTx.
+func (r *Repository) PendingApprovedForTransaction(ctx context.Context, tenantID, txID string) (bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return false, fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	xid, err := optUUID(&txID)
+	if err != nil {
+		return false, fmt.Errorf("postgres: parse transaction id: %w", err)
+	}
+	var exists bool
+	err = r.withTenant(ctx, tenantID, func(q *sqlc.Queries) error {
+		var err error
+		exists, err = q.PendingApprovedForTransaction(ctx, sqlc.PendingApprovedForTransactionParams{
+			TenantID:      tid,
+			TransactionID: xid,
+		})
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("postgres: pending approved for transaction: %w", err)
+	}
+	return exists, nil
+}
+
+// InsertPendingTransaction is the domain.Tx counterpart to
+// Repository.InsertPendingTransaction (Task 6, ADR-025): the same insert,
+// but run against the bound transaction's queries (tr.q) rather than a
+// dedicated withTenant call, so holdForApproval can write the pending and
+// its approval.requested audit_outbox row together inside one RunInTx.
+func (tr txRepo) InsertPendingTransaction(ctx context.Context, tenantID string, p *domain.PendingTransaction) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse tenant id: %w", err)
+	}
+	if p.ID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return fmt.Errorf("postgres: generate pending transaction id: %w", err)
+		}
+		p.ID = id.String()
+	}
+	if !p.Kind.Valid() || len(p.Payload) == 0 || p.ThresholdCcy == "" || p.CreatedBy == "" {
+		return domain.ErrInvalidPendingTransaction
+	}
+	p.TenantID = tenantID
+	p.Status = domain.PendingStatusPending
+	pid, err := uuid.Parse(p.ID)
+	if err != nil {
+		return fmt.Errorf("postgres: parse pending transaction id: %w", err)
+	}
+	return tr.q.InsertPendingTransaction(ctx, sqlc.InsertPendingTransactionParams{
+		ID:           pid,
+		TenantID:     tid,
+		Kind:         string(p.Kind),
+		Payload:      p.Payload,
+		ThresholdCcy: p.ThresholdCcy,
+		ThresholdAmt: p.ThresholdAmt,
+		CreatedBy:    p.CreatedBy,
+	})
+}
+
 // GetPendingForUpdate returns the pending transaction, row-locked (SELECT
 // ... FOR UPDATE) for the rest of the surrounding transaction, or
 // domain.ErrPendingTransactionNotFound if absent (Task 4, ADR-025).

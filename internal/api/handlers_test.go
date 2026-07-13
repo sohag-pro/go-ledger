@@ -1209,6 +1209,18 @@ func (f *fakeRepo) UpdatePendingStatus(_ context.Context, tenantID, id string, s
 	return nil
 }
 
+// PendingApprovedForTransaction mirrors postgres.Repository.
+// PendingApprovedForTransaction (Task 6, ADR-025): true only when some
+// pending in f.pending both names txID as its TransactionID and is approved.
+func (f *fakeRepo) PendingApprovedForTransaction(_ context.Context, tenantID, txID string) (bool, error) {
+	for _, p := range f.pending {
+		if p.TenantID == tenantID && p.Status == domain.PendingStatusApproved && p.TransactionID != nil && *p.TransactionID == txID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 var _ domain.Repository = (*fakeRepo)(nil)
 
 // fakeFXProvider is a fixed-rate fx.Provider for handler tests: it stands in

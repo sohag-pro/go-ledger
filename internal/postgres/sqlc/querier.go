@@ -545,6 +545,14 @@ type Querier interface {
 	// tenant_id is of type uuid but expression is of type text"). Casting to
 	// uuid explicitly at each use pins its type regardless of statement order.
 	MintCryptoKeyVersion(ctx context.Context, arg MintCryptoKeyVersionParams) (MintCryptoKeyVersionRow, error)
+	// Task 6 (ADR-025): the reverse-of-approved exemption's read. True only when
+	// some pending transaction's decision produced transaction_id AND that
+	// decision was an approval (a rejected or cancelled pending never sets
+	// transaction_id at all, per the transaction_id IS NULL OR status =
+	// 'approved' check in migration 0035, so the status filter here is mostly
+	// belt-and-suspenders). TransactionService.ReverseTransaction calls this
+	// before gating a reversal, never from inside RunInTx.
+	PendingApprovedForTransaction(ctx context.Context, arg PendingApprovedForTransactionParams) (bool, error)
 	// Task 6.3, audit A9.2: the guarded transition out of 'open'. The WHERE
 	// status = 'open' clause is what makes resolving an already-resolved (or
 	// concurrently-being-resolved) dispute return zero rows rather than

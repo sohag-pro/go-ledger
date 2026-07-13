@@ -177,6 +177,34 @@ func (q *Queries) ListPendingTransactions(ctx context.Context, arg ListPendingTr
 	return items, nil
 }
 
+const pendingApprovedForTransaction = `-- name: PendingApprovedForTransaction :one
+SELECT EXISTS(
+    SELECT 1 FROM pending_transactions
+    WHERE tenant_id = $1
+      AND transaction_id = $2
+      AND status = 'approved'
+) AS exists
+`
+
+type PendingApprovedForTransactionParams struct {
+	TenantID      uuid.UUID
+	TransactionID pgtype.UUID
+}
+
+// Task 6 (ADR-025): the reverse-of-approved exemption's read. True only when
+// some pending transaction's decision produced transaction_id AND that
+// decision was an approval (a rejected or cancelled pending never sets
+// transaction_id at all, per the transaction_id IS NULL OR status =
+// 'approved' check in migration 0035, so the status filter here is mostly
+// belt-and-suspenders). TransactionService.ReverseTransaction calls this
+// before gating a reversal, never from inside RunInTx.
+func (q *Queries) PendingApprovedForTransaction(ctx context.Context, arg PendingApprovedForTransactionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, pendingApprovedForTransaction, arg.TenantID, arg.TransactionID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const sweepExpiredPending = `-- name: SweepExpiredPending :many
 UPDATE pending_transactions
 SET status = 'expired', decided_at = now(), decided_by = 'system'

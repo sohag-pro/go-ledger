@@ -225,6 +225,20 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return nil, false, err
 	}
 
+	// Approval gate (ADR-025, Task 6), same as Post: an over-threshold
+	// conversion is held as a pending instead of posted, unless this is the
+	// approval replay of an already-cleared pending. Gated over the full
+	// four-leg set built above, the same set enforceTenantPolicy and
+	// enforceAccountConstraints below check, so the converted destination
+	// amount is judged exactly like an ordinary post's legs would be. Convert
+	// returns a *domain.Transaction, not the (replayed, err) shape Post uses,
+	// so a hold reports nil, false, and the *HeldForApprovalError.
+	if !isApprovalReplay(ctx) {
+		if ccy, amt, gated := s.approval.Gate(t.Postings); gated {
+			return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindConvert, convertPayload(req), ccy, amt)
+		}
+	}
+
 	// Encrypt-once, same as Post (Task 6.2, audit A9.3): see Post's own doc
 	// comment at its matching call site in service.go for the full
 	// same-ciphertext-in-the-audit-snapshot argument. t.Postings is

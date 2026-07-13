@@ -112,6 +112,27 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 		return nil, false, err
 	}
 
+	// Approval gate (ADR-025, Task 6), same as Post and Convert: an
+	// over-threshold reversal is held as a pending instead of posted, unless
+	// this is the approval replay of an already-cleared pending. A reversal
+	// gets one exemption Post and Convert do not need: if the ORIGINAL
+	// transaction being reversed already cleared the gate (an approved
+	// pending produced it), the reversal is not held again, because that
+	// money was already approved once and a reversal is just undoing it, not
+	// moving new, never-reviewed funds.
+	if !isApprovalReplay(ctx) {
+		if ccy, amt, gated := s.approval.Gate(t.Postings); gated {
+			approved, err := s.repo.PendingApprovedForTransaction(ctx, tenantID, originalID)
+			if err != nil {
+				span.RecordError(err)
+				return nil, false, err
+			}
+			if !approved {
+				return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindReverse, reversePayload(originalID), ccy, amt)
+			}
+		}
+	}
+
 	// Encrypt-once, same as Post and Convert (Task 6.2, audit A9.3): see
 	// Post's own doc comment at its matching call site in service.go. The
 	// reversal's narration ("reversal of <original id>", see BuildReversal)

@@ -184,6 +184,15 @@ type Tx interface {
 	// is a plain unconditional update, the lock is what prevents a second
 	// concurrent decision, not a WHERE clause here.
 	UpdatePendingStatus(ctx context.Context, tenantID string, id string, status PendingStatus, decidedBy string, reason *string, txID *string) error
+
+	// InsertPendingTransaction assigns an identity if p.ID is empty and
+	// inserts p (Task 6, ADR-025), the same insert Repository.
+	// InsertPendingTransaction performs, exposed on Tx as well so
+	// TransactionService.holdForApproval can write the pending and its
+	// approval.requested lifecycle event together, inside one RunInTx: a
+	// crash between the two would otherwise leave a pending with no audit
+	// trail, or an audit row for a pending that never actually persisted.
+	InsertPendingTransaction(ctx context.Context, tenantID string, p *PendingTransaction) error
 }
 
 // Repository is the persistence port for the ledger. The domain owns this
@@ -620,4 +629,14 @@ type Repository interface {
 	// request's unit of work. The returned rows let the caller emit one
 	// approval.expired lifecycle event per row, without a second read.
 	SweepExpiredPending(ctx context.Context, olderThan time.Duration) ([]PendingTransaction, error)
+
+	// PendingApprovedForTransaction reports whether an approved pending
+	// transaction produced txID (Task 6, ADR-025): the reverse-of-approved
+	// exemption. TransactionService.ReverseTransaction calls this before
+	// gating a reversal so money that already cleared the approval gate
+	// once, when it was originally posted, is not held a second time just
+	// because its reversal happens to touch the same over-threshold amount.
+	// false (with a nil error) is the ordinary case: most transactions were
+	// never gated at all.
+	PendingApprovedForTransaction(ctx context.Context, tenantID, txID string) (bool, error)
 }
