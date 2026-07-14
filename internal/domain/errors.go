@@ -64,6 +64,10 @@ var (
 	// against a stale rate is a loss/arbitrage vector, so the conversion is
 	// refused rather than priced against an out-of-date quote.
 	ErrFXRateStale = errors.New("domain: fx rate is stale")
+	// ErrReportTooLarge is returned when an unpaged whole-tenant read (the
+	// account tree or the trial balance) would exceed the bounded row cap: the
+	// endpoint refuses rather than build an unbounded response in memory.
+	ErrReportTooLarge = errors.New("domain: result set is too large for a single response")
 	// ErrFXRateNotFound is returned when no fx_rates row exists for a currency
 	// pair, in either direction, at or before the requested time.
 	ErrFXRateNotFound = errors.New("domain: fx rate not found")

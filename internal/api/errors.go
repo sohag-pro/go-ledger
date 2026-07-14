@@ -205,6 +205,8 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("no fx rate is configured for this currency pair")
 	case errors.Is(err, domain.ErrFXRateStale):
 		return huma.Error422UnprocessableEntity("the fx rate for this currency pair is stale; a fresh rate is required before converting")
+	case errors.Is(err, domain.ErrReportTooLarge):
+		return huma.Error422UnprocessableEntity("this tenant has too many accounts for a single unpaged response; narrow the query")
 	case errors.Is(err, domain.ErrNonPositiveConvertAmount):
 		return huma.Error422UnprocessableEntity("source_amount must be positive")
 	case errors.Is(err, domain.ErrSelfConversion):

@@ -132,6 +132,7 @@ WHERE a.tenant_id = $1
 GROUP BY a.id, a.tenant_id, a.name, a.type, a.currency, a.status, a.min_balance,
          a.is_system, a.created_at, a.party_reference, a.party_type, a.parent_id
 ORDER BY a.name, a.id
+LIMIT 10001
 `
 
 type AllAccountBalancesRow struct {
@@ -154,6 +155,10 @@ type AllAccountBalancesRow struct {
 // account with no postings returns 0) and its parent_id, so the caller can
 // build the tree and roll up in memory in one pass. Ordered by name, id for a
 // stable base order the Go rollup then re-threads parent-before-child.
+// Bounded read (audit remediation): one more than ledger.MaxReportRows, so the
+// service can detect "too large for a single unpaged response" and refuse
+// rather than stream an unbounded result set into memory. Keep in sync with
+// ledger.MaxReportRows.
 func (q *Queries) AllAccountBalances(ctx context.Context, tenantID uuid.UUID) ([]AllAccountBalancesRow, error) {
 	rows, err := q.db.Query(ctx, allAccountBalances, tenantID)
 	if err != nil {

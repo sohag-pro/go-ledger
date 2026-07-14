@@ -19,4 +19,8 @@ FROM accounts a
 LEFT JOIN postings p ON p.tenant_id = a.tenant_id AND p.account_id = a.id
 WHERE a.tenant_id = $1
 GROUP BY a.id, a.name, a.type, a.currency, a.is_system
-ORDER BY a.name, a.id;
+ORDER BY a.name, a.id
+-- Bounded read (audit remediation): one more than ledger.MaxReportRows so the
+-- service can refuse an over-large trial balance rather than build it unbounded
+-- in memory. Keep in sync with ledger.MaxReportRows.
+LIMIT 10001;

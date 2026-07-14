@@ -19,6 +19,7 @@ LEFT JOIN postings p ON p.tenant_id = a.tenant_id AND p.account_id = a.id
 WHERE a.tenant_id = $1
 GROUP BY a.id, a.name, a.type, a.currency, a.is_system
 ORDER BY a.name, a.id
+LIMIT 10001
 `
 
 type TrialBalanceAccountsRow struct {
@@ -35,6 +36,9 @@ type TrialBalanceAccountsRow struct {
 // balance proof. The LEFT JOIN means an account with no postings yet still
 // returns one row, with balance COALESCEd to 0, the same shape
 // AccountBalances (postings.sql) already uses.
+// Bounded read (audit remediation): one more than ledger.MaxReportRows so the
+// service can refuse an over-large trial balance rather than build it unbounded
+// in memory. Keep in sync with ledger.MaxReportRows.
 func (q *Queries) TrialBalanceAccounts(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceAccountsRow, error) {
 	rows, err := q.db.Query(ctx, trialBalanceAccounts, tenantID)
 	if err != nil {
