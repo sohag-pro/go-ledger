@@ -590,7 +590,10 @@ func run(logger *slog.Logger) error {
 	// stored mid, so a duplicate poll from a second instance is a no-op insert.
 	if cfg.fxFeedEnabled {
 		var feedSpread *int32
-		if cfg.fxFeedSpreadBps >= 0 {
+		// Bounded to a valid spread (0..<10000 bps, the fx_rates CHECK range);
+		// out of range leaves it nil so the feed rows fall back to the markup
+		// default. The bound also proves the int->int32 conversion is safe.
+		if cfg.fxFeedSpreadBps >= 0 && cfg.fxFeedSpreadBps < 10000 {
 			s := int32(cfg.fxFeedSpreadBps)
 			feedSpread = &s
 		}

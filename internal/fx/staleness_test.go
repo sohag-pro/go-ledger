@@ -57,7 +57,7 @@ func TestProvider_HubStalenessUsesOlderLeg(t *testing.T) {
 	ctx := context.Background()
 	tenant := newTestTenant(t, pool)
 
-	insertTenantRate(t, q, tenant, "USD", "EUR", 50_000_000, 10, time.Now())                    // fresh
+	insertTenantRate(t, q, tenant, "USD", "EUR", 50_000_000, 10, time.Now())                        // fresh
 	insertTenantRate(t, q, tenant, "USD", "BDT", 10_000_000_000, 10, time.Now().Add(-48*time.Hour)) // stale
 
 	guarded := fx.NewDBProvider(pool, fx.WithMaxRateAge(24*time.Hour))
