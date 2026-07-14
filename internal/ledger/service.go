@@ -244,7 +244,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 			if idem != nil {
 				idemKey = idem.Key
 			}
-			return false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindPost, postPayload(t), ccy, amt, idemKey)
+			return false, s.holdForApproval(ctx, tenantID, actorOr(ctx, tenantID), domain.PendingKindPost, postPayload(t), ccy, amt, idemKey)
 		}
 	}
 
@@ -296,7 +296,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: t.ID,
-			Actor:         tenantID,
+			Actor:         actorOr(ctx, tenantID),
 			After:         after,
 		})
 	})

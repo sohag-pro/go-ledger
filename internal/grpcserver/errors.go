@@ -55,6 +55,19 @@ func toStatus(err error) error {
 	if errors.As(err, &screeningRejectedErr) {
 		return status.Error(codes.FailedPrecondition, screeningRejectedErr.Error())
 	}
+	// *ledger.HeldForApprovalError (audit A: gRPC held mapping): the write
+	// exceeded the approval threshold and was stored as a pending instead of
+	// posted (ADR-025). REST reports this as 202 with the pending resource;
+	// gRPC has no such body, so without this case it would fall through to a
+	// generic Internal and look like a server fault. Map it to
+	// FailedPrecondition, the same class as the guardrail checks above (the
+	// request is well-formed, the current state just requires approval first),
+	// and name the pending id so a caller can approve it via the REST
+	// /v1/pending surface. The pending IS committed by the time this returns.
+	if pending, held := ledger.AsHeldForApproval(err); held {
+		return status.Errorf(codes.FailedPrecondition,
+			"transaction held for approval: pending %s (approve via the /v1/pending REST API)", pending.ID)
+	}
 
 	switch {
 	case err == nil:

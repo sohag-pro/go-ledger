@@ -116,6 +116,19 @@ func tenantFromCtx(ctx context.Context) (string, error) {
 	return tenant, nil
 }
 
+// actorFromCtx returns the individual principal (API-key id) behind the
+// request, falling back to the tenant id when no key is present (a path that
+// never authenticated). Money paths record this as the audit Actor and a held
+// pending's CreatedBy, and it is the value ApprovalConfig.RequireDifferentActor
+// and Cancel's creator check compare, so maker-checker and Cancel operate on
+// individual keys rather than on the whole tenant (audit A: four-eyes).
+func actorFromCtx(ctx context.Context, tenant string) string {
+	if p := auth.PrincipalID(ctx); p != "" {
+		return p
+	}
+	return tenant
+}
+
 // New builds the huma API on the given chi router, registers every operation,
 // and returns the API. huma also serves /openapi.json, /openapi.yaml, and
 // /schemas/ from the same router. The interactive playground is registered

@@ -133,7 +133,7 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 				// transactions_one_reversal_idx unique constraint on
 				// reverses_transaction_id, not a request header), so there
 				// is nothing to dedup a held reversal's pending on here.
-				return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindReverse, reversePayload(originalID), ccy, amt, "")
+				return nil, false, s.holdForApproval(ctx, tenantID, actorOr(ctx, tenantID), domain.PendingKindReverse, reversePayload(originalID), ccy, amt, "")
 			}
 		}
 	}
@@ -166,7 +166,7 @@ func (s *TransactionService) ReverseTransaction(ctx context.Context, tenantID, o
 		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionReversed,
 			TransactionID: t.ID,
-			Actor:         tenantID,
+			Actor:         actorOr(ctx, tenantID),
 			After:         after,
 		})
 	})

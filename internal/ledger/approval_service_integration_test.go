@@ -149,12 +149,13 @@ func TestApprovalService_FourEyesBlocksSelfApproval(t *testing.T) {
 	tenant := uuid.NewString()
 	debit, credit := newApprovalGateAccounts(t, repo, tenant)
 
-	// holdForApproval currently stamps CreatedBy as the tenant id (Task 6's
-	// actor plumbing is not yet wired to a real caller identity), so the
-	// creator to compare against is the tenant id itself.
+	// This ledger-level test calls the service directly, with no HTTP/gRPC
+	// layer to supply a per-key principal via ledger.WithActor, so actorOr
+	// falls back to the tenant id: CreatedBy is the tenant, and approving as
+	// the same tenant is the same-principal case four-eyes must block.
 	pending := holdGatedPost(t, svc, tenant, debit.ID, credit.ID)
 	if pending.CreatedBy != tenant {
-		t.Fatalf("pending.CreatedBy = %q, want %q (tenant id)", pending.CreatedBy, tenant)
+		t.Fatalf("pending.CreatedBy = %q, want %q (tenant fallback principal)", pending.CreatedBy, tenant)
 	}
 
 	_, err := approvals.Approve(ctx, tenant, pending.ID, tenant)

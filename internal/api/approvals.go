@@ -176,16 +176,14 @@ func registerApprovals(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
-		// The actor is the tenant, the same identity the rest of this codebase
-		// records as Actor on every audit event (see internal/ledger/service.go,
-		// convert.go, reverse.go, and approval_events.go, which all stamp
-		// Actor: tenantID): go-ledger's actor granularity is per tenant, not
-		// per API key, and CreatedBy on a pending is likewise stamped as
-		// tenantID at hold time (internal/ledger's holdForApproval callers).
-		// Passing the same tenant value here keeps that convention, so
-		// ApprovalConfig.RequireDifferentActor and Cancel's creator check
-		// compare like with like.
-		txn, err := deps.Approvals.Approve(ctx, tenant, in.ID, tenant)
+		// The actor is the individual API key behind the request, not the
+		// tenant. A held pending's CreatedBy is stamped with the creating key
+		// the same way (holdForApproval via actorFromCtx), so with
+		// ApprovalConfig.RequireDifferentActor enabled a key cannot approve a
+		// pending it created: maker-checker compares two distinct keys, which
+		// per-tenant granularity could never do. In demo the flag is off, so a
+		// single key may create and approve for demonstration.
+		txn, err := deps.Approvals.Approve(ctx, tenant, in.ID, actorFromCtx(ctx, tenant))
 		if err != nil {
 			return nil, toApprovalHumaErr(err)
 		}
@@ -206,7 +204,7 @@ func registerApprovals(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
-		if err := deps.Approvals.Reject(ctx, tenant, in.ID, tenant, in.Body.Reason); err != nil {
+		if err := deps.Approvals.Reject(ctx, tenant, in.ID, actorFromCtx(ctx, tenant), in.Body.Reason); err != nil {
 			return nil, toApprovalHumaErr(err)
 		}
 		p, err := deps.Approvals.Get(ctx, tenant, in.ID)
@@ -229,7 +227,7 @@ func registerApprovals(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
-		if err := deps.Approvals.Cancel(ctx, tenant, in.ID, tenant); err != nil {
+		if err := deps.Approvals.Cancel(ctx, tenant, in.ID, actorFromCtx(ctx, tenant)); err != nil {
 			return nil, toApprovalHumaErr(err)
 		}
 		p, err := deps.Approvals.Get(ctx, tenant, in.ID)

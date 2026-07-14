@@ -239,7 +239,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 			if idem != nil {
 				idemKey = idem.Key
 			}
-			return nil, false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindConvert, convertPayload(req), ccy, amt, idemKey)
+			return nil, false, s.holdForApproval(ctx, tenantID, actorOr(ctx, tenantID), domain.PendingKindConvert, convertPayload(req), ccy, amt, idemKey)
 		}
 	}
 
@@ -296,7 +296,7 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: t.ID,
-			Actor:         tenantID,
+			Actor:         actorOr(ctx, tenantID),
 			After:         after,
 		})
 	})

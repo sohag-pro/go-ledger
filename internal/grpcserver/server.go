@@ -387,6 +387,7 @@ func (s *Server) PostTransaction(ctx context.Context, req *ledgerv1.PostTransact
 		txn.EffectiveAt = &effectiveAt
 	}
 	idem := &domain.Idempotency{Key: key}
+	ctx = ledger.WithActor(ctx, auth.PrincipalID(ctx))
 	replayed, err := s.txns.Post(ctx, tenantFrom(ctx), txn, idem)
 	if err != nil {
 		return nil, toStatus(err)
@@ -412,6 +413,7 @@ func (s *Server) Convert(ctx context.Context, req *ledgerv1.ConvertRequest) (*le
 		SourceAmount:  req.SourceAmount,
 	}
 	idem := &domain.Idempotency{Key: key}
+	ctx = ledger.WithActor(ctx, auth.PrincipalID(ctx))
 	txn, replayed, err := s.txns.Convert(ctx, tenantFrom(ctx), creq, idem)
 	if err != nil {
 		return nil, toStatus(err)
@@ -522,6 +524,7 @@ func (s *Server) ListTransactions(ctx context.Context, req *ledgerv1.ListTransac
 // repeat call for the same original returns the SAME reversal, with
 // already_reversed = true, instead of posting a second one.
 func (s *Server) ReverseTransaction(ctx context.Context, req *ledgerv1.ReverseTransactionRequest) (*ledgerv1.ReverseTransactionResponse, error) {
+	ctx = ledger.WithActor(ctx, auth.PrincipalID(ctx))
 	reversal, alreadyReversed, err := s.txns.ReverseTransaction(ctx, tenantFrom(ctx), req.OriginalTransactionId)
 	if err != nil {
 		return nil, toStatus(err)

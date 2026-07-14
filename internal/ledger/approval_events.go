@@ -9,9 +9,12 @@ import (
 
 // appendPendingEvent writes a v2 lifecycle audit event for a pending
 // transition (ADR-025): subject is the pending, transaction_id is empty
-// except for approval.approved (passed as txID, a later task's concern; this
-// task only ever calls it with txID nil, from holdForApproval).
-func appendPendingEvent(ctx context.Context, tx domain.Tx, tenantID, action string, p *domain.PendingTransaction, txID *string) error {
+// except for approval.approved (passed as txID). actor is the individual
+// principal that drove the transition (the creator for approval.requested,
+// the decider for approve/reject/cancel, "system" for the expiry sweep), so
+// the tamper-evident log attributes each lifecycle event to a specific key
+// rather than to the whole tenant.
+func appendPendingEvent(ctx context.Context, tx domain.Tx, tenantID, actor, action string, p *domain.PendingTransaction, txID *string) error {
 	after, err := json.Marshal(map[string]any{
 		"id":            p.ID,
 		"kind":          p.Kind,
@@ -25,7 +28,7 @@ func appendPendingEvent(ctx context.Context, tx domain.Tx, tenantID, action stri
 	}
 	ev := domain.AuditEvent{
 		Action:      action,
-		Actor:       tenantID,
+		Actor:       actor,
 		After:       after,
 		SubjectType: "pending_transaction",
 		SubjectID:   p.ID,

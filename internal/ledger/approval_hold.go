@@ -111,7 +111,7 @@ func (s *TransactionService) holdForApproval(
 		if err := tx.InsertPendingTransaction(ctx, tenantID, p); err != nil {
 			return err
 		}
-		return appendPendingEvent(ctx, tx, tenantID, "approval.requested", p, nil)
+		return appendPendingEvent(ctx, tx, tenantID, p.CreatedBy, "approval.requested", p, nil)
 	})
 	if err != nil {
 		// A concurrent hold raced in between the check above and this

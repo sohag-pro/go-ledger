@@ -42,6 +42,19 @@ func KeyFromContext(ctx context.Context) (domain.APIKey, bool) {
 	return v, ok
 }
 
+// PrincipalID returns the resolved API key's id, the individual principal that
+// authenticated this request, or "" when no key is present (spec generation,
+// background workers, or a test that never authenticated). Money paths use it
+// to attribute a hold, an approval decision, and the audit trail to a specific
+// key rather than to the whole tenant, which is what makes maker-checker and
+// per-principal accountability real (audit A: four-eyes, actor granularity).
+func PrincipalID(ctx context.Context) string {
+	if k, ok := KeyFromContext(ctx); ok {
+		return k.ID
+	}
+	return ""
+}
+
 // RequestLogInfo is a mutable box the access-log middleware (cmd/server's
 // slogLogger) installs on a request's context BEFORE the request reaches
 // HumaMiddleware, so the key id and tenant id it resolves can flow back out
