@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -121,8 +122,10 @@ func (w *Worker) attemptOne(ctx context.Context, row sqlc.ListDueWebhookDeliveri
 	if err != nil {
 		return outcomeDead, fmt.Errorf("build request: %w", err)
 	}
+	ts := time.Now().Unix()
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(HeaderSignature, SignatureHeader(row.Secret, body))
+	req.Header.Set(HeaderTimestamp, strconv.FormatInt(ts, 10))
+	req.Header.Set(HeaderSignature, SignatureHeaderAt(row.Secret, ts, body))
 	req.Header.Set(HeaderDeliveryID, row.ID.String())
 	req.Header.Set(HeaderEvent, row.EventType)
 

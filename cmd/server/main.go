@@ -149,6 +149,7 @@ type config struct {
 	idempotencyTTL           time.Duration
 	idempotencySweepInterval time.Duration
 	webhooksEnabled          bool
+	webhookAllowPrivate      bool
 	webhookMaxAttempts       int
 	webhookDeliveryInterval  time.Duration
 	metricsCollectInterval   time.Duration
@@ -276,6 +277,7 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		// picks exactly one active worker regardless, so disabling it here
 		// is never required for correctness.
 		webhooksEnabled:         getenvBool("WEBHOOKS_ENABLED", true),
+		webhookAllowPrivate:     getenvBool("WEBHOOK_ALLOW_PRIVATE_TARGETS", false),
 		webhookMaxAttempts:      getenvInt("WEBHOOK_MAX_ATTEMPTS", webhook.DefaultMaxAttempts),
 		webhookDeliveryInterval: getenvDuration("WEBHOOK_DELIVERY_INTERVAL", webhook.DefaultInterval),
 		// METRICS_COLLECT_INTERVAL (Task 5.6a, audit A6.1): how often the
@@ -701,8 +703,9 @@ func run(logger *slog.Logger) error {
 		webhookCtx, cancelWebhook := context.WithCancel(context.Background())
 		defer cancelWebhook()
 		webhookWorker := webhook.NewWorker(pool, logger, webhook.Config{
-			Interval:    cfg.webhookDeliveryInterval,
-			MaxAttempts: cfg.webhookMaxAttempts,
+			Interval:            cfg.webhookDeliveryInterval,
+			MaxAttempts:         cfg.webhookMaxAttempts,
+			AllowPrivateTargets: cfg.webhookAllowPrivate,
 		})
 		go webhookWorker.Run(webhookCtx)
 	}
