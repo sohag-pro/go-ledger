@@ -127,3 +127,32 @@ func TestPlayground(t *testing.T) {
 		}
 	})
 }
+
+// TestCSVSafeField checks the CSV/formula-injection guard used by the export
+// endpoints (audit A: CSV formula injection): a free-text cell that begins with
+// a formula trigger is prefixed with a single quote so a spreadsheet treats it
+// as text, while ordinary text (and, importantly, values that are not the first
+// character) is left untouched.
+func TestCSVSafeField(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty untouched", in: "", want: ""},
+		{name: "plain text untouched", in: "salary payment", want: "salary payment"},
+		{name: "equals neutralized", in: `=HYPERLINK("http://evil","x")`, want: `'=HYPERLINK("http://evil","x")`},
+		{name: "plus neutralized", in: "+1+1", want: "'+1+1"},
+		{name: "minus neutralized", in: "-cmd", want: "'-cmd"},
+		{name: "at neutralized", in: "@SUM(A1)", want: "'@SUM(A1)"},
+		{name: "tab neutralized", in: "\t=1", want: "'\t=1"},
+		{name: "trigger not first char untouched", in: "a=b", want: "a=b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := csvSafeField(tt.in); got != tt.want {
+				t.Errorf("csvSafeField(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

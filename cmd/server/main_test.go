@@ -236,6 +236,40 @@ func TestLoadConfig_ValidatesMasterKey(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_RejectsUnparseableEnv proves the getenv* helpers no longer
+// silently substitute a default for a set-but-malformed value (audit A: config
+// parse silently swallowed): a bad duration, integer, or boolean fails boot
+// with an error naming the offending var, instead of the operator's intent
+// being quietly ignored.
+func TestLoadConfig_RejectsUnparseableEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		value   string
+		wantErr bool
+	}{
+		{name: "valid duration boots", key: "SEED_INTERVAL", value: "4h", wantErr: false},
+		{name: "malformed duration rejected", key: "SEED_INTERVAL", value: "4hr", wantErr: true},
+		{name: "malformed integer rejected", key: "RATE_LIMIT_RPM", value: "12O", wantErr: true},
+		{name: "malformed boolean rejected", key: "CHAINER_ENABLED", value: "flase", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://example/db")
+			t.Setenv("DEFAULT_CURRENCY", "")
+			t.Setenv(tt.key, tt.value)
+
+			_, err := loadConfig()
+			if tt.wantErr && err == nil {
+				t.Fatalf("loadConfig() with %s=%q: got nil error, want an error", tt.key, tt.value)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("loadConfig() with %s=%q: got error %v, want nil", tt.key, tt.value, err)
+			}
+		})
+	}
+}
+
 // TestLoadConfig_GRPCAddrDefaultsToLoopback proves GRPC_ADDR defaults to
 // loopback-only (Task 5.1, audit A2.2, ADR-015 Phase 5): the gRPC server
 // ships with no TLS of its own, so binding every interface by default (the

@@ -116,6 +116,25 @@ func tenantFromCtx(ctx context.Context) (string, error) {
 	return tenant, nil
 }
 
+// csvSafeField neutralizes CSV/spreadsheet formula injection in a free-text
+// export cell (audit A: CSV formula injection). A value a caller controls, a
+// posting description or a transaction reference, that begins with a formula
+// trigger (= + - @) or a leading tab/CR is prefixed with a single quote so a
+// spreadsheet renders it as literal text instead of evaluating it (for example
+// a description of =HYPERLINK("http://evil","clickme") opening the exported
+// file). Applied ONLY to free-text columns: numeric columns are left alone so a
+// legitimately negative amount ("-800") is not mangled.
+func csvSafeField(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
 // actorFromCtx returns the individual principal (API-key id) behind the
 // request, falling back to the tenant id when no key is present (a path that
 // never authenticated). Money paths record this as the audit Actor and a held

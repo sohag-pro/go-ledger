@@ -245,8 +245,8 @@ func transactionsCSV(items []domain.TransactionListItem) []byte {
 				p.AccountID,
 				strconv.FormatInt(p.Amount.Amount(), 10),
 				string(p.Amount.Currency()),
-				p.Description,
-				reference,
+				csvSafeField(p.Description),
+				csvSafeField(reference),
 				createdAt,
 				effectiveAt,
 			})

@@ -164,6 +164,7 @@ type config struct {
 	approvalRequireDifferentActor bool
 	pendingTTL                    time.Duration
 	pendingSweepInterval          time.Duration
+	shutdownTimeout               time.Duration
 }
 
 // loadConfig loads the server's configuration from the environment, running
@@ -182,6 +183,7 @@ func loadConfig() (config, error) {
 // byte-for-byte the fail-fast behavior that existed before ADR-019: a clear
 // "DATABASE_URL is required" error, never a hang waiting on input.
 func loadConfigWithTTY(interactive bool) (config, error) {
+	envParseErrs = nil
 	cfg := config{
 		port:        getenv("PORT", "8080"),
 		metricsAddr: getenv("METRICS_ADDR", "127.0.0.1:9090"),
@@ -303,6 +305,19 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		approvalRequireDifferentActor: getenvBool("APPROVAL_REQUIRE_DIFFERENT_ACTOR", false),
 		pendingTTL:                    getenvDuration("PENDING_TTL", 72*time.Hour),
 		pendingSweepInterval:          getenvDuration("PENDING_SWEEP_INTERVAL", time.Hour),
+		// Total budget for graceful shutdown, shared across the metrics server,
+		// the gRPC graceful-stop, and the HTTP drain. Configurable so an
+		// operator can widen it for a deployment with long-running requests.
+		shutdownTimeout: getenvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+	}
+	// Fail fast on any env var that was set but unparseable (audit A: config
+	// parse silently swallowed). A money service must not boot with, say,
+	// SEED_INTERVAL=4hr silently becoming 1h or CHAINER_ENABLED=flase silently
+	// becoming false: the operator asked for a value the process ignored. The
+	// getenv* helpers record every parse failure into envParseErrs (reset at
+	// the top of this function); surface them all at once here.
+	if len(envParseErrs) > 0 {
+		return config{}, fmt.Errorf("invalid environment configuration: %w", errors.Join(envParseErrs...))
 	}
 	if cfg.databaseURL == "" {
 		if !interactive {
@@ -391,12 +406,21 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// envParseErrs accumulates every "the var was set but could not be parsed"
+// failure the getenv* helpers below hit during one loadConfigWithTTY run
+// (reset at the top of that function). loadConfigWithTTY refuses to boot if
+// any are present, so a typo'd numeric/bool/duration is a startup error rather
+// than a silently-substituted default. loadConfig runs once, on the main
+// goroutine at boot, so a plain package-level slice is safe here.
+var envParseErrs []error
+
 func getenvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		n, err := strconv.Atoi(v)
 		if err == nil {
 			return n
 		}
+		envParseErrs = append(envParseErrs, fmt.Errorf("%s=%q is not a valid integer", key, v))
 	}
 	return fallback
 }
@@ -407,6 +431,7 @@ func getenvBool(key string, fallback bool) bool {
 		if err == nil {
 			return b
 		}
+		envParseErrs = append(envParseErrs, fmt.Errorf("%s=%q is not a valid boolean (use true/false)", key, v))
 	}
 	return fallback
 }
@@ -417,6 +442,7 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		if err == nil {
 			return d
 		}
+		envParseErrs = append(envParseErrs, fmt.Errorf("%s=%q is not a valid duration (for example 30s, 4h)", key, v))
 	}
 	return fallback
 }
@@ -816,14 +842,20 @@ func run(logger *slog.Logger) error {
 	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// A serve error and a shutdown signal both lead to the SAME graceful
+	// shutdown below (audit A: one exit path skipped it). Previously an errCh
+	// error returned immediately, racing in-flight requests against the
+	// deferred pool.Close(); now it is recorded and the servers are drained
+	// first, then the error is returned.
+	var serveErr error
 	select {
-	case err := <-errCh:
-		return err
+	case serveErr = <-errCh:
+		logger.Error("server error, shutting down", "error", serveErr)
 	case <-signalCtx.Done():
 	}
 
 	logger.Info("shutting down servers")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 	defer cancel()
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("metrics server shutdown", "error", err)
@@ -838,7 +870,13 @@ func run(logger *slog.Logger) error {
 	case <-shutdownCtx.Done():
 		grpcSrv.Stop()
 	}
-	return srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http server shutdown", "error", err)
+		if serveErr == nil {
+			serveErr = err
+		}
+	}
+	return serveErr
 }
 
 // runMigrations applies every pending embedded goose migration to
