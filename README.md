@@ -173,26 +173,7 @@ Every post also writes a transactional outbox row in the same transaction; a
 single-leader chainer drains that into a hash-chained, tamper-evident
 `audit_log`, which is also the event stream webhooks are delivered from.
 
-```
-  CLIENTS                   SERVICE                          STORAGE
-
-  REST (huma)  ┐                                             Postgres
-  gRPC         ├──▶  keys, scopes,  ──▶  domain services ──▶  • RLS per tenant
-  console/CLI  ┘     throttle            (internal/ledger)    • append-only postings
-                                         post · convert ·     • balances = SUM(amount)
-                                         reverse · approve    • CHECK trigger: sum = 0
-                                         · report
-                                         (SERIALIZABLE + retry)
-                                              │
-                                              │ each post also writes
-                                              │ an outbox row (same tx)
-                                              ▼
-  audit_outbox  ──▶  chainer  ──▶  audit_log      ──▶  webhook fan-out  ──▶  subscribers
-  (per event)      (1 leader)    (hash chain,          (1 leader, signed,     (HTTPS,
-                                  tamper-evident)        at-least-once)         dedup by id)
-
-  Observability:  OpenTelemetry traces · slog (JSON) · Prometheus metrics
-```
+![go-ledger architecture: clients over REST and gRPC reach the domain services, which post to Postgres under SERIALIZABLE with the zero-sum CHECK trigger; each post also writes an outbox row that a single-leader chainer drains into a hash-chained audit_log, which the webhook fan-out delivers to subscribers.](assets/architecture.png)
 
 ## Features
 
