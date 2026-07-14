@@ -61,6 +61,10 @@ const (
 	HeaderSignature  = "X-Ledger-Signature"
 	HeaderDeliveryID = "X-Ledger-Delivery-Id"
 	HeaderEvent      = "X-Ledger-Event"
+	// HeaderTimestamp carries the Unix-seconds send time. It is part of the
+	// signed content (see SignatureHeaderAt), so a subscriber that rejects a
+	// stale timestamp is protected against replay of a captured delivery.
+	HeaderTimestamp = "X-Ledger-Timestamp"
 )
 
 // Config tunes a Worker; every zero field falls back to its Default constant
@@ -96,6 +100,11 @@ type Config struct {
 	BackoffBase   time.Duration
 	BackoffCap    time.Duration
 	HTTPTimeout   time.Duration
+	// AllowPrivateTargets disables the SSRF guard so a webhook may be delivered
+	// to a loopback/private/link-local address. Off by default (the safe
+	// posture); a demo or self-hosted deployment whose receivers live on a
+	// private network sets WEBHOOK_ALLOW_PRIVATE_TARGETS to turn it on.
+	AllowPrivateTargets bool
 }
 
 func (c Config) withDefaults() Config {
@@ -160,7 +169,7 @@ func NewWorker(pool *pgxpool.Pool, log *slog.Logger, cfg Config) *Worker {
 		pool:   pool,
 		log:    log,
 		cfg:    cfg,
-		client: &http.Client{Timeout: cfg.HTTPTimeout},
+		client: newHTTPClient(cfg.HTTPTimeout, cfg.AllowPrivateTargets),
 	}
 }
 

@@ -26,6 +26,16 @@ import (
 // service is constructed without WithIdempotencyTTL (Task 4.5, audit A1.4):
 // generous enough that existing tests' within-test retries still replay, and
 // the same default cmd/server falls back to for IDEMPOTENCY_TTL.
+//
+// KNOWN WINDOW (audit remediation): a genuine client retry of the same body
+// under the same key AFTER the TTL has elapsed is treated as a brand-new
+// request and posts a SECOND transaction, because the expired key is swept and
+// GetIdempotencyKey no longer finds it. This is the standard bounded-idempotency
+// tradeoff (keys cannot be retained forever). The mitigation for a client that
+// needs stronger-than-TTL protection is a unique per-tenant `reference`: the
+// transactions_tenant_reference_idx unique index rejects a late duplicate that
+// reuses it, catching the double-post the expired key no longer can. Set
+// IDEMPOTENCY_TTL comfortably longer than any client's real retry horizon.
 const DefaultIdempotencyTTL = 24 * time.Hour
 
 // TransactionService posts transactions to the ledger. It is the single entry
@@ -212,7 +222,17 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		case err == nil:
 			return s.replay(ctx, tenantID, idem.Key, before, t)
 		case errors.Is(err, domain.ErrIdempotencyKeyNotFound):
-			// No existing key: proceed with a real post.
+			// No POSTED transaction under this key. A gated create (ADR-025)
+			// may still have held a PENDING under it, and the approval gate
+			// below might no longer fire (APPROVAL_ENABLED/THRESHOLDS changed
+			// between the hold and this retry): without this check we would post
+			// a second transaction for the same request under the client key
+			// while the approved pending already posted one under its derived
+			// approval key (audit A: idempotency double-post on config change).
+			if perr := s.dedupPendingForKey(ctx, tenantID, idem.Key); perr != nil {
+				return false, perr
+			}
+			// No existing key or pending: proceed with a real post.
 		default:
 			span.RecordError(err)
 			return false, err
@@ -244,7 +264,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 			if idem != nil {
 				idemKey = idem.Key
 			}
-			return false, s.holdForApproval(ctx, tenantID, tenantID, domain.PendingKindPost, postPayload(t), ccy, amt, idemKey)
+			return false, s.holdForApproval(ctx, tenantID, actorOr(ctx, tenantID), domain.PendingKindPost, postPayload(t), ccy, amt, idemKey)
 		}
 	}
 
@@ -296,7 +316,7 @@ func (s *TransactionService) Post(ctx context.Context, tenantID string, t *domai
 		return tx.AppendAuditOutbox(ctx, tenantID, domain.AuditEvent{
 			Action:        domain.ActionTransactionCreated,
 			TransactionID: t.ID,
-			Actor:         tenantID,
+			Actor:         actorOr(ctx, tenantID),
 			After:         after,
 		})
 	})

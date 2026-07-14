@@ -6,6 +6,15 @@ import (
 	"github.com/sohag-pro/go-ledger/internal/domain"
 )
 
+// MaxReportRows bounds an unpaged whole-tenant read (the account tree and the
+// trial balance): the underlying queries LIMIT at MaxReportRows+1 so the
+// service can detect an over-large result and return domain.ErrReportTooLarge
+// rather than build an unbounded response in memory (audit remediation: bound
+// the unbounded reads). Keep in sync with the LIMIT literals in
+// queries/accounts.sql (AllAccountBalances) and queries/reports.sql
+// (TrialBalanceAccounts).
+const MaxReportRows = 10000
+
 // CurrencyBalance is one currency's net posted total across a tenant's
 // postings, plus whether it is an imbalance (Task 6.3, audit A9.2): the
 // per-currency half of TrialBalance. See domain.CurrencyTotal for the raw
@@ -69,6 +78,9 @@ func (s *ReportService) TrialBalance(ctx context.Context, tenantID string) (Tria
 	accounts, err := s.repo.TrialBalanceAccounts(ctx, tenantID)
 	if err != nil {
 		return TrialBalance{}, err
+	}
+	if len(accounts) > MaxReportRows {
+		return TrialBalance{}, domain.ErrReportTooLarge
 	}
 	// Reuse the same tree rollup Tree/AccountService.buildTree uses: one
 	// query (AllAccountBalances) covers the same account universe

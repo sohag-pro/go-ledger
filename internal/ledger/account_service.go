@@ -97,6 +97,9 @@ func (s *AccountService) Tree(ctx context.Context, tenantID string) ([]domain.Ac
 	if err != nil {
 		return nil, err
 	}
+	if len(rows) > MaxReportRows {
+		return nil, domain.ErrReportTooLarge
+	}
 	return buildTree(rows), nil
 }
 

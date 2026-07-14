@@ -245,8 +245,8 @@ func transactionsCSV(items []domain.TransactionListItem) []byte {
 				p.AccountID,
 				strconv.FormatInt(p.Amount.Amount(), 10),
 				string(p.Amount.Currency()),
-				p.Description,
-				reference,
+				csvSafeField(p.Description),
+				csvSafeField(reference),
 				createdAt,
 				effectiveAt,
 			})
@@ -385,6 +385,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
+		ctx = ledger.WithActor(ctx, actorFromCtx(ctx, tenant))
 		replayed, err := deps.Transactions.Post(ctx, tenant, txn, idem)
 		if err != nil {
 			// ADR-025: an over-threshold post is held as a pending instead of
@@ -448,6 +449,7 @@ func registerTransactions(api huma.API, deps Deps) {
 			SourceAmount:  in.Body.SourceAmount,
 		}
 		idem := &domain.Idempotency{Key: in.IdempotencyKey}
+		ctx = ledger.WithActor(ctx, actorFromCtx(ctx, tenant))
 		txn, replayed, err := deps.Transactions.Convert(ctx, tenant, req, idem)
 		if err != nil {
 			// ADR-025: see create-transaction's identical check above.
@@ -481,6 +483,7 @@ func registerTransactions(api huma.API, deps Deps) {
 		if err != nil {
 			return nil, err
 		}
+		ctx = ledger.WithActor(ctx, actorFromCtx(ctx, tenant))
 		reversal, alreadyReversed, err := deps.Transactions.ReverseTransaction(ctx, tenant, in.ID)
 		if err != nil {
 			// ADR-025: see create-transaction's identical check above.

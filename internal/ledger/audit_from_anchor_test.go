@@ -226,3 +226,72 @@ func TestAuditService_VerifyFromLatestAnchor_CatchesTailTamper(t *testing.T) {
 		t.Errorf("checked = %d, want 2 (only the tail past the anchor, up to and including the break)", result.Checked)
 	}
 }
+
+// TestAuditService_VerifyFromLatestAnchor_SignedAnchorDetectsForgery proves the
+// anchor signature (audit remediation) makes a DB-privileged rewrite of the
+// audit_anchors row detectable: with signing on, a valid signed anchor still
+// bounds verification to the tail, but forging the stored anchor row_hash
+// (which an attacker with DB access could do) invalidates the signature they
+// cannot recompute, so VerifyFromLatestAnchor reports the chain as not
+// verifiable instead of trusting the forged checkpoint.
+func TestAuditService_VerifyFromLatestAnchor_SignedAnchorDetectsForgery(t *testing.T) {
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	accounts := ledger.NewAccountService(repo)
+	ctx := context.Background()
+	key := []byte("test-anchor-signing-key")
+	audits := ledger.NewAuditService(repo, ledger.WithAnchorSigningKey(key))
+	tenant := uuid.NewString()
+	if err := repo.CreateTenant(ctx, tenant, "signed anchor forgery test tenant"); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	cash := &domain.Account{Name: "Cash", Type: domain.Asset, Currency: "USD"}
+	revenue := &domain.Account{Name: "Revenue", Type: domain.Income, Currency: "USD"}
+	if err := accounts.Create(ctx, tenant, cash, nil); err != nil {
+		t.Fatalf("create cash: %v", err)
+	}
+	if err := accounts.Create(ctx, tenant, revenue, nil); err != nil {
+		t.Fatalf("create revenue: %v", err)
+	}
+
+	postAndDrainChain(t, pool, repo, tenant, cash.ID, revenue.ID, 4)
+
+	// Anchor WITH the signing key, then extend the chain.
+	anchorJob := audit.NewAnchorJob(pool, discardLogger(), time.Hour, audit.WithAnchorSigningKey(key))
+	if _, err := anchorJob.AnchorOnce(ctx); err != nil {
+		t.Fatalf("anchor once: %v", err)
+	}
+	txns := ledger.NewTransactionService(repo, discardLogger(), nil)
+	for i := 0; i < 3; i++ {
+		if _, err := txns.Post(ctx, tenant, mkTxn(t, cash.ID, revenue.ID), nil); err != nil {
+			t.Fatalf("post tail %d: %v", i, err)
+		}
+	}
+	drainChainer(t, pool, tenant)
+
+	// A genuine signed anchor still verifies, bounded to the tail.
+	ok, err := audits.VerifyFromLatestAnchor(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify from signed anchor: %v", err)
+	}
+	if !ok.Valid {
+		t.Fatalf("verify from valid signed anchor: Valid=false, want true")
+	}
+
+	// Simulate a DB-privileged attacker forging the anchor's stored row_hash.
+	tid, _ := uuid.Parse(tenant)
+	if _, err := pool.Exec(ctx, "UPDATE audit_anchors SET row_hash = $1 WHERE tenant_id = $2", "forgeddeadbeef", tid); err != nil {
+		t.Fatalf("forge anchor row_hash: %v", err)
+	}
+
+	forged, err := audits.VerifyFromLatestAnchor(ctx, tenant)
+	if err != nil {
+		t.Fatalf("verify from forged anchor: %v", err)
+	}
+	if forged.Valid {
+		t.Error("verify from a forged anchor: Valid=true, want false (signature no longer matches the forged row_hash)")
+	}
+	if forged.Checked != 0 {
+		t.Errorf("verify from a forged anchor: Checked=%d, want 0 (stopped at the signature gate, never walked the tail)", forged.Checked)
+	}
+}

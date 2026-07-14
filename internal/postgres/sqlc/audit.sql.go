@@ -72,7 +72,7 @@ func (q *Queries) GetLastAuditHash(ctx context.Context, tenantID uuid.UUID) (pgt
 }
 
 const getLatestAuditAnchor = `-- name: GetLatestAuditAnchor :one
-SELECT tenant_id, chain_seq, row_hash, created_at FROM audit_anchors
+SELECT tenant_id, chain_seq, row_hash, signature, created_at FROM audit_anchors
 WHERE tenant_id = $1
 ORDER BY chain_seq DESC
 LIMIT 1
@@ -82,6 +82,7 @@ type GetLatestAuditAnchorRow struct {
 	TenantID  uuid.UUID
 	ChainSeq  int64
 	RowHash   string
+	Signature []byte
 	CreatedAt time.Time
 }
 
@@ -96,20 +97,22 @@ func (q *Queries) GetLatestAuditAnchor(ctx context.Context, tenantID uuid.UUID) 
 		&i.TenantID,
 		&i.ChainSeq,
 		&i.RowHash,
+		&i.Signature,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const insertAuditAnchor = `-- name: InsertAuditAnchor :exec
-INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash)
-VALUES ($1, $2, $3)
+INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash, signature)
+VALUES ($1, $2, $3, $4)
 `
 
 type InsertAuditAnchorParams struct {
-	TenantID uuid.UUID
-	ChainSeq int64
-	RowHash  string
+	TenantID  uuid.UUID
+	ChainSeq  int64
+	RowHash   string
+	Signature []byte
 }
 
 // Records tenantID's current chain head as a new off-box-anchored
@@ -118,8 +121,15 @@ type InsertAuditAnchorParams struct {
 // runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
 // insert is not scoped through withTenant the way a request-path write
 // would be.
+// signature is the app-held HMAC over (tenant_id, chain_seq, row_hash), or
+// NULL when AUDIT_ANCHOR_SIGNING_KEY is unset (signing disabled).
 func (q *Queries) InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error {
-	_, err := q.db.Exec(ctx, insertAuditAnchor, arg.TenantID, arg.ChainSeq, arg.RowHash)
+	_, err := q.db.Exec(ctx, insertAuditAnchor,
+		arg.TenantID,
+		arg.ChainSeq,
+		arg.RowHash,
+		arg.Signature,
+	)
 	return err
 }
 

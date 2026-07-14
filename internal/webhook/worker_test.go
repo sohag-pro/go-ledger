@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -308,10 +309,11 @@ func TestDelivery_SignedPayloadVerifiedAndMarkedDelivered(t *testing.T) {
 	tenant, debit, credit := seedTenant(t, repo, "webhook delivery signed test tenant")
 
 	var gotBody []byte
-	var gotSigHeader, gotDeliveryIDHeader, gotEventHeader string
+	var gotSigHeader, gotTsHeader, gotDeliveryIDHeader, gotEventHeader string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
 		gotSigHeader = r.Header.Get(webhook.HeaderSignature)
+		gotTsHeader = r.Header.Get(webhook.HeaderTimestamp)
 		gotDeliveryIDHeader = r.Header.Get(webhook.HeaderDeliveryID)
 		gotEventHeader = r.Header.Get(webhook.HeaderEvent)
 		w.WriteHeader(http.StatusOK)
@@ -322,7 +324,9 @@ func TestDelivery_SignedPayloadVerifiedAndMarkedDelivered(t *testing.T) {
 	txnID := post(t, svc, tenant, debit, credit, 1234)
 	drainAudit(t, pool, repo, tenant)
 
-	worker := webhook.NewWorker(pool, discardLogger(), webhook.Config{})
+	// AllowPrivateTargets: httptest binds 127.0.0.1, which the SSRF guard
+	// blocks by default; this test legitimately delivers to loopback.
+	worker := webhook.NewWorker(pool, discardLogger(), webhook.Config{AllowPrivateTargets: true})
 	if _, err := worker.FanOutOnce(ctx); err != nil {
 		t.Fatalf("fan out: %v", err)
 	}
@@ -337,9 +341,16 @@ func TestDelivery_SignedPayloadVerifiedAndMarkedDelivered(t *testing.T) {
 	if gotBody == nil {
 		t.Fatal("receiver never got a request body")
 	}
-	wantSig := webhook.SignatureHeader(secret, gotBody)
+	if gotTsHeader == "" {
+		t.Fatal("receiver never got an X-Ledger-Timestamp header")
+	}
+	ts, err := strconv.ParseInt(gotTsHeader, 10, 64)
+	if err != nil {
+		t.Fatalf("X-Ledger-Timestamp = %q, not a Unix-seconds integer: %v", gotTsHeader, err)
+	}
+	wantSig := webhook.SignatureHeaderAt(secret, ts, gotBody)
 	if gotSigHeader != wantSig {
-		t.Errorf("X-Ledger-Signature = %q, want %q (HMAC-SHA256 of the exact body received, keyed by the subscription secret)", gotSigHeader, wantSig)
+		t.Errorf("X-Ledger-Signature = %q, want %q (HMAC-SHA256 of \"<timestamp>.<body>\", keyed by the subscription secret)", gotSigHeader, wantSig)
 	}
 	if gotEventHeader != domain.ActionTransactionCreated {
 		t.Errorf("X-Ledger-Event = %q, want %q", gotEventHeader, domain.ActionTransactionCreated)
@@ -418,9 +429,10 @@ func TestDelivery_RetrySucceedsAtLeastOnce(t *testing.T) {
 	// what keeps this assertion meaningful instead of flaky.
 	const backoff = 500 * time.Millisecond
 	worker := webhook.NewWorker(pool, discardLogger(), webhook.Config{
-		MaxAttempts: 5,
-		BackoffBase: backoff,
-		BackoffCap:  backoff,
+		MaxAttempts:         5,
+		BackoffBase:         backoff,
+		BackoffCap:          backoff,
+		AllowPrivateTargets: true, // httptest loopback; see the signed-delivery test
 	})
 	if _, err := worker.FanOutOnce(ctx); err != nil {
 		t.Fatalf("fan out: %v", err)
@@ -501,9 +513,10 @@ func TestDelivery_RetryToDeadAfterMaxAttempts(t *testing.T) {
 		backoff     = 15 * time.Millisecond
 	)
 	worker := webhook.NewWorker(pool, discardLogger(), webhook.Config{
-		MaxAttempts: maxAttempts,
-		BackoffBase: backoff,
-		BackoffCap:  backoff,
+		MaxAttempts:         maxAttempts,
+		BackoffBase:         backoff,
+		BackoffCap:          backoff,
+		AllowPrivateTargets: true, // httptest loopback; see the signed-delivery test
 	})
 	if _, err := worker.FanOutOnce(ctx); err != nil {
 		t.Fatalf("fan out: %v", err)
@@ -585,7 +598,7 @@ func TestDeactivatedSubscription_StopsFutureDeliveries(t *testing.T) {
 	post(t, svc, tenant, debit, credit, 55)
 	drainAudit(t, pool, repo, tenant)
 
-	worker := webhook.NewWorker(pool, discardLogger(), webhook.Config{})
+	worker := webhook.NewWorker(pool, discardLogger(), webhook.Config{AllowPrivateTargets: true})
 	if _, err := worker.FanOutOnce(ctx); err != nil {
 		t.Fatalf("fan out: %v", err)
 	}
@@ -648,8 +661,8 @@ func TestWorker_LeaderElection_OnlyOneRunsAtATime(t *testing.T) {
 	defer srv.Close()
 	sub, _ := createSubscription(t, repo, tenant, srv.URL, nil)
 
-	workerA := webhook.NewWorker(poolA, discardLogger(), webhook.Config{Interval: 20 * time.Millisecond})
-	workerB := webhook.NewWorker(poolB, discardLogger(), webhook.Config{Interval: 20 * time.Millisecond})
+	workerA := webhook.NewWorker(poolA, discardLogger(), webhook.Config{Interval: 20 * time.Millisecond, AllowPrivateTargets: true})
+	workerB := webhook.NewWorker(poolB, discardLogger(), webhook.Config{Interval: 20 * time.Millisecond, AllowPrivateTargets: true})
 
 	ctxA, cancelA := context.WithCancel(context.Background())
 	doneA := make(chan struct{})

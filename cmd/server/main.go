@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -140,15 +141,24 @@ type config struct {
 	authNegativeWindow       time.Duration
 	defaultCurrency          string
 	fxRates                  string
+	fxMaxRateAge             time.Duration
+	fxFeedEnabled            bool
+	fxFeedURL                string
+	fxFeedBase               string
+	fxFeedCurrencies         string
+	fxFeedInterval           time.Duration
+	fxFeedSpreadBps          int
 	masterKey                string
 	chainerEnabled           bool
 	chainerInterval          time.Duration
 	chainerBatch             int
 	anchorEnabled            bool
 	anchorInterval           time.Duration
+	anchorSigningKey         string
 	idempotencyTTL           time.Duration
 	idempotencySweepInterval time.Duration
 	webhooksEnabled          bool
+	webhookAllowPrivate      bool
 	webhookMaxAttempts       int
 	webhookDeliveryInterval  time.Duration
 	metricsCollectInterval   time.Duration
@@ -164,6 +174,7 @@ type config struct {
 	approvalRequireDifferentActor bool
 	pendingTTL                    time.Duration
 	pendingSweepInterval          time.Duration
+	shutdownTimeout               time.Duration
 }
 
 // loadConfig loads the server's configuration from the environment, running
@@ -182,6 +193,7 @@ func loadConfig() (config, error) {
 // byte-for-byte the fail-fast behavior that existed before ADR-019: a clear
 // "DATABASE_URL is required" error, never a hang waiting on input.
 func loadConfigWithTTY(interactive bool) (config, error) {
+	envParseErrs = nil
 	cfg := config{
 		port:        getenv("PORT", "8080"),
 		metricsAddr: getenv("METRICS_ADDR", "127.0.0.1:9090"),
@@ -218,6 +230,18 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		authNegativeWindow:      getenvDuration("AUTH_NEGATIVE_WINDOW", auth.DefaultNegativeThrottleWindow),
 		defaultCurrency:         getenv("DEFAULT_CURRENCY", "USD"),
 		fxRates:                 os.Getenv("FX_RATES"),
+		// FX rate staleness + live feed (audit A: no FX rate staleness guard).
+		// fxMaxRateAge 0 (the default) disables the staleness check; when set,
+		// a conversion whose rate is older than this is refused. The feed keeps
+		// rates fresh from a free provider (Frankfurter) so the guard does not
+		// starve conversions; it is off by default (opt-in network calls).
+		fxMaxRateAge:     getenvDuration("FX_MAX_RATE_AGE", 0),
+		fxFeedEnabled:    getenvBool("FX_FEED_ENABLED", false),
+		fxFeedURL:        getenv("FX_FEED_URL", fx.DefaultFeedURL),
+		fxFeedBase:       getenv("FX_FEED_BASE", "USD"),
+		fxFeedCurrencies: os.Getenv("FX_FEED_CURRENCIES"),
+		fxFeedInterval:   getenvDuration("FX_FEED_INTERVAL", fx.DefaultFeedInterval),
+		fxFeedSpreadBps:  getenvInt("FX_FEED_SPREAD_BPS", -1),
 		// LEDGER_MASTER_KEY (Task 6.2, audit A9.3): a 32-byte, base64-encoded
 		// master key for envelope-encrypting posting descriptions at rest
 		// (internal/crypto.Cipher). Left empty by default (getenv's fallback
@@ -253,6 +277,12 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		// recency, so a coarse cadence is the right default.
 		anchorEnabled:  getenvBool("AUDIT_ANCHOR_ENABLED", true),
 		anchorInterval: getenvDuration("AUDIT_ANCHOR_INTERVAL", audit.DefaultAnchorInterval),
+		// A secret the DB role does not hold, used to sign audit anchors so a
+		// DB-privileged rewrite of audit_anchors is caught by
+		// VerifyFromLatestAnchor. Empty (the default, and the demo) leaves
+		// anchors unsigned, unchanged. Any non-empty secret works; longer is
+		// stronger.
+		anchorSigningKey: os.Getenv("AUDIT_ANCHOR_SIGNING_KEY"),
 		// IDEMPOTENCY_TTL bounds how long a stored idempotency key blocks
 		// reuse before it is treated as absent (Task 4.5, audit A1.4): the
 		// default matches ledger.DefaultIdempotencyTTL and migration 0019's
@@ -274,6 +304,7 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		// picks exactly one active worker regardless, so disabling it here
 		// is never required for correctness.
 		webhooksEnabled:         getenvBool("WEBHOOKS_ENABLED", true),
+		webhookAllowPrivate:     getenvBool("WEBHOOK_ALLOW_PRIVATE_TARGETS", false),
 		webhookMaxAttempts:      getenvInt("WEBHOOK_MAX_ATTEMPTS", webhook.DefaultMaxAttempts),
 		webhookDeliveryInterval: getenvDuration("WEBHOOK_DELIVERY_INTERVAL", webhook.DefaultInterval),
 		// METRICS_COLLECT_INTERVAL (Task 5.6a, audit A6.1): how often the
@@ -303,6 +334,19 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		approvalRequireDifferentActor: getenvBool("APPROVAL_REQUIRE_DIFFERENT_ACTOR", false),
 		pendingTTL:                    getenvDuration("PENDING_TTL", 72*time.Hour),
 		pendingSweepInterval:          getenvDuration("PENDING_SWEEP_INTERVAL", time.Hour),
+		// Total budget for graceful shutdown, shared across the metrics server,
+		// the gRPC graceful-stop, and the HTTP drain. Configurable so an
+		// operator can widen it for a deployment with long-running requests.
+		shutdownTimeout: getenvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+	}
+	// Fail fast on any env var that was set but unparseable (audit A: config
+	// parse silently swallowed). A money service must not boot with, say,
+	// SEED_INTERVAL=4hr silently becoming 1h or CHAINER_ENABLED=flase silently
+	// becoming false: the operator asked for a value the process ignored. The
+	// getenv* helpers record every parse failure into envParseErrs (reset at
+	// the top of this function); surface them all at once here.
+	if len(envParseErrs) > 0 {
+		return config{}, fmt.Errorf("invalid environment configuration: %w", errors.Join(envParseErrs...))
 	}
 	if cfg.databaseURL == "" {
 		if !interactive {
@@ -391,12 +435,21 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// envParseErrs accumulates every "the var was set but could not be parsed"
+// failure the getenv* helpers below hit during one loadConfigWithTTY run
+// (reset at the top of that function). loadConfigWithTTY refuses to boot if
+// any are present, so a typo'd numeric/bool/duration is a startup error rather
+// than a silently-substituted default. loadConfig runs once, on the main
+// goroutine at boot, so a plain package-level slice is safe here.
+var envParseErrs []error
+
 func getenvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		n, err := strconv.Atoi(v)
 		if err == nil {
 			return n
 		}
+		envParseErrs = append(envParseErrs, fmt.Errorf("%s=%q is not a valid integer", key, v))
 	}
 	return fallback
 }
@@ -407,6 +460,7 @@ func getenvBool(key string, fallback bool) bool {
 		if err == nil {
 			return b
 		}
+		envParseErrs = append(envParseErrs, fmt.Errorf("%s=%q is not a valid boolean (use true/false)", key, v))
 	}
 	return fallback
 }
@@ -417,6 +471,7 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		if err == nil {
 			return d
 		}
+		envParseErrs = append(envParseErrs, fmt.Errorf("%s=%q is not a valid duration (for example 30s, 4h)", key, v))
 	}
 	return fallback
 }
@@ -528,6 +583,38 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("seed fx rates: %w", err)
 	}
 
+	// The live FX rate feed (audit A: no FX rate staleness guard). Off by
+	// default; when enabled it polls a free provider (Frankfurter) and appends
+	// fresh global rows so FX_MAX_RATE_AGE conversions keep working without a
+	// paid feed. Runs on every instance: writes are dedup'd against the current
+	// stored mid, so a duplicate poll from a second instance is a no-op insert.
+	if cfg.fxFeedEnabled {
+		var feedSpread *int32
+		// Bounded to a valid spread (0..<10000 bps, the fx_rates CHECK range);
+		// out of range leaves it nil so the feed rows fall back to the markup
+		// default. The bound also proves the int->int32 conversion is safe.
+		if cfg.fxFeedSpreadBps >= 0 && cfg.fxFeedSpreadBps < 10000 {
+			s := int32(cfg.fxFeedSpreadBps)
+			feedSpread = &s
+		}
+		var feedCcys []domain.Currency
+		for _, c := range strings.Split(cfg.fxFeedCurrencies, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				feedCcys = append(feedCcys, domain.Currency(c))
+			}
+		}
+		feed := fx.NewFeed(pool, logger, fx.FeedConfig{
+			URL:        cfg.fxFeedURL,
+			Base:       domain.Currency(cfg.fxFeedBase),
+			Currencies: feedCcys,
+			Interval:   cfg.fxFeedInterval,
+			SpreadBps:  feedSpread,
+		})
+		feedCtx, cancelFeed := context.WithCancel(context.Background())
+		defer cancelFeed()
+		go feed.Run(feedCtx)
+	}
+
 	// PII crypto-shredding (Task 6.2, audit A9.3): a nil cipher (the default
 	// when LEDGER_MASTER_KEY is unset) leaves encryption disabled everywhere
 	// it is wired below, so posting descriptions are stored and returned as
@@ -578,7 +665,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	transactions := ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
-		ledger.WithFXProvider(fx.NewDBProvider(pool)),
+		ledger.WithFXProvider(fx.NewDBProvider(pool, fx.WithMaxRateAge(cfg.fxMaxRateAge))),
 		ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
 		// PrePostHook (Task 6.1, audit A9.1) is scaffolding for an external
 		// compliance/screening integration: wired explicitly to
@@ -603,7 +690,7 @@ func run(logger *slog.Logger) error {
 			ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency)),
 			ledger.WithAccountCipher(cipher)),
 		Transactions: transactions,
-		Audit:        ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher)),
+		Audit:        ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher), ledger.WithAnchorSigningKey([]byte(cfg.anchorSigningKey))),
 		Admin:        adminSvc,
 		Reports:      ledger.NewReportService(repo),
 		// Disputes resolves action=reverse through the SAME
@@ -660,7 +747,7 @@ func run(logger *slog.Logger) error {
 	if cfg.anchorEnabled {
 		anchorCtx, cancelAnchor := context.WithCancel(context.Background())
 		defer cancelAnchor()
-		anchorJob := audit.NewAnchorJob(pool, logger, cfg.anchorInterval)
+		anchorJob := audit.NewAnchorJob(pool, logger, cfg.anchorInterval, audit.WithAnchorSigningKey([]byte(cfg.anchorSigningKey)))
 		go anchorJob.Run(anchorCtx)
 	}
 
@@ -675,8 +762,9 @@ func run(logger *slog.Logger) error {
 		webhookCtx, cancelWebhook := context.WithCancel(context.Background())
 		defer cancelWebhook()
 		webhookWorker := webhook.NewWorker(pool, logger, webhook.Config{
-			Interval:    cfg.webhookDeliveryInterval,
-			MaxAttempts: cfg.webhookMaxAttempts,
+			Interval:            cfg.webhookDeliveryInterval,
+			MaxAttempts:         cfg.webhookMaxAttempts,
+			AllowPrivateTargets: cfg.webhookAllowPrivate,
 		})
 		go webhookWorker.Run(webhookCtx)
 	}
@@ -816,14 +904,20 @@ func run(logger *slog.Logger) error {
 	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// A serve error and a shutdown signal both lead to the SAME graceful
+	// shutdown below (audit A: one exit path skipped it). Previously an errCh
+	// error returned immediately, racing in-flight requests against the
+	// deferred pool.Close(); now it is recorded and the servers are drained
+	// first, then the error is returned.
+	var serveErr error
 	select {
-	case err := <-errCh:
-		return err
+	case serveErr = <-errCh:
+		logger.Error("server error, shutting down", "error", serveErr)
 	case <-signalCtx.Done():
 	}
 
 	logger.Info("shutting down servers")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 	defer cancel()
 	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("metrics server shutdown", "error", err)
@@ -838,7 +932,13 @@ func run(logger *slog.Logger) error {
 	case <-shutdownCtx.Done():
 		grpcSrv.Stop()
 	}
-	return srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http server shutdown", "error", err)
+		if serveErr == nil {
+			serveErr = err
+		}
+	}
+	return serveErr
 }
 
 // runMigrations applies every pending embedded goose migration to

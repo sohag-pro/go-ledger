@@ -132,4 +132,9 @@ LEFT JOIN postings p ON p.tenant_id = a.tenant_id AND p.account_id = a.id
 WHERE a.tenant_id = $1
 GROUP BY a.id, a.tenant_id, a.name, a.type, a.currency, a.status, a.min_balance,
          a.is_system, a.created_at, a.party_reference, a.party_type, a.parent_id
-ORDER BY a.name, a.id;
+ORDER BY a.name, a.id
+-- Bounded read (audit remediation): one more than ledger.MaxReportRows, so the
+-- service can detect "too large for a single unpaged response" and refuse
+-- rather than stream an unbounded result set into memory. Keep in sync with
+-- ledger.MaxReportRows.
+LIMIT 10001;

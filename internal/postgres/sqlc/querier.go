@@ -64,6 +64,10 @@ type Querier interface {
 	// account with no postings returns 0) and its parent_id, so the caller can
 	// build the tree and roll up in memory in one pass. Ordered by name, id for a
 	// stable base order the Go rollup then re-threads parent-before-child.
+	// Bounded read (audit remediation): one more than ledger.MaxReportRows, so the
+	// service can detect "too large for a single unpaged response" and refuse
+	// rather than stream an unbounded result set into memory. Keep in sync with
+	// ledger.MaxReportRows.
 	AllAccountBalances(ctx context.Context, tenantID uuid.UUID) ([]AllAccountBalancesRow, error)
 	// The oldest transaction id still in flight, cast the same way audit_outbox.txid
 	// is (xid8 has no direct cast to bigint). A row whose txid is strictly below
@@ -250,6 +254,8 @@ type Querier interface {
 	// runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
 	// insert is not scoped through withTenant the way a request-path write
 	// would be.
+	// signature is the app-held HMAC over (tenant_id, chain_seq, row_hash), or
+	// NULL when AUDIT_ANCHOR_SIGNING_KEY is unset (signing disabled).
 	InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error
 	// outbox_id is the source audit_outbox row this audit_log row was chained
 	// from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a
@@ -704,6 +710,9 @@ type Querier interface {
 	// balance proof. The LEFT JOIN means an account with no postings yet still
 	// returns one row, with balance COALESCEd to 0, the same shape
 	// AccountBalances (postings.sql) already uses.
+	// Bounded read (audit remediation): one more than ledger.MaxReportRows so the
+	// service can refuse an over-large trial balance rather than build it unbounded
+	// in memory. Keep in sync with ledger.MaxReportRows.
 	TrialBalanceAccounts(ctx context.Context, tenantID uuid.UUID) ([]TrialBalanceAccountsRow, error)
 	// Task 6.3, audit A9.2: the double-entry balance proof. Each currency's net
 	// posted total across every account in the tenant; in a correct ledger every

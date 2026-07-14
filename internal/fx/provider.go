@@ -41,17 +41,49 @@ type Provider interface {
 }
 
 // dbRateProvider is the v1 Provider: it reads the current row from fx_rates
-// (populated by Seed, and in the future by a live rate feed writing into the
-// same table). It is inverse-aware: a pair only needs to be stored in one
+// (populated by Seed and by the live rate feed, both writing into the same
+// table). It is inverse-aware: a pair only needs to be stored in one
 // direction, and the reverse is derived by inverting the mid.
 type dbRateProvider struct {
-	q *sqlc.Queries
+	q      *sqlc.Queries
+	maxAge time.Duration // 0 disables the staleness check
+}
+
+// ProviderOption configures a dbRateProvider built by NewDBProvider.
+type ProviderOption func(*dbRateProvider)
+
+// WithMaxRateAge rejects any resolved rate whose effective_at is older than
+// age, with domain.ErrFXRateStale (audit A: no FX rate staleness guard). A
+// zero or negative age (the default) disables the check, preserving the prior
+// behavior of pricing against whatever the latest row is.
+func WithMaxRateAge(age time.Duration) ProviderOption {
+	return func(p *dbRateProvider) { p.maxAge = age }
 }
 
 // NewDBProvider builds a Provider backed by fx_rates. db may be a
 // *pgxpool.Pool, a pgx.Tx, or anything else satisfying sqlc.DBTX.
-func NewDBProvider(db sqlc.DBTX) Provider {
-	return &dbRateProvider{q: sqlc.New(db)}
+func NewDBProvider(db sqlc.DBTX, opts ...ProviderOption) Provider {
+	p := &dbRateProvider{q: sqlc.New(db)}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// freshOrErr returns q unchanged when its effective_at is within maxAge (or the
+// check is disabled), otherwise domain.ErrFXRateStale. Every success path in
+// Rate routes its resolved quote through this so the staleness rule lives in
+// one place, whether the quote came from a direct row, an inversion, or the
+// USD hub.
+func (p *dbRateProvider) freshOrErr(q domain.FXQuote) (domain.FXQuote, error) {
+	if p.maxAge <= 0 {
+		return q, nil
+	}
+	if time.Since(q.EffectiveAt) > p.maxAge {
+		return domain.FXQuote{}, fmt.Errorf("%w: %s/%s rate from %s is older than %s",
+			domain.ErrFXRateStale, q.Base, q.Quote, q.EffectiveAt.UTC().Format(time.RFC3339), p.maxAge)
+	}
+	return q, nil
 }
 
 // Rate tries CurrentFXRate(tenantID, base, quote) first. If that pair is not
@@ -77,10 +109,11 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 		if sErr != nil {
 			return domain.FXQuote{}, 0, sErr
 		}
-		return domain.FXQuote{
+		q, fErr := p.freshOrErr(domain.FXQuote{
 			Base: base, Quote: quote, MidRateE8: direct.MidRateE8,
 			RateID: direct.ID, Source: direct.Source, EffectiveAt: direct.EffectiveAt,
-		}, spread, nil
+		})
+		return q, spread, fErr
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return domain.FXQuote{}, 0, fmt.Errorf("fx: lookup %s/%s: %w", base, quote, err)
@@ -101,7 +134,8 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 			return domain.FXQuote{}, 0, herr
 		}
 		if ok {
-			return hq, hs, nil
+			q, fErr := p.freshOrErr(hq)
+			return q, hs, fErr
 		}
 		return domain.FXQuote{}, 0, fmt.Errorf("%w: %s/%s", domain.ErrFXRateNotFound, base, quote)
 	}
@@ -123,12 +157,13 @@ func (p *dbRateProvider) Rate(ctx context.Context, tenantID string, base, quote 
 	if sErr != nil {
 		return domain.FXQuote{}, 0, sErr
 	}
-	return domain.FXQuote{
+	q, fErr := p.freshOrErr(domain.FXQuote{
 		Base: base, Quote: quote, MidRateE8: invertedMidE8,
 		// Provenance is the row that was actually found and inverted: there is
 		// no separate stored row for this direction (see FXQuote's doc comment).
 		RateID: inverse.ID, Source: inverse.Source, EffectiveAt: inverse.EffectiveAt,
-	}, spread, nil
+	})
+	return q, spread, fErr
 }
 
 // leg is one directed rate a hub conversion uses: the mid (quote per base,
@@ -195,13 +230,33 @@ func (p *dbRateProvider) hubQuote(ctx context.Context, tid pgtype.UUID, base, qu
 	if !cross.IsInt64() {
 		return domain.FXQuote{}, 0, false, fmt.Errorf("fx: composed %s/%s rate via %s overflows int64", base, quote, fxHubCurrency)
 	}
-	spread, err := p.resolveSpread(ctx, tid, fromLeg.spread)
+	// Widen by BOTH legs' spreads, not just the base leg's (audit A: hub spread
+	// under-applied). A two-hop conversion crosses two markups; charging one
+	// made cross pairs cheaper than the equivalent pair of direct conversions
+	// and left an A->USD->B vs A->B arbitrage. Basis points add (the tiny
+	// second-order cross term is immaterial at realistic spreads); the sum is
+	// capped just under the fx_rates CHECK ceiling so it stays a valid spread.
+	fromSpread, err := p.resolveSpread(ctx, tid, fromLeg.spread)
 	if err != nil {
 		return domain.FXQuote{}, 0, false, err
 	}
+	toSpread, err := p.resolveSpread(ctx, tid, toLeg.spread)
+	if err != nil {
+		return domain.FXQuote{}, 0, false, err
+	}
+	spread := fromSpread + toSpread
+	if spread >= maxSpreadBps {
+		spread = maxSpreadBps - 1
+	}
+	// The cross is only as fresh as its STALER leg: price it off the older
+	// effective_at so the staleness guard trips if either USD leg is stale.
+	effectiveAt := fromLeg.effectiveAt
+	if toLeg.effectiveAt.Before(effectiveAt) {
+		effectiveAt = toLeg.effectiveAt
+	}
 	return domain.FXQuote{
 		Base: base, Quote: quote, MidRateE8: cross.Int64(),
-		RateID: fromLeg.rateID, Source: fromLeg.source, EffectiveAt: fromLeg.effectiveAt,
+		RateID: fromLeg.rateID, Source: fromLeg.source, EffectiveAt: effectiveAt,
 	}, spread, true, nil
 }
 

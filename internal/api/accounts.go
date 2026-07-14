@@ -233,7 +233,7 @@ func statementCSV(entries []domain.StatementEntry, currency string) []byte {
 			strconv.FormatInt(e.Amount.Amount(), 10),
 			currency,
 			strconv.FormatInt(e.RunningBalance.Amount(), 10),
-			e.Description,
+			csvSafeField(e.Description),
 		})
 	}
 	w.Flush()

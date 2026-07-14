@@ -126,15 +126,17 @@ LIMIT 1;
 -- runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
 -- insert is not scoped through withTenant the way a request-path write
 -- would be.
-INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash)
-VALUES (sqlc.arg(tenant_id), sqlc.arg(chain_seq), sqlc.arg(row_hash));
+-- signature is the app-held HMAC over (tenant_id, chain_seq, row_hash), or
+-- NULL when AUDIT_ANCHOR_SIGNING_KEY is unset (signing disabled).
+INSERT INTO audit_anchors (tenant_id, chain_seq, row_hash, signature)
+VALUES (sqlc.arg(tenant_id), sqlc.arg(chain_seq), sqlc.arg(row_hash), sqlc.narg(signature));
 
 -- name: GetLatestAuditAnchor :one
 -- The tenant's most recently recorded anchor (Task 5.3): the chain_seq,
 -- row_hash, and timestamp the anchor job last logged off-box for this
 -- tenant. ErrNoRows means no anchor has ever been recorded (a brand-new
 -- tenant, or one that posted before the anchor job's first tick).
-SELECT tenant_id, chain_seq, row_hash, created_at FROM audit_anchors
+SELECT tenant_id, chain_seq, row_hash, signature, created_at FROM audit_anchors
 WHERE tenant_id = sqlc.arg(tenant_id)
 ORDER BY chain_seq DESC
 LIMIT 1;

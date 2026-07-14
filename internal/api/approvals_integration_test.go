@@ -27,6 +27,11 @@ import (
 const (
 	approvalsPostKeyPlaintext    = "glk_approvals-test-post-key"    //nolint:gosec // test fixture key, not a real credential
 	approvalsApproveKeyPlaintext = "glk_approvals-test-approve-key" //nolint:gosec // test fixture key, not a real credential
+	// approvalsBothKeyPlaintext holds post AND approve, so it can create an
+	// over-threshold pending and then attempt to approve its own: the maker and
+	// checker are the SAME principal. Four-eyes (RequireDifferentActor) rejects
+	// that, which is the whole point of the control.
+	approvalsBothKeyPlaintext = "glk_approvals-test-both-key" //nolint:gosec // test fixture key, not a real credential
 )
 
 // approvalsThresholdUSD is the low USD threshold every test router below
@@ -47,6 +52,7 @@ func newApprovalsRouter(t *testing.T, requireDifferentActor bool) chi.Router {
 	keys := map[string][]domain.Scope{
 		approvalsPostKeyPlaintext:    {domain.ScopeRead, domain.ScopePost},
 		approvalsApproveKeyPlaintext: {domain.ScopeRead, domain.ScopeApprove},
+		approvalsBothKeyPlaintext:    {domain.ScopeRead, domain.ScopePost, domain.ScopeApprove},
 	}
 	for plaintext, scopes := range keys {
 		if err := repo.InsertAPIKey(context.Background(),
@@ -142,7 +148,15 @@ type heldResponse struct {
 // body whose kind is "post" and status "pending". Returns the pending's id.
 func postOverThreshold(t *testing.T, r chi.Router, debit, credit string, amount int64, idemKey string) string {
 	t.Helper()
-	rec := doAsHeaders(t, r, approvalsPostKeyPlaintext, http.MethodPost, "/v1/transactions", map[string]any{
+	return postOverThresholdAs(t, r, approvalsPostKeyPlaintext, debit, credit, amount, idemKey)
+}
+
+// postOverThresholdAs is postOverThreshold with an explicit posting key, so a
+// four-eyes test can make the maker be a specific principal (the same key that
+// later attempts to approve).
+func postOverThresholdAs(t *testing.T, r chi.Router, postKey, debit, credit string, amount int64, idemKey string) string {
+	t.Helper()
+	rec := doAsHeaders(t, r, postKey, http.MethodPost, "/v1/transactions", map[string]any{
 		"currency": "USD",
 		"postings": []map[string]any{
 			{"account_id": debit, "amount": amount},
@@ -352,24 +366,31 @@ func TestApprovals_PostOnlyKeyForbiddenFromApprove(t *testing.T) {
 }
 
 // TestApprovals_RequireDifferentActorBlocksSelfApproval checks four-eyes
-// (ApprovalConfig.RequireDifferentActor, ADR-025): go-ledger's actor
-// granularity is per tenant, not per API key (every audit event's Actor
-// field is stamped as the tenant id, see internal/ledger/service.go,
-// convert.go, reverse.go, and approval_events.go), and a pending's CreatedBy
-// is likewise stamped as the tenant at hold time. The HTTP layer passes that
-// same tenant as the approve actor (see registerApprovals' own comment), so
-// with RequireDifferentActor on, approving a pending created by that SAME
-// tenant always trips ErrCannotApproveOwn, regardless of which of the
-// tenant's own keys calls approve.
+// (ApprovalConfig.RequireDifferentActor, ADR-025) at PRINCIPAL granularity:
+// the actor is the individual API key (auth.PrincipalID), not the tenant.
+// A pending's CreatedBy is the creating key; approve compares the approving
+// key against it. So the SAME key creating and approving is blocked with 409
+// (maker == checker), while a DIFFERENT key approving succeeds even though
+// both keys belong to the same tenant. Per-tenant granularity could never draw
+// that distinction; per-principal is what makes the control real.
 func TestApprovals_RequireDifferentActorBlocksSelfApproval(t *testing.T) {
 	r := newApprovalsRouter(t, true)
 	cash := createAccountAs(t, r, approvalsPostKeyPlaintext, "Cash", "asset")
 	revenue := createAccountAs(t, r, approvalsPostKeyPlaintext, "Revenue", "income")
 
-	pendingID := postOverThreshold(t, r, cash, revenue, 800, "approvals-four-eyes-1")
+	// Same principal: approvalsBothKeyPlaintext creates the pending and then
+	// tries to approve its own. Four-eyes trips ErrCannotApproveOwn -> 409.
+	ownPending := postOverThresholdAs(t, r, approvalsBothKeyPlaintext, cash, revenue, 800, "approvals-four-eyes-self")
+	selfRec := doAs(t, r, approvalsBothKeyPlaintext, http.MethodPost, "/v1/pending/"+ownPending+"/approve", nil)
+	if selfRec.Code != http.StatusConflict {
+		t.Errorf("same key approving its own pending with require-different-actor: status %d, want 409 (%s)", selfRec.Code, selfRec.Body.String())
+	}
 
-	rec := doAs(t, r, approvalsApproveKeyPlaintext, http.MethodPost, "/v1/pending/"+pendingID+"/approve", nil)
-	if rec.Code != http.StatusConflict {
-		t.Errorf("approve own tenant's pending with require-different-actor: status %d, want 409 (%s)", rec.Code, rec.Body.String())
+	// Different principals: post key creates, approve key approves. Same
+	// tenant, different keys, so four-eyes is satisfied -> 200.
+	otherPending := postOverThreshold(t, r, cash, revenue, 800, "approvals-four-eyes-other")
+	otherRec := doAs(t, r, approvalsApproveKeyPlaintext, http.MethodPost, "/v1/pending/"+otherPending+"/approve", nil)
+	if otherRec.Code != http.StatusOK {
+		t.Errorf("different key approving another key's pending with require-different-actor: status %d, want 200 (%s)", otherRec.Code, otherRec.Body.String())
 	}
 }

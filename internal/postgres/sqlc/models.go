@@ -45,6 +45,7 @@ type AuditAnchor struct {
 	ChainSeq  int64
 	RowHash   string
 	CreatedAt time.Time
+	Signature []byte
 }
 
 type AuditLog struct {

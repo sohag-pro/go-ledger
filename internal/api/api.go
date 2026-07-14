@@ -116,6 +116,38 @@ func tenantFromCtx(ctx context.Context) (string, error) {
 	return tenant, nil
 }
 
+// csvSafeField neutralizes CSV/spreadsheet formula injection in a free-text
+// export cell (audit A: CSV formula injection). A value a caller controls, a
+// posting description or a transaction reference, that begins with a formula
+// trigger (= + - @) or a leading tab/CR is prefixed with a single quote so a
+// spreadsheet renders it as literal text instead of evaluating it (for example
+// a description of =HYPERLINK("http://evil","clickme") opening the exported
+// file). Applied ONLY to free-text columns: numeric columns are left alone so a
+// legitimately negative amount ("-800") is not mangled.
+func csvSafeField(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
+// actorFromCtx returns the individual principal (API-key id) behind the
+// request, falling back to the tenant id when no key is present (a path that
+// never authenticated). Money paths record this as the audit Actor and a held
+// pending's CreatedBy, and it is the value ApprovalConfig.RequireDifferentActor
+// and Cancel's creator check compare, so maker-checker and Cancel operate on
+// individual keys rather than on the whole tenant (audit A: four-eyes).
+func actorFromCtx(ctx context.Context, tenant string) string {
+	if p := auth.PrincipalID(ctx); p != "" {
+		return p
+	}
+	return tenant
+}
+
 // New builds the huma API on the given chi router, registers every operation,
 // and returns the API. huma also serves /openapi.json, /openapi.yaml, and
 // /schemas/ from the same router. The interactive playground is registered

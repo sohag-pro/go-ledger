@@ -234,7 +234,7 @@ func (s *ApprovalService) Approve(ctx context.Context, tenantID, id, actor strin
 				return err
 			}
 			current.Status = domain.PendingStatusApproved
-			return appendPendingEvent(ctx, dtx, tenantID, "approval.approved", current, &txID)
+			return appendPendingEvent(ctx, dtx, tenantID, actor, "approval.approved", current, &txID)
 		default:
 			// rejected, cancelled, or expired: a concurrent decision
 			// terminalized this pending while our replay above was
@@ -255,7 +255,7 @@ func (s *ApprovalService) Approve(ctx context.Context, tenantID, id, actor strin
 				return err
 			}
 			current.Status = domain.PendingStatusApproved
-			return appendPendingEvent(ctx, dtx, tenantID, "approval.approved", current, &txID)
+			return appendPendingEvent(ctx, dtx, tenantID, actor, "approval.approved", current, &txID)
 		}
 	})
 	if err != nil {
@@ -309,7 +309,7 @@ func (s *ApprovalService) Reject(ctx context.Context, tenantID, id, actor string
 			}
 			pending.Status = domain.PendingStatusRejected
 			pending.Reason = reason
-			return appendPendingEvent(ctx, tx, tenantID, "approval.rejected", pending, nil)
+			return appendPendingEvent(ctx, tx, tenantID, actor, "approval.rejected", pending, nil)
 		},
 	)
 }
@@ -335,7 +335,7 @@ func (s *ApprovalService) Cancel(ctx context.Context, tenantID, id, actor string
 				return err
 			}
 			pending.Status = domain.PendingStatusCancelled
-			return appendPendingEvent(ctx, tx, tenantID, "approval.cancelled", pending, nil)
+			return appendPendingEvent(ctx, tx, tenantID, actor, "approval.cancelled", pending, nil)
 		},
 	)
 }
@@ -363,7 +363,7 @@ func (s *ApprovalService) SweepExpiredPending(ctx context.Context) (int64, error
 	for i := range expired {
 		p := expired[i]
 		err := s.repo.RunInTx(ctx, p.TenantID, func(ctx context.Context, tx domain.Tx) error {
-			return appendPendingEvent(ctx, tx, p.TenantID, "approval.expired", &p, nil)
+			return appendPendingEvent(ctx, tx, p.TenantID, "system", "approval.expired", &p, nil)
 		})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("ledger: emit approval.expired for pending %s: %w", p.ID, err))
