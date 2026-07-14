@@ -163,15 +163,45 @@ The signing secret (to verify the `X-Ledger-Signature` header on each delivery) 
 curl localhost:8080/v1/reports/trial-balance -H "Authorization: Bearer $KEY"
 ```
 
+## Architecture
+
+One place moves money (the domain services), reached identically over REST and
+gRPC. Balances are never stored: they are summed from an append-only posting
+history, and the zero-sum invariant is enforced both in the domain type and by a
+Postgres `CHECK` trigger on the postings table, so no write path can break it.
+Every post also writes a transactional outbox row in the same transaction; a
+single-leader chainer drains that into a hash-chained, tamper-evident
+`audit_log`, which is also the event stream webhooks are delivered from.
+
+```
+Clients                      Service                      Storage
+--------                     --------                     --------
+REST (huma) -.
+gRPC         :- keys+scopes -> domain services - SERIALIZABLE -> Postgres
+console/CLI -'   +throttle      (internal/ledger)   +retry        . RLS per tenant
+                                post.convert.reverse              . append-only postings
+                                approve.report                    . balances = SUM(amount)
+                                      |                            . CHECK trigger: sum = 0
+                                      | each post also writes an outbox row (same tx)
+                                      v
+        audit_outbox --> chainer --> audit_log --> webhook fan-out --> subscribers
+          (per event)   (1 leader)  (hash chain,   (1 leader, signed,   (HTTPS,
+                                     tamper-evident) at-least-once)       dedup by id)
+
+Observability: OpenTelemetry traces . slog (JSON) . Prometheus metrics
+```
+
 ## Features
 
 - **Tenants with a status lifecycle:** active, suspended, closed, each fully isolated by Postgres row-level security so one tenant can never see another's data even through a bug.
-- **API keys with scopes, expiry, and rotation:** `read`, `post`, `admin`, an optional expiry, and a rotate flow that keeps the old key live for an overlap window.
-- **Multi-currency accounts and FX conversion,** env-configured rates, four-leg atomic conversion through clearing accounts. See [ADR-014](docs/adr/014-multi-currency-and-fx.md).
+- **API keys with scopes, expiry, and rotation:** `read`, `post`, `approve`, `admin`, an optional expiry, and a rotate flow that keeps the old key live for an overlap window.
+- **Multi-currency accounts and FX conversion,** env-configured rates or an optional free live rate feed with a staleness guard, four-leg atomic conversion through per-currency clearing accounts, and USD-hub triangulation for cross pairs. See [ADR-014](docs/adr/014-multi-currency-and-fx.md), [ADR-022](docs/adr/022-usd-hub-fx-triangulation.md), and [ADR-026](docs/adr/026-security-and-correctness-hardening.md).
+- **Approval workflows:** over-threshold transactions are held as pending intent (no postings, balances untouched) until an approver replays them against current balances, with an optional per-key four-eyes control. See [ADR-025](docs/adr/025-approval-workflows-and-lifecycle-events.md).
+- **Account hierarchy and rollup reporting:** nested accounts with balances rolled up over each subtree. See [ADR-023](docs/adr/023-account-hierarchy-and-rollup.md).
 - **Transaction reversal,** posting the exact inverse of an existing transaction, idempotent against re-reversal.
 - **External reference and value date:** an optional reconciliation id (unique per tenant) and an `effective_at` distinct from post time.
 - **Mandatory idempotency keys** on every posting endpoint, with a bounded, server-configured replay window. See [ADR-012](docs/adr/012-api-authentication-and-hardening.md).
-- **Webhooks:** signed, retried, at-least-once delivery of transaction events to a tenant's registered URLs.
+- **Webhooks:** signed (HMAC over a timestamped body, so a receiver can reject replays), retried with backoff, at-least-once delivery of ledger events to a tenant's registered URLs, fanned out off the same tamper-evident event stream, with an SSRF egress guard. See [ADR-027](docs/adr/027-webhooks.md).
 - **Per-tenant policy:** an optional max transaction amount, daily volume cap, and currency allowlist, enforced per currency.
 - **Row-level security (RLS)** at the Postgres layer as the backstop for tenant isolation, not just application-layer checks.
 - **PII crypto-shredding:** an irreversible per-tenant erasure of posting-description encryption keys, reconciling the right to erasure with an append-only ledger. See [ADR-018](docs/adr/018-pii-crypto-shredding.md).
