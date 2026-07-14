@@ -575,8 +575,8 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
   <!-- proof strip -->
   <div class="proof" role="group" aria-label="Build discipline at a glance">
     <div class="proof-in">
-      <div class="proof-item"><div class="proof-num">13<span class="u"> / </span>14</div><div class="proof-lbl">weeks shipped, on a public 14-week roadmap</div></div>
-      <div class="proof-item"><div class="proof-num">25 <span class="u">ADRs</span></div><div class="proof-lbl">one architecture decision record per significant decision</div></div>
+      <div class="proof-item"><div class="proof-num">14<span class="u"> / </span>14</div><div class="proof-lbl">weeks shipped: the full public roadmap, complete</div></div>
+      <div class="proof-item"><div class="proof-num">27 <span class="u">ADRs</span></div><div class="proof-lbl">one architecture decision record per significant decision</div></div>
       <div class="proof-item"><div class="proof-num">race <span class="u">+</span> lint</div><div class="proof-lbl">tests run with the race detector, lint green in CI</div></div>
       <div class="proof-item"><div class="proof-num">live <span class="u">on push</span></div><div class="proof-lbl">every push to main deploys to production via CI/CD</div></div>
     </div>
@@ -637,7 +637,7 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
   <div class="wrap">
     <header class="sec-head rv">
       <p class="sec-no">02 &middot; the plan</p>
-      <h2 id="roadmap-h">Fourteen weeks, in public, on schedule.</h2>
+      <h2 id="roadmap-h">Fourteen weeks, in public, all shipped.</h2>
       <p class="sec-sub">The roadmap was published before week one. Every week ships code, a blog post, and the decision records behind it.</p>
     </header>
     <div class="road-cols rv">
@@ -657,12 +657,12 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
         <div class="week shipped"><span class="wk-no">wk 11</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Multi-currency + FX</span> <span class="wk-d">per-currency invariant, live admin rates, USD-hub conversion</span></span></div>
         <div class="week shipped"><span class="wk-no">wk 12</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Nested accounts + reporting</span> <span class="wk-d">rolled-up balances, trial balance</span></span></div>
         <div class="week shipped"><span class="wk-no">wk 13</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Approvals + event stream</span> <span class="wk-d">threshold gate, lifecycle events on the audit chain</span></span></div>
-        <div class="week current"><span class="wk-no">wk 14</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Webhooks + launch<span class="wk-tag">current</span></span> <span class="wk-d">signed delivery, retrospective</span></span></div>
+        <div class="week shipped"><span class="wk-no">wk 14</span><span class="wk-dot" aria-hidden="true"></span><span><span class="wk-t">Webhooks + launch</span> <span class="wk-d">signed delivery, SSRF-guarded, and the retrospective</span></span></div>
       </div>
     </div>
     <div class="road-note rv" role="group" aria-label="Discipline proof points">
-      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> 13 of 14 weeks shipped</span>
-      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> one ADR per significant decision (23 so far)</span>
+      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> all 14 weeks shipped</span>
+      <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> one ADR per significant decision (27 in all)</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> go test -race + lint green in CI</span>
       <span class="chip-proof"><span class="ok" aria-hidden="true">&#10003;</span> live deploy on every push to main</span>
     </div>
@@ -706,17 +706,17 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       <div class="series-rail">
         <div class="sstat">
           <!-- EDIT HERE: weeks shipped (number + matching .on/.live sticks below) -->
-          <div class="sstat-num">13<span class="u"> / </span>14</div>
+          <div class="sstat-num">14<span class="u"> / </span>14</div>
           <div class="sticks" aria-hidden="true">
-            <span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick live"></span>
+            <span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span><span class="stick on"></span>
           </div>
           <div class="sstat-lbl">weeks shipped</div>
         </div>
         <div class="sstat">
           <!-- EDIT HERE: ADR count (number + one .adr stick per ADR) -->
-          <div class="sstat-num">25</div>
+          <div class="sstat-num">27</div>
           <div class="sticks" aria-hidden="true">
-            <span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span>
+            <span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span><span class="stick adr"></span>
           </div>
           <div class="sstat-lbl">architecture decisions recorded</div>
         </div>
