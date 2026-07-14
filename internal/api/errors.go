@@ -203,6 +203,8 @@ func toHumaErr(err error) error {
 		return huma.Error422UnprocessableEntity("fx spread is out of range")
 	case errors.Is(err, domain.ErrFXRateNotFound):
 		return huma.Error422UnprocessableEntity("no fx rate is configured for this currency pair")
+	case errors.Is(err, domain.ErrFXRateStale):
+		return huma.Error422UnprocessableEntity("the fx rate for this currency pair is stale; a fresh rate is required before converting")
 	case errors.Is(err, domain.ErrNonPositiveConvertAmount):
 		return huma.Error422UnprocessableEntity("source_amount must be positive")
 	case errors.Is(err, domain.ErrSelfConversion):

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -140,6 +141,13 @@ type config struct {
 	authNegativeWindow       time.Duration
 	defaultCurrency          string
 	fxRates                  string
+	fxMaxRateAge             time.Duration
+	fxFeedEnabled            bool
+	fxFeedURL                string
+	fxFeedBase               string
+	fxFeedCurrencies         string
+	fxFeedInterval           time.Duration
+	fxFeedSpreadBps          int
 	masterKey                string
 	chainerEnabled           bool
 	chainerInterval          time.Duration
@@ -221,6 +229,18 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		authNegativeWindow:      getenvDuration("AUTH_NEGATIVE_WINDOW", auth.DefaultNegativeThrottleWindow),
 		defaultCurrency:         getenv("DEFAULT_CURRENCY", "USD"),
 		fxRates:                 os.Getenv("FX_RATES"),
+		// FX rate staleness + live feed (audit A: no FX rate staleness guard).
+		// fxMaxRateAge 0 (the default) disables the staleness check; when set,
+		// a conversion whose rate is older than this is refused. The feed keeps
+		// rates fresh from a free provider (Frankfurter) so the guard does not
+		// starve conversions; it is off by default (opt-in network calls).
+		fxMaxRateAge:     getenvDuration("FX_MAX_RATE_AGE", 0),
+		fxFeedEnabled:    getenvBool("FX_FEED_ENABLED", false),
+		fxFeedURL:        getenv("FX_FEED_URL", fx.DefaultFeedURL),
+		fxFeedBase:       getenv("FX_FEED_BASE", "USD"),
+		fxFeedCurrencies: os.Getenv("FX_FEED_CURRENCIES"),
+		fxFeedInterval:   getenvDuration("FX_FEED_INTERVAL", fx.DefaultFeedInterval),
+		fxFeedSpreadBps:  getenvInt("FX_FEED_SPREAD_BPS", -1),
 		// LEDGER_MASTER_KEY (Task 6.2, audit A9.3): a 32-byte, base64-encoded
 		// master key for envelope-encrypting posting descriptions at rest
 		// (internal/crypto.Cipher). Left empty by default (getenv's fallback
@@ -556,6 +576,35 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("seed fx rates: %w", err)
 	}
 
+	// The live FX rate feed (audit A: no FX rate staleness guard). Off by
+	// default; when enabled it polls a free provider (Frankfurter) and appends
+	// fresh global rows so FX_MAX_RATE_AGE conversions keep working without a
+	// paid feed. Runs on every instance: writes are dedup'd against the current
+	// stored mid, so a duplicate poll from a second instance is a no-op insert.
+	if cfg.fxFeedEnabled {
+		var feedSpread *int32
+		if cfg.fxFeedSpreadBps >= 0 {
+			s := int32(cfg.fxFeedSpreadBps)
+			feedSpread = &s
+		}
+		var feedCcys []domain.Currency
+		for _, c := range strings.Split(cfg.fxFeedCurrencies, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				feedCcys = append(feedCcys, domain.Currency(c))
+			}
+		}
+		feed := fx.NewFeed(pool, logger, fx.FeedConfig{
+			URL:        cfg.fxFeedURL,
+			Base:       domain.Currency(cfg.fxFeedBase),
+			Currencies: feedCcys,
+			Interval:   cfg.fxFeedInterval,
+			SpreadBps:  feedSpread,
+		})
+		feedCtx, cancelFeed := context.WithCancel(context.Background())
+		defer cancelFeed()
+		go feed.Run(feedCtx)
+	}
+
 	// PII crypto-shredding (Task 6.2, audit A9.3): a nil cipher (the default
 	// when LEDGER_MASTER_KEY is unset) leaves encryption disabled everywhere
 	// it is wired below, so posting descriptions are stored and returned as
@@ -606,7 +655,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	transactions := ledger.NewTransactionService(repo, logger, otel.Tracer(ledgerTracerName),
-		ledger.WithFXProvider(fx.NewDBProvider(pool)),
+		ledger.WithFXProvider(fx.NewDBProvider(pool, fx.WithMaxRateAge(cfg.fxMaxRateAge))),
 		ledger.WithIdempotencyTTL(cfg.idempotencyTTL),
 		// PrePostHook (Task 6.1, audit A9.1) is scaffolding for an external
 		// compliance/screening integration: wired explicitly to

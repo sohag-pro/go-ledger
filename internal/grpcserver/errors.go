@@ -135,6 +135,8 @@ func toStatus(err error) error {
 		return status.Error(codes.InvalidArgument, "fx spread is out of range")
 	case errors.Is(err, domain.ErrFXRateNotFound):
 		return status.Error(codes.InvalidArgument, "no fx rate is configured for this currency pair")
+	case errors.Is(err, domain.ErrFXRateStale):
+		return status.Error(codes.FailedPrecondition, "the fx rate for this currency pair is stale; a fresh rate is required before converting")
 	case errors.Is(err, domain.ErrNonPositiveConvertAmount):
 		return status.Error(codes.InvalidArgument, "source_amount must be positive")
 	case errors.Is(err, domain.ErrSelfConversion):
