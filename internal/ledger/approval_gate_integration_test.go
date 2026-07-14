@@ -297,3 +297,50 @@ func TestApprovalGate_NoIdempotencyKeyStillHoldsFreshPendingEachTime(t *testing.
 		t.Fatalf("ListPendingTransactions() = %d rows, want 2 (a fresh pending per no-key hold)", len(pendings))
 	}
 }
+
+// TestApprovalGate_DisablingGateDoesNotDoublePostHeldKey is the audit-remediation
+// regression for the config-change double-post window: a request held as a
+// pending under an idempotency key while the gate was ON must not post a SECOND
+// transaction when the client retries the same key after the gate is turned OFF.
+// dedupPendingForKey catches the still-pending hold and returns it as held
+// instead of posting fresh.
+func TestApprovalGate_DisablingGateDoesNotDoublePostHeldKey(t *testing.T) {
+	t.Parallel()
+	pool := newTestPool(t)
+	repo := postgres.NewRepository(pool)
+	ctx := context.Background()
+	tenant := uuid.NewString()
+	debit, credit := newApprovalGateAccounts(t, repo, tenant)
+	const key = "gate-toggle-1"
+
+	// Gate ON: an over-threshold post is held as a pending under the key.
+	gated := ledger.NewTransactionService(repo, discardLogger(), nil,
+		ledger.WithApproval(ledger.ApprovalConfig{Enabled: true, Thresholds: map[string]int64{"USD": 100000}}),
+	)
+	_, err := gated.Post(ctx, tenant, gatedTxn(debit.ID, credit.ID, 150000), &domain.Idempotency{Key: key})
+	firstPending, ok := ledger.AsHeldForApproval(err)
+	if !ok {
+		t.Fatalf("first over-threshold post: AsHeldForApproval(%v) ok = false, want held", err)
+	}
+
+	// Gate OFF (config changed), same key retried: must NOT post a second
+	// transaction; the still-pending hold is returned instead.
+	ungated := ledger.NewTransactionService(repo, discardLogger(), nil)
+	_, err = ungated.Post(ctx, tenant, gatedTxn(debit.ID, credit.ID, 150000), &domain.Idempotency{Key: key})
+	retryPending, ok := ledger.AsHeldForApproval(err)
+	if !ok {
+		t.Fatalf("retry after disabling the gate: AsHeldForApproval(%v) ok = false, want the existing pending", err)
+	}
+	if retryPending.ID != firstPending.ID {
+		t.Errorf("retry pending.ID = %q, want the original %q", retryPending.ID, firstPending.ID)
+	}
+
+	// No transaction was ever posted for this held request.
+	items, err := repo.ListTransactions(ctx, tenant, domain.TransactionFilter{}, nil, 10)
+	if err != nil {
+		t.Fatalf("ListTransactions: %v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("ListTransactions() = %d rows, want 0 (the held request must not double-post when the gate is disabled)", len(items))
+	}
+}

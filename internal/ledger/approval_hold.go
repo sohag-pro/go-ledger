@@ -129,6 +129,40 @@ func (s *TransactionService) holdForApproval(
 	return &HeldForApprovalError{Pending: p}
 }
 
+// dedupPendingForKey guards a keyed Post/Convert against re-posting a request
+// that was already held as a pending under the same idempotency key, when the
+// approval gate no longer fires on the retry (audit A: idempotency double-post
+// on config change). It returns:
+//
+//   - a *HeldForApprovalError carrying the existing pending, when one exists and
+//     is still pending or already approved (so the caller returns 202 with that
+//     pending instead of posting a second transaction). An approved pending's
+//     body carries its status and linked transaction id, so the client can see
+//     the request was already decided.
+//   - nil, when no pending exists for the key, or the only one is terminal-
+//     negative (rejected/cancelled/expired): those never moved money, so a
+//     fresh post is not a double-post and the caller proceeds normally.
+//   - a non-nil error only on a real lookup failure.
+//
+// It runs an extra indexed lookup on every keyed Post/Convert. That cost buys
+// correctness across an approval-config change, the one window where the
+// posted-transaction idempotency key alone cannot see the held pending.
+func (s *TransactionService) dedupPendingForKey(ctx context.Context, tenantID, key string) error {
+	existing, err := s.repo.GetPendingByIdempotencyKey(ctx, tenantID, key)
+	if errors.Is(err, domain.ErrPendingTransactionNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	switch existing.Status {
+	case domain.PendingStatusPending, domain.PendingStatusApproved:
+		return &HeldForApprovalError{Pending: existing}
+	default:
+		return nil
+	}
+}
+
 // payloadPosting is one leg of a held post or reversal request, capturing
 // exactly what CreateTransaction needs to rebuild the same postings on
 // approval (Task 6, ADR-025): the account, the signed amount and its

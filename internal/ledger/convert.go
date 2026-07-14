@@ -103,7 +103,14 @@ func (s *TransactionService) Convert(ctx context.Context, tenantID string, req C
 		case err == nil:
 			return s.convertReplay(ctx, tenantID, idem.Key, req, rec)
 		case errors.Is(err, domain.ErrIdempotencyKeyNotFound):
-			// No existing key: proceed with a real conversion.
+			// A gated convert may have held a pending under this key; dedup
+			// against it so a retry after the approval gate was reconfigured off
+			// does not post a second conversion (audit A: idempotency
+			// double-post on config change; see dedupPendingForKey).
+			if perr := s.dedupPendingForKey(ctx, tenantID, idem.Key); perr != nil {
+				return nil, false, perr
+			}
+			// No existing key or pending: proceed with a real conversion.
 		default:
 			span.RecordError(err)
 			return nil, false, err
