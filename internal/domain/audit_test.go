@@ -207,3 +207,54 @@ func TestComputeAuditRowHash_V2UsesSubject(t *testing.T) {
 		t.Fatal("precondition: v2 rejection has no transaction id")
 	}
 }
+
+// TestAnchorSignature checks the audit-anchor HMAC (audit remediation): a valid
+// signature verifies, and changing any bound field (tenant, chain_seq,
+// row_hash), the key, or the signature bytes makes it fail.
+func TestAnchorSignature(t *testing.T) {
+	key := []byte("anchor-signing-secret")
+	tenant := "11111111-1111-1111-1111-111111111111"
+	sig := ComputeAnchorSignature(key, tenant, 42, "deadbeef")
+
+	if !VerifyAnchorSignature(key, tenant, 42, "deadbeef", sig) {
+		t.Fatal("valid signature did not verify")
+	}
+
+	cases := []struct {
+		name string
+		ok   bool
+		run  func() bool
+	}{
+		{"wrong tenant", false, func() bool {
+			return VerifyAnchorSignature(key, "22222222-2222-2222-2222-222222222222", 42, "deadbeef", sig)
+		}},
+		{"wrong chain_seq", false, func() bool { return VerifyAnchorSignature(key, tenant, 43, "deadbeef", sig) }},
+		{"wrong row_hash", false, func() bool { return VerifyAnchorSignature(key, tenant, 42, "cafe", sig) }},
+		{"wrong key", false, func() bool {
+			return VerifyAnchorSignature([]byte("other-key"), tenant, 42, "deadbeef", sig)
+		}},
+		{"tampered signature", false, func() bool {
+			bad := append([]byte(nil), sig...)
+			bad[0] ^= 0xFF
+			return VerifyAnchorSignature(key, tenant, 42, "deadbeef", bad)
+		}},
+		{"empty signature", false, func() bool { return VerifyAnchorSignature(key, tenant, 42, "deadbeef", nil) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.run(); got != tc.ok {
+				t.Errorf("VerifyAnchorSignature = %v, want %v", got, tc.ok)
+			}
+		})
+	}
+
+	// No field-boundary collision: (seq=1, hash="23") must differ from
+	// (seq=12, hash="3") even though a naive concat would collide.
+	if ComputeAnchorSignatureHex(key, tenant, 1, "23") == ComputeAnchorSignatureHex(key, tenant, 12, "3") {
+		t.Error("anchor signature collides across a field boundary")
+	}
+}
+
+func ComputeAnchorSignatureHex(key []byte, tenant string, seq int64, hash string) string {
+	return string(ComputeAnchorSignature(key, tenant, seq, hash))
+}

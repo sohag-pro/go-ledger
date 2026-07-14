@@ -17,9 +17,10 @@ const DefaultVerifyPageSize = 1000
 // repository: the audit rows are written transactionally by TransactionService,
 // so this service only queries them.
 type AuditService struct {
-	repo     domain.Repository
-	pageSize int
-	cipher   DescriptionCipher
+	repo          domain.Repository
+	pageSize      int
+	cipher        DescriptionCipher
+	anchorsignKey []byte
 }
 
 // AuditServiceOption configures an optional AuditService dependency, mirroring
@@ -38,6 +39,16 @@ type AuditServiceOption func(*AuditService)
 // unchanged, exactly as before Task 6.2.
 func WithAuditCipher(c DescriptionCipher) AuditServiceOption {
 	return func(s *AuditService) { s.cipher = c }
+}
+
+// WithAnchorSigningKey makes VerifyFromLatestAnchor require a valid signature
+// on the anchor it trusts (domain.ComputeAnchorSignature), so a DB-privileged
+// rewrite of audit_anchors is caught instead of trusted (audit remediation).
+// The same key the AnchorJob signs with. Without this option (a nil key) the
+// verifier trusts the in-DB anchor as before, so a deployment that does not set
+// AUDIT_ANCHOR_SIGNING_KEY (including the demo) is unchanged.
+func WithAnchorSigningKey(key []byte) AuditServiceOption {
+	return func(s *AuditService) { s.anchorsignKey = key }
 }
 
 // NewAuditService returns an AuditService backed by repo, paging Verify and
@@ -206,6 +217,30 @@ func (s *AuditService) VerifyFromLatestAnchor(ctx context.Context, tenantID stri
 	}
 	if !ok {
 		return s.Verify(ctx, tenantID)
+	}
+	// When anchor signing is configured (audit remediation), the in-DB anchor
+	// is trustworthy as a checkpoint only if it carries a valid app-held
+	// signature: a DB-privileged attacker can rewrite audit_anchors but cannot
+	// forge the HMAC (the key is not in the database).
+	if len(s.anchorsignKey) > 0 {
+		if len(anchor.Signature) == 0 {
+			// Signing is on but this anchor predates it (unsigned). It cannot be
+			// trusted as a checkpoint, so verify from genesis rather than seed
+			// from an unauthenticated anchor. (A consistent full-chain rewrite
+			// is still only caught by the off-box anchor copy; see the doc
+			// comment above.)
+			return s.Verify(ctx, tenantID)
+		}
+		if !domain.VerifyAnchorSignature(s.anchorsignKey, tenantID, anchor.ChainSeq, anchor.RowHash, anchor.Signature) {
+			// Present but invalid: the anchor's identity no longer matches its
+			// signature, so it was tampered. Report the chain as not verifiable
+			// instead of trusting a forged checkpoint.
+			pending, perr := s.repo.CountPendingOutbox(ctx, tenantID)
+			if perr != nil {
+				return VerifyResult{}, perr
+			}
+			return VerifyResult{Valid: false, Pending: pending}, nil
+		}
 	}
 	return s.verifyFrom(ctx, tenantID, anchor.RowHash, anchor.ChainSeq)
 }

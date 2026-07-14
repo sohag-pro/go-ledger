@@ -250,6 +250,8 @@ type Querier interface {
 	// runs with the RLS GUC unset (a cross-tenant worker, Task 5.4b), so this
 	// insert is not scoped through withTenant the way a request-path write
 	// would be.
+	// signature is the app-held HMAC over (tenant_id, chain_seq, row_hash), or
+	// NULL when AUDIT_ANCHOR_SIGNING_KEY is unset (signing disabled).
 	InsertAuditAnchor(ctx context.Context, arg InsertAuditAnchorParams) error
 	// outbox_id is the source audit_outbox row this audit_log row was chained
 	// from (ADR-017 MINOR 3, migration 0016): a UNIQUE constraint on it means a

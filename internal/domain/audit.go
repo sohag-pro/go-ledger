@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -84,6 +85,34 @@ type AuditAnchor struct {
 	ChainSeq  int64
 	RowHash   string
 	CreatedAt time.Time
+	// Signature is the app-held HMAC over (tenant_id, chain_seq, row_hash),
+	// or nil when signing is disabled. See ComputeAnchorSignature.
+	Signature []byte
+}
+
+// ComputeAnchorSignature returns the HMAC-SHA256 of an anchor's identity
+// (tenantID, chainSeq, rowHash), keyed by key. Fields are length-prefixed with
+// the same writeField helper ComputeAuditRowHash uses, so no field-boundary
+// ambiguity lets one anchor's preimage collide with another's.
+//
+// This is what makes an audit anchor tamper-evident against a DB-privileged
+// attacker (audit remediation): audit_anchors lives in the database, so a
+// rewrite of audit_log plus a matching rewrite of audit_anchors would otherwise
+// pass VerifyFromLatestAnchor. The key is held by the application
+// (AUDIT_ANCHOR_SIGNING_KEY), NOT by the database role, so an attacker with
+// only DB access cannot forge a valid signature for the rewritten head.
+func ComputeAnchorSignature(key []byte, tenantID string, chainSeq int64, rowHash string) []byte {
+	mac := hmac.New(sha256.New, key)
+	writeField(mac, []byte(tenantID))
+	writeField(mac, []byte(strconv.FormatInt(chainSeq, 10)))
+	writeField(mac, []byte(rowHash))
+	return mac.Sum(nil)
+}
+
+// VerifyAnchorSignature reports whether sig is a valid ComputeAnchorSignature
+// for the given anchor identity under key, using a constant-time compare.
+func VerifyAnchorSignature(key []byte, tenantID string, chainSeq int64, rowHash string, sig []byte) bool {
+	return hmac.Equal(sig, ComputeAnchorSignature(key, tenantID, chainSeq, rowHash))
 }
 
 // AuditEvent is the payload a post or convert writes to the audit outbox

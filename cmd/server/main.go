@@ -154,6 +154,7 @@ type config struct {
 	chainerBatch             int
 	anchorEnabled            bool
 	anchorInterval           time.Duration
+	anchorSigningKey         string
 	idempotencyTTL           time.Duration
 	idempotencySweepInterval time.Duration
 	webhooksEnabled          bool
@@ -276,6 +277,12 @@ func loadConfigWithTTY(interactive bool) (config, error) {
 		// recency, so a coarse cadence is the right default.
 		anchorEnabled:  getenvBool("AUDIT_ANCHOR_ENABLED", true),
 		anchorInterval: getenvDuration("AUDIT_ANCHOR_INTERVAL", audit.DefaultAnchorInterval),
+		// A secret the DB role does not hold, used to sign audit anchors so a
+		// DB-privileged rewrite of audit_anchors is caught by
+		// VerifyFromLatestAnchor. Empty (the default, and the demo) leaves
+		// anchors unsigned, unchanged. Any non-empty secret works; longer is
+		// stronger.
+		anchorSigningKey: os.Getenv("AUDIT_ANCHOR_SIGNING_KEY"),
 		// IDEMPOTENCY_TTL bounds how long a stored idempotency key blocks
 		// reuse before it is treated as absent (Task 4.5, audit A1.4): the
 		// default matches ledger.DefaultIdempotencyTTL and migration 0019's
@@ -680,7 +687,7 @@ func run(logger *slog.Logger) error {
 			ledger.WithDefaultCurrency(domain.Currency(cfg.defaultCurrency)),
 			ledger.WithAccountCipher(cipher)),
 		Transactions: transactions,
-		Audit:        ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher)),
+		Audit:        ledger.NewAuditService(repo, ledger.WithAuditCipher(cipher), ledger.WithAnchorSigningKey([]byte(cfg.anchorSigningKey))),
 		Admin:        adminSvc,
 		Reports:      ledger.NewReportService(repo),
 		// Disputes resolves action=reverse through the SAME
@@ -737,7 +744,7 @@ func run(logger *slog.Logger) error {
 	if cfg.anchorEnabled {
 		anchorCtx, cancelAnchor := context.WithCancel(context.Background())
 		defer cancelAnchor()
-		anchorJob := audit.NewAnchorJob(pool, logger, cfg.anchorInterval)
+		anchorJob := audit.NewAnchorJob(pool, logger, cfg.anchorInterval, audit.WithAnchorSigningKey([]byte(cfg.anchorSigningKey)))
 		go anchorJob.Run(anchorCtx)
 	}
 

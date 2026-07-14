@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/sohag-pro/go-ledger/internal/domain"
 	"github.com/sohag-pro/go-ledger/internal/postgres/sqlc"
 )
 
@@ -62,22 +63,38 @@ const anchorLockKey int64 = 4_921_019
 // still worth having anyway, purely to keep the off-box log stream free of
 // that routine duplication.
 type AnchorJob struct {
-	pool     *pgxpool.Pool
-	log      *slog.Logger
-	interval time.Duration
+	pool       *pgxpool.Pool
+	log        *slog.Logger
+	interval   time.Duration
+	signingKey []byte
+}
+
+// AnchorOption configures an AnchorJob.
+type AnchorOption func(*AnchorJob)
+
+// WithAnchorSigningKey makes the job sign every anchor it writes with key
+// (domain.ComputeAnchorSignature), so audit_anchors is tamper-evident against a
+// DB-privileged rewrite. A nil/empty key (the default) writes unsigned anchors,
+// the prior behavior.
+func WithAnchorSigningKey(key []byte) AnchorOption {
+	return func(j *AnchorJob) { j.signingKey = key }
 }
 
 // NewAnchorJob returns an AnchorJob that reads and writes through pool.
 // interval falls back to DefaultAnchorInterval when zero or negative; log
 // falls back to slog.Default() when nil.
-func NewAnchorJob(pool *pgxpool.Pool, log *slog.Logger, interval time.Duration) *AnchorJob {
+func NewAnchorJob(pool *pgxpool.Pool, log *slog.Logger, interval time.Duration, opts ...AnchorOption) *AnchorJob {
 	if log == nil {
 		log = slog.Default()
 	}
 	if interval <= 0 {
 		interval = DefaultAnchorInterval
 	}
-	return &AnchorJob{pool: pool, log: log, interval: interval}
+	j := &AnchorJob{pool: pool, log: log, interval: interval}
+	for _, opt := range opts {
+		opt(j)
+	}
+	return j
 }
 
 // Run is the job's long-running loop: until ctx is done, it repeatedly tries
@@ -189,10 +206,15 @@ func (j *AnchorJob) anchorOnce(ctx context.Context, db sqlc.DBTX) (int, error) {
 	for _, head := range heads {
 		tenantID := head.TenantID.String()
 		rowHash := head.RowHash.String
+		var signature []byte
+		if len(j.signingKey) > 0 {
+			signature = domain.ComputeAnchorSignature(j.signingKey, tenantID, head.ChainSeq, rowHash)
+		}
 		if err := q.InsertAuditAnchor(ctx, sqlc.InsertAuditAnchorParams{
-			TenantID: head.TenantID,
-			ChainSeq: head.ChainSeq,
-			RowHash:  rowHash,
+			TenantID:  head.TenantID,
+			ChainSeq:  head.ChainSeq,
+			RowHash:   rowHash,
+			Signature: signature,
 		}); err != nil {
 			j.log.ErrorContext(ctx, "audit anchor job: insert anchor failed for tenant", "tenant_id", tenantID, "error", err)
 			if firstErr == nil {

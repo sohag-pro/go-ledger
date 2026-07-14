@@ -1399,7 +1399,7 @@ func (r *Repository) LatestAuditAnchor(ctx context.Context, tenantID string) (do
 	if err != nil {
 		return domain.AuditAnchor{}, false, fmt.Errorf("postgres: get latest audit anchor: %w", err)
 	}
-	return domain.AuditAnchor{ChainSeq: row.ChainSeq, RowHash: row.RowHash, CreatedAt: row.CreatedAt}, true, nil
+	return domain.AuditAnchor{ChainSeq: row.ChainSeq, RowHash: row.RowHash, CreatedAt: row.CreatedAt, Signature: row.Signature}, true, nil
 }
 
 // CountPendingOutbox returns the number of tenantID's audit_outbox rows the
