@@ -174,21 +174,24 @@ single-leader chainer drains that into a hash-chained, tamper-evident
 `audit_log`, which is also the event stream webhooks are delivered from.
 
 ```
-Clients                      Service                      Storage
---------                     --------                     --------
-REST (huma) -.
-gRPC         :- keys+scopes -> domain services - SERIALIZABLE -> Postgres
-console/CLI -'   +throttle      (internal/ledger)   +retry        . RLS per tenant
-                                post.convert.reverse              . append-only postings
-                                approve.report                    . balances = SUM(amount)
-                                      |                            . CHECK trigger: sum = 0
-                                      | each post also writes an outbox row (same tx)
-                                      v
-        audit_outbox --> chainer --> audit_log --> webhook fan-out --> subscribers
-          (per event)   (1 leader)  (hash chain,   (1 leader, signed,   (HTTPS,
-                                     tamper-evident) at-least-once)       dedup by id)
+  CLIENTS                   SERVICE                          STORAGE
 
-Observability: OpenTelemetry traces . slog (JSON) . Prometheus metrics
+  REST (huma)  ┐                                             Postgres
+  gRPC         ├──▶  keys, scopes,  ──▶  domain services ──▶  • RLS per tenant
+  console/CLI  ┘     throttle            (internal/ledger)    • append-only postings
+                                         post · convert ·     • balances = SUM(amount)
+                                         reverse · approve    • CHECK trigger: sum = 0
+                                         · report
+                                         (SERIALIZABLE + retry)
+                                              │
+                                              │ each post also writes
+                                              │ an outbox row (same tx)
+                                              ▼
+  audit_outbox  ──▶  chainer  ──▶  audit_log      ──▶  webhook fan-out  ──▶  subscribers
+  (per event)      (1 leader)    (hash chain,          (1 leader, signed,     (HTTPS,
+                                  tamper-evident)        at-least-once)         dedup by id)
+
+  Observability:  OpenTelemetry traces · slog (JSON) · Prometheus metrics
 ```
 
 ## Features
