@@ -81,6 +81,38 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update && sudo apt-get install -y k6
 
+      - name: Warm up before the gated run (readiness, not just liveness)
+        # /healthz is liveness-only (it never touches the pool), so it passes
+        # while the app is still cold: the pgx pool opens connections lazily and
+        # the first queries pay the connection-setup cost. Without this, the
+        # gated k6 run measured that cold-start burst, tripping the strict
+        # http_req_failed rate==0 gate and inflating p99 (a ~989ms tail against a
+        # 500ms ceiling) even though the steady-state median was ~2ms. Poll a
+        # DB-backed authed read until it is consistently ready (proves the pool
+        # and the per-tenant load key are provisioned), then fire a concurrent
+        # burst to force every pool connection open, so k6 starts warm.
+        run: |
+          key="${API_KEY:-glk_loadtest_fixed_local_key}-t0"
+          hdr="Authorization: Bearer $key"
+          streak=0
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "$hdr" http://localhost:8080/v1/accounts)
+            if [ "$code" = "200" ]; then streak=$((streak+1)); else streak=0; fi
+            if [ "$streak" -ge 5 ]; then echo "app ready for load after $i polls"; break; fi
+            sleep 0.5
+          done
+          if [ "$streak" -lt 5 ]; then
+            echo "app never became ready for load"
+            docker compose --profile load-test logs app
+            exit 1
+          fi
+          # Concurrent burst: force the pool to open all its connections warm.
+          for i in $(seq 1 40); do
+            curl -s -o /dev/null -H "$hdr" http://localhost:8080/v1/accounts &
+          done
+          wait
+          echo "warm-up complete"
+
       - name: Smoke load (gate on errors and a loose p99 ceiling only)
         run: SMOKE=1 k6 run test/load/post_transactions.js
 
