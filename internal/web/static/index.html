@@ -367,6 +367,21 @@ h2{font:650 clamp(26px,3.4vw,38px)/1.15 var(--sans);letter-spacing:-.025em;margi
   font:500 13px/1.5 var(--mono);color:#8A5A14;
 }
 .book-note span{color:#C07E1D;margin-right:6px}
+.print-callout{
+  margin-top:22px;padding:14px 18px;border-radius:8px;
+  border:1px dashed rgba(0,173,216,.5);background:rgba(0,173,216,.06);
+  display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+}
+.print-callout .flag{font-size:20px;line-height:1}
+.print-callout .body{flex:1;min-width:220px;font:500 13px/1.5 var(--sans);color:var(--text)}
+.print-callout .body strong{color:#E8EDF2;font-weight:700}
+.print-callout .body em{color:var(--muted);font-style:normal;font-size:12px;display:block;margin-top:4px}
+.print-callout .cta{
+  font:600 13px/1 var(--mono);padding:10px 16px;border-radius:7px;
+  background:var(--cyan);color:#04202A;border:1px solid transparent;
+  white-space:nowrap;
+}
+.print-callout .cta:hover{background:#33bee0;text-decoration:none;transform:translateY(-1px)}
 .book-ribbon{
   position:absolute;top:22px;right:-38px;width:150px;
   transform:rotate(45deg);
@@ -469,9 +484,9 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       </svg>
     </span>
     <span class="bb-body">
-      <span class="bb-kick"><span class="bb-dot" aria-hidden="true"></span>new &middot; book-only</span>
+      <span class="bb-kick"><span class="bb-dot" aria-hidden="true"></span>v1.0 out today &middot; 699 pages</span>
       <div class="bb-title">Read <span class="g">The Ledger Book</span></div>
-      <p class="bb-sub">The whole 14-week build in one volume, <strong>plus the senior-engineer interview Q&amp;A that lives only here.</strong></p>
+      <p class="bb-sub">The full 14-week build in one volume, <strong>plus the senior-engineer interview Q&amp;A that lives only here.</strong> Foreword by Hasin Hayder.</p>
     </span>
     <span class="bb-cta">Get the book <span class="a" aria-hidden="true">&rarr;</span></span>
   </span>
@@ -736,13 +751,22 @@ footer{border-top:1px solid var(--hair);background:var(--bg-deep);padding:44px 0
       </div>
       <div>
         <p class="sec-no">05 &middot; the book</p>
-        <h2 id="book-h">The whole build, plus an interview you won't find anywhere else. <span class="first-tag" style="vertical-align:6px">book-only</span></h2>
-        <p>Every blog post and architecture decision, edited into one volume. Then the part that lives only here: for each week, the senior-engineer interview questions this project would put you through, with what a strong answer covers. A new chapter every week, in PDF and EPUB. My first book.</p>
+        <h2 id="book-h">The whole build, plus an interview you won't find anywhere else. <span class="first-tag" style="vertical-align:6px">v1.0 out today</span></h2>
+        <p>Every blog post, every architecture decision, and 50 bonus interview questions, edited into one 699-page volume. The part that lives only here: for each week, the senior-engineer interview questions this project would put you through, with what a strong answer covers. Foreword by Hasin Hayder. Free to read, PDF and EPUB.</p>
         <div class="dl-row">
           <a class="dl" href="/the-ledger-book.pdf" target="_blank" rel="noopener">&darr; PDF</a>
           <a class="dl" href="https://github.com/sohag-pro/go-ledger/raw/main/the-ledger-book.epub">&darr; EPUB</a>
         </div>
-        <p class="book-note"><span aria-hidden="true">&#10022;</span> Every week adds a chapter of interview Q&amp;A, only in the book.</p>
+        <p class="book-note"><span aria-hidden="true">&#10022;</span> The full 14-week series is complete, and so is the book: 21 Parts, 27 ADRs, 50-question bonus round.</p>
+        <p class="book-note"><span aria-hidden="true">&#10022;</span> If any of this was useful, a <a href="https://github.com/sohag-pro/go-ledger" style="color:#00ADD8">GitHub star</a> is the kindest way to say so. Two seconds, and it is what keeps this in front of the next engineer who needs it.</p>
+        <div class="print-callout">
+          <span class="flag" aria-hidden="true">&#127463;&#127465;</span>
+          <div class="body">
+            <strong>Print edition, Bangladesh only.</strong> If you would read this in print, sign the interest form. A print run only happens once enough people ask.
+            <em>Not a pre-order. No charge. No commitment.</em>
+          </div>
+          <a class="cta" href="https://forms.gle/T6jdJVVmbCpdcvhh8" target="_blank" rel="noopener">Sign interest &rarr;</a>
+        </div>
       </div>
     </div>
   </div>
