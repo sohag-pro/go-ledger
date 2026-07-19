@@ -1,7 +1,9 @@
 # go-ledger
 
-[![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sohag-pro/go-ledger/badges/coverage.json)](https://github.com/sohag-pro/go-ledger/actions)
-[![Go Report Card](https://goreportcard.com/badge/github.com/sohag-pro/go-ledger)](https://goreportcard.com/report/github.com/sohag-pro/go-ledger)
+[![CI/CD](https://github.com/sohag-pro/go-ledger/actions/workflows/deploy.yml/badge.svg?branch=main)](https://github.com/sohag-pro/go-ledger/actions/workflows/deploy.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsohag-pro%2Fgo-ledger%2Fbadges%2Fcoverage.json)](https://github.com/sohag-pro/go-ledger/actions/workflows/deploy.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sohag-pro/go-ledger.svg)](https://pkg.go.dev/github.com/sohag-pro/go-ledger)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **A production-grade, multi-tenant, white-label double-entry payment ledger, built in public.**
 
