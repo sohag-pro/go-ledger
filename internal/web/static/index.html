@@ -368,20 +368,58 @@ h2{font:650 clamp(26px,3.4vw,38px)/1.15 var(--sans);letter-spacing:-.025em;margi
 }
 .book-note span{color:#C07E1D;margin-right:6px}
 .print-callout{
-  margin-top:22px;padding:14px 18px;border-radius:8px;
-  border:1px dashed rgba(0,173,216,.5);background:rgba(0,173,216,.06);
-  display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+  margin-top:26px;padding:22px 24px;border-radius:12px;
+  background:#0E1B2A;border:1px solid rgba(0,173,216,.35);
+  box-shadow:0 6px 20px rgba(14,27,42,.15);
+  display:grid;grid-template-columns:auto 1fr auto;gap:18px;align-items:center;
 }
-.print-callout .flag{font-size:20px;line-height:1}
-.print-callout .body{flex:1;min-width:220px;font:500 13px/1.5 var(--sans);color:var(--text)}
-.print-callout .body strong{color:#E8EDF2;font-weight:700}
-.print-callout .body em{color:var(--muted);font-style:normal;font-size:12px;display:block;margin-top:4px}
+.print-callout .flag{font-size:34px;line-height:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
+.print-callout .body{
+  font:500 14px/1.55 var(--sans);color:#D9E4EF;
+}
+.print-callout .body strong{color:#fff;font-weight:700;display:block;margin-bottom:4px;font-size:15px}
+.print-callout .body em{color:#8B9AA9;font-style:normal;font-size:12.5px;display:block;margin-top:6px;letter-spacing:.02em}
 .print-callout .cta{
-  font:600 13px/1 var(--mono);padding:10px 16px;border-radius:7px;
+  font:600 14px/1 var(--mono);padding:13px 20px;border-radius:8px;
   background:var(--cyan);color:#04202A;border:1px solid transparent;
-  white-space:nowrap;
+  white-space:nowrap;transition:transform .15s ease,background .15s ease;
 }
 .print-callout .cta:hover{background:#33bee0;text-decoration:none;transform:translateY(-1px)}
+@media (max-width:640px){
+  .print-callout{grid-template-columns:auto 1fr;gap:14px;padding:18px 18px}
+  .print-callout .cta{grid-column:1 / -1;text-align:center;padding:12px 16px}
+}
+/* Star strip: full-width hook at the top of the page, above the hero.
+   Frames the star ask around the whole project (repo, blog, book), not
+   just the book. Kept slim so it does not steal attention from the hero. */
+.star-strip{
+  background:linear-gradient(90deg,#0E1B2A,#132437);
+  border-bottom:1px solid rgba(0,173,216,.22);
+  padding:12px 0;
+}
+.star-strip .wrap{
+  display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+}
+.star-strip .icon{
+  font-size:18px;line-height:1;color:#F4C15C;
+  text-shadow:0 0 12px rgba(244,193,92,.35);
+}
+.star-strip .msg{
+  flex:1;min-width:220px;
+  font:500 13.5px/1.4 var(--sans);color:#D9E4EF;
+}
+.star-strip .msg strong{color:#fff;font-weight:700}
+.star-strip .msg small{color:#8B9AA9;font-size:12.5px;margin-left:6px}
+.star-strip .cta{
+  font:600 13px/1 var(--mono);padding:9px 15px;border-radius:7px;
+  background:transparent;color:var(--cyan);
+  border:1px solid rgba(0,173,216,.55);
+  display:inline-flex;align-items:center;gap:7px;white-space:nowrap;
+  transition:background .15s ease,border-color .15s ease;
+}
+.star-strip .cta:hover{background:rgba(0,173,216,.12);border-color:var(--cyan);text-decoration:none}
+.star-strip .cta .s{color:#F4C15C}
+@media (max-width:520px){.star-strip .msg small{display:block;margin-left:0;margin-top:2px}}
 .book-ribbon{
   position:absolute;top:22px;right:-38px;width:150px;
   transform:rotate(45deg);
@@ -470,6 +508,15 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
 <main id="main">
 
 <!-- ============ BOOK ANNOUNCEMENT BANNER ============ -->
+<!-- ================= STAR STRIP ================= -->
+<div class="star-strip" role="region" aria-label="Support the project">
+  <div class="wrap">
+    <span class="icon" aria-hidden="true">&#9733;</span>
+    <p class="msg"><strong>If any part of this helped you</strong>, the code, the blog series, or the book, the kindest thing you can do is star the repo. <small>Two seconds. Signals what to keep building.</small></p>
+    <a class="cta" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener"><span class="s" aria-hidden="true">&#9733;</span> Star on GitHub</a>
+  </div>
+</div>
+
 <a class="book-banner" href="#book" aria-label="The Ledger Book: the whole build plus interview Q and A found only in the book">
   <span class="bb-in">
     <span class="bb-cover" aria-hidden="true">
@@ -758,7 +805,6 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
           <a class="dl" href="https://github.com/sohag-pro/go-ledger/raw/main/the-ledger-book.epub">&darr; EPUB</a>
         </div>
         <p class="book-note"><span aria-hidden="true">&#10022;</span> The full 14-week series is complete, and so is the book: 21 Parts, 27 ADRs, 50-question bonus round.</p>
-        <p class="book-note"><span aria-hidden="true">&#10022;</span> If any of this was useful, a <a href="https://github.com/sohag-pro/go-ledger" style="color:#00ADD8">GitHub star</a> is the kindest way to say so. Two seconds, and it is what keeps this in front of the next engineer who needs it.</p>
         <div class="print-callout">
           <span class="flag" aria-hidden="true">&#127463;&#127465;</span>
           <div class="body">
