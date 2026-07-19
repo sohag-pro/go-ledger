@@ -1,7 +1,4 @@
-# ADR-025: Approval workflows and a lifecycle event stream
-
-Status: Accepted
-Date: 2026-07-13
+# ADR-025: Approval Workflows and a Lifecycle Event Stream
 
 This ADR records adding an env-configured approval gate to go-ledger (Week 13:
 approval workflows and event streaming). An over-threshold transaction is held
@@ -9,6 +6,12 @@ as pending and must be approved before it posts. Approval lifecycle transitions
 emit events onto the existing tamper-evident chain, which the webhook fanout
 already delivers. The core invariant is untouched: balances stay derived from
 postings, and nothing an approver has not cleared ever reaches `postings`.
+
+## Status
+
+Accepted: 2026-07-13
+Amended by ADR-026. The four-eyes control described in decision 3 shipped
+non-functional; see the Amendment at the end of this ADR.
 
 ## Context
 
@@ -173,6 +176,35 @@ render a subject-based (non-transaction) event.
   Rejected: gross-debit obscures which leg is large, and a single global number
   ignores that currencies differ in scale; largest-leg-per-currency is the
   clearest fit for the per-currency invariant.
+
+## Amendment (ADR-026): the four-eyes flag shipped non-functional
+
+Decision 3 above claims `APPROVAL_REQUIRE_DIFFERENT_ACTOR` "enforces
+maker-checker (the approver's actor must differ from the creator's)." It did
+not, and the external audit behind ADR-026 caught it.
+
+The reason is one level of indirection. At the time, every audit event and every
+held pending's `CreatedBy` stamped the **tenant id** as the actor, not the
+individual key (a leftover from ADR-007, written before auth existed). So the
+flag compared a tenant against itself. With the flag off it was a no-op, which
+is what the demo exercised and why nothing looked wrong. With the flag on it
+compared a value to itself and blocked every approval, including legitimate
+ones: not a weak control, a self-deadlock. Either way a single admin key could
+create and approve the same over-threshold movement, which is precisely the
+thing the control exists to prevent.
+
+ADR-026 fixed the underlying model rather than the comparison: the individual
+API-key id (`auth.PrincipalID`) is now threaded through the money paths as the
+acting principal, so `CreatedBy` and the deciding actor are distinct keys and
+the flag compares two real principals. Background paths with no principal (the
+pending sweep, the demo seeder) still fall back to the tenant id.
+
+The lesson is recorded rather than edited away, because it is the more useful
+artifact: this ADR asserted a control was real, the tests exercised it in the
+configuration where it was a no-op, and nothing caught the gap until someone
+read the code asking whether the claim held. A control that is documented,
+flagged, and shipped is not the same as a control that works, and an ADR
+claiming otherwise is exactly the kind of thing an audit is for.
 
 ## Out of scope (this week)
 

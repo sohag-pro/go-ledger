@@ -1,4 +1,4 @@
-# ADR-014: Multi-currency accounts and FX conversion
+# ADR-014: Multi-Currency Accounts and FX Conversion
 
 ## Status
 
@@ -7,6 +7,13 @@ Accepted: 2026-07-09
 Supersedes the v1 scope note (CLAUDE.md) that listed multi-currency and FX as out
 of scope. The public roadmap was extended from 12 to 14 weeks, and Week 11 brings
 multi-currency and FX into scope deliberately.
+
+Superseded in part by ADR-020, ADR-022, and ADR-026. Three items this ADR listed
+as out of scope have since shipped: currency triangulation (ADR-022 added a
+single-hop USD hub), a live rate feed (ADR-026 added an optional
+Frankfurter-backed poller), and a rate staleness check (`FX_MAX_RATE_AGE`).
+ADR-020 also moved rate and markup configuration from the `FX_RATES` environment
+variable to a live admin API. See the annotations on the Out of scope section.
 
 ## Context
 
@@ -59,7 +66,9 @@ convert 100.00 USD to EUR, applied rate 0.9200 EUR per USD
 
 Because an account is single-currency but an FX position spans currencies, the
 clearing is a set of per-tenant, per-currency system accounts (one per currency,
-auto-created on first use). They use a distinct **system** account type: excluded
+auto-created on first use). They are marked with a boolean **`is_system`** flag
+on `accounts` (migration 0010), not a new account type, so the five existing
+types stay untouched: excluded
 from user-facing balance listings, and expected to carry a permanent, often
 negative, open position (that position, revalued at current rates, is the FX
 exposure, and its drift is FX gain or loss). This is standard nostro-style FX
@@ -203,13 +212,13 @@ set `NOT NULL`, then swap `assert_txn_balanced` to the per-currency version.
 ### 9. The idempotency fingerprint changes, and that is a breaking change
 
 Dropping the transaction currency means the idempotency request fingerprint
-(ADR-006), which hashed the transaction currency plus every posting, moves to
+(ADR-007), which hashed the transaction currency plus every posting, moves to
 hashing each posting's currency. This is a breaking change: a client retrying a
 request created *before* this deploy would produce a different fingerprint and be
 rejected as "same key, different body" (409).
 
 We accept this now without a migration. The service is still being built, no real
-money flows through it, and the demo tenant is wiped every four hours, so there
+money flows through it, and the demo tenant is wiped on every seeder interval (hourly by default), so there
 are no durable in-flight keys to protect. A fingerprint-scheme version id (store
 the scheme with the key, accept old-scheme keys under their old hash) is the
 correct fix once real traffic exists; it is deferred to that point, recorded here
@@ -295,13 +304,23 @@ against minor-unit amounts.
 
 ## Out of scope (v1)
 
+*Three items in this list shipped after all, in Weeks 12 to 14. They are marked
+inline below; the rest still stand.*
+
 Live rate-provider integration (the seam is built, the implementation is not),
+**[shipped, ADR-026: an optional `FX_FEED_ENABLED` poller against Frankfurter, a
+free keyless ECB-backed source, appending fresh global rows through the same
+seam]**,
 FX gain-or-loss *reporting* (the position sits in clearing accounts; reporting is
-Week 12), currency triangulation beyond direct and single-inverse lookup,
+Week 12), currency triangulation beyond direct and single-inverse lookup
+**[shipped, ADR-022: a single-hop USD hub, tried only after the direct and
+inverse lookups both miss]**,
 per-rate historical revaluation, bid/ask sourced from a real market (v1 is a
 single configured spread around a mid), the idempotency fingerprint-scheme
 versioning (decision 9), a rate max-age / staleness check (v1 env rates do not
-expire; the current-rate query has no freshness bound), a database-level guard
+expire; the current-rate query has no freshness bound)
+**[shipped, ADR-026: `FX_MAX_RATE_AGE`, off by default, refuses a conversion
+priced against a rate older than the configured age]**, a database-level guard
 making the FX snapshot columns immutable (v1 relies on the append-only, never-
 updated convention rather than an enforced trigger), and surfacing the FX rate
 detail on the transaction read path (`GET /v1/transactions/{id}`): the applied rate

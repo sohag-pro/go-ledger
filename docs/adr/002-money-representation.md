@@ -3,6 +3,10 @@
 ## Status
 
 Accepted: 2026-06-15
+Superseded in part by ADR-014. This ADR treats v1 as single-currency and calls
+per-currency exponents a later problem. Multi-currency shipped in v1 (Week 11),
+and the exponent registry `Currency.MinorUnits()` is now live, so the
+"no per-currency scaling to track yet" framing below is historical.
 
 ## Context
 

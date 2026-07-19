@@ -1,12 +1,12 @@
-# ADR-015: Audit remediation, white-label hardening, durability, and scale
+# ADR-015: Audit Remediation, White-Label Hardening, Durability, and Scale
 
 ## Status
 
 Accepted: 2026-07-10
 
-Basis: the fintech / white-label audit at `docs/audit/2026-07-10-fintech-white-label-audit.md`
-(3 Blocker, 10 High, 15 Medium, 7 Low system findings; 6 must-fix and 7
-nice-to-have book findings). This ADR records the remediation decision for each
+Basis: an internal fintech / white-label audit of the service, whose findings are
+referenced below by id (A1.1, A3.6, and so on). This ADR records the remediation
+decision for each
 area and the order the work lands in. Two of the Blockers (durability/DR and
 multi-instance scaling) are deep enough that each gets its own detailed ADR
 authored at the start of its phase; this ADR fixes the direction so the phasing is
@@ -26,8 +26,9 @@ absent compliance / eventing / reporting layer. This ADR decides how each of tho
 is closed and in what order.
 
 The goal is a production-grade, multi-tenant, white-label money core, and a premium
-printable book. The work is phased by leverage and dependency, cheapest-highest-risk
-first, so the disqualifying risks fall before the product features.
+printable book. The work is phased by risk first and cost second: the findings that
+would disqualify the system outright come before the product features, and within a
+phase the cheapest fix goes first.
 
 ## Decision
 
@@ -70,7 +71,8 @@ path. Nothing else in this remediation matters if this is not done.
 `tenants` table (id, name, status, settings jsonb, created_at) with a foreign key
 from `api_keys`. Posting and reads gate on tenant status (active / suspended /
 closed). Per-tenant settings hold what is global today: default currency, rate
-limits, FX spread policy. API keys gain scopes (`read`, `post`, `admin`), optional
+limits, FX spread policy. API keys gain scopes (`read`, `post`, `admin`; a fourth,
+`approve`, was added later by ADR-025 and migration 0033), optional
 `expires_at`, and a `last_used_at` touch; the SHA-256-hashed, `glk_`-prefixed
 storage stays. An operator-authenticated admin surface (an admin-scoped API, with a
 thin CLI wrapper) provides: create tenant, issue key (plaintext shown once), rotate
@@ -200,9 +202,8 @@ white-label bar.
   may briefly lag a committed transaction) and requires a single-runner guarantee.
   ADR-017 records that design; it is not hand-waved here.
 - Per-finding severity and file references stay in the audit report; this ADR is the
-  decision and sequencing record, and the implementation plan
-  (`docs/superpowers/plans/2026-07-10-audit-remediation.md`) maps every finding to a
-  task within these phases.
+  decision and sequencing record, and a separate implementation plan maps every
+  finding to a task within these phases.
 - Two Blockers (DR, multi-instance) and the largest features (webhooks, compliance)
   are multi-week; this ADR commits the direction and order, not a promise that all
   of it lands in one week. The cheap, high-leverage fixes (Phase 0, the book
@@ -218,7 +219,8 @@ white-label bar.
 - **Managed Postgres now (A4.1/A4.2):** the cleaner durability answer, deferred as
   the growth path rather than the immediate step, because WAL archiving off the
   current box removes the disqualifying data-loss risk at far lower cost and change;
-  ADR-017 decides the trigger for the move.
+  ADR-016 decides the trigger for the move, and names this ADR's Phase 3
+  (multi-instance) as that trigger.
 - **Per-tenant RLS as the only isolation:** rejected as a replacement; adopted as
   defense in depth on top of the existing composite-FK and tenant-scoped-query
   isolation, which stays the primary guarantee.

@@ -77,7 +77,7 @@ The sampler is `ParentBased` with the root sampler read from the standard
 `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` variables, defaulting to
 always-on for local development. Production sets a ratio (documented as
 `parentbased_traceidratio` at `0.25`) because the demo seeder writes about 285
-transactions every four hours, each fanning out to per-query DB spans under
+transactions every seeder interval (hourly by default), each fanning out to per-query DB spans under
 SERIALIZABLE retries, and Honeycomb's free tier is twenty million events a month.
 Always-on plus that write volume burns the budget on demo noise.
 

@@ -3,6 +3,10 @@
 ## Status
 
 Accepted: 2026-06-29
+Superseded in part by ADR-014. The "currency lives on the transaction" decision
+below was reversed by migration 0010, which added `postings.currency` and
+dropped `transactions.currency`. Everything else here (append-only postings,
+derived balances, composite tenant foreign keys, UUIDv7 keys) still stands.
 
 ## Context
 
@@ -59,16 +63,22 @@ non-obvious choice:
   (`Transaction.Validate`). Storing it once on the transaction keeps a posting to
   a single signed `bigint amount`, and each posting's `Money` is reconstructed
   from the transaction's currency on read. Accounts also carry their own currency.
+  *(Superseded by ADR-014: migration 0010 moved currency onto the posting and
+  dropped `transactions.currency`, because an FX transaction spans currencies and
+  a single transaction currency stopped being meaningful.)*
 
 - **Account type is `text` with a CHECK, not a Postgres enum.** The five types
   are constrained by `CHECK (type IN (...))`. Readable in plain SQL, and adding or
   changing a type is an ordinary migration rather than the awkward `ALTER TYPE`
   dance an enum forces.
 
-- **No balance CHECK constraint yet.** The sum-to-zero invariant is enforced in
-  the domain (`Transaction.Validate`) for Week 3. The database-level CHECK lands
-  in Week 4 alongside the transaction-posting service and its concurrency
-  handling, where it belongs.
+- **No database-level balance constraint yet.** The sum-to-zero invariant is
+  enforced in the domain (`Transaction.Validate`) for Week 3. The database-level
+  enforcement lands in Week 4 alongside the transaction-posting service and its
+  concurrency handling, where it belongs. It cannot be a row CHECK: the sum spans
+  every posting row of a transaction, so what actually ships (migration 0002) is
+  a `DEFERRABLE INITIALLY DEFERRED` constraint trigger that fires at COMMIT. See
+  ADR-004.
 
 The repository follows a port-and-adapter split: `domain.Repository` is the port
 (the domain owns the contract); `internal/postgres` is the adapter, built on pgx

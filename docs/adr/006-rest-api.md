@@ -3,6 +3,11 @@
 ## Status
 
 Accepted: 2026-06-29
+Superseded in part by ADR-012 and ADR-016. The "single default tenant, no auth
+yet" decision below is gone: every `/v1` operation now requires a bearer API key
+and derives its tenant from that key. The `pg_dump` backup mentioned under
+"Server now owns its database" was replaced as the durability mechanism by
+ADR-016 (pgBackRest, WAL archiving, offsite encrypted storage).
 
 ## Context
 
@@ -47,6 +52,11 @@ in URLs or trust a client header, every request acts as a single default tenant
 service call. When auth lands it will populate the same tenant value from a token
 instead, without changing any resource URL.
 
+*Superseded by ADR-012. That seam is now filled: every `/v1` operation requires
+`Authorization: Bearer glk_...`, and the tenant comes from the resolved key. The
+prediction held, in that no resource URL changed. `DEFAULT_TENANT_ID` survives
+only as the tenant the demo and first-boot keys are provisioned against.*
+
 ### Account statement with running balance and keyset paging
 
 Beyond the planned endpoints, `GET /v1/accounts/{id}/statement` lists the
@@ -79,7 +89,9 @@ moves into a dedicated CI step to avoid a migration race.
 Production Postgres runs natively on the VPS (a dedicated database and user,
 listening on localhost, backed up with `pg_dump`), consistent with the
 native-binary deploy. This is provisioned out of band before the deploy; see the
-ops runbook.
+ops runbook. *(The `pg_dump` half is superseded by ADR-016, which replaced the
+same-disk dump with pgBackRest WAL archiving to encrypted offsite storage as the
+recovery path. The dump is retained only for quick same-box inspection.)*
 
 ### Error mapping
 

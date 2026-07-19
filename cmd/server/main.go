@@ -1051,8 +1051,11 @@ type apiKeyStore interface {
 
 // demoKeyScopes returns the scopes the demo key is provisioned with. In demo
 // mode the demo key carries admin scope so the public operator console can
-// exercise the admin surface (safe: the demo resets every four hours and is
-// rate limited, ADR-019). Outside demo mode it never gets admin scope.
+// exercise the admin surface (ADR-019). It is NOT tenant-scoped: admin scope
+// also unlocks X-Act-As-Tenant and every /v1/admin route, so containment rests
+// on the demo deployment having no tenants worth reaching, plus the periodic
+// reset (SEED_INTERVAL, hourly by default) and rate limiting. Outside demo mode
+// it never gets admin scope.
 func demoKeyScopes(demoMode bool) []domain.Scope {
 	if demoMode {
 		return []domain.Scope{domain.ScopeRead, domain.ScopePost, domain.ScopeAdmin}

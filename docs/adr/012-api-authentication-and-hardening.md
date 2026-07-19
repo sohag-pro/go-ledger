@@ -1,8 +1,24 @@
-# ADR-012: API authentication, mandatory idempotency, input hardening, and a tamper-evident audit chain
+# ADR-012: API Authentication, Mandatory Idempotency, Input Hardening, and a Tamper-Evident Audit Chain
 
 ## Status
 
 Accepted: 2026-07-08
+Superseded in part by ADR-017, ADR-019, and ADR-021. Three of this ADR's
+decisions were later reversed or qualified:
+
+- The audit chain is no longer extended inside the posting transaction, and the
+  per-tenant in-process mutex described below was removed (ADR-017). The audit
+  found that mutex to be a single-instance correctness cliff, a Blocker: it
+  lives in one process's memory, so a second instance could fork a tenant's
+  chain. Posts now write an `audit_outbox` row and a single background chainer
+  builds the chain.
+- "The tenant is derived only from the key. No request field, header, or body
+  can set or override it" is now qualified: an **admin**-scoped key may act on
+  another tenant via the `X-Act-As-Tenant` header (ADR-021). The statement still
+  holds for every non-admin key.
+- The demo key is described below as "low-privilege" and able to "only touch
+  the demo tenant." That is no longer true, and ADR-019 relaxed it knowingly.
+  See the corrections inline.
 
 ## Context
 
@@ -32,7 +48,7 @@ The audit's top five findings:
 
 The hard constraint on any fix: the public try-it console at `/console` and the
 Scalar playground must keep working with no login, and the demo tenant must keep
-resetting every four hours (see the demo seeder). A naive "require auth
+resetting on its schedule (hourly by default, see the demo seeder). A naive "require auth
 everywhere" breaks the demo, which is the point of the public deployment.
 
 This ADR records the decisions that close all five findings while keeping the
@@ -60,7 +76,16 @@ The tenant is derived **only** from the key. No request field, header, or body
 can set or override it. That is what makes tenant scoping the authorization
 boundary: a key for tenant A can only ever act on tenant A, and the composite
 foreign keys from Week 3 already make a posting into another tenant's account
-impossible at the database. So "can this principal touch this account?" reduces
+impossible at the database.
+
+*Qualified by ADR-021. An admin-scoped key may now send `X-Act-As-Tenant` and
+operate on any tenant, read and write. This was not a new capability (an admin
+key could already mint a key for any tenant via `/v1/admin/keys`), but the
+absolute claim above is no longer literally true. For any key without the
+`admin` scope it still is: the header is ignored, and the key stays pinned to
+its own tenant.*
+
+So "can this principal touch this account?" reduces
 to "is this account in the key's tenant?", which the schema enforces for free. We
 deliberately did not add per-account access-control lists: they would be
 redundant with the tenant foreign keys and add a whole authorization surface for
@@ -78,15 +103,26 @@ a REST-only speed bump.
 
 Rather than special-case the demo tenant as unauthenticated (two code paths, and
 a permanently open write surface), authentication is uniform and the demo is
-reached with a real, low-privilege **demo key**. It is provisioned at startup
-from `DEMO_API_KEY` (a known, public value with a safe default), scoped to the
-demo tenant, and carries a tighter rate limit than a normal key. The console and
-the playground ship it. Exposing it is fine on purpose: it can only touch the
-demo tenant, it is rate limited, and that tenant is wiped every four hours.
+reached with a real **demo key**. It is provisioned at startup from
+`DEMO_API_KEY` (a known, public value with a safe default) and carries a tighter
+rate limit than a normal key. The console and the playground ship it. Exposing
+it is fine on purpose: it is rate limited, and the demo tenant is wiped hourly.
+
+**Correction (ADR-019).** As written, this section called the demo key
+"low-privilege" and said it "can only touch the demo tenant." Neither is true of
+the deployment as it now runs. In demo mode the key is provisioned with
+`{read, post, admin}`, and `admin` is a superset scope that unlocks the whole
+`/v1/admin` surface plus `X-Act-As-Tenant` (ADR-021), so the key can act on any
+tenant, not just the demo one. ADR-019 made that change deliberately, so the
+public operator console could exercise its admin panels with no login, and
+accepted the consequence: on a demo deployment, anonymous means admin. What
+actually bounds the risk is the rate limit, the hourly wipe, and the fact that
+the tenant holds nothing real. It is **not** bounded by scope. Outside demo mode
+the key is provisioned `{read, post}` and never gets `admin`.
 
 The demo key survives the wipe because the seeder resets tenant **data**
 (accounts, transactions, postings, audit rows, idempotency keys) and never
-touches the `api_keys` table. So after each four-hour reset the console keeps
+touches the `api_keys` table. So after each hourly reset the console keeps
 working with the same key against a fresh ledger, exactly as before.
 
 ### Idempotency is mandatory on money-moving POSTs
@@ -131,8 +167,15 @@ ledger transaction, so a committed transaction always leaves the chain
 consistent, and `created_at` is set by the application (not the database default)
 so the hash is deterministic and verifiable.
 
+*Superseded by ADR-017. Extending the chain inside the posting transaction is
+what pinned correctness to a single process. A post now writes an append-only
+`audit_outbox` row in that transaction instead, and one background chainer,
+elected by a Postgres advisory lock, drains the outbox and builds the chain. The
+chain became eventually consistent, with a monitored lag, in exchange for
+multi-instance correctness.*
+
 The chain is per tenant, not global, for two reasons: it keeps tenants
-decoupled, and it means the four-hour demo wipe restarts only the demo tenant's
+decoupled, and it means the hourly demo wipe restarts only the demo tenant's
 chain from genesis without touching or invalidating any other tenant's history.
 
 A new `GET /v1/audit/verify` endpoint walks the caller's tenant chain oldest
@@ -143,16 +186,27 @@ mutation, and the chain detects a privileged rewrite that bypasses it.
 
 ### Same-tenant posts serialize with an in-process mutex
 
+> **Superseded by ADR-017. This entire section describes a mechanism that no
+> longer exists.** The later white-label audit classified the in-process mutex
+> as a Blocker (finding A3.6, "single-instance correctness cliff"): it lives in
+> one process's memory, so with two app instances both could read the same chain
+> head and fork a tenant's chain, and SERIALIZABLE would not necessarily catch
+> it. ADR-017 removed the chain read from the posting transaction altogether,
+> which removed the reason for the mutex, and `RunInTx` no longer takes one
+> (`internal/postgres/repository.go` carries a comment saying exactly this).
+> The section is kept because the reasoning below, and the advisory-lock attempt
+> it rejects, is the record of how the design got to the outbox.
+
 The audit chain's read-then-insert above is a genuine same-tenant conflict.
 Every post reads the tenant's latest `row_hash` and then inserts the next row,
 in the same SERIALIZABLE transaction as the ledger posting, so two concurrent
 same-tenant posts reading the same chain tail is a real read-write
-antidependency. PostgreSQL aborts the loser with a serialization failure
+antidependency. Postgres aborts the loser with a serialization failure
 (SQLSTATE 40001), and under sustained same-tenant concurrency the repeated
 abort can exhaust the retry budget (25 attempts) and surface to the caller as
 a `503`.
 
-We first tried closing this with a per-tenant PostgreSQL session advisory
+We first tried closing this with a per-tenant session-level Postgres advisory
 lock (`pg_advisory_lock`), taken on a connection checked out from the pool
 before the SERIALIZABLE transaction began, so a blocked waiter's snapshot was
 not fixed until the lock holder had committed. A review found this had two
@@ -218,7 +272,7 @@ database connection.
   key cannot flood the service.
 - The audit log is now cryptographically tamper-evident and verifiable through the
   API, not merely trigger-guarded.
-- The public demo and its four-hour reset are unchanged: one uniform auth path, a
+- The public demo and its hourly reset are unchanged: one uniform auth path, a
   public demo key that survives the wipe, no special-casing.
 
 ### Negative
@@ -232,10 +286,18 @@ database connection.
   tenant's queued posts hold no database connection while they wait. It is
   still real coupling that a very high-throughput single tenant would feel as
   added latency, just not as blocked connections or a database lock timeout.
+  *(Superseded by ADR-017: the chain is no longer on the posting path, the mutex
+  is gone, and same-tenant posts run fully concurrently across any number of
+  instances.)*
 - Key management for real tenants is still manual this pass (insert a row, or a
   small CLI): there is no self-service key issuance UI, which is out of scope.
-- The demo key is public by design. That is safe only because it is tenant-scoped,
-  rate limited, and wiped, and those three properties must stay true.
+- The demo key is public by design. As written this ADR justified that with three
+  properties: tenant-scoped, rate limited, and wiped. Only two of them survived.
+  ADR-019 gave the demo key `admin` scope so the public console could drive the
+  admin panels, which means it is not tenant-scoped and, with `X-Act-As-Tenant`
+  (ADR-021), not confined to the demo tenant either. The rate limit and the
+  hourly wipe are what actually bound the exposure now, together with the rule
+  that demo mode must never be enabled on a deployment holding real data.
 
 ## Alternatives considered
 
@@ -255,14 +317,14 @@ database connection.
   keys already make cross-tenant access impossible, and the key already resolves
   to exactly one tenant.
 - **A single global audit chain**: rejected. It couples all tenants into one
-  hash sequence and makes the per-tenant four-hour wipe impossible without
+  hash sequence and makes the per-tenant hourly wipe impossible without
   breaking the chain. Per-tenant chains keep the demo reset clean.
 - **Cryptographic signing of each audit row (HMAC or asymmetric) instead of a
   hash chain**: deferred. A hash chain detects reordering, insertion, and
   deletion, which is the property the audit needed. Signing adds authenticity of
   the writer on top, which matters once there is more than one writer identity;
   that is a later concern.
-- **A per-tenant PostgreSQL session advisory lock, to serialize same-tenant
+- **A per-tenant session-level Postgres advisory lock, to serialize same-tenant
   posts**: tried and reverted. It closed the audit-chain serialization storm
   but introduced two problems of its own: the lock wait was subject to the
   pool's `lock_timeout` and could abort with an unmapped SQLSTATE 55P03 (an

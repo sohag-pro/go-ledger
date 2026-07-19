@@ -1,7 +1,4 @@
-# ADR-026: Security and correctness hardening from an external audit
-
-Status: Accepted
-Date: 2026-07-14
+# ADR-026: Security and Correctness Hardening from an External Audit
 
 This ADR records a batch of hardening changes made in response to an external
 audit of the codebase (a professional-grade review by a Go/fintech engineer).
@@ -10,6 +7,10 @@ flagged a set of authorization-integrity, safety, and correctness gaps. This
 records the decisions behind fixing them. Nothing here changes the core
 invariant: balances stay derived from an append-only posting history, enforced
 per currency in the domain type and by the deferred database constraint trigger.
+
+## Status
+
+Accepted: 2026-07-14
 
 ## Context
 
@@ -22,7 +23,7 @@ and default-off where a new guarantee needs an operator secret, so the demo
 deployment and any existing clone behave exactly as before until the operator
 opts in.
 
-## Decisions
+## Decision
 
 ### 1. The audit actor is the API key, not the tenant
 
@@ -142,8 +143,11 @@ The controls the system advertises now hold: maker-checker is real when enabled,
 the audit anchor is tamper-evident against a DB-privileged attacker when signed,
 and conversions refuse stale rates when a max age is set. Every new guarantee is
 opt-in behind an operator secret or flag, so the demo and existing deployments
-are unchanged until configured. The audit's remaining items that were accepted
-as fine for a demo deployment (the seeder's blast radius, the public demo admin
-key, the absence of production Prometheus and offsite backups) are deliberately
-not addressed here: they are operational choices of the demo box, documented in
-the audit report, not defects in the service code.
+are unchanged until configured. A handful of the audit's remaining items are
+deliberately not addressed here: they are operational choices about how the
+public demo box is configured, not defects in the service code, and they are
+tracked in the audit report rather than fixed in this pass. Drawing that line
+explicitly is the point. A finding that says "this deployment is configured
+loosely on purpose" and a finding that says "this code does not do what it
+claims" call for different responses, and only the second class belongs in a
+hardening ADR.

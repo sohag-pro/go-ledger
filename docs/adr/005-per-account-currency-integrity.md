@@ -3,6 +3,12 @@
 ## Status
 
 Accepted: 2026-06-29
+Superseded in part by ADR-014. This ADR's premise is that currency lives on the
+transaction (ADR-003) and never on the posting, and it explicitly rejects
+"denormalize currency onto postings" in Alternatives. Migration 0010 shipped
+exactly that rejected alternative. The invariant this ADR introduced survives
+in a rewritten form: `assert_posting_currency` now compares each posting's own
+currency against its account's, rather than against the transaction's.
 
 ## Context
 
@@ -28,7 +34,9 @@ currency, which lives in the database.
 Enforce it in the database. Migration 0003 adds an immediate `AFTER INSERT`
 trigger on `postings` (`assert_posting_currency`) that, for each inserted posting,
 looks up its account's currency and its transaction's currency and rejects the row
-if they differ.
+if they differ. *(Superseded by ADR-014: with currency now on the posting itself,
+the trigger compares `posting.currency` against its account's currency. The rule
+is the same; the source of the posting's currency changed.)*
 
 - It is immediate, not deferred: the account and transaction both already exist
   when a posting is inserted (the foreign keys require it), so there is nothing to
@@ -65,6 +73,15 @@ that currency matches each account, even against a direct write.
   put currency back on the posting row, undoing the ADR-003 decision to keep a
   posting to a single signed amount, for no extra safety beyond what the trigger
   gives.
+
+  *This rejection did not hold. Migration 0010 (ADR-014) put currency on the
+  posting exactly as described here. The reasoning above was sound given its
+  premise, which was that a transaction has one currency; multi-currency broke
+  that premise. An FX transaction spans currencies, so there is no
+  transaction-level currency left to compare a posting against, and the
+  posting has to carry its own. Recorded here rather than quietly deleted,
+  because a rejected alternative that later shipped is the most useful kind of
+  entry in an ADR.*
 - **Enforce only in application code** (check each account's currency in
   `CreateTransaction`): rejected. That is the very thing we want the database to
   guarantee; an application-only check is one forgotten code path away from a

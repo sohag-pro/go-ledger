@@ -1,7 +1,8 @@
-# ADR-017: Multi-instance audit chain (transactional outbox + single chainer)
+# ADR-017: Multi-Instance Audit Chain (Transactional Outbox and a Single Chainer)
 
-Status: Accepted
-Date: 2026-07-10
+## Status
+
+Accepted: 2026-07-10
 Referenced by ADR-015 (audit remediation, Phase 3). Closes audit finding A3.6
 (Blocker, single-instance correctness cliff), with A5.1 (audit chain on the hot
 path), A8.2 (two-instance contention test), and A4.3 (migrations to CI).
@@ -135,24 +136,45 @@ explicit rather than pretend it away:
   and an alert (ADR-015 Phase 5 observability). A growing lag means the chainer is
   down or behind, which is an operational signal, not a data-loss event: the
   events are durable in the outbox and will be chained when it recovers.
-- The restore-verify job (ADR-016) additionally checks that every committed
-  transaction is eventually represented in the chain (no outbox row left
-  unprocessed indefinitely), catching a chainer that silently stopped.
+- A chainer that silently stops is caught by the outbox-lag alert
+  (`LedgerAuditOutboxLagHigh` in `deploy/alerts.yml`, firing on
+  `ledger_audit_outbox_lag_seconds > 300`), which watches the age of the oldest
+  unprocessed row rather than the raw pending count, since a small backlog that
+  never drains is the interesting case. The restore-verify job (ADR-016) checks
+  the two invariants that live in restored data, the per-currency zero-sum and
+  the chain walk; it does not read `audit_outbox`, so it is not the control for
+  chainer liveness.
 
 ### 6. Migrations run in CI before deploy (A4.3)
 
 With multiple instances, a schema change must land before the new code that needs
 it, and no instance may run migrations racing another. Migrations move to a
-dedicated pre-deploy CI step that runs `goose up` once against the database before
-any instance rolls over, gated and ordered in the pipeline, rather than each
-instance migrating on boot. This is recorded here because it is a direct
-consequence of going multi-instance.
+dedicated pre-deploy CI step: the pipeline runs the `migrate` subcommand once
+against production, gated and ordered ahead of the binary swap, so a migration
+failure aborts the deploy before any new code runs.
+
+What this does **not** do is remove the on-boot migration. `run()` still calls
+`runMigrations` on every start, and it is kept on purpose as an idempotent
+safety net for local dev, docker-compose, and anything that starts the server
+directly without a separate migrate step. That matters for the multi-instance
+claim: `goose.UpContext`, the legacy entry point this code uses, takes no
+advisory lock or other cross-process serialization (that exists only via
+`goose.NewProvider` with a `SessionLocker`), so two instances booting at once
+could still race each other on it. Today's safety rests on the deployment being
+single-instance and on the pre-deploy step having already applied everything,
+not on goose serializing anything. A genuinely multi-instance deploy has to
+remove the on-boot call, not just add the CI step. The comment at that call site
+says the same thing; see also `docs/ops/server-setup.md`.
 
 ## Consequences
 
-- The single-instance correctness cliff is removed: the service can run N
-  instances without forking any tenant's audit chain. Horizontal scaling and
-  rolling deploys become safe.
+- The single-instance correctness cliff is removed **for the audit chain**: the
+  service can run N instances without forking any tenant's chain, which is what
+  this ADR set out to fix. That is not the same as the whole deployment being
+  multi-instance ready. Migration-on-boot is still in the startup path and takes
+  no cross-process lock (see decision 6), so rolling deploys are not yet safe;
+  removing that call is the remaining prerequisite. The claim here is scoped to
+  the chain deliberately, because the two are easy to conflate.
 - The audit chain is now **eventually consistent** with a bounded, monitored lag.
   Consumers that need "is this transaction in the tamper-evident chain yet" must
   treat chaining as asynchronous. This is a real semantic change, called out in

@@ -1,13 +1,14 @@
-# ADR-019: Operator console, public-demo admin, and one-command onboarding
-
-Status: Accepted
-Date: 2026-07-11
+# ADR-019: Operator Console, Public-Demo Admin, and One-Command Onboarding
 
 This ADR records a deliberate reversal of an earlier scope rule and the design of
 the developer-experience work that follows from it: turning the thin developer
 console into an operator console with admin panels, exposing admin publicly in
 demo mode, a one-command run experience, an interactive first-run setup for the
 binary, and cross-platform release binaries.
+
+## Status
+
+Accepted: 2026-07-11
 
 ## Context
 
@@ -45,12 +46,13 @@ already exist, not a new capability.
 The console's admin panels unlock based on the deployment mode:
 
 - **Demo mode** (`DEMO_MODE=true`, the public go.sohag.pro deployment): admin is
-  **public, no key required**. The whole database resets every four hours and the
+  **public, no key required**. The whole database resets on the seeder interval
+  (hourly by default) and the
   demo key is rate limited, so there is nothing durable to protect and no
   privilege worth stealing. To make the console's admin calls work with the public
   demo key, the demo key is elevated to include the `admin` scope in demo mode
   only. The accepted risk is that anyone can create tenants and keys on the demo
-  between resets; it is bounded by the demo key's low rate limit and the four-hour
+  between resets; it is bounded by the demo key's low rate limit and the hourly
   wipe, and it never touches a real deployment.
 - **Production mode** (`DEMO_MODE` unset/false): admin panels stay hidden until the
   operator enters an **admin-scoped API key** in the console (stored in the
@@ -75,12 +77,19 @@ provisions an admin credential on first boot:
 
 ### 4. One-command run: docker compose with two profiles
 
-The primary newcomer experience is `docker compose up`:
+The primary newcomer experience is a one-line `docker compose` invocation. Both
+newcomer stacks sit behind an explicit profile, because Compose always starts
+profile-less services and the pre-existing `dev` and `load-test` stacks would
+otherwise collide on ports:
 
-- A `demo` profile: `DEMO_MODE=true`, the seeder on, so a newcomer immediately sees
-  a populated demo tenant with public admin.
-- A default `local` profile: an empty, production-like ledger with a printed random
-  admin key.
+- `docker compose --profile demo up`: `DEMO_MODE=true`, the seeder on, so a
+  newcomer immediately sees a populated demo tenant with public admin.
+- `docker compose --profile local up`: an empty, production-like ledger with a
+  printed random admin key.
+
+`local` is a named profile like any other, not a default. A bare `docker compose
+up` starts only the profile-less services (Jaeger), which is not a running
+ledger, so the README quotes the `--profile` form in both cases.
 
 Both bring up Postgres and the app and apply migrations as an init step (the
 `migrate` subcommand from ADR-017's pre-swap step, reused). The README documents
@@ -113,9 +122,18 @@ in the refreshed README.
   admin UI. This is a real scope expansion, recorded here so the reversal is
   explicit and not an accident. The corresponding CLAUDE.md scope note is updated.
 - Demo mode now exposes admin publicly. This is safe only because of the demo's
-  four-hour reset and rate limits; it must never be enabled on a deployment that
-  holds real data. The `DEMO_MODE`-in-production guard (ADR-015 Phase 0) already
-  refuses that combination at boot, which is what makes this safe to adopt.
+  hourly reset and rate limits; it must never be enabled on a deployment that
+  holds real data. The `DEMO_MODE`-in-production guard (ADR-015 Phase 0) refuses
+  that combination at boot, but it is worth being precise about how much that
+  guard actually covers, because this ADR originally leaned on it as the thing
+  "that makes this safe to adopt." The guard fires only when `APP_ENV` is
+  exactly `"production"`, and `APP_ENV` defaults to `"development"`. It is
+  therefore **opt-in**: a self-hoster who sets `DEMO_MODE=true` and never sets
+  `APP_ENV` boots with a publicly reachable, unauthenticated admin surface over
+  their real data, and nothing stops them. The real control is the operator
+  knowing not to enable demo mode outside a demo; the boot guard is a backstop
+  for the one environment that declares itself production, not a general safety
+  net.
 - The console remains a thin client with no server-side logic of its own, so it
   cannot become a second, divergent implementation of any rule; it can only call
   the same authenticated, scope-checked, RLS-protected APIs everything else uses.

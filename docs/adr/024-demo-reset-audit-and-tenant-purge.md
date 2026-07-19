@@ -1,12 +1,13 @@
-# ADR-024: Demo seeder writes audit events and purges visitor tenants
-
-Status: Accepted
-Date: 2026-07-13
+# ADR-024: Demo Seeder Writes Audit Events and Purges Visitor Tenants
 
 This ADR records two changes to the demo seeder (`internal/seed`), the
 in-process tool that resets and repopulates the public demo on a schedule. Both
 close inconsistencies a visitor could see at go.sohag.pro. Neither touches the
 core service path; the seeder remains a demo-only tool.
+
+## Status
+
+Accepted: 2026-07-13
 
 ## Context
 

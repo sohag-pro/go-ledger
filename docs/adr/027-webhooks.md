@@ -1,8 +1,5 @@
 # ADR-027: Webhooks
 
-Status: Accepted
-Date: 2026-07-14
-
 This ADR records go-ledger's webhook delivery: how a tenant subscribes to
 ledger events, how deliveries are signed, and how they are delivered at least
 once off the tamper-evident event stream. It is written in Week 14, the final
@@ -10,6 +7,10 @@ week, and it is deliberately retroactive: the webhook code shipped in an earlier
 week without its own ADR, breaking the project's "an ADR before the code" rule.
 Writing it now, after the fact, is the honest correction, and the gap itself is
 one of the retrospective's lessons.
+
+## Status
+
+Accepted: 2026-07-14
 
 ## Context
 
@@ -35,7 +36,7 @@ The constraints a payment webhook has to satisfy shaped the design:
 - More than one app instance runs at a time, so exactly one of them must own the
   fan-out cursor, exactly as the chainer owns the chain.
 
-## Decisions
+## Decision
 
 ### 1. Fan out off `audit_log`, not the raw outbox
 

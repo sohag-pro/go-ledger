@@ -1,4 +1,4 @@
-# ADR-011: Testing strategy: unit, property, integration, chaos, load
+# ADR-011: Testing Strategy Across Five Layers
 
 ## Status
 
@@ -42,8 +42,8 @@ service wants.
   across a large input space, not just hand-picked cases. See below.
 - **Integration** (Docker via testcontainers): the service and repository against
   real Postgres, so the schema, triggers, `CHECK` constraints, and SERIALIZABLE
-  retry behaviour are exercised, not mocked.
-- **Chaos** (Docker via testcontainers plus toxiproxy): partial-failure behaviour
+  retry behavior are exercised, not mocked.
+- **Chaos** (Docker via testcontainers plus toxiproxy): partial-failure behavior
   when the database connection dies mid-transaction. See below.
 - **Load** (k6 against a Compose stack): throughput and tail latency under
   sustained traffic, in two contention profiles.
@@ -140,7 +140,7 @@ Two rules keep the load test honest:
   treated as a hard SLO.
 
 The `load-test` Compose profile sets `SEED_ENABLED=false`. The demo seeder resets
-the demo tenant every four hours and would collide with a load run, so the load
+the demo tenant on its `SEED_INTERVAL` (hourly by default) and would collide with a load run, so the load
 test uses its own tenant against a stack with the seeder off.
 
 ### CI: parallel test jobs, a non-gating smoke-load, deploy unchanged in intent
@@ -154,13 +154,25 @@ not paying for artificial serialization:
   unit, property, integration, and chaos tests together, because the suite is not
   separated by build tags: the integration and chaos tests skip themselves when no
   Docker is present and run for real when it is. The GitHub runner has Docker, so
-  the full suite runs and coverage reflects the real numbers. The testcontainers
+  the full suite runs and coverage reflects the real numbers.
+
+  That skip is worth being blunt about, because it is the sharpest edge in the
+  whole strategy. A container that fails to start is a `t.Skipf`, and a skip is
+  a PASS. Locally the tests skip **silently** unless the Docker socket is
+  reachable (colima running, with `DOCKER_HOST` set) *and*
+  `TESTCONTAINERS_RYUK_DISABLED=true` is exported. Miss either and `make test`
+  prints green while the entire integration and chaos layer never ran, and
+  `make cover` reports a floor-passing number computed from unit tests alone.
+  The build cache compounds it: a cached skip replays as a pass without
+  retrying. So CI, which has a real Docker daemon, is the only place these
+  numbers mean anything, and a green local run is not evidence that any
+  database-backed path works. The testcontainers
   tests wait on the Postgres readiness log (`"ready to accept connections"` seen
   twice), not on the port opening, because port-open races with the initdb restart
   and produces connection resets on CI. Splitting unit from integration would mean
   either running the suite twice or inventing build tags the codebase does not use,
   so one honest `test` job is the better trade. The coverage profile is scoped to
-  `internal/` only: `cmd/main.go` is wiring with no unit tests, and folding its zero
+  `internal/` only: `cmd/server/main.go` is wiring with no unit tests, and folding its zero
   into the number would drag the gate down for no signal, so `cmd/` is compiled and
   smoke-run as a build check but kept out of the coverage measurement.
 - `smoke-load`: boots the Compose stack and runs a short low-RPS k6.

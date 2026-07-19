@@ -1,7 +1,8 @@
-# ADR-018: PII crypto-shredding (reconciling immutability with the right to erasure)
+# ADR-018: PII Crypto-Shredding (Reconciling Immutability with the Right to Erasure)
 
-Status: Accepted
-Date: 2026-07-11
+## Status
+
+Accepted: 2026-07-11
 Referenced by ADR-015 (audit remediation, Phase 6). Closes audit finding A9.3.
 
 ## Context
@@ -65,15 +66,15 @@ mutated, so the append-only invariant and the hash chain are untouched.
 - Reading a description whose DEK version was shredded returns a redacted marker
   (`"[redacted: erased]"`) without error, so reads keep working after an erasure.
 - Cross-tenant isolation: each tenant has its own DEK, and `crypto_keys` carries
-  row-level security (ADR-015 Phase 5, ADR / migration 0024's FORCE + allow-when-
-  unset pattern), so one tenant can never decrypt another's data.
+  row-level security (ADR-015 Phase 5, reusing migration 0024's FORCE plus
+  allow-when-unset pattern), so one tenant can never decrypt another's data.
 
 ### 3. Granularity: per-tenant in v1, per-party as the growth path
 
 v1 shreds at the **tenant** grain (one DEK sequence per tenant). This demonstrates
 and delivers the crypto-shred mechanism, but a real GDPR erasure targets one
 customer, not a whole tenant. The growth path is a per-party (per-subject) DEK,
-keyed off the party reference on accounts (ADR / Phase 6.1), so a single subject's
+keyed off the party reference on accounts (ADR-015 Phase 6), so a single subject's
 descriptions can be erased without touching anyone else's. The versioned-envelope
 design above extends to that grain without changing the hash-chain reasoning.
 

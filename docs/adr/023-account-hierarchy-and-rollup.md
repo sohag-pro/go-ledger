@@ -1,12 +1,13 @@
-# ADR-023: Account hierarchy and rolled-up reporting
-
-Status: Accepted
-Date: 2026-07-12
+# ADR-023: Account Hierarchy and Rolled-Up Reporting
 
 This ADR records adding a parent/child account hierarchy and rolled-up balances
 to go-ledger (Week 12: account hierarchy and reporting). It keeps the core
 invariant intact: balances stay derived from postings, never stored, and a
 rollup is a query, not a maintained number.
+
+## Status
+
+Accepted: 2026-07-12
 
 ## Context
 
@@ -45,8 +46,11 @@ things: a self-parent (`parent_id = id`), a cycle (walking the ancestor chain
 from the proposed parent and finding the row itself), and a currency mismatch
 against the parent. The trigger is the guarantee; the service also checks and
 returns a clean error, but the database is the backstop that no code path can
-bypass. The cycle walk also bounds hierarchy depth in practice, so no separate
-depth cap is needed.
+bypass. The ancestor walk is itself bounded: it bails out past 10,000 hops
+(migration 0032), so a chain corrupted by some future bug cannot spin the walk
+forever. That hop ceiling is a backstop against a broken chain, not a product
+limit on how deep a chart of accounts may be; no realistic hierarchy approaches
+it.
 
 ### 3. Rollup is a recursive CTE at query time, not a stored column
 

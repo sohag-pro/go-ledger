@@ -1,12 +1,13 @@
-# ADR-022: USD-hub FX triangulation for cross-currency pairs
-
-Status: Accepted
-Date: 2026-07-12
+# ADR-022: USD-Hub FX Triangulation for Cross-Currency Pairs
 
 This ADR reverses one narrow decision from ADR-014: that FX conversion never
 routes through a third currency. It adds a single-hop triangulation through a
 fixed hub currency (USD) so a conversion between two non-USD currencies works
 when only each side's rate against USD is configured.
+
+## Status
+
+Accepted: 2026-07-12
 
 ## Context
 

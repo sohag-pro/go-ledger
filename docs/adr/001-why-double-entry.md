@@ -28,7 +28,8 @@ Double-entry bookkeeping, in use since the 15th century, solves all three
 structurally:
 
 - Every transaction consists of two or more **postings** (ledger entries).
-- Each posting debits one account and credits another.
+- Each posting is a single signed entry against one account: a debit or a
+  credit, never both. A movement between two accounts is two postings.
 - The sum of all postings in a transaction must equal zero.
 
 ## Decision
@@ -39,8 +40,10 @@ go-ledger models all money movement as double-entry transactions:
 - `Posting`: a single signed entry against one account; a transaction has
   two or more postings.
 - **Invariant:** Σ(postings) = 0 for every transaction. Enforced in the domain
-  types (`Transaction.Validate()`), and later at the database level with a
-  CHECK constraint.
+  types (`Transaction.Validate()`), and later at the database level. The
+  database mechanism is a `DEFERRABLE INITIALLY DEFERRED` constraint trigger,
+  not a row CHECK: the sum spans many posting rows, which a single-row CHECK
+  cannot express (see ADR-004 and migration 0002).
 - Postings are append-only. Balances are *derived* (sum of postings), never
   stored as mutable primary state.
 

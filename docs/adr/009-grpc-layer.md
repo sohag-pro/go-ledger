@@ -3,6 +3,11 @@
 ## Status
 
 Accepted: 2026-07-02
+Superseded in part by ADR-012. The "gRPC is unauthenticated for now" position
+below no longer holds: every non-health RPC is authenticated and scope-checked
+by an interceptor in the chain this ADR set up. The default-tenant interceptor
+described under "Interceptors now" was replaced by that auth interceptor,
+exactly as predicted.
 
 ## Context
 
@@ -122,7 +127,10 @@ the service already supports idempotency.
   green, and the buf remote-plugin fetch needs network at generate time (not at
   build or run time).
 - gRPC is unauthenticated for now, same as REST, guarded only by the default
-  tenant and the VPS network posture.
+  tenant and the VPS network posture. *(Closed by ADR-012: an auth interceptor
+  now sits in this same chain, reading the bearer token from request metadata,
+  resolving the key, and checking the scope the method requires. Only the health
+  service is exempt.)*
 
 ## Alternatives considered
 

@@ -1,4 +1,4 @@
-# ADR-013: VPS infrastructure-as-code with Ansible, and Docker as a dev-only artifact
+# ADR-013: VPS Infrastructure-as-Code with Ansible, and Docker as a Dev-Only Artifact
 
 ## Status
 
@@ -19,13 +19,13 @@ stale:
    AWS. The service has run in production at https://go.sohag.pro since
    2026-06-12, and the CI/CD pipeline the plan scheduled for Week 11 already
    ships every push to `main`.
-2. How prod actually runs is settled and deliberately un-containerized. The VPS
-   is a 1 CPU / 1 GB RAM Virtuozzo container on Ubuntu 24.04, shared with the
-   portfolio at sohag.pro. The ledger runs as a **bare prebuilt binary** under a
-   hardened `go-ledger.service` systemd unit. Postgres 16 is installed on the
-   same box, memory-tuned for 1 GB, and backed up with pg_dump. Docker is not
-   installed on the server; all building happens in CI, which ships the binary to
-   `/opt/go-ledger`.
+2. How prod actually runs is settled and deliberately un-containerized. It is a
+   single small VPS running Ubuntu LTS, shared with one other low-traffic site.
+   The ledger runs as a **bare prebuilt binary** under a hardened
+   `go-ledger.service` systemd unit. Postgres 16 is installed on the same box,
+   memory-tuned for the host's modest RAM, and backed up with pg_dump. Docker is
+   not installed on the server; all building happens in CI, which ships the
+   binary to a fixed install directory.
 
 So the AWS half of the planned Week 10 is dead on arrival, and the deploy half is
 already done. What genuinely remains, and fits the VPS decision, is two gaps:
@@ -53,10 +53,10 @@ the real box. The plan file's Week 10 is treated as superseded by this ADR.
 The multi-stage Dockerfile produces a distroless image under 20 MB, used for
 local development and CI (build and load test). Prod is unaffected: it stays a
 bare systemd binary against a co-located Postgres. We do not add a Docker daemon
-to the 1 GB shared box, and we do not run compose in prod.
+to the shared box, and we do not run compose in prod.
 
-Rationale: the box has 1 GB of RAM split between the app, Postgres, and the
-portfolio. A container runtime is pure overhead there, and the bare-binary +
+Rationale: the box's RAM is split between the app, Postgres, and the other site
+it hosts. A container runtime is pure overhead there, and the bare-binary +
 systemd model already gives strong isolation (NoNewPrivileges, ProtectSystem=
 strict, the full hardening block) at zero memory cost. Docker earns its keep for
 reproducible local dev and for the load-test stack, so that is where it lives.
@@ -84,9 +84,9 @@ here reaches prod.
 The prose in `server-setup.md` becomes an executable, re-runnable Ansible
 playbook under `infra/ansible/`, split into roles that mirror the runbook: base
 (ufw, fail2ban, unattended upgrades), postgres (Postgres 16, role and
-database, 1 GB memory tuning, pg_dump backup cron), app (`/opt/go-ledger`,
-root-owned env file, deploy user, restricted sudoers), systemd (the hardened
-unit), nginx (the go.sohag.pro vhost with gzip), and tls (certbot).
+database, small-host memory tuning, pg_dump backup cron), app (the install
+directory, root-owned env file, deploy user, restricted sudoers), systemd (the
+hardened unit), nginx (the service vhost with gzip), and tls (certbot).
 
 Ansible over the alternatives:
 
@@ -109,12 +109,11 @@ is. Committed `*.example` files show the shape without the secrets. The public
 repo gets reproducible IaC; the live box's address and credentials stay out of
 it.
 
-The nginx role runs on a host shared with the portfolio, which uses HSTS preload
-(every sohag.pro subdomain must always serve valid HTTPS). The role therefore
-validates with `nginx -t`, reloads rather than restarts, and asserts that
-`https://sohag.pro/` still returns 200 after any change. Re-running the playbook
-against the live box is deliberate, not casual: the README documents a
-check-mode-first workflow.
+The nginx role runs on a shared host, so a bad config or a failed reload is not
+contained to this service. The role therefore validates with `nginx -t`, reloads
+rather than restarts, and asserts that the other site on the box still returns
+200 after any change. Re-running the playbook against the live box is deliberate,
+not casual: the README documents a check-mode-first workflow.
 
 ## Consequences
 

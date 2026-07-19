@@ -1,13 +1,14 @@
-# ADR-020: FX rates and markup as live admin config
-
-Status: Accepted
-Date: 2026-07-11
+# ADR-020: FX Rates and Markup as Live Admin Config
 
 This ADR records moving FX rate configuration from a boot-time environment
 variable to a live admin API, and adding a per-tenant and global markup default
 that a conversion falls back to when a rate carries no explicit spread. It builds
 directly on ADR-014 (multi-currency and FX) and reuses its append-only rate
 history and provider seam.
+
+## Status
+
+Accepted: 2026-07-11
 
 ## Context
 
@@ -61,10 +62,19 @@ one default per scope: `(id, tenant_id NULL for global, default_spread_bps,
 source, effective_at, created_at)`, mirroring `fx_rates` exactly (server-stamped
 `effective_at`, a `[0, 10000)` check on the bps, a current-row index).
 
+`default_spread_bps` is itself nullable, and a null there is meaningful rather
+than absent: it is a **clear**, not a value. On a tenant-scoped row it means
+"this tenant no longer has its own override, follow the global default again,"
+which is the only way back once a tenant has set one (a tenant row otherwise
+always beats the global). On the global row it means no markup at all, that is,
+zero. This mirrors the nullable `fx_rates.spread_bps` above: in both tables an
+append of null is how you retract, since nothing is ever updated in place.
+
 When a conversion runs, the effective spread is resolved in this order:
 
 1. the pair's `fx_rates.spread_bps`, if non-null (per-pair override);
-2. the tenant's current `fx_markup_defaults` row;
+2. the tenant's current `fx_markup_defaults` row, if its `default_spread_bps`
+   is non-null (a null row is a clear and falls through to the global);
 3. the global `fx_markup_defaults` row (`tenant_id IS NULL`);
 4. zero, if nothing above is set.
 
@@ -145,6 +155,15 @@ global rates and the global markup default. For the single-operator v1 deploymen
 other global-ish admin actions already behave. A future multi-operator deployment
 would want a distinct platform-admin scope for the global writes; that is out of
 scope here and recorded so the gap is deliberate, not forgotten.
+
+"Any admin key" is a weaker bound than it sounds on a **demo** deployment.
+`DEMO_MODE=true` provisions the published demo key with `admin` scope (ADR-019),
+so on go.sohag.pro the holder of an admin key is any anonymous visitor, and the
+global rate and markup writes described here are effectively public. That is
+accepted for the demo (the rates are demo data, and the whole database resets
+hourly), but it is the reason this note says "any admin key" rather than "an
+operator": on a demo box those are not the same set of people. A deployment with
+real FX exposure must not run demo mode.
 
 ## Out of scope (v1)
 

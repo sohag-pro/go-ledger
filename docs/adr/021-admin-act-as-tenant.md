@@ -1,13 +1,14 @@
-# ADR-021: Admin act-as-tenant for cross-tenant operator access
-
-Status: Accepted
-Date: 2026-07-12
+# ADR-021: Admin Act-as-Tenant for Cross-Tenant Operator Access
 
 This ADR records letting an admin-scoped API key operate against a tenant other
 than the one its key belongs to, by sending an `X-Act-As-Tenant` header, so the
 operator console's tenant switcher can actually isolate the ledger and reporting
 views to the selected tenant. It builds on ADR-012 (auth and scopes), ADR-019
 (the operator console), and the row-level security added during the remediation.
+
+## Status
+
+Accepted: 2026-07-12
 
 ## Context
 

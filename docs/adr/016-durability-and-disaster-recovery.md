@@ -1,7 +1,8 @@
-# ADR-016: Durability and disaster recovery (WAL archiving, offsite encrypted backups, PITR)
+# ADR-016: Durability and Disaster Recovery (WAL Archiving, Offsite Encrypted Backups, PITR)
 
-Status: Accepted
-Date: 2026-07-10
+## Status
+
+Accepted: 2026-07-10
 Supersedes the backup portion of the Week 10 VPS setup (the same-disk daily
 `pg_dump`). Referenced by ADR-015 (audit remediation, Phase 1) and closes audit
 finding A4.1 (Blocker), with A8.1 (restore drill).
@@ -46,11 +47,24 @@ does not know how it is backed up.
 
 ### 2. Topology: co-located archiving to encrypted offsite object storage
 
-Now: PostgreSQL on the VPS ships WAL and base backups to an S3-compatible object
+Now: Postgres on the VPS ships WAL and base backups to an S3-compatible object
 store in a **different failure domain** (a separate provider or region from the
 VPS), with pgBackRest repository encryption on, so the offsite copy is ciphertext
 at rest. WAL archiving is asynchronous (`archive-async`) so archiving never
 stalls a commit.
+
+**Status of this decision, as of the v1 release.** The above describes the
+decided design, not the running system. The Ansible role gates
+`archive_mode`, `archive_command`, and `archive_timeout` behind a
+`postgres_pgbackrest_configured` flag, and deliberately so: enabling archiving
+with an unprovisioned repository makes Postgres retain unarchived WAL forever
+and fill the shared disk. Until the object-store bucket, credentials, and
+encryption passphrase exist (see Consequences, "Operational prerequisites"),
+that flag stays false, pgBackRest is inert configuration, and the production
+box's only backup is still the same-disk daily `pg_dump` this ADR calls
+disqualifying above. The gap is the provisioning, not the code. It is recorded
+here rather than left implicit, because a durability ADR that reads as done
+while the box runs the mechanism it rejects is worse than no ADR.
 
 The growth path, explicitly out of scope for this ADR, is a managed Postgres
 service (the provider owns WAL archiving, PITR, and replicas) when the service
@@ -87,7 +101,7 @@ repository is the system of record for recovery.
 ### 5. Automated restore-and-verify
 
 A backup is not trusted until a restore has been proven, so a scheduled job
-**restores the latest offsite backup into a throwaway PostgreSQL instance and
+**restores the latest offsite backup into a throwaway Postgres instance and
 verifies the ledger's own invariants against the restored data**:
 
 - every account's balance derived from its postings is internally consistent and
@@ -101,6 +115,15 @@ from a different machine than the one that wrote it, and it fails loudly (red
 build, alert) on any mismatch or any inability to restore. Running it off-box is
 deliberate: it proves the copy that would survive losing the VPS is actually
 restorable, which is the only thing that matters in a disaster.
+
+One honest caveat about "fails loudly," which matters while the repository is
+unprovisioned: the workflow's first job checks whether the `PGBACKREST_S3_KEY`
+secret is set, and when it is absent the restore job is skipped entirely and the
+run finishes **green**. So today the drill verifies nothing and reports success,
+which is the failure mode a restore drill exists to prevent. The gate is there
+so the workflow can be committed before the bucket exists, but a green
+restore-verify is only evidence of anything once that secret is set. Treat the
+skip as unproven, not as passing.
 
 The RPO and RTO, the restore runbook, and the verify job are documented in
 `docs/ops/server-setup.md`.

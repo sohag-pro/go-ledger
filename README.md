@@ -236,4 +236,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, running the test suite
 
 ## License
 
-[MIT](LICENSE)
+Code is [MIT](LICENSE).
+
+The book (`the-ledger-book.pdf`, `the-ledger-book.epub`, and the cover image) is
+copyright Sohag Hasan and licensed
+[CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/): free to
+read and to redistribute unmodified, with credit, for non-commercial use.
+
+Cover gopher by Takuya Ueda,
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/); original mascot design
+by Renee French.

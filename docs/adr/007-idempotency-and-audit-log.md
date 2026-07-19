@@ -3,6 +3,14 @@
 ## Status
 
 Accepted: 2026-07-02
+Superseded in part by ADR-012, ADR-017, and ADR-026. Three of this ADR's
+decisions changed: the idempotency key is no longer optional (ADR-012 made it
+mandatory on `POST /v1/transactions`), idempotency rows no longer grow without
+bound (migration 0019 added `expires_at` and a sweep), and the audit actor is no
+longer the tenant id (ADR-026 made it the API-key principal). ADR-017 also moved
+the audit write off the posting transaction and onto an outbox plus a background
+chainer. The idempotency mechanism itself, a primary key inside the posting
+transaction as the exactly-once referee, is unchanged.
 
 ## Context
 
@@ -69,11 +77,19 @@ backward compatible (the console and seeder callers are unaffected) and matches
 common payment APIs where the key is recommended but not mandatory. A keyless post
 is still audited.
 
+*Superseded by ADR-012. A security audit called opt-in idempotency a
+double-post waiting to happen, and the header is now required: `POST
+/v1/transactions` returns 400 without it. The "Required idempotency key"
+alternative rejected at the bottom of this ADR is what shipped.*
+
 ### The audit log is written in the same transaction and is create-only
 
 Each posted transaction writes one `audit_log` row inside the same `RunInTx`
 closure as the postings: `action = transaction.created`, `before` NULL, `after` a
-JSON snapshot of the transaction, `actor` the tenant id (until auth lands). Because
+JSON snapshot of the transaction, `actor` the tenant id (until auth lands).
+*(Superseded by ADR-026: the actor is now the individual API-key principal, which
+is what makes maker-checker enforceable. Background paths with no principal, the
+pending sweep and the demo seeder, still fall back to the tenant id.)* Because
 the audit insert shares the transaction, a posting and its audit record commit
 together or roll back together; there is no separate "log it later" step that could
 fail on its own and leave a transaction nobody recorded. On the replay path the
@@ -91,8 +107,8 @@ FOR EACH ROW`), so the log is immutable even against a direct `DELETE FROM
 audit_log` in psql, not just by application convention. This is the same
 defense-in-depth pattern as the balance and currency triggers (ADR-004, ADR-005).
 
-The one sanctioned exception is the demo seeder, which resets the tenant every few
-hours and must clear the log. The trigger allows the mutation only when the
+The one sanctioned exception is the demo seeder, which resets the tenant on its
+`SEED_INTERVAL` (hourly by default) and must clear the log. The trigger allows the mutation only when the
 transaction-local GUC `audit.allow_purge` is set to `on`; the seeder sets `SET
 LOCAL audit.allow_purge = 'on'` at the start of its reset transaction. `SET LOCAL`
 is transaction-scoped, so it cannot leak to other pooled connections, and the
@@ -125,7 +141,9 @@ scoped on both the outer table and the subquery.
 ### Negative
 
 - The idempotency key table grows without bound in v1 (no TTL or expiry); the demo
-  seeder clears it on reset, and real retention is a later concern.
+  seeder clears it on reset, and real retention is a later concern. *(Closed:
+  migration 0019 added `expires_at` with a configurable `IDEMPOTENCY_TTL`,
+  default 24h, plus a background sweep.)*
 - The audit `after` snapshot duplicates data already in the postings; accepted, as
   the point of an audit log is a self-contained record.
 - The immutability trigger's gated branch currently permits any mutation (not just
