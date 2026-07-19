@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +49,16 @@ var (
 	// live check.
 	noDefaultSpreadBps int32
 	noDefaultErr       error
+
+	// globalMarkupMu serialises every test window that writes a global
+	// (tenant_id NULL) row in fx_markup_defaults and then reads it back,
+	// directly or via Provider.Rate / AdminService.ListRates. The row is a
+	// single package-wide slot with no per-pair partition, and the resolver
+	// picks the most recently inserted one, so two parallel tests that both
+	// touch it will race: whichever landed second wins the read the other
+	// test was about to assert against. Hold the mutex around the whole
+	// "insert-then-observe" pair, not just the insert.
+	globalMarkupMu sync.Mutex
 )
 
 func TestMain(m *testing.M) {

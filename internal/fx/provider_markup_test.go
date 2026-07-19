@@ -177,6 +177,16 @@ func TestProviderResolvesMarkupPrecedence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// Every case writes at least one global (tenant_id NULL) markup
+			// row and then reads it back through Rate. That row lives in a
+			// single package-wide slot, and admin_test.go's parallel tests
+			// (TestListRatesResolvesEffectiveSpreadAgainstRequestedScope,
+			// TestSetMarkupClearFallsBackToGlobal) also write a global
+			// markup=50. Hold the shared mutex across insert+read so a
+			// concurrent SetMarkup cannot land between them.
+			globalMarkupMu.Lock()
+			defer globalMarkupMu.Unlock()
+
 			tenantID := newTestTenant(t, pool)
 			base, quote := tc.setup(t, tenantID)
 

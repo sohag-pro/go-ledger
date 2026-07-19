@@ -200,6 +200,14 @@ func TestListRatesResolvesEffectiveSpreadAgainstRequestedScope(t *testing.T) {
 		t.Fatalf("InsertRate(global, %s/%s) error = %v", base, quote, err)
 	}
 
+	// This test writes the shared global markup slot then reads it back via
+	// ListRates. TestProviderResolvesMarkupPrecedence does the same on a
+	// disjoint currency pair, and the resolver picks the latest global row
+	// across all pairs, so hold globalMarkupMu across the whole write-then-
+	// read window to keep the two tests from racing on that one shared slot.
+	globalMarkupMu.Lock()
+	defer globalMarkupMu.Unlock()
+
 	if _, err := svc.SetMarkup(ctx, tenantID, int32Ptr(80)); err != nil {
 		t.Fatalf("SetMarkup(tenant, 80) error = %v", err)
 	}
