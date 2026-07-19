@@ -418,9 +418,30 @@ h2{font:650 clamp(26px,3.4vw,38px)/1.15 var(--sans);letter-spacing:-.025em;margi
   transform:rotate(45deg) translateY(-1px);
 }
 .star-ribbon .s{margin-right:5px}
+.star-ribbon .lbl-full{display:inline}
+.star-ribbon .lbl-short{display:none}
+/* Mobile: the 45deg diagonal projects past narrow viewports and collides
+   with the nav's Menu button. Swap to a compact square pill fixed to the
+   top-right just below the nav bar, so it stays visible while scrolling
+   without touching the menu. */
 @media (max-width:640px){
-  .star-ribbon{top:14px;right:-70px;width:200px;padding:7px 0;font-size:11px}
+  .star-ribbon{
+    top:66px;right:12px;
+    transform:none;
+    width:auto;padding:8px 12px;
+    background:linear-gradient(135deg,#F4C15C,#E8A33D);
+    border-radius:8px;
+    box-shadow:0 3px 12px rgba(0,0,0,.3),0 1px 3px rgba(0,0,0,.25);
+    font:700 11px/1 var(--mono);letter-spacing:.06em;
+    display:inline-flex;align-items:center;gap:5px;
+  }
+  .star-ribbon:hover{transform:translateY(-1px)}
+  .star-ribbon .lbl-full{display:none}
+  .star-ribbon .lbl-short{display:inline}
 }
+/* Prevent the rotated ribbon's right-hand overflow from producing a
+   phantom horizontal scrollbar on narrow viewports. */
+html,body{overflow-x:hidden}
 .book-ribbon{
   position:absolute;top:22px;right:-38px;width:150px;
   transform:rotate(45deg);
@@ -512,7 +533,9 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
 <!-- Fixed corner ribbon: the star ask for the whole project (repo + blog +
      book), always visible while scrolling. -->
 <a class="star-ribbon" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener" aria-label="Star the go-ledger project on GitHub if it helped you">
-  <span class="s" aria-hidden="true">&#9733;</span> Star on GitHub
+  <span class="s" aria-hidden="true">&#9733;</span>
+  <span class="lbl-full">Star on GitHub</span>
+  <span class="lbl-short">Star repo</span>
 </a>
 
 <a class="book-banner" href="#book" aria-label="The Ledger Book: the whole build plus interview Q and A found only in the book">
