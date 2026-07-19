@@ -22,6 +22,13 @@ func TestFeed_RefreshWritesAndDedups(t *testing.T) {
 	// A tenant with no rates of its own resolves the global default the feed writes.
 	tenant := newTestTenant(t, pool)
 
+	// The mocked feed writes global USD/EUR with a NULL spread; the same
+	// pair is written by TestSeed_ParsesExactValues (fx.Seed) with a fixed
+	// spread. Hold the shared mutex around the whole write-then-observe
+	// window so neither test's assertion sees the other test's row.
+	globalUSDEURRateMu.Lock()
+	defer globalUSDEURRateMu.Unlock()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"base":"USD","rates":{"EUR":0.92,"GBP":0.79}}`))

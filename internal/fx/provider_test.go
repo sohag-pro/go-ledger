@@ -59,6 +59,17 @@ var (
 	// test was about to assert against. Hold the mutex around the whole
 	// "insert-then-observe" pair, not just the insert.
 	globalMarkupMu sync.Mutex
+
+	// globalUSDEURRateMu serialises writes to the global (tenant_id NULL)
+	// USD/EUR row in fx_rates that several parallel tests share:
+	// TestSeed_ParsesExactValues writes it with spread 25 via fx.Seed and
+	// reads back the exact value; TestFeed_RefreshWritesAndDedups writes it
+	// with NULL spread via the live-feed HTTP mock. CurrentFXRate picks the
+	// latest global row for (base, quote), so if the feed writes land
+	// between seed's write and its assertion, seed sees a NULL spread
+	// instead of 25. Every test that writes USD/EUR globally must acquire
+	// this before its write and hold it across the assert.
+	globalUSDEURRateMu sync.Mutex
 )
 
 func TestMain(m *testing.M) {

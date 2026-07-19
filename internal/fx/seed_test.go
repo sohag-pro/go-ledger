@@ -36,6 +36,15 @@ func TestSeed_ParsesExactValues(t *testing.T) {
 	ctx := context.Background()
 	q := sqlc.New(pool)
 
+	// USD/EUR is also written by TestFeed_RefreshWritesAndDedups (globally,
+	// with NULL spread from the live-feed mock). CurrentFXRate returns the
+	// latest global row for the pair, so a concurrent feed write between
+	// this Seed and the CurrentFXRate read below would give us the feed's
+	// NULL where we expect Seed's 25. Hold the shared mutex for the whole
+	// write-then-observe window.
+	globalUSDEURRateMu.Lock()
+	defer globalUSDEURRateMu.Unlock()
+
 	if err := fx.Seed(ctx, pool, "USD:EUR=0.9200/25,USD:BDT=110.50/50"); err != nil {
 		t.Fatalf("Seed() error = %v", err)
 	}
