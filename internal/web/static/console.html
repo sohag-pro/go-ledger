@@ -5,16 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#16202E">
-<title>go-ledger console</title>
-<meta name="description" content="The go-ledger operator console: create accounts, post transactions, manage tenants and api keys, configure webhooks and policy, and read reports, all against the live public API.">
+<title>go-ledger demo</title>
+<meta name="description" content="The go-ledger demo: click around a live example UI that calls the real public API, to create accounts, post transactions, manage tenants and API keys, configure webhooks and policy, and read reports.">
 <link rel="icon" href="/static/favicon.ico" sizes="any">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="go-ledger">
-<meta property="og:title" content="go-ledger console">
-<meta property="og:description" content="The go-ledger operator console: manage tenants, keys, webhooks, and policy, and browse the ledger, against the live API.">
+<meta property="og:title" content="go-ledger demo">
+<meta property="og:description" content="A live demo UI built on top of the go-ledger public API: browse the ledger, post transactions, and try the operator surface.">
 <meta property="og:url" content="https://go.sohag.pro/console">
 <meta property="og:image" content="https://go.sohag.pro/static/og-image.jpg">
 <meta property="og:image:width" content="1200">
@@ -339,11 +339,32 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
         <h1>Overview</h1>
         <p class="page-sub">A double-entry ledger for <span id="ovTenant" class="mono"></span>. Every transaction sums to zero.</p>
 
+        <!-- Beginner-friendly disclaimer: the product is an API, not a UI.
+             This page is a demo built on top of that API. Keep the language
+             plain for readers who are new to the "API-only" idea. -->
+        <div class="card" style="margin:0 0 20px;background:rgba(0,173,216,.05);border:1px solid rgba(0,173,216,.25)">
+          <h3 style="margin:0 0 10px;color:var(--text);font-size:16px;display:flex;align-items:center;gap:8px">
+            <span aria-hidden="true">&#128161;</span> New here? Read this first.
+          </h3>
+          <p style="margin:0 0 12px;color:var(--muted);line-height:1.55">
+            <strong style="color:var(--text)">go-ledger has no user interface of its own. It is an API.</strong>
+            The actual product is a set of HTTP endpoints your app calls to create accounts, move money, and read reports. There is no shipped dashboard, no login form, no admin panel. The API <em>is</em> the product.
+          </p>
+          <p style="margin:0 0 12px;color:var(--muted);line-height:1.55">
+            <strong style="color:var(--text)">This page is a demo.</strong>
+            I built this small UI on top of those same APIs so you can click around and see what the ledger does, without writing any code. Every button and form here fires a real API call against the live server. Nothing is faked or hardcoded.
+          </p>
+          <p style="margin:0;color:var(--muted);line-height:1.55">
+            <strong style="color:var(--text)">Want to see the API itself?</strong>
+            Open the <a href="/playground" style="color:var(--cyan)">API Playground</a>. Every endpoint used on this page is documented there, with example requests and responses you can send straight from your browser.
+          </p>
+        </div>
+
         <div class="card" style="margin:0 0 20px;border-color:rgba(0,173,216,.22)">
           <p style="margin:0 0 16px;color:var(--muted)">
             <strong style="color:var(--text)">go-ledger</strong> is an open-source, multi-tenant, double-entry payment ledger written in Go.
             Money moves as balanced transactions: every set of postings sums to zero, so funds are never created or lost, only shifted between accounts.
-            This console is a thin client over the live API.
+            This demo is a thin client over the live API.
           </p>
           <ul class="feat-list">
             <li><strong>Double-entry core</strong> zero-sum postings, balances derived from history, never edited in place</li>
@@ -422,7 +443,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
               <button class="btn primary" type="submit">Create account</button>
               <button class="btn ghost" type="button" id="accountFormCancel">Cancel</button>
             </div>
-            <div class="hint" style="margin-top:10px">Amounts across this console are in major units (for example 100.00), converted to the minor units the API stores.</div>
+            <div class="hint" style="margin-top:10px">Amounts across this demo are in major units (for example 100.00), converted to the minor units the API stores.</div>
           </form>
         </div>
       </section>
@@ -767,7 +788,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
 
         <div class="card" id="demoKeyCard" hidden>
           <h2 style="font-size:14.5px;margin:0 0 10px">API key</h2>
-          <p style="margin:0;color:var(--muted)">This is the public demo. The console uses the shared, rate-limited demo key automatically, so there is nothing to set here. On your own server this card lets you paste an admin key.</p>
+          <p style="margin:0;color:var(--muted)">This is the public demo. It uses the shared, rate-limited demo key automatically, so there is nothing to set here. On your own server this card lets you paste an admin key.</p>
         </div>
 
         <div class="card">
@@ -775,7 +796,7 @@ details.adv .adv-body{margin-top:14px;padding:16px;border:1px solid var(--line);
           <div class="field" style="max-width:280px">
             <label for="setTenant">Current tenant</label>
             <select id="setTenant"></select>
-            <div class="hint">Scopes the whole console to this tenant: the ledger and reporting views as well as the admin panels. With an admin key the server isolates each view to the selected tenant; a non-admin key stays on its own tenant.</div>
+            <div class="hint">Scopes the whole demo to this tenant: the ledger and reporting views as well as the admin panels. With an admin key the server isolates each view to the selected tenant; a non-admin key stays on its own tenant.</div>
           </div>
           <div class="field">
             <label>Mode</label>

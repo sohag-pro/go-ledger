@@ -197,22 +197,49 @@ single-leader chainer drains that into a hash-chained, tamper-evident
 ```
 go-ledger/
 ├── cmd/
-│   ├── server/        # main.go: wiring, config, migrations, graceful shutdown. No business logic.
-│   └── ledgerctl/      # operator CLI over the admin surface: tenants, keys, rates, webhooks
-├── internal/          # the heart of the project; domain and service code, unimportable from outside
-│   ├── domain/         # the double-entry model: Transaction, Posting, Account, Validate()
-│   ├── api/            # REST handlers (huma), OpenAPI generation, the Scalar playground
-│   ├── web/             # the /console operator console (thin client, no server-side logic of its own)
-│   └── postgres/       # repository layer, goose migrations, sqlc-generated queries
-├── docs/
-│   └── adr/            # architecture decision records: why double-entry, schema, auth, FX, RLS, PII...
+│   ├── server/            # main.go: wiring, config, migrations, graceful shutdown. No business logic.
+│   ├── ledgerctl/         # operator CLI over the admin surface: tenants, keys, rates, webhooks
+│   ├── genopenapi/        # generates api/openapi.yaml from huma handlers (`make openapi`)
+│   └── verify-restore/    # PITR restore verifier used by the CI restore-verify workflow
+├── internal/              # the heart of the project; domain and service code, unimportable from outside
+│   ├── domain/            # the double-entry model: Transaction, Posting, Account, Validate()
+│   ├── ledger/            # posting service, idempotency, approval workflow (ADR-025)
+│   ├── postgres/          # repository layer, goose migrations, sqlc-generated queries
+│   ├── api/               # REST handlers (huma), OpenAPI generation, the Scalar playground
+│   ├── grpcserver/        # gRPC layer, chained interceptors (auth, rate limit, tracing)
+│   ├── web/               # the /console demo UI (thin client, no server-side logic of its own)
+│   ├── auth/              # API-key middleware, scopes, X-Act-As-Tenant (ADR-021)
+│   ├── admin/             # tenant lifecycle, key rotation, per-tenant policy
+│   ├── audit/             # append-only audit chain and outbox (ADR-017)
+│   ├── crypto/            # PII crypto-shredding, versioned keys (ADR-018)
+│   ├── fx/                # multi-currency rates, USD-hub triangulation, markup (ADR-014, 022)
+│   ├── webhook/           # signed outbound events, per-tenant subscriptions (ADR-027)
+│   ├── seed/              # demo tenant seeder: reset + backdated fixtures
+│   ├── verify/            # end-to-end chain and posting verifiers
+│   ├── observability/     # OpenTelemetry setup, slog handler, trace correlation
+│   ├── metrics/           # Prometheus registry, business + SLO histograms
+│   ├── opsmetrics/        # operator-only metrics (audit chain lag, restore health)
+│   ├── paging/            # cursor pagination helper shared across endpoints
+│   └── genproto/          # protoc-gen-go output (never edit by hand)
+├── proto/ledger/          # protobuf schema, linted and break-checked with buf
 ├── api/
-│   └── openapi.yaml    # committed OpenAPI spec, regenerated with `make openapi`
-├── Makefile            # run, build, test, lint, dev, migrations
-├── docker-compose.yml   # demo, local, dev, and load-test profiles
-├── Dockerfile           # multi-stage build, distroless base
-├── .golangci.yml        # lint config (gofumpt, gosec, and friends)
-└── .air.toml            # hot reload for local dev
+│   └── openapi.yaml       # committed OpenAPI spec, regenerated with `make openapi`
+├── docs/
+│   └── adr/               # architecture decision records: why double-entry, schema, auth, FX, RLS, PII, webhooks...
+├── infra/ansible/         # infrastructure-as-code for the VPS (ADR-013): nginx, systemd, pgBackRest
+├── deploy/                # Prometheus scrape config and alert rules shipped alongside the service
+├── test/load/             # k6 load-test scenarios (smoke gate in CI, longer runs for capacity)
+├── examples/grpc-client/  # tiny Go client that exercises the gRPC surface end-to-end
+├── bruno/                 # Bruno API collection: click-through examples of every endpoint
+├── scripts/coverage.sh    # per-package coverage floors used by `make test-coverage`
+├── Makefile               # run, build, test, lint, dev, migrations, openapi
+├── docker-compose.yml     # demo, local, dev, and load-test profiles
+├── Dockerfile             # multi-stage build, distroless base
+├── sqlc.yaml              # sqlc code generation from internal/postgres/sqlc/queries.sql
+├── buf.yaml / buf.gen.yaml # buf lint / breaking / generation config for the proto layer
+├── .golangci.yml          # lint config (gofumpt, gosec, and friends)
+├── .env.example           # every environment variable the service reads, with defaults
+└── .air.toml              # hot reload for local dev
 ```
 
 ## Development
