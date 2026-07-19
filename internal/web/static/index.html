@@ -136,7 +136,8 @@ h1 .go{color:var(--cyan)}
 .btn-ghost{border-color:var(--hair-strong);color:var(--text)}
 .btn-ghost:hover{color:var(--text);border-color:var(--muted);background:rgba(159,176,195,.06)}
 /* book announcement banner (top of page, first thing seen) */
-.book-banner{display:block;text-decoration:none;position:relative;overflow:hidden;border-bottom:1px solid var(--hair);
+.book-banner,.book-banner:hover{text-decoration:none}
+.book-banner{display:block;position:relative;overflow:hidden;border-bottom:1px solid var(--hair);
   background:
     radial-gradient(130% 200% at 12% 0%, rgba(0,173,216,.18), transparent 52%),
     radial-gradient(130% 200% at 92% 120%, rgba(232,163,61,.16), transparent 52%),
@@ -367,59 +368,59 @@ h2{font:650 clamp(26px,3.4vw,38px)/1.15 var(--sans);letter-spacing:-.025em;margi
   font:500 13px/1.5 var(--mono);color:#8A5A14;
 }
 .book-note span{color:#C07E1D;margin-right:6px}
-.print-callout{
-  margin-top:26px;padding:22px 24px;border-radius:12px;
-  background:#0E1B2A;border:1px solid rgba(0,173,216,.35);
-  box-shadow:0 6px 20px rgba(14,27,42,.15);
-  display:grid;grid-template-columns:auto 1fr auto;gap:18px;align-items:center;
+.book-meta{
+  font:500 12px/1.4 var(--mono)!important;color:#8A8272!important;
+  letter-spacing:.02em;margin:6px 0 20px!important;
 }
-.print-callout .flag{font-size:34px;line-height:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
-.print-callout .body{
-  font:500 14px/1.55 var(--sans);color:#D9E4EF;
+.dl-primary{
+  background:var(--ink)!important;color:var(--paper)!important;
+  border-color:var(--ink)!important;
 }
-.print-callout .body strong{color:#fff;font-weight:700;display:block;margin-bottom:4px;font-size:15px}
-.print-callout .body em{color:#8B9AA9;font-style:normal;font-size:12.5px;display:block;margin-top:6px;letter-spacing:.02em}
-.print-callout .cta{
-  font:600 14px/1 var(--mono);padding:13px 20px;border-radius:8px;
-  background:var(--cyan);color:#04202A;border:1px solid transparent;
-  white-space:nowrap;transition:transform .15s ease,background .15s ease;
+.dl-primary:hover{
+  background:#0F1620!important;color:var(--paper)!important;
+  border-color:var(--ink)!important;
 }
-.print-callout .cta:hover{background:#33bee0;text-decoration:none;transform:translateY(-1px)}
+.print-strip{
+  display:flex;align-items:center;gap:12px;
+  margin-top:22px;padding:12px 16px;border-radius:8px;
+  background:rgba(32,38,46,.05);border:1px solid rgba(32,38,46,.15);
+  font:500 13.5px/1.4 var(--sans);color:var(--ink);
+  transition:background .15s ease,border-color .15s ease,transform .15s ease;
+}
+.print-strip:hover{
+  background:rgba(0,173,216,.08);border-color:rgba(0,173,216,.35);
+  color:var(--ink);text-decoration:none;transform:translateY(-1px);
+}
+.print-strip .flag{font-size:20px;line-height:1;flex:none}
+.print-strip .txt{flex:1;min-width:0}
+.print-strip .txt strong{font-weight:700}
+.print-strip .arrow{flex:none;color:var(--cyan);font-weight:700;font-family:var(--mono)}
+/* GitHub star ribbon: fixed diagonal ribbon at the top-right corner, always
+   visible while scrolling. Framed for the whole project (code, blog series,
+   book), not just the book. Sits above nav (z-index) so it stays in view. */
+.star-ribbon{
+  position:fixed;top:22px;right:-58px;
+  transform:rotate(45deg);
+  width:220px;text-align:center;
+  padding:9px 0;
+  background:linear-gradient(135deg,#F4C15C,#E8A33D);
+  color:#2B1D06;
+  font:700 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+  text-decoration:none;
+  box-shadow:0 4px 16px rgba(0,0,0,.35),0 1px 3px rgba(0,0,0,.3);
+  z-index:1000;
+  transition:transform .18s ease,box-shadow .18s ease,background .18s ease;
+}
+.star-ribbon:hover{
+  background:linear-gradient(135deg,#F7CE7A,#F0B04D);
+  color:#2B1D06;text-decoration:none;
+  box-shadow:0 6px 22px rgba(244,193,92,.35),0 2px 4px rgba(0,0,0,.35);
+  transform:rotate(45deg) translateY(-1px);
+}
+.star-ribbon .s{margin-right:5px}
 @media (max-width:640px){
-  .print-callout{grid-template-columns:auto 1fr;gap:14px;padding:18px 18px}
-  .print-callout .cta{grid-column:1 / -1;text-align:center;padding:12px 16px}
+  .star-ribbon{top:14px;right:-70px;width:200px;padding:7px 0;font-size:11px}
 }
-/* Star strip: full-width hook at the top of the page, above the hero.
-   Frames the star ask around the whole project (repo, blog, book), not
-   just the book. Kept slim so it does not steal attention from the hero. */
-.star-strip{
-  background:linear-gradient(90deg,#0E1B2A,#132437);
-  border-bottom:1px solid rgba(0,173,216,.22);
-  padding:12px 0;
-}
-.star-strip .wrap{
-  display:flex;align-items:center;gap:16px;flex-wrap:wrap;
-}
-.star-strip .icon{
-  font-size:18px;line-height:1;color:#F4C15C;
-  text-shadow:0 0 12px rgba(244,193,92,.35);
-}
-.star-strip .msg{
-  flex:1;min-width:220px;
-  font:500 13.5px/1.4 var(--sans);color:#D9E4EF;
-}
-.star-strip .msg strong{color:#fff;font-weight:700}
-.star-strip .msg small{color:#8B9AA9;font-size:12.5px;margin-left:6px}
-.star-strip .cta{
-  font:600 13px/1 var(--mono);padding:9px 15px;border-radius:7px;
-  background:transparent;color:var(--cyan);
-  border:1px solid rgba(0,173,216,.55);
-  display:inline-flex;align-items:center;gap:7px;white-space:nowrap;
-  transition:background .15s ease,border-color .15s ease;
-}
-.star-strip .cta:hover{background:rgba(0,173,216,.12);border-color:var(--cyan);text-decoration:none}
-.star-strip .cta .s{color:#F4C15C}
-@media (max-width:520px){.star-strip .msg small{display:block;margin-left:0;margin-top:2px}}
 .book-ribbon{
   position:absolute;top:22px;right:-38px;width:150px;
   transform:rotate(45deg);
@@ -508,14 +509,11 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
 <main id="main">
 
 <!-- ============ BOOK ANNOUNCEMENT BANNER ============ -->
-<!-- ================= STAR STRIP ================= -->
-<div class="star-strip" role="region" aria-label="Support the project">
-  <div class="wrap">
-    <span class="icon" aria-hidden="true">&#9733;</span>
-    <p class="msg"><strong>If any part of this helped you</strong>, the code, the blog series, or the book, the kindest thing you can do is star the repo. <small>Two seconds. Signals what to keep building.</small></p>
-    <a class="cta" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener"><span class="s" aria-hidden="true">&#9733;</span> Star on GitHub</a>
-  </div>
-</div>
+<!-- Fixed corner ribbon: the star ask for the whole project (repo + blog +
+     book), always visible while scrolling. -->
+<a class="star-ribbon" href="https://github.com/sohag-pro/go-ledger" target="_blank" rel="noopener" aria-label="Star the go-ledger project on GitHub if it helped you">
+  <span class="s" aria-hidden="true">&#9733;</span> Star on GitHub
+</a>
 
 <a class="book-banner" href="#book" aria-label="The Ledger Book: the whole build plus interview Q and A found only in the book">
   <span class="bb-in">
@@ -531,9 +529,8 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
       </svg>
     </span>
     <span class="bb-body">
-      <span class="bb-kick"><span class="bb-dot" aria-hidden="true"></span>v1.0 out today &middot; 699 pages</span>
-      <div class="bb-title">Read <span class="g">The Ledger Book</span></div>
-      <p class="bb-sub">The full 14-week build in one volume, <strong>plus the senior-engineer interview Q&amp;A that lives only here.</strong> Foreword by Hasin Hayder.</p>
+      <span class="bb-kick"><span class="bb-dot" aria-hidden="true"></span>v1.0 &middot; 699 pages &middot; free</span>
+      <div class="bb-title"><span class="g">The Ledger Book</span> is out.</div>
     </span>
     <span class="bb-cta">Get the book <span class="a" aria-hidden="true">&rarr;</span></span>
   </span>
@@ -741,13 +738,15 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
     </header>
     <div class="stack-row rv">
       <span class="chip lead">Go</span>
-      <span class="chip">chi</span>
+      <span class="chip">chi + huma</span>
       <span class="chip">pgx + sqlc</span>
       <span class="chip">goose</span>
       <span class="chip">Postgres</span>
       <span class="chip">gRPC / buf</span>
       <span class="chip">OpenTelemetry</span>
+      <span class="chip">Prometheus</span>
       <span class="chip">Docker</span>
+      <span class="chip">Ansible</span>
       <span class="chip">VPS</span>
       <span class="chip">GitHub Actions</span>
     </div>
@@ -798,21 +797,18 @@ footer{background:var(--bg-deep);padding:44px 0 52px}
       </div>
       <div>
         <p class="sec-no">05 &middot; the book</p>
-        <h2 id="book-h">The whole build, plus an interview you won't find anywhere else. <span class="first-tag" style="vertical-align:6px">v1.0 out today</span></h2>
-        <p>Every blog post, every architecture decision, and 50 bonus interview questions, edited into one 699-page volume. The part that lives only here: for each week, the senior-engineer interview questions this project would put you through, with what a strong answer covers. Foreword by Hasin Hayder. Free to read, PDF and EPUB.</p>
+        <h2 id="book-h">The whole build. <br>Plus the interview.</h2>
+        <p>The 14-week build, every ADR, and the senior-engineer interview questions this project would put you through, in one volume. Free.</p>
+        <p class="book-meta">v1.0 &middot; 699 pages &middot; PDF + EPUB &middot; CC BY-NC-ND 4.0</p>
         <div class="dl-row">
-          <a class="dl" href="/the-ledger-book.pdf" target="_blank" rel="noopener">&darr; PDF</a>
+          <a class="dl dl-primary" href="/the-ledger-book.pdf" target="_blank" rel="noopener">&darr; Download PDF</a>
           <a class="dl" href="https://github.com/sohag-pro/go-ledger/raw/main/the-ledger-book.epub">&darr; EPUB</a>
         </div>
-        <p class="book-note"><span aria-hidden="true">&#10022;</span> The full 14-week series is complete, and so is the book: 21 Parts, 27 ADRs, 50-question bonus round.</p>
-        <div class="print-callout">
+        <a class="print-strip" href="https://forms.gle/T6jdJVVmbCpdcvhh8" target="_blank" rel="noopener">
           <span class="flag" aria-hidden="true">&#127463;&#127465;</span>
-          <div class="body">
-            <strong>Print edition, Bangladesh only.</strong> If you would read this in print, sign the interest form. A print run only happens once enough people ask.
-            <em>Not a pre-order. No charge. No commitment.</em>
-          </div>
-          <a class="cta" href="https://forms.gle/T6jdJVVmbCpdcvhh8" target="_blank" rel="noopener">Sign interest &rarr;</a>
-        </div>
+          <span class="txt">Want it in print? <strong>Sign interest, Bangladesh only.</strong></span>
+          <span class="arrow" aria-hidden="true">&rarr;</span>
+        </a>
       </div>
     </div>
   </div>
